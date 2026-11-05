@@ -282,6 +282,21 @@ def test_ufunc_values_and_dtypes() -> None:
     assert np.matmul(a, np.arange(12, dtype=np.float64).reshape(3, 4)).shape == (2, 4)
 
 
+def test_named_dtype_and_helpers() -> None:
+    a = np.arange(6, dtype=np.float64).reshape(2, 3)
+    assert np.zeros((2, 3), dtype=np.float32).dtype == np.dtype(np.float32)
+    assert np.asarray(a, dtype=np.float32).dtype == np.dtype(np.float32)
+    assert np.asarray(a, dtype="float32").dtype == np.dtype(np.float32)
+    assert a.astype(np.float32).dtype == np.dtype(np.float32)
+    assert np.array([105.0, 68.0]).shape == (2,)
+    assert np.array([105.0, 68.0]).dtype == np.dtype(np.float64)
+    assert np.array([1, 2, 3]).dtype == np.dtype(np.int64)
+    assert (-a).shape == (2, 3) and (+a).shape == (2, 3)
+    assert len(a) == 2
+    assert a.shape == (2, 3)
+    assert np.broadcast_to(np.zeros(3), a.shape).shape == (2, 3)
+
+
 def test_fancy_index_and_take_values() -> None:
     a = np.zeros((5, 10, 2))
     ids = np.zeros((5, 3), dtype=np.int64)

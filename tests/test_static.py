@@ -268,6 +268,69 @@ def test_take_nonaxis_mismatch() -> None:
     )
 
 
+def test_take_axis_out_of_range() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_take_axis.py"),
+        "take_along_axis axis 5 is out of range for 2 dimensions",
+    )
+
+
+def test_logical_broadcast_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_logical_broadcast.py"),
+        "broadcast shapes disagree at trailing axis 0",
+        "3 vs 4",
+        "(2, 3)",
+        "(2, 4)",
+    )
+
+
+def test_any_axis_out_of_range() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_any_axis.py"),
+        "axis 5 is out of range for 2 dimensions",
+    )
+
+
+def test_reshape_symbolic_size() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_reshape_sym_size.py"),
+        "reshape changes total size: 20 -> 21",
+        "(N, 10, 2)",
+        "(N, 21)",
+    )
+
+
+def test_reshape_symbolic_minus1() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_reshape_sym_minus1.py"),
+        "reshape cannot infer -1",
+        "20",
+        "3",
+    )
+
+
+def test_min_axis_out_of_range() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_min_axis.py"),
+        "axis 5 is out of range for 2 dimensions",
+    )
+
+
+def test_callsite_conflict() -> None:
+    result = run_mypy(FIXTURES / "bad_callsite_conflict.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 3, result.stdout
+    assert "shape conflict for 'N'" in errors[0], result.stdout
+    assert "'a'" in errors[0] and "'b'" in errors[0], result.stdout
+    assert "5" in errors[0] and "7" in errors[0], result.stdout
+    assert "shape conflict for 'K'" in errors[1], result.stdout
+    assert "7" in errors[1] and "9" in errors[1], result.stdout
+    assert "shape conflict for 'N'" in errors[2], result.stdout
+    assert "'a'" in errors[2] and "'b'" in errors[2], result.stdout
+
+
 def test_fancy_dtype_mismatch() -> None:
     assert_rank_mismatch(
         run_mypy(FIXTURES / "bad_fancy_dtype.py"),
@@ -280,6 +343,13 @@ def test_symbolic_take_rank_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_sym_take_rank.py"),
         "must have the same number of dimensions",
+    )
+
+
+def test_len_unsized_object() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_len_scalar.py"),
+        "len() of unsized object",
     )
 
 

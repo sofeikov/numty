@@ -24,7 +24,10 @@ What it does:
   bail out to the stubs.
 - shape builders (*_like from the prototype, full, eye, arange,
   concatenate/stack over tuple or list displays) compute the result shape.
-  Explicit dtype= and unknown dims bail out.
+  An explicit, resolvable dtype= is used as-is; unknown dims bail out.
+- np.array/asarray build from displays, .astype converts, len() folds
+  known first dims, .shape reports literal (and symbolic) dims, and
+  unary -/~ keep the shape.
 - comparisons broadcast shapes and return bool arrays; argmax/argsort
   drop or keep the axis; Generator/RandomState methods solve from size=.
 - getitem solves integer-array (fancy) indices and take_along_axis;
@@ -49,27 +52,42 @@ from functools import partial
 
 from mypy.nodes import (
     ARG_NAMED,
+    ARG_OPT,
     ARG_POS,
+    ARG_STAR,
+    ARG_STAR2,
+    CallExpr,
     EllipsisExpr,
     Expression,
     IntExpr,
+    ListComprehension,
     ListExpr,
     MemberExpr,
     NameExpr,
     OpExpr,
+    OverloadedFuncDef,
     SliceExpr,
     StarExpr,
     StrExpr,
     TupleExpr,
+    TypeInfo,
     UnaryExpr,
     Var,
 )
-from mypy.plugin import FunctionContext, MethodContext, Plugin
+from mypy.plugin import (
+    AttributeContext,
+    FunctionContext,
+    FunctionSigContext,
+    MethodContext,
+    Plugin,
+)
 from mypy.types import (
     AnyType,
+    CallableType,
     Instance,
     LiteralType,
     NoneType,
+    Overloaded,
     TupleType,
     Type,
     TypeOfAny,
@@ -89,14 +107,87 @@ def plugin(version: str) -> type[Plugin]:
 
 
 class NumtyPlugin(Plugin):
+    def __init__(self, options) -> None:
+        super().__init__(options)
+        self._seen_conflicts: set[tuple[str, int, str]] = set()
+
+    def get_function_signature_hook(
+        self, fullname: str
+    ) -> Callable[[FunctionSigContext], Type] | None:
+        # Dedicated hooks own numpy/numty calls; everything else with
+        # shape TypeVars in its formals gets the call-site conflict
+        # check. Overloads are skipped: the hook runs per candidate and
+        # a non-matching item would false-positive.
+        if fullname.startswith("numpy.") or fullname.startswith("numty."):
+            return None
+        return self.callsite_signature_hook
+
+    def callsite_signature_hook(self, ctx: FunctionSigContext) -> Type:
+        try:
+            return self._callsite_check(ctx)
+        except Exception:
+            return ctx.default_signature
+
+    def _callsite_check(self, ctx: FunctionSigContext) -> Type:
+        sig = ctx.default_signature
+        if not isinstance(sig, CallableType):
+            return sig
+        if isinstance(ctx.context, CallExpr) and isinstance(
+            ctx.context.callee.node if hasattr(ctx.context.callee, "node") else None,
+            OverloadedFuncDef,
+        ):
+            # The hook runs per overload candidate; a non-matching
+            # item would false-positive, so overloaded callees stay out.
+            return sig
+        formals = _shape_tvar_formals(sig)
+        if not formals or len(ctx.args) != len(sig.arg_types):
+            return sig
+        by_var: dict[str, tuple[str, list[tuple[str, int]]]] = {}
+        for i, positions in formals:
+            actuals = ctx.args[i]
+            if len(actuals) != 1:
+                continue
+            try:
+                actual = ctx.api.get_expression_type(actuals[0])
+            except Exception:
+                continue
+            parts = _ndarray_parts(actual)
+            if parts is None:
+                continue
+            adims, _ = parts
+            formal_name = sig.arg_names[i] or "?"
+            for dim, tvar in positions:
+                if dim >= len(adims) or not isinstance(adims[dim], int):
+                    continue
+                name, occs = by_var.get(tvar.fullname, (tvar.name, []))
+                occs.append((formal_name, adims[dim]))
+                by_var[tvar.fullname] = (name, occs)
+        for _, (name, occs) in by_var.items():
+            first = occs[0]
+            for other in occs[1:]:
+                if other[1] != first[1]:
+                    message = (
+                        f"call-site shape conflict for '{name}': "
+                        f"{first[1]} (argument '{first[0]}') vs "
+                        f"{other[1]} (argument '{other[0]}')"
+                    )
+                    key = (ctx.api.path, ctx.context.line, message)
+                    if key not in self._seen_conflicts:
+                        self._seen_conflicts.add(key)
+                        ctx.api.fail(message, ctx.context)
+                    break
+        return sig
+
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         # numpy re-exports these from private modules (e.g.
         # numpy._core.multiarray), so match the public tail.
         short = fullname.rsplit(".", 1)[-1]
+        if fullname == "builtins.len":
+            return len_function_hook
         if fullname.startswith("numpy.") and short in {"zeros", "ones", "empty"}:
             return zeros_like_hook
-        # np.matmul itself has no stub definition to hook (it resolves to
-        # Any), so solve at our own wrapper instead.
+        # Raw np.matmul solves through the ufunc __call__ hook; the
+        # numty.matmul wrapper below stays as a convenience alias.
         if fullname == "numty.matmul":
             return matmul_hook
         # np.reshape lives in numpy._core.fromnumeric; match the tail like
@@ -119,6 +210,8 @@ class NumtyPlugin(Plugin):
             "var",
         }:
             return reduction_function_hook
+        if fullname.startswith("numpy.") and short in {"any", "all"}:
+            return allany_function_hook
         if fullname.startswith("numpy.") and short in {
             "zeros_like",
             "ones_like",
@@ -153,7 +246,7 @@ class NumtyPlugin(Plugin):
             return clip_function_hook
         if fullname.startswith("numpy.") and short == "broadcast_to":
             return broadcast_to_function_hook
-        if fullname.startswith("numpy.") and short in {"asarray", "asanyarray"}:
+        if fullname.startswith("numpy.") and short in {"asarray", "asanyarray", "array"}:
             return asarray_function_hook
         if fullname.startswith("numpy.") and short == "take_along_axis":
             return take_along_axis_function_hook
@@ -199,6 +292,13 @@ class NumtyPlugin(Plugin):
             return partial(rng_method_hook, op=short)
         return None
 
+    def get_attribute_hook(
+        self, fullname: str
+    ) -> Callable[[AttributeContext], Type] | None:
+        if fullname == "numpy.ndarray.shape":
+            return shape_attribute_hook
+        return None
+
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
         # NOTE: no __matmul__ hook. In testing, operator dispatch consulted
         # the method hook inconsistently across statements for @ (silent
@@ -235,8 +335,14 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__rtruediv__",
         }:
             return truediv_method_hook
-        if fullname == "numpy.ndarray.__invert__":
-            return invert_method_hook
+        if fullname in {
+            "numpy.ndarray.__invert__",
+            "numpy.ndarray.__neg__",
+            "numpy.ndarray.__pos__",
+        }:
+            return identity_method_hook
+        if fullname == "numpy.ndarray.astype":
+            return astype_method_hook
         if fullname == "numpy.ndarray.reshape":
             return reshape_method_hook
         if fullname == "numpy.ndarray.transpose":
@@ -255,6 +361,15 @@ class NumtyPlugin(Plugin):
             "__ge__",
         }:
             return compare_method_hook
+        if fullname.startswith("numpy.ndarray.") and short in {
+            "__and__",
+            "__rand__",
+            "__or__",
+            "__ror__",
+        }:
+            return logical_method_hook
+        if fullname.startswith("numpy.ndarray.") and short in {"any", "all"}:
+            return allany_method_hook
         if fullname.startswith("numpy.ndarray.") and short in {
             "argmax",
             "argmin",
@@ -410,6 +525,33 @@ def _fold_int(expr: Expression) -> int | None:
         node = expr.node
         if isinstance(node, Var) and node.type is not None:
             return _int_value(node.type)
+    if (
+        isinstance(expr, CallExpr)
+        and isinstance(expr.callee, NameExpr)
+        and expr.callee.name == "len"
+        and len(expr.args) == 1
+        and expr.arg_kinds[0] == ARG_POS
+        and not isinstance(expr.args[0], StarExpr)
+    ):
+        fn = expr.callee.node
+        if fn is None or getattr(fn, "fullname", "") != "builtins.len":
+            return None
+        return _fold_len_arg(expr.args[0])
+    return None
+
+
+def _fold_len_arg(arg: Expression) -> int | None:
+    """len() of a Final/param array's first literal dim, or an int enum."""
+    if not isinstance(arg, NameExpr):
+        return None
+    node = arg.node
+    if isinstance(node, Var) and node.type is not None:
+        parts = _ndarray_parts(node.type)
+        if parts is not None and parts[0] and isinstance(parts[0][0], int):
+            return parts[0][0]
+        return None
+    if isinstance(node, TypeInfo) and node.is_enum:
+        return _enum_member_count(node)
     return None
 
 
@@ -443,6 +585,25 @@ def _ndarray_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
     return (dims, proper.args[1]) if dims is not None else None
 
 
+def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
+    """Formals with shape TypeVars: (formal index, [(dim index, tvar)]).
+
+    Only plain positional-or-defaulted ndarray formals; anything
+    fancier (star args, non-array shapes) stays out of the check.
+    """
+    out: list[tuple[int, list[tuple[int, TypeVarType]]]] = []
+    for i, (tp, kind) in enumerate(zip(sig.arg_types, sig.arg_kinds)):
+        if kind not in (ARG_POS, ARG_OPT):
+            continue
+        parts = _ndarray_parts(tp)
+        if parts is None:
+            continue
+        positions = [(d, t) for d, t in enumerate(parts[0]) if isinstance(t, TypeVarType)]
+        if positions:
+            out.append((i, positions))
+    return out
+
+
 def _ndarray_type(
     ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
 ) -> Instance:
@@ -456,27 +617,25 @@ def _ndarray_type(
 
 
 def _single_shape_arg(ctx: FunctionContext | MethodContext) -> Type | None:
-    """The shape argument of a one-argument call, else None.
+    """The shape argument (first positional) of a call, else None.
 
-    arg_types/arg_kinds are grouped by formal (unfilled formals pad as []),
-    so gate on the flattened actual arguments instead.
+    Extra named arguments (dtype=, order=, ...) are ignored here and
+    handled by the caller's own formal lookups.
     """
-    actual = [kind for group in ctx.arg_kinds for kind in group]
-    if actual not in ([ARG_POS], [ARG_NAMED]):
-        return None
-    if not ctx.arg_types or not ctx.arg_types[0]:
-        return None
-    return ctx.arg_types[0][0]
+    for kinds, types in zip(ctx.arg_kinds, ctx.arg_types):
+        for kind, tp in zip(kinds, types):
+            if kind == ARG_POS:
+                return tp
+    return None
 
 
 def _single_shape_expr(ctx: FunctionContext | MethodContext) -> Expression | None:
-    """The shape argument expression of a one-argument call, else None."""
-    actual = [kind for group in ctx.arg_kinds for kind in group]
-    if actual not in ([ARG_POS], [ARG_NAMED]):
-        return None
-    if not ctx.args or not ctx.args[0]:
-        return None
-    return ctx.args[0][0]
+    """The shape argument expression (first positional), else None."""
+    for kinds, exprs in zip(ctx.arg_kinds, ctx.args):
+        for kind, expr in zip(kinds, exprs):
+            if kind == ARG_POS:
+                return expr
+    return None
 
 
 def _shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
@@ -492,6 +651,12 @@ def _shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
     return [single] if single is not None else None
 
 
+def _default_float_dtype(ctx: FunctionContext | MethodContext) -> Type:
+    return ctx.api.named_generic_type(
+        DTYPE_FULLNAME, [ctx.api.named_generic_type(FLOAT64_FULLNAME, [])]
+    )
+
+
 def zeros_like_hook(ctx: FunctionContext) -> Type:
     shape_arg = _single_shape_arg(ctx)
     if shape_arg is None:
@@ -499,10 +664,12 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
     dims = _shape_from_arg(shape_arg, _single_shape_expr(ctx))
     if dims is None:
         return ctx.default_return_type
-    dtype = ctx.api.named_generic_type(
-        DTYPE_FULLNAME, [ctx.api.named_generic_type(FLOAT64_FULLNAME, [])]
-    )
-    return _ndarray_type(ctx, dims, dtype)
+    if _explicit_dtype(ctx):
+        dtype = _named_dtype(ctx)
+        if dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, dtype)
+    return _ndarray_type(ctx, dims, _default_float_dtype(ctx))
 
 
 def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
@@ -699,13 +866,16 @@ def broadcast_function_hook(ctx: FunctionContext) -> Type:
 STR_FULLNAME = "builtins.str"
 
 
-def _reshape_new_dims(pairs: list[tuple[Type, Expression | None]]) -> list[int] | None:
+def _reshape_new_dims(
+    pairs: list[tuple[Type, Expression | None]],
+) -> list[int | TypeVarType] | None:
     """Target dims from leading positional reshape args, else None to bail.
 
     Accepts one tuple (reshape((2, 4))), one int (reshape(6)), or several
-    ints (reshape(2, 4)). Expressions fold first (Final names, arithmetic),
-    types are the fallback. A positional order= string (np.reshape(a, shape,
-    "F")) ends the scan; anything else unknown bails out.
+    ints (reshape(2, 4)); symbolic TypeVars pass through. Expressions fold
+    first (Final names, arithmetic), types are the fallback. A positional
+    order= string (np.reshape(a, shape, "F")) ends the scan; anything else
+    unknown bails out.
     """
     if not pairs:
         return None
@@ -713,16 +883,22 @@ def _reshape_new_dims(pairs: list[tuple[Type, Expression | None]]) -> list[int] 
     if isinstance(first_expr, (TupleExpr, ListExpr)) or (
         first_expr is None and isinstance(get_proper_type(first_tp), TupleType)
     ):
-        return _shape_from_arg(first_tp, first_expr)
-    dims: list[int] = []
+        got = _shape_from_arg(first_tp, first_expr)
+        if got is None or any(
+            not isinstance(d, int) and not isinstance(d, TypeVarType) for d in got
+        ):
+            return None
+        return [d for d in got if isinstance(d, int) or isinstance(d, TypeVarType)]
+    dims: list[int | TypeVarType] = []
     for tp, expr in pairs:
         proper = get_proper_type(tp)
         if isinstance(proper, Instance) and proper.type.fullname == STR_FULLNAME:
             break
         value = _fold_int(expr) if expr is not None else None
         if value is None:
-            value = _int_value(tp)
-        if value is None:
+            dim = _dim_value(tp)
+            value = dim if isinstance(dim, (int, TypeVarType)) else None
+        if value is None or isinstance(value, bool):
             return None
         dims.append(value)
     return dims or None
@@ -738,36 +914,50 @@ def _solve_reshape(
     raw = _reshape_new_dims(pairs)
     if raw is None:
         return ctx.default_return_type
-    if any(d < -1 for d in raw):
+    raw_ints = [d for d in raw if isinstance(d, int)]
+    if any(d < -1 for d in raw_ints):
         ctx.api.fail(
-            f"reshape has invalid dimension {min(raw)}; only -1 may be negative "
-            f"(shape {tuple(raw)})",
+            f"reshape has invalid dimension {min(raw_ints)}; only -1 may be negative "
+            f"(shape {_dims_str(raw)})",
             ctx.context,
         )
         return ctx.default_return_type
-    if raw.count(-1) > 1:
+    if raw_ints.count(-1) > 1:
         ctx.api.fail(
-            f"reshape accepts only one -1 dimension (shape {tuple(raw)})",
+            f"reshape accepts only one -1 dimension (shape {_dims_str(raw)})",
             ctx.context,
         )
         return ctx.default_return_type
-    if any(not isinstance(d, int) for d in dims_old):
-        # Symbolic sizes cannot be multiplied for the conservation check.
+    # Conservation with symbolic sizes: int products must match and the
+    # TypeVar multisets must agree; anything else bails out.
+    old_ints = [d for d in dims_old if isinstance(d, int)]
+    old_vars = sorted(d.fullname for d in dims_old if isinstance(d, TypeVarType))
+    if len(old_ints) + len(old_vars) != len(dims_old):
         return ctx.default_return_type
+    new_vars = sorted(d.fullname for d in raw if isinstance(d, TypeVarType))
     size_old = 1
-    for d in dims_old:
-        assert isinstance(d, int)
+    for d in old_ints:
         size_old *= d
-    dims_new: list[int] | None
-    if -1 in raw:
+    dims_new: list[int | TypeVarType] | None
+    raw_str = _dims_str(raw) if new_vars else f"{tuple(raw)}"
+    if -1 in raw_ints:
         known = 1
-        for d in raw:
+        for d in raw_ints:
             if d != -1:
                 known *= d
+        if old_vars != new_vars:
+            # The inferred dim would absorb a symbolic size (N * 50 is not
+            # expressible), so this stays out of scope instead of erroring.
+            return ctx.default_return_type
         if known == 0 or size_old % known != 0:
+            detail = (
+                f"(shape {_dims_str(dims_old)} vs {raw_str})"
+                if old_vars
+                else f"(shape {raw_str})"
+            )
             ctx.api.fail(
                 f"reshape cannot infer -1: total size {size_old} is not divisible "
-                f"by {known} (shape {tuple(raw)})",
+                f"by {known} {detail}",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -775,14 +965,18 @@ def _solve_reshape(
         dims_new = [inferred if d == -1 else d for d in raw]
     else:
         size_new = 1
-        for d in raw:
+        for d in raw_ints:
             size_new *= d
         if size_new != size_old:
             ctx.api.fail(
                 f"reshape changes total size: {size_old} -> {size_new} "
-                f"(shapes {_dims_str(dims_old)} vs {tuple(raw)})",
+                f"(shapes {_dims_str(dims_old)} vs {raw_str})",
                 ctx.context,
             )
+            return ctx.default_return_type
+        if old_vars != new_vars:
+            # Same int total but different symbolic factors (N vs M): the
+            # equality is unprovable, so bail out instead of erroring.
             return ctx.default_return_type
         dims_new = raw
     return _ndarray_type(ctx, dims_new, dtype)
@@ -1208,11 +1402,13 @@ def _solve_reduction(
     axis: list[int] | None | str,
     keepdims: bool | None,
     has_dtype: bool,
+    force_dtype: Type | None = None,
 ) -> Type:
     if not isinstance(axis, list) or keepdims is None or has_dtype:
         return ctx.default_return_type
-    if _dtype_fullname(dtype) not in REDUCTION_DTYPES:
+    if force_dtype is None and _dtype_fullname(dtype) not in REDUCTION_DTYPES:
         return ctx.default_return_type
+    out_dtype = force_dtype if force_dtype is not None else dtype
     ndim = len(dims)
     normalized: list[int] = []
     for ax in axis:
@@ -1230,8 +1426,36 @@ def _solve_reduction(
         normalized.append(norm)
     chosen = set(normalized)
     if keepdims:
-        return _ndarray_type(ctx, [1 if i in chosen else d for i, d in enumerate(dims)], dtype)
-    return _ndarray_type(ctx, [d for i, d in enumerate(dims) if i not in chosen], dtype)
+        return _ndarray_type(ctx, [1 if i in chosen else d for i, d in enumerate(dims)], out_dtype)
+    return _ndarray_type(ctx, [d for i, d in enumerate(dims) if i not in chosen], out_dtype)
+
+
+def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) -> Type:
+    """any/all: same axis rules as reductions, but the output is bool."""
+    parts = _ndarray_parts(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    keep_pair = _formal_pair(ctx, "keepdims")
+    keepdims = False if keep_pair is None else _fold_flag(keep_pair)
+    dtype_pair = _formal_pair(ctx, "dtype")
+    has_dtype = dtype_pair is not None and not _is_none_type(dtype_pair[0])
+    dtype = _construct_dtype(ctx, "numpy.bool")
+    if dtype is None:
+        return ctx.default_return_type
+    return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, dtype)
+
+
+def allany_method_hook(ctx: MethodContext) -> Type:
+    return _reduction_inputs_bool(ctx, ctx.type)
+
+
+def allany_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _reduction_inputs_bool(ctx, pairs[0][0])
 
 
 _DTYPE_BASE = {
@@ -1249,15 +1473,51 @@ _DTYPE_BASE = {
 }
 
 
+_NBIT_TAG_BY_BYTES = {
+    1: "_8Bit",
+    2: "_16Bit",
+    4: "_32Bit",
+    8: "_64Bit",
+    16: "_128Bit",
+}
+_NBIT_MODULES = ("numpy._typing._nbit_base", "numpy._typing._nbit")
+
+
+def _exact_element(
+    ctx: FunctionContext | MethodContext, base: str, size: int
+) -> Type | None:
+    """base[_NBit] for a known byte size, else None when the tag won't load.
+
+    Complex takes the component tag twice (complex64 is
+    complexfloating[_32Bit, _32Bit]).
+    """
+    twice = base == "numpy.complexfloating"
+    tag = _NBIT_TAG_BY_BYTES.get(size // 2 if twice else size)
+    if tag is None:
+        return None
+    modules = getattr(ctx.api, "modules", None) or {}
+    for module in _NBIT_MODULES:
+        try:
+            mod = modules.get(module)
+            node = mod.names.get(tag) if mod is not None else None
+            info = node.node if node is not None else None
+            if info is None or not hasattr(info, "fullname"):
+                continue
+            bit = Instance(info, [])
+            return ctx.api.named_generic_type(base, [bit, bit] if twice else [bit])
+        except Exception:
+            continue
+    return None
+
+
 def _construct_dtype(ctx: FunctionContext | MethodContext, name: str) -> Type | None:
     """A dtype[...] Instance for a promotion result, else None to bail.
 
     Most numpy scalar names are type aliases, which named_generic_type
     rejects (it asserts on TypeAlias). Reusable inputs keep their exact
-    dtype; anything else builds the generic base with Any bits. Exact bit
-    widths live behind stub-only tag classes whose loading is not
-    guaranteed in a plugin context, so they are never depended on. Never
-    crashes: failure means bail.
+    dtype; anything else builds the base with the exact bit-width tag
+    (falling back to Any bits when the stub-only tag class won't load).
+    Never crashes: failure means bail.
     """
     try:
         if name in ("numpy.float64", "numpy.complex128"):
@@ -1270,11 +1530,13 @@ def _construct_dtype(ctx: FunctionContext | MethodContext, name: str) -> Type | 
             base = _DTYPE_BASE.get(name)
             if base is None:
                 return None
-            any_arg = AnyType(TypeOfAny.explicit)
-            try:
-                element = ctx.api.named_generic_type(base, [any_arg])
-            except AssertionError:
-                element = ctx.api.named_generic_type(base, [any_arg, any_arg])
+            element = _exact_element(ctx, base, _DTYPE_INFO[name][1])
+            if element is None:
+                any_arg = AnyType(TypeOfAny.explicit)
+                try:
+                    element = ctx.api.named_generic_type(base, [any_arg])
+                except AssertionError:
+                    element = ctx.api.named_generic_type(base, [any_arg, any_arg])
         return ctx.api.named_generic_type(DTYPE_FULLNAME, [element])
     except AssertionError:
         return None
@@ -1308,6 +1570,136 @@ def _explicit_dtype(ctx: FunctionContext | MethodContext) -> bool:
     return pair is not None and not _is_none_type(pair[0])
 
 
+_BUILTIN_DTYPE = {
+    "builtins.bool": "numpy.bool",
+    "builtins.int": "numpy.int64",
+    "builtins.float": "numpy.float64",
+    "builtins.complex": "numpy.complex128",
+}
+
+
+def _instance_fullname(tp: Type) -> str | None:
+    proper = get_proper_type(tp)
+    if isinstance(proper, Instance):
+        return proper.type.fullname
+    return None
+
+
+_DTYPE_STRINGS = {
+    "bool": "numpy.bool",
+    "int8": "numpy.int8",
+    "int16": "numpy.int16",
+    "int32": "numpy.int32",
+    "int64": "numpy.int64",
+    "uint8": "numpy.uint8",
+    "uint16": "numpy.uint16",
+    "uint32": "numpy.uint32",
+    "uint64": "numpy.uint64",
+    "float16": "numpy.float16",
+    "float32": "numpy.float32",
+    "float64": "numpy.float64",
+    "complex64": "numpy.complex64",
+    "complex128": "numpy.complex128",
+}
+
+
+def _scalar_ret_name(ret: Type) -> str | None:
+    """Concrete dtype name for a scalar-constructor return type (np.float32
+    is a stub function returning floating[_32Bit]), else None."""
+    proper = get_proper_type(ret)
+    if not isinstance(proper, Instance):
+        return None
+    base = proper.type.fullname
+    if base == "numpy.bool":
+        return "numpy.bool"
+    tables = {
+        "numpy.floating": {16: "numpy.float16", 32: "numpy.float32", 64: "numpy.float64"},
+        "numpy.complexfloating": {64: "numpy.complex64", 128: "numpy.complex128"},
+        "numpy.signedinteger": {
+            8: "numpy.int8",
+            16: "numpy.int16",
+            32: "numpy.int32",
+            64: "numpy.int64",
+        },
+        "numpy.unsignedinteger": {
+            8: "numpy.uint8",
+            16: "numpy.uint16",
+            32: "numpy.uint32",
+            64: "numpy.uint64",
+        },
+    }
+    table = tables.get(base)
+    if table is None or len(proper.args) != 1:
+        return None
+    bit = get_proper_type(proper.args[0])
+    if not isinstance(bit, Instance):
+        return None
+    try:
+        bits = int(bit.type.fullname.rsplit("_", 1)[-1].removesuffix("Bit"))
+    except ValueError:
+        return None
+    return table.get(bits)
+
+
+def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
+    """dtype[...] for an explicit, resolvable dtype= argument.
+
+    Uses the dtype the caller named (type objects, scalar constructors
+    like np.float32, np.dtype(...) results, canonical strings); anything
+    else bails out instead of guessing.
+    """
+    pair = _formal_pair(ctx, "dtype")
+    if pair is None or _is_none_type(pair[0]):
+        return None
+    tp, expr = pair
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType) and isinstance(proper.value, str):
+        name = _DTYPE_STRINGS.get(proper.value)
+        return _construct_dtype(ctx, name) if name is not None else None
+    if (
+        isinstance(proper, Instance)
+        and proper.type.fullname == "builtins.type"
+        and len(proper.args) == 1
+    ):
+        element = get_proper_type(proper.args[0])
+        if isinstance(element, Instance):
+            fullname = element.type.fullname
+            if fullname == "numpy.bool_":
+                fullname = "numpy.bool"
+            fullname = _BUILTIN_DTYPE.get(fullname, fullname)
+            if fullname in _DTYPE_INFO:
+                return _construct_dtype(ctx, fullname)
+    if isinstance(proper, Instance) and proper.type.fullname == DTYPE_FULLNAME:
+        if len(proper.args) == 1:
+            element = get_proper_type(proper.args[0])
+            if isinstance(element, Instance) and element.type.fullname in _DTYPE_INFO:
+                return _construct_dtype(ctx, element.type.fullname)
+        return None
+    if isinstance(proper, CallableType):
+        name = _scalar_ret_name(proper.ret_type)
+        if name is None:
+            name = _BUILTIN_DTYPE.get(_instance_fullname(proper.ret_type))
+        return _construct_dtype(ctx, name) if name is not None else None
+    if isinstance(proper, Overloaded):
+        # Bare builtins (int, float, ...) arrive as constructor
+        # overloads; use the dtype only when every item agrees.
+        names = set()
+        for item in proper.items:
+            name = _scalar_ret_name(item.ret_type)
+            if name is None:
+                name = _BUILTIN_DTYPE.get(_instance_fullname(item.ret_type))
+            if name is None:
+                return None
+            names.add(name)
+        if len(names) != 1:
+            return None
+        return _construct_dtype(ctx, names.pop())
+    if isinstance(expr, StrExpr):
+        name = _DTYPE_STRINGS.get(expr.value)
+        return _construct_dtype(ctx, name) if name is not None else None
+    return None
+
+
 def like_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -1323,7 +1715,10 @@ def like_function_hook(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         dims = override
     if _explicit_dtype(ctx):
-        return ctx.default_return_type
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, named)
     return _ndarray_type(ctx, dims, dtype)
 
 
@@ -1337,7 +1732,10 @@ def full_function_hook(ctx: FunctionContext) -> Type:
     if dims is None:
         return ctx.default_return_type
     if _explicit_dtype(ctx):
-        return ctx.default_return_type
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, named)
     name = _fill_dtype_name(fill_pair[0])
     if name is not None:
         dtype = _construct_dtype(ctx, name)
@@ -1370,11 +1768,36 @@ def eye_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     if _explicit_dtype(ctx):
-        return ctx.default_return_type
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, [n, m], named)
     dtype = _construct_dtype(ctx, "numpy.float64")
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, [n, m], dtype)
+
+
+def _arange_symbolic(
+    pairs: list[tuple[Type, Expression | None]],
+) -> list[int | TypeVarType] | None:
+    """arange(N) / arange(0, N) / arange(0, N, 1): N elements, else None."""
+    if len(pairs) == 1:
+        start: int | None = 0
+        stop_tp = pairs[0][0]
+        step: int | None = 1
+    elif len(pairs) in (2, 3):
+        start = _fold_single(pairs[0])
+        stop_tp = pairs[1][0]
+        step = _fold_single(pairs[2]) if len(pairs) == 3 else 1
+    else:
+        return None
+    if start != 0 or step != 1:
+        return None
+    stop = _dim_value(stop_tp)
+    if not isinstance(stop, TypeVarType):
+        return None
+    return [stop]
 
 
 def arange_function_hook(ctx: FunctionContext) -> Type:
@@ -1385,39 +1808,88 @@ def arange_function_hook(ctx: FunctionContext) -> Type:
     for pair in pairs:
         value = _fold_single(pair)
         if value is None:
-            return ctx.default_return_type
+            break
         values.append(value)
-    if len(values) == 1:
-        start, stop, step = 0, values[0], 1
+    dims: list[int | TypeVarType] | None
+    if len(values) == len(pairs):
+        if len(values) == 1:
+            start, stop, step = 0, values[0], 1
+        else:
+            start, stop = values[0], values[1]
+            step = values[2] if len(values) == 3 else 1
+        try:
+            dims = [len(range(start, stop, step))]
+        except ValueError:
+            ctx.api.fail("arange step is zero", ctx.context)
+            return ctx.default_return_type
     else:
-        start, stop = values[0], values[1]
-        step = values[2] if len(values) == 3 else 1
+        dims = _arange_symbolic(pairs)
+        if dims is None:
+            return ctx.default_return_type
     if _explicit_dtype(ctx):
-        return ctx.default_return_type
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        explicit_dtype: Type | None = named
+    else:
+        explicit_dtype = None
+    if explicit_dtype is not None:
+        return _ndarray_type(ctx, dims, explicit_dtype)
+    return _ndarray_type(ctx, dims, _default_dtype(ctx))
+
+
+def _comprehension_parts(
+    ctx: FunctionContext | MethodContext, expr: Expression
+) -> list[tuple[list[int | Type], Type]] | None:
+    """[f(c) for c in EnumClass]: item type from the element expression,
+    count from the enum members. Anything else bails out."""
+    if not isinstance(expr, ListComprehension):
+        return None
+    gen = expr.generator
+    if len(gen.indices) != 1 or len(gen.sequences) != 1 or any(gen.condlists):
+        return None
+    seq = gen.sequences[0]
+    if not isinstance(seq, NameExpr):
+        return None
+    node = seq.node
+    if not isinstance(node, TypeInfo) or not node.is_enum:
+        return None
+    count = _enum_member_count(node)
+    if count is None:
+        return None
     try:
-        count = len(range(start, stop, step))
-    except ValueError:
-        ctx.api.fail("arange step is zero", ctx.context)
-        return ctx.default_return_type
-    return _ndarray_type(ctx, [count], _default_dtype(ctx))
+        item_tp = ctx.api.get_expression_type(gen.left_expr)
+    except Exception:
+        return None
+    if item_tp is None:
+        return None
+    parts = _ndarray_parts(item_tp)
+    if parts is None:
+        return None
+    dims, dtype = parts
+    return [(list(dims), dtype) for _ in range(count)] or None
 
 
 def _sequence_parts(
     ctx: FunctionContext | MethodContext, tp: Type, expr: Expression | None
-) -> list[tuple[list[int], Type]] | None:
+) -> list[tuple[list[int | Type], Type]] | None:
     """Per-array (dims, dtype) of a tuple display, else None to bail.
 
     List displays arrive already joined against the ArrayLike formal, so
     each item's type is re-read from its own expression instead.
     """
+    comp = _comprehension_parts(ctx, expr) if expr is not None else None
+    if comp is not None:
+        return comp
     proper = get_proper_type(tp)
     if isinstance(proper, TupleType):
-        items: list[tuple[list[int], Type]] = []
+        items: list[tuple[list[int | Type], Type]] = []
         for item in proper.items:
             parts = _ndarray_parts(item)
             if parts is None:
                 return None
-            items.append(parts)
+            dims, dtype = parts
+            items.append((list(dims), dtype))
         return items or None
     if isinstance(expr, ListExpr):
         items = []
@@ -1464,10 +1936,13 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     if items is None:
         return ctx.default_return_type
     if _explicit_dtype(ctx):
-        return ctx.default_return_type
-    dtype = _promote_all(ctx, [dtype for _, dtype in items])
-    if dtype is None:
-        return ctx.default_return_type
+        dtype = _named_dtype(ctx)
+        if dtype is None:
+            return ctx.default_return_type
+    else:
+        dtype = _promote_all(ctx, [dtype for _, dtype in items])
+        if dtype is None:
+            return ctx.default_return_type
     axis = _concat_axis(ctx, pairs)
     if axis is None:
         return ctx.default_return_type
@@ -1526,10 +2001,13 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     if items is None:
         return ctx.default_return_type
     if _explicit_dtype(ctx):
-        return ctx.default_return_type
-    dtype = _promote_all(ctx, [dtype for _, dtype in items])
-    if dtype is None:
-        return ctx.default_return_type
+        dtype = _named_dtype(ctx)
+        if dtype is None:
+            return ctx.default_return_type
+    else:
+        dtype = _promote_all(ctx, [dtype for _, dtype in items])
+        if dtype is None:
+            return ctx.default_return_type
     axis = _concat_axis(ctx, pairs)
     if axis is None or axis == "none":
         return ctx.default_return_type
@@ -1817,7 +2295,12 @@ def _solve_getitem(
             _, begin, end, stride = item
             size = dims[dim]
             if not isinstance(size, int):
-                return ctx.default_return_type
+                if begin == "missing" and end == "missing" and stride == "missing":
+                    out.append(size)
+                else:
+                    return ctx.default_return_type
+                dim += 1
+                continue
             bounds = tuple(None if b == "missing" else b for b in (begin, end, stride))
             try:
                 out.append(len(range(*slice(*bounds).indices(size))))
@@ -1867,6 +2350,33 @@ def _broadcast_dims(
 def compare_method_hook(ctx: MethodContext) -> Type:
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
+        return ctx.default_return_type
+    dims = _broadcast_dims(ctx, ctx.type, pairs[0][0])
+    if dims is None:
+        return ctx.default_return_type
+    dtype = _construct_dtype(ctx, "numpy.bool")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def logical_method_hook(ctx: MethodContext) -> Type:
+    """& and | on bool arrays: broadcast shapes, bool out.
+
+    Anything else (int arrays, exotic scalars) bails to the stubs,
+    exactly like before this hook existed.
+    """
+    parts = _ndarray_parts(ctx.type)
+    if parts is None or _dtype_base(parts[1]) != "b":
+        return ctx.default_return_type
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    other = _ndarray_parts(pairs[0][0])
+    if other is not None:
+        if _dtype_base(other[1]) != "b":
+            return ctx.default_return_type
+    elif _bool_value(pairs[0][0]) is None:
         return ctx.default_return_type
     dims = _broadcast_dims(ctx, ctx.type, pairs[0][0])
     if dims is None:
@@ -2692,16 +3202,17 @@ def _combine_specs(
 
 
 def _broadcast_shapes(
-    ctx: FunctionContext | MethodContext, shapes: list[list[int]], op: str
-) -> list[int] | None:
+    ctx: FunctionContext | MethodContext, shapes: list[list[int | Type]], op: str
+) -> list[int | Type] | None:
     """Broadcast known shapes pairwise; None (after failing) on conflict."""
-    dims: list[int] = []
+    dims: list[int | Type] = []
     for other in shapes:
         out, cause = _broadcast_result(dims, other)
         if cause is not None:
             ctx.api.fail(f"{op} shapes disagree: {cause}", ctx.context)
             return None
-        assert out is not None
+        if out is None:
+            return None
         dims = out
     return dims
 
@@ -2859,17 +3370,72 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, dims, dtype)
 
 
+def _display_element_kind(tp: Type, expr: Expression | None) -> str | None:
+    """weak scalar kind of a flat display element, else None to bail."""
+    value = _fold_int(expr) if expr is not None else None
+    if isinstance(value, bool):
+        return "builtins.bool"
+    if isinstance(value, int):
+        return "builtins.int"
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType):
+        if isinstance(proper.value, bool):
+            return "builtins.bool"
+        if isinstance(proper.value, int):
+            return "builtins.int"
+        if isinstance(proper.value, float):
+            return "builtins.float"
+        if isinstance(proper.value, complex):
+            return "builtins.complex"
+        return None
+    if isinstance(proper, Instance) and proper.type.fullname in (
+        "builtins.float",
+        "builtins.complex",
+    ):
+        return proper.type.fullname
+    return None
+
+
 def _solve_asarray(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    # An explicit dtype means the caller controls the result.
-    if _formal_pair(ctx, "dtype") is not None:
+    named = _named_dtype(ctx) if _explicit_dtype(ctx) else None
+    if _explicit_dtype(ctx) and named is None:
         return ctx.default_return_type
     part = _ndarray_parts(pairs[0][0])
-    if part is None:
+    if part is not None:
+        return _ndarray_type(ctx, part[0], named if named is not None else part[1])
+    tp, expr = pairs[0]
+    elems: list[tuple[Type, Expression | None]] = []
+    proper = get_proper_type(tp)
+    if isinstance(proper, TupleType):
+        elems = list(zip(proper.items, [None] * len(proper.items)))
+    elif isinstance(expr, (ListExpr, TupleExpr)):
+        checked = [ctx.api.get_expression_type(e) for e in expr.items]
+        if any(t is None for t in checked):
+            return ctx.default_return_type
+        elems = list(zip([t for t in checked if t is not None], expr.items))
+    if not elems:
         return ctx.default_return_type
-    return _ndarray_type(ctx, part[0], part[1])
+    kinds = [_display_element_kind(t, e) for t, e in elems]
+    if any(k is None for k in kinds):
+        return ctx.default_return_type
+    if named is None:
+        if "builtins.complex" in kinds:
+            default_name = "numpy.complex128"
+        elif "builtins.float" in kinds:
+            default_name = "numpy.float64"
+        elif "builtins.int" in kinds:
+            default_name = "numpy.int64"
+        else:
+            default_name = "numpy.bool"
+        dtype = _construct_dtype(ctx, default_name)
+        if dtype is None:
+            return ctx.default_return_type
+    else:
+        dtype = named
+    return _ndarray_type(ctx, [len(elems)], dtype)
 
 
 def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
@@ -2984,12 +3550,90 @@ def truediv_method_hook(ctx: MethodContext) -> Type:
     return _solve_truediv_pair(ctx, ctx.type, args[0])
 
 
-def invert_method_hook(ctx: MethodContext) -> Type:
+def identity_method_hook(ctx: MethodContext) -> Type:
     parts = _ndarray_parts(ctx.type)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
     return _ndarray_type(ctx, dims, dtype)
+
+
+def astype_method_hook(ctx: MethodContext) -> Type:
+    parts = _ndarray_parts(ctx.type)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    # dtype is the first positional or the named formal; _formal_pair
+    # covers both through the callee's argument names.
+    named = _named_dtype(ctx)
+    if named is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, named)
+
+
+def shape_attribute_hook(ctx: AttributeContext) -> Type:
+    parts = _ndarray_parts(ctx.type)
+    if parts is None:
+        return ctx.default_attr_type
+    dims, _ = parts
+    int_fallback = ctx.api.named_generic_type("builtins.int", [])
+    items: list[Type] = [
+        LiteralType(v, fallback=int_fallback) if isinstance(v, int) else v for v in dims
+    ]
+    fallback = ctx.api.named_generic_type(
+        TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
+    )
+    return TupleType(items, fallback)
+
+
+def _enum_member_count(info) -> int | None:
+    """Member count of an int enum, deduped by value (aliases share one).
+
+    Anything non-conforming bails: only all-int-literal members give a
+    provable count, which is exactly the runtime len() of the class.
+    """
+    names = getattr(info, "enum_members", None)
+    if not isinstance(names, list):
+        return None
+    values: set[int] = set()
+    for name in names:
+        node = info.names[name].node if name in info.names else None
+        if not isinstance(node, Var):
+            return None
+        value = _int_value(node.type) if node.type is not None else None
+        if value is None:
+            return None
+        values.add(value)
+    return len(values)
+
+
+def len_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    int_fallback = ctx.api.named_generic_type("builtins.int", [])
+    proper = get_proper_type(pairs[0][0])
+    if isinstance(proper, CallableType):
+        # An enum class arrives as its constructor; len() counts members.
+        ret = get_proper_type(proper.ret_type)
+        if isinstance(ret, Instance) and ret.type.is_enum:
+            count = _enum_member_count(ret.type)
+            if count is not None:
+                return LiteralType(count, fallback=int_fallback)
+            return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if not dims:
+        ctx.api.fail("len() of unsized object", ctx.context)
+        return ctx.default_return_type
+    first = dims[0]
+    if isinstance(first, TypeVarType):
+        return first
+    if not isinstance(first, int):
+        return ctx.default_return_type
+    return LiteralType(first, fallback=int_fallback)
 
 
 def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
@@ -3041,7 +3685,12 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
     out: list[int | Type] = []
     for d, (x, y) in enumerate(zip(dims_a, dims_i)):
         if d == norm:
-            out.append(y)
+            # Along the axis the index wins, except a 1 falls back to
+            # the array dim; anything symbolic is unprovable, so bail.
+            if isinstance(y, int):
+                out.append(x if y == 1 else y)
+            else:
+                return ctx.default_return_type
         elif _dim_eq(x, y):
             out.append(x)
         elif isinstance(x, int) and x == 1:

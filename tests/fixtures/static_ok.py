@@ -1,4 +1,5 @@
 """All good: mypy must report zero errors here."""
+from enum import IntEnum
 from typing import Any, Final, Literal, TypeVar, cast
 
 import numpy as np
@@ -9,6 +10,12 @@ N = TypeVar("N", bound=int)
 K = TypeVar("K", bound=int)
 M = TypeVar("M", bound=int)
 C = TypeVar("C", bound=int)
+
+
+class Slots(IntEnum):
+    X = 0
+    Y = 1
+    VX = 2
 
 A2 = FloatArray[tuple[Literal[2]]]
 A3 = FloatArray[tuple[Literal[3]]]
@@ -236,6 +243,13 @@ Ai4 = np.ndarray[tuple[Literal[4]], np.dtype[np.signedinteger[Any]]]
 Ai2 = np.ndarray[tuple[Literal[2]], np.dtype[np.signedinteger[Any]]]
 Ai3 = np.ndarray[tuple[Literal[3]], np.dtype[np.signedinteger[Any]]]
 Ai2x3 = np.ndarray[tuple[Literal[2], Literal[3]], np.dtype[np.signedinteger[Any]]]
+Af2x3 = np.ndarray[tuple[Literal[2], Literal[3]], np.dtype[np.floating[Any]]]
+Ai5 = np.ndarray[tuple[Literal[5]], np.dtype[np.signedinteger[Any]]]
+Bb1x3 = np.ndarray[tuple[Literal[1], Literal[3]], np.dtype[np.bool_]]
+Bb3 = np.ndarray[tuple[Literal[3]], np.dtype[np.bool_]]
+SN102 = np.ndarray[tuple[N, Literal[10], Literal[2]], np.dtype[np.float64]]
+SN20 = np.ndarray[tuple[N, Literal[20]], np.dtype[np.float64]]
+A5x20 = FloatArray[tuple[Literal[5], Literal[20]]]
 Ai5x10 = np.ndarray[tuple[Literal[5], Literal[10]], np.dtype[np.signedinteger[Any]]]
 A5 = FloatArray[tuple[Literal[5]]]
 A5x10 = FloatArray[tuple[Literal[5], Literal[10]]]
@@ -259,6 +273,27 @@ def use_i3(m: Ai3) -> None: ...
 
 
 def use_i2x3(m: Ai2x3) -> None: ...
+
+
+def use_f2x3(m: Af2x3) -> None: ...
+
+
+def use_i5(m: Ai5) -> None: ...
+
+
+def use_b1x3(m: Bb1x3) -> None: ...
+
+
+def use_b3(m: Bb3) -> None: ...
+
+
+def use_5x20(m: A5x20) -> None: ...
+
+
+A2x3x3 = FloatArray[tuple[Literal[2], Literal[3], Literal[3]]]
+
+
+def use_2x3x3(m: A2x3x3) -> None: ...
 
 
 def use_i5x10(m: Ai5x10) -> None: ...
@@ -406,8 +441,75 @@ def symbolic_solve(
     return np.linalg.solve(a, b)
 
 
+def sym_slice_keep(a: SNK[N, K]) -> SNK[N, K]:
+    return a[:, :]
+
+
+def sym_slice_fancy(
+    a: SNK[N, K], idx: np.ndarray[tuple[N], np.dtype[np.int64]]
+) -> SNK[N, K]:
+    return a[idx, :]
+
+
+def sym_take_broadcast(
+    a: SNKC[N, K, C], idx: np.ndarray[tuple[N, K], np.dtype[np.signedinteger[Any]]]
+) -> SNKC[N, K, C]:
+    return np.take_along_axis(a, idx[..., None], axis=1)
+
+
+def sym_callsite_ok(a: SNK[N, K], b: SNK[N, K]) -> SNK[N, K]:
+    return a
+
+
+def sym_and(a: SNKb[N, K], b: SNKb[N, K]) -> SNKb[N, K]:
+    return a & b
+
+
+def sym_or(a: SNKb[N, K], b: SNKb[N, K]) -> SNKb[N, K]:
+    return a | b
+
+
+def sym_reshape(a: SN102[N]) -> SN20[N]:
+    return a.reshape(a.shape[0], 20)
+
+
+def sym_reshape_tup(a: SN102[N]) -> SN20[N]:
+    return a.reshape((a.shape[0], 20))
+
+
+def sym_reshape_m1(a: SN102[N]) -> SN20[N]:
+    return a.reshape(a.shape[0], -1)
+
+
+def sym_len(a: SNK[N, K]) -> np.ndarray[tuple[N], np.dtype[np.signedinteger[Any]]]:
+    return np.arange(len(a))
+
+
+def sym_stack_enum(d: dict[Slots, SNK[N, K]]) -> np.ndarray[tuple[N, K, Literal[3]], np.dtype[np.float64]]:
+    return np.stack([d[c] for c in Slots], axis=-1)
+
+
 def symbolic_calls_stay_precise() -> None:
     use_5x10x2(pack_like(np.zeros((5, 10, 2)), np.zeros((5, 10)) > 1.0))
+    use_2x3(sym_slice_keep(np.zeros((2, 3))))
+    use_2x3(sym_slice_fancy(np.zeros((2, 3)), np.arange(2)))
+    use_5x10x2(sym_take_broadcast(np.zeros((5, 10, 2)), np.arange(50).reshape(5, 10)))
+    use_2x3(sym_callsite_ok(np.zeros((2, 3)), np.zeros((2, 3))))
+    use_2x3(sym_callsite_ok(b=np.zeros((2, 3)), a=np.zeros((2, 3))))
+    use_2x3(sym_callsite_ok(*[np.zeros((2, 3)), np.zeros((2, 3))]))
+    use_b2x3(sym_and(np.zeros((2, 3), dtype=bool), np.zeros((2, 3), dtype=bool)))
+    use_b2x3(sym_or(np.zeros((2, 3), dtype=bool), np.zeros((2, 3), dtype=bool)))
+    use_b3(np.zeros((2, 3), dtype=bool).any(axis=0))
+    use_b1x3(np.zeros((2, 3), dtype=bool).all(axis=0, keepdims=True))
+    use_5x20(sym_reshape(np.zeros((5, 10, 2))))
+    use_5x20(sym_reshape_tup(np.zeros((5, 10, 2))))
+    use_5x20(sym_reshape_m1(np.zeros((5, 10, 2))))
+    use_i2(sym_len(np.zeros((2, 3))))
+    use_3(np.zeros(len(Slots)))
+    use_2x3(np.zeros((2, len(Slots))))
+    use_2x3(np.zeros(len(Slots) * 2).reshape(2, 3))
+    use_2x3x3(sym_stack_enum({c: np.zeros((2, 3)) for c in Slots}))
+    use_i3(np.arange(len(Slots)))
     use_2x4(symbolic_matmul(np.zeros((2, 3)), np.zeros((3, 4))))
     use_2x3(symbolic_broadcast(np.zeros((2, 3)), np.zeros(3)))
     use_2x4(symbolic_einsum(np.zeros((2, 3)), np.zeros((3, 4))))
@@ -430,6 +532,18 @@ def indexing_stays_precise() -> None:
     use_5x4(table[np.arange(5)])
     use_5x10x2(a[ids[:, 0]])
     use_5x3x10x2(a[ids])
+
+
+def named_dtype_stays_precise() -> None:
+    use_f2x3(np.zeros((2, 3), dtype=np.float32))
+    use_i2x3(np.zeros((2, 3), dtype=np.int64))
+    use_f2x3(np.asarray(np.zeros((2, 3)), dtype=np.float32))
+    use_f2x3(np.zeros((2, 3)).astype(np.float32))
+    use_2(np.array([105.0, 68.0]))
+    use_i3(np.array([1, 2, 3]))
+    use_f2x3(-np.zeros((2, 3)))
+    use_i5(np.arange(len(np.zeros(5))))
+    use_2x3(np.broadcast_to(np.zeros(3), np.zeros((2, 3)).shape))
 
 
 def ufunc_stays_precise() -> None:
