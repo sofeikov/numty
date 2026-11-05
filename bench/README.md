@@ -23,12 +23,13 @@ Scorecard:
 
 - Clean files: **zero diagnostics** on both — correct code stays silent,
   because unknown shapes bail instead of erroring.
-- Seeded bugs: **15 of 18 caught** statically, all before running. Every
+- Seeded bugs: **17 of 18 caught** statically, all before running. Every
   caught bug also raises at runtime, so these are true saves.
-- Misses (3): two use raw `np.matmul`, which resolves to `Any` and has no
-  stub definition to hook — unhookable from a plugin, use `numty.matmul`.
-  One passes an unannotated `ndarray` parameter, so there is no shape to
-  check against — correctly silent.
+- Miss (1): one passes an unannotated `ndarray` parameter, so there is no
+  shape to check against — correctly silent. (Raw `np.matmul` used to be
+  unhookable — a gufunc object with no stub definition — but the ufunc
+  `__call__` hook reaches it through its generic type, so those two bugs
+  are caught now too.)
 
 Advance notes from triage went straight into the plugin: comparisons,
 argmax/argsort family, list-form `stack`/`concatenate` (item types are
@@ -37,4 +38,6 @@ re-read from each expression, since lists arrive joined against the
 in these files. The second round added `einsum` (subscript parsing
 with implicit mode and ellipsis) and `linalg` solvers (square/inner-dim
 checks, tuple outputs, result dtypes) — again driven by `ml.py` and
-`mathlib.py` lines that previously bailed.
+`mathlib.py` lines that previously bailed. The third round dogfooded a
+real project (`pass_geometry.py`): `where`, unary math ufuncs, `-`/`/`/`**`,
+`clip`, `broadcast_to` — the ops real numeric code actually uses.

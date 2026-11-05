@@ -330,6 +330,34 @@ def linalg_stays_precise() -> None:
     use_2(np.linalg.norm(np.zeros((2, 3)), axis=1))
 
 
+def ufunc_stays_precise() -> None:
+    a = np.zeros((2, 3))
+    b = np.zeros(3)
+    use_2x3(np.sqrt(a))
+    use_2x3(np.exp(a))
+    use_2x3(np.sin(a))
+    use_2x3(np.abs(a))
+    use_2x3(np.floor(a))
+    use_2x3(np.add(a, b))
+    use_2x3(np.subtract(a, b))
+    use_2x3(a - b)
+    use_2x3(a / b)
+    use_2x3(a**2)
+    use_2x3(np.power(a, 2))
+    use_2x3(np.where(a > 0, a, 0.0))
+    use_2x3(np.clip(a, 0.0, 1.0))
+    use_2x3(a.clip(0.0, 1.0))
+    use_2x3(np.broadcast_to(b, (2, 3)))
+    use_2x3(np.asarray(a))
+    use_b2x3(np.isfinite(a))
+    use_b2x3(np.equal(a, b))
+    use_2x4(np.matmul(np.zeros((2, 3)), np.zeros((3, 4))))
+    ints = np.arange(6).reshape(2, 3)
+    use_2x3(np.sqrt(ints))
+    use_2x3(np.true_divide(ints, ints))
+    use_i2x3(ints - ints)
+
+
 def rng_stays_precise() -> None:
     g = np.random.default_rng(0)
     use_2x3(g.normal(size=(2, 3)))

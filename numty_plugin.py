@@ -27,6 +27,11 @@ What it does:
   Explicit dtype= and unknown dims bail out.
 - comparisons broadcast shapes and return bool arrays; argmax/argsort
   drop or keep the axis; Generator/RandomState methods solve from size=.
+- arithmetic operators (-, /, **) and bare ufuncs (np.sqrt, np.add, ...)
+  broadcast and promote; the ufuncs are stub variables, reached through
+  the Literal name in their generic type (raw np.matmul included).
+  np.where/clip/broadcast_to/asarray solve; unary math ufuncs track
+  int->float64 and complex->real rules.
 - einsum parses the subscript string (explicit/implicit, ellipsis,
   diagonals) and solves label sizes; linalg solvers (solve, inv,
   cholesky, eig/eigh, svd, lstsq, norm) check squareness/inner dims,
@@ -128,6 +133,33 @@ class NumtyPlugin(Plugin):
             return stack_function_hook
         if fullname.startswith("numpy.") and short == "einsum":
             return einsum_function_hook
+        if fullname.startswith("numpy.") and short in {
+            "add",
+            "multiply",
+            "subtract",
+            "power",
+        }:
+            return broadcast_function_hook
+        if fullname.startswith("numpy.") and short in {"divide", "true_divide"}:
+            return truediv_function_hook
+        if fullname.startswith("numpy.") and short == "where":
+            return where_function_hook
+        if fullname.startswith("numpy.") and short == "clip":
+            return clip_function_hook
+        if fullname.startswith("numpy.") and short == "broadcast_to":
+            return broadcast_to_function_hook
+        if fullname.startswith("numpy.") and short in {"asarray", "asanyarray"}:
+            return asarray_function_hook
+        if fullname.startswith("numpy.") and short in _UFUNC_KEEP:
+            return partial(ufunc_function_hook, group="keep")
+        if fullname.startswith("numpy.") and short in _UFUNC_ABS:
+            return partial(ufunc_function_hook, group="abs")
+        if fullname.startswith("numpy.") and short in _UFUNC_FLOAT:
+            return partial(ufunc_function_hook, group="float")
+        if fullname.startswith("numpy.") and short in _UFUNC_REAL:
+            return partial(ufunc_function_hook, group="real")
+        if fullname.startswith("numpy.") and short in _UFUNC_BOOL:
+            return partial(ufunc_function_hook, group="bool")
         if fullname.startswith("numpy.linalg.") and short in {
             "solve",
             "inv",
@@ -171,8 +203,31 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__radd__",
             "numpy.ndarray.__mul__",
             "numpy.ndarray.__rmul__",
+            "numpy.ndarray.__sub__",
+            "numpy.ndarray.__rsub__",
+            "numpy.ndarray.__pow__",
+            "numpy.ndarray.__rpow__",
         }:
             return broadcast_method_hook
+        if fullname == "numpy.ndarray.clip":
+            return clip_method_hook
+        # Bare ufunc objects (np.sqrt, np.add, ...) are stub variables, not
+        # functions, so get_function_hook never sees them. Their generic
+        # type carries the ufunc name as a Literal, which this hook reads.
+        if fullname in {
+            "numpy.ufunc.__call__",
+            "numpy._typing._ufunc._UFunc_Nin1_Nout1.__call__",
+            "numpy._typing._ufunc._UFunc_Nin2_Nout1.__call__",
+            "numpy._typing._ufunc._UFunc_Nin1_Nout2.__call__",
+            "numpy._typing._ufunc._UFunc_Nin2_Nout2.__call__",
+            "numpy._typing._ufunc._GUFunc_Nin2_Nout1.__call__",
+        }:
+            return ufunc_call_hook
+        if fullname in {
+            "numpy.ndarray.__truediv__",
+            "numpy.ndarray.__rtruediv__",
+        }:
+            return truediv_method_hook
         if fullname == "numpy.ndarray.reshape":
             return reshape_method_hook
         if fullname == "numpy.ndarray.transpose":
@@ -481,7 +536,7 @@ def _broadcast_result(a: list[int], b: list[int]) -> tuple[list[int] | None, str
     return [*prefix, *reversed(out)], None
 
 
-def _solve_broadcast(ctx: MethodContext, left: Type, right: Type) -> Type:
+def _solve_broadcast(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
     a = _ndarray_parts(left)
     if a is None:
         return ctx.default_return_type
@@ -533,6 +588,13 @@ def broadcast_method_hook(ctx: MethodContext) -> Type:
     if args is None:
         return ctx.default_return_type
     return _solve_broadcast(ctx, ctx.type, args[0])
+
+
+def broadcast_function_hook(ctx: FunctionContext) -> Type:
+    args = _positional_actuals(ctx, 2)
+    if args is None:
+        return ctx.default_return_type
+    return _solve_broadcast(ctx, args[0], args[1])
 
 
 STR_FULLNAME = "builtins.str"
@@ -2300,4 +2362,518 @@ def linalg_function_hook(ctx: FunctionContext, op: str) -> Type:
     if op == "norm":
         return _linalg_norm(ctx)
     return ctx.default_return_type
+
+
+_UFUNC_KEEP = frozenset(
+    {
+        "square",
+        "floor",
+        "ceil",
+        "trunc",
+        "sign",
+        "conjugate",
+        "conj",
+        "positive",
+        "negative",
+        "invert",
+        "bitwise_not",
+    }
+)
+_UFUNC_ABS = frozenset({"absolute", "abs"})
+_UFUNC_FLOAT = frozenset(
+    {
+        "sqrt",
+        "cbrt",
+        "exp",
+        "exp2",
+        "expm1",
+        "log",
+        "log2",
+        "log10",
+        "log1p",
+        "sin",
+        "cos",
+        "tan",
+        "arcsin",
+        "arccos",
+        "arctan",
+        "sinh",
+        "cosh",
+        "tanh",
+        "rint",
+        "sinc",
+    }
+)
+_UFUNC_REAL = frozenset({"real", "imag"})
+_UFUNC_BOOL = frozenset(
+    {
+        "isfinite",
+        "isinf",
+        "isnan",
+        "isneginf",
+        "isposinf",
+        "signbit",
+        "logical_not",
+    }
+)
+
+
+def _operand_spec(tp: Type) -> tuple[list[int] | None, str, str] | None:
+    """(dims, kind, name) for an array or scalar operand, else None to bail.
+
+    dims is None for scalars (broadcast-neutral); kind is "strong" for
+    array dtypes and numpy scalars, "weak" for Python scalars.
+    """
+    part = _ndarray_parts(tp)
+    if part is not None:
+        name = _dtype_fullname(part[1])
+        if name is None:
+            return None
+        return (part[0], "strong", name)
+    key = _scalar_key(tp)
+    if key is None:
+        return None
+    return (None, key[0], key[1])
+
+
+_WEAK_DEFAULT = {
+    "builtins.bool": "numpy.bool",
+    "builtins.int": "numpy.int64",
+    "builtins.float": "numpy.float64",
+    "builtins.complex": "numpy.complex128",
+}
+
+
+def _combine_specs(
+    a: tuple[str, str], b: tuple[str, str]
+) -> str | None:
+    """Promoted dtype name for two (kind, name) operand specs."""
+    (ka, na), (kb, nb) = a, b
+    if ka == "strong" and kb == "strong":
+        return na if na == nb else _promote_strong(na, nb)
+    if ka == "weak" and kb == "weak":
+        order = ("builtins.bool", "builtins.int", "builtins.float", "builtins.complex")
+        if na not in order or nb not in order:
+            return None
+        winner = na if order.index(na) >= order.index(nb) else nb
+        return _WEAK_DEFAULT[winner]
+    weak, strong = (na, nb) if ka == "weak" else (nb, na)
+    return _promote_weak(weak, strong)
+
+
+def _broadcast_shapes(
+    ctx: FunctionContext | MethodContext, shapes: list[list[int]], op: str
+) -> list[int] | None:
+    """Broadcast known shapes pairwise; None (after failing) on conflict."""
+    dims: list[int] = []
+    for other in shapes:
+        out, cause = _broadcast_result(dims, other)
+        if cause is not None:
+            ctx.api.fail(f"{op} shapes disagree: {cause}", ctx.context)
+            return None
+        assert out is not None
+        dims = out
+    return dims
+
+
+def _kind_of(name: str) -> str | None:
+    info = _DTYPE_INFO.get(name)
+    if info is not None:
+        return info[0]
+    if name in ("builtins.bool", "builtins.int"):
+        return "i"
+    if name == "builtins.float":
+        return "f"
+    if name == "builtins.complex":
+        return "c"
+    return None
+
+
+def _specs_dtype(
+    ctx: FunctionContext | MethodContext,
+    specs: list[tuple[str, str]],
+    array_dtypes: list[Type],
+) -> Type | None:
+    """dtype[...] for combined (kind, name) specs, reusing an input dtype."""
+    current: tuple[str, str] | None = None
+    for kind, spec_name in specs:
+        if current is None:
+            current = (kind, spec_name)
+            continue
+        combined = _combine_specs(current, (kind, spec_name))
+        if combined is None:
+            return None
+        # Once combined, the running result behaves as a strong dtype.
+        current = ("strong", combined)
+    if current is None:
+        return None
+    kind, name = current
+    final = _WEAK_DEFAULT.get(name, name) if kind == "weak" else name
+    for dtype in array_dtypes:
+        if _dtype_fullname(dtype) == final:
+            return dtype
+    return _construct_dtype(ctx, final)
+
+
+def _solve_where(ctx: FunctionContext) -> Type:
+    args = _positional_actuals(ctx, 3)
+    if args is None:
+        # Single-argument where(cond) returns indices: the stubs own it.
+        return ctx.default_return_type
+    specs = [_operand_spec(tp) for tp in args]
+    if any(spec is None for spec in specs):
+        return ctx.default_return_type
+    assert all(spec is not None for spec in specs)
+    shapes = [dims for dims, _, _ in specs if dims is not None]
+    if not shapes:
+        return ctx.default_return_type
+    dims = _broadcast_shapes(ctx, shapes, "where")
+    if dims is None:
+        return ctx.default_return_type
+    branches = [(specs[1][1], specs[1][2]), (specs[2][1], specs[2][2])]
+    array_dtypes = []
+    for tp in args[1:]:
+        part = _ndarray_parts(tp)
+        if part is not None:
+            array_dtypes.append(part[1])
+    dtype = _specs_dtype(ctx, branches, array_dtypes)
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def _solve_clip(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    # clip preserves the first array operand's dtype (bounds cast to it).
+    specs = [_operand_spec(tp) for tp, _ in pairs]
+    if any(spec is None for spec in specs):
+        return ctx.default_return_type
+    assert all(spec is not None for spec in specs)
+    shapes = [dims for dims, _, _ in specs if dims is not None]
+    if not shapes:
+        return ctx.default_return_type
+    dims = _broadcast_shapes(ctx, shapes, "clip")
+    if dims is None:
+        return ctx.default_return_type
+    for (tp, _), (arr_dims, _, _) in zip(pairs, specs):
+        if arr_dims is not None:
+            part = _ndarray_parts(tp)
+            assert part is not None
+            return _ndarray_type(ctx, dims, part[1])
+    return ctx.default_return_type
+
+
+def _solve_broadcast_to(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    spec = _operand_spec(pairs[0][0])
+    if spec is None:
+        return ctx.default_return_type
+    arr_dims, kind, name = spec
+    dims = _shape_from_arg(pairs[1][0], pairs[1][1])
+    if dims is None:
+        return ctx.default_return_type
+    if any(d < 0 for d in dims):
+        ctx.api.fail(
+            f"broadcast_to dimensions must be non-negative, got {tuple(dims)}",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    if arr_dims is not None:
+        part = _ndarray_parts(pairs[0][0])
+        assert part is not None
+        return _ndarray_type(ctx, dims, part[1])
+    dtype = _construct_dtype(ctx, _WEAK_DEFAULT.get(name, name))
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def _solve_asarray(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    # An explicit dtype means the caller controls the result.
+    if _formal_pair(ctx, "dtype") is not None:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, part[0], part[1])
+
+
+def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    for name in ("out", "where", "dtype"):
+        if _formal_pair(ctx, name) is not None:
+            return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if group == "keep":
+        return _ndarray_type(ctx, dims, dtype)
+    if group == "bool":
+        bool_dtype = _construct_dtype(ctx, "numpy.bool")
+        if bool_dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, bool_dtype)
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, size = ks
+    if group == "abs":
+        # abs of complex is real; everything else keeps its dtype.
+        if kind != "c":
+            return _ndarray_type(ctx, dims, dtype)
+        name = _linalg_real_name(kind, size)
+    elif group == "real":
+        # real/imag of real dtypes is the identity.
+        if kind != "c":
+            return _ndarray_type(ctx, dims, dtype)
+        name = _linalg_real_name(kind, size)
+    else:
+        if kind in ("f", "c"):
+            return _ndarray_type(ctx, dims, dtype)
+        name = "numpy.float64"
+    if name is None:
+        return ctx.default_return_type
+    out_dtype = _linalg_dtype(ctx, dtype, name)
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, out_dtype)
+
+
+def ufunc_function_hook(ctx: FunctionContext, group: str) -> Type:
+    return _solve_ufunc(ctx, group)
+
+
+def where_function_hook(ctx: FunctionContext) -> Type:
+    return _solve_where(ctx)
+
+
+def clip_function_hook(ctx: FunctionContext) -> Type:
+    return _solve_clip(ctx)
+
+
+def broadcast_to_function_hook(ctx: FunctionContext) -> Type:
+    return _solve_broadcast_to(ctx)
+
+
+def asarray_function_hook(ctx: FunctionContext) -> Type:
+    return _solve_asarray(ctx)
+
+
+def _solve_truediv_pair(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> Type:
+    specs = [_operand_spec(left), _operand_spec(right)]
+    if any(spec is None for spec in specs):
+        return ctx.default_return_type
+    assert all(spec is not None for spec in specs)
+    shapes = [dims for dims, _, _ in specs if dims is not None]
+    dims = _broadcast_shapes(ctx, shapes, "true_divide") if shapes else []
+    if dims is None:
+        return ctx.default_return_type
+    (_, kind_l, name_l), (_, kind_r, name_r) = specs
+    names = {name_l, name_r}
+    array_dtypes: list[Type] = []
+    for tp in (left, right):
+        part = _ndarray_parts(tp)
+        if part is not None:
+            array_dtypes.append(part[1])
+    # Division by (or of) an integer array yields the default float.
+    strong_int = any(
+        kind == "strong" and _kind_of(name) in ("i", "u", "b")
+        for kind, name in ((kind_l, name_l), (kind_r, name_r))
+    )
+    if strong_int and not any(_kind_of(name) == "c" for name in names):
+        dtype = _construct_dtype(ctx, "numpy.float64")
+        if dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, dtype)
+    dtype = _specs_dtype(ctx, [(kind_l, name_l), (kind_r, name_r)], array_dtypes)
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def truediv_function_hook(ctx: FunctionContext) -> Type:
+    args = _positional_actuals(ctx, 2)
+    if args is None:
+        return ctx.default_return_type
+    return _solve_truediv_pair(ctx, args[0], args[1])
+
+
+def truediv_method_hook(ctx: MethodContext) -> Type:
+    args = _positional_actuals(ctx, 1)
+    if args is None:
+        return ctx.default_return_type
+    return _solve_truediv_pair(ctx, ctx.type, args[0])
+
+
+def clip_method_hook(ctx: MethodContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    specs = [_operand_spec(ctx.type)] + [_operand_spec(tp) for tp, _ in pairs]
+    if any(spec is None for spec in specs):
+        return ctx.default_return_type
+    assert all(spec is not None for spec in specs)
+    shapes = [dims for dims, _, _ in specs if dims is not None]
+    if not shapes:
+        return ctx.default_return_type
+    dims = _broadcast_shapes(ctx, shapes, "clip")
+    if dims is None:
+        return ctx.default_return_type
+    part = _ndarray_parts(ctx.type)
+    assert part is not None
+    return _ndarray_type(ctx, dims, part[1])
+
+
+_UFUNC_BINARY_PROMOTE = frozenset(
+    {
+        "add",
+        "subtract",
+        "multiply",
+        "power",
+        "floor_divide",
+        "remainder",
+        "fmod",
+        "minimum",
+        "maximum",
+        "fmin",
+        "fmax",
+        "logaddexp",
+        "logaddexp2",
+    }
+)
+_UFUNC_BINARY_FLOAT = frozenset({"hypot", "arctan2"})
+_UFUNC_BINARY_BOOL = frozenset(
+    {
+        "equal",
+        "not_equal",
+        "less",
+        "less_equal",
+        "greater",
+        "greater_equal",
+        "logical_and",
+        "logical_or",
+        "logical_xor",
+    }
+)
+
+
+def _ufunc_name(ctx: FunctionContext | MethodContext) -> str | None:
+    """The ufunc name from its Literal type argument, else None."""
+    proper = get_proper_type(ctx.type)
+    if not isinstance(proper, Instance) or not proper.args:
+        return None
+    first = get_proper_type(proper.args[0])
+    if isinstance(first, LiteralType) and isinstance(first.value, str):
+        return first.value
+    return None
+
+
+def ufunc_call_hook(ctx: MethodContext) -> Type:
+    proper = get_proper_type(ctx.type)
+    if isinstance(proper, Instance) and "Nout2" in proper.type.fullname:
+        # Two-output ufuncs (frexp, modf): the stubs own the tuple.
+        return ctx.default_return_type
+    name = _ufunc_name(ctx)
+    if name is None:
+        return ctx.default_return_type
+    if name in _UFUNC_KEEP:
+        return _solve_ufunc(ctx, "keep")
+    if name in _UFUNC_ABS:
+        return _solve_ufunc(ctx, "abs")
+    if name in _UFUNC_FLOAT:
+        return _solve_ufunc(ctx, "float")
+    if name in _UFUNC_REAL:
+        return _solve_ufunc(ctx, "real")
+    if name in _UFUNC_BOOL:
+        return _solve_ufunc(ctx, "bool")
+    if name == "matmul":
+        pairs = _all_positionals(ctx)
+        if len(pairs) != 2:
+            return ctx.default_return_type
+        return _solve_matmul(ctx, pairs[0][0], pairs[1][0])
+    if name in {"divide", "true_divide"}:
+        pairs = _all_positionals(ctx)
+        if len(pairs) != 2:
+            return ctx.default_return_type
+        return _solve_truediv_pair(ctx, pairs[0][0], pairs[1][0])
+    if name in _UFUNC_BINARY_PROMOTE:
+        pairs = _all_positionals(ctx)
+        if len(pairs) != 2:
+            return ctx.default_return_type
+        return _solve_broadcast(ctx, pairs[0][0], pairs[1][0])
+    if name in _UFUNC_BINARY_FLOAT:
+        pairs = _all_positionals(ctx)
+        if len(pairs) != 2:
+            return ctx.default_return_type
+        return _solve_ufunc_binary_float(ctx, pairs[0][0], pairs[1][0])
+    if name in _UFUNC_BINARY_BOOL:
+        pairs = _all_positionals(ctx)
+        if len(pairs) != 2:
+            return ctx.default_return_type
+        return _solve_ufunc_binary_bool(ctx, pairs[0][0], pairs[1][0])
+    return ctx.default_return_type
+
+
+def _solve_ufunc_binary_float(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> Type:
+    specs = [_operand_spec(left), _operand_spec(right)]
+    if any(spec is None for spec in specs):
+        return ctx.default_return_type
+    assert all(spec is not None for spec in specs)
+    shapes = [dims for dims, _, _ in specs if dims is not None]
+    dims = _broadcast_shapes(ctx, shapes, "ufunc") if shapes else []
+    if dims is None:
+        return ctx.default_return_type
+    (_, kind_l, name_l), (_, kind_r, name_r) = specs
+    combined = _combine_specs((kind_l, name_l), (kind_r, name_r))
+    if combined is None:
+        return ctx.default_return_type
+    kind = _kind_of(combined)
+    if kind in ("f", "c"):
+        out_name = combined
+    elif kind in ("i", "u", "b"):
+        out_name = "numpy.float64"
+    else:
+        return ctx.default_return_type
+    array_dtypes = []
+    for tp in (left, right):
+        part = _ndarray_parts(tp)
+        if part is not None:
+            array_dtypes.append(part[1])
+    dtype = _specs_dtype(ctx, [("strong", out_name)], array_dtypes)
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def _solve_ufunc_binary_bool(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> Type:
+    specs = [_operand_spec(left), _operand_spec(right)]
+    if any(spec is None for spec in specs):
+        return ctx.default_return_type
+    assert all(spec is not None for spec in specs)
+    shapes = [dims for dims, _, _ in specs if dims is not None]
+    if not shapes:
+        return ctx.default_return_type
+    dims = _broadcast_shapes(ctx, shapes, "ufunc")
+    if dims is None:
+        return ctx.default_return_type
+    bool_dtype = _construct_dtype(ctx, "numpy.bool")
+    if bool_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, bool_dtype)
 

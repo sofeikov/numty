@@ -233,6 +233,27 @@ def test_norm_axis_mismatch() -> None:
     )
 
 
+def test_where_broadcast_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_where_broadcast.py"),
+        "where shapes disagree:",
+    )
+
+
+def test_raw_matmul_inner_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matmul_raw.py"),
+        "matmul inner dimensions disagree: 3 vs 5",
+    )
+
+
+def test_truediv_broadcast_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_truediv_broadcast.py"),
+        "true_divide shapes disagree:",
+    )
+
+
 def assert_rank_mismatch(
     result: "subprocess.CompletedProcess[str]", ours: str, native: str, *extra: str
 ) -> None:

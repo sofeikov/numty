@@ -96,6 +96,25 @@ np.zeros((2, 3)) == np.zeros((3, 2))  # error: broadcast shapes disagree
 `rng.integers`, `choice`, `permutation`); a missing size means a scalar,
 so the plugin bails to the stub.
 
+Elementwise ops broadcast shapes and promote dtypes — including the bare
+`np.*` ufunc forms, which the plugin reaches through the ufunc's own
+generic type (the stubs declare them as variables, not functions):
+
+```python
+np.sqrt(a)                 # same shape; ints become float64
+np.abs(c)                  # complex becomes real (float)
+np.isfinite(a)             # bool, same shape
+np.add(a, b)               # same as a + b, with promotion
+np.where(cond, x, 0.0)     # broadcast of all three, promoted branches
+np.equal(a, b)             # bool, broadcast
+a - b; a / b; a**2         # operators too; int / int is float64
+np.clip(a, 0.0, 1.0)       # same shape and dtype as a (method too)
+np.broadcast_to(v, (2, 3)) # new shape, same dtype
+np.asarray(a)              # identity on known arrays (explicit dtype= bails)
+np.matmul(a, b)            # raw np.matmul solves now, errors included
+np.zeros((2, 3)) / np.zeros((4,))  # error: true_divide shapes disagree
+```
+
 `einsum` parses the subscript string and solves label sizes, including
 implicit mode, ellipsis, and diagonals:
 
@@ -187,7 +206,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, `+`/`*` (with promotion), `reshape`, rank-changing ops, shape builders, comparisons, the arg family, `einsum`, and `linalg` solvers, folds constant int expressions, solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape`, rank-changing ops, shape builders, comparisons, the arg family, `einsum`, and `linalg` solvers, folds constant int expressions, solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `Array1D`,
@@ -231,11 +250,13 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
   across plugin edits, so never trust the default cache while hacking
   on the plugin.
 - The `@` operator is accepted but unchecked: operator dispatch consulted
-  the method hook inconsistently in testing, so only the `matmul()`
-  wrapper solves. Same for reflected ops beyond `__radd__`/`__rmul__`.
-- `np.matmul` itself is a gufunc object in the stubs, not a plain function,
-  so it cannot be hooked; the plugin solves at our own `matmul` wrapper
-  instead.
+  the method hook inconsistently in testing. Raw `np.matmul` solves
+  through the ufunc hook instead, as does the `numty.matmul` wrapper.
+  Same for reflected ops beyond the hooked pairs.
+- Ufunc calls need mypy to follow imports (the default): under
+  `--follow-imports=skip` the ufunc generic aliases stay unresolved and
+  bare `np.sqrt`-style calls bail out. Operators, methods, and real
+  `def` stubs are unaffected.
 
 ## Layout
 
@@ -246,7 +267,7 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 - [demo.py](/home/sofeikov/my/numty/demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.
 - [bench/](/home/sofeikov/my/numty/bench) — realistic benchmark (MLP training,
-  math library, 18 seeded mistakes), with its own scorecard in
+  math library, 17 of 18 seeded mistakes caught), with its own scorecard in
   [bench/README.md](/home/sofeikov/my/numty/bench/README.md).
 - [tests/test_runtime.py](/home/sofeikov/my/numty/tests/test_runtime.py) —
   shapes, values, narrowing accept/reject.

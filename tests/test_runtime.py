@@ -227,3 +227,56 @@ def test_linalg_shapes_and_dtypes() -> None:
     assert np.linalg.norm(np.zeros((2, 3)), axis=0).shape == (3,)
     assert np.linalg.norm(np.zeros((2, 3)), axis=(0, 1), keepdims=True).shape == (1, 1)
     assert np.linalg.norm(np.eye(2, dtype=np.int32), axis=0).dtype == np.dtype(np.float64)
+
+
+def test_ufunc_values_and_dtypes() -> None:
+    a = np.arange(6, dtype=np.float64).reshape(2, 3)
+    i = np.arange(6).reshape(2, 3)
+    f32 = np.zeros((2, 3), dtype=np.float32)
+    assert np.sqrt(a).shape == (2, 3)
+    assert np.sqrt(i).dtype == np.dtype(np.float64)
+    assert np.exp(a).dtype == np.dtype(np.float64)
+    assert np.sin(a).shape == (2, 3)
+    assert np.floor(i).dtype == i.dtype
+    assert np.abs(-i).dtype == i.dtype
+    assert np.abs(np.array([-1 + 1j])).dtype == np.dtype(np.float64)
+    assert np.isfinite(a).dtype == np.dtype(np.bool_)
+    assert np.real(np.zeros(3, dtype=np.complex64)).dtype == np.dtype(np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for name in [
+            "sqrt", "cbrt", "exp", "exp2", "expm1", "log", "log2", "log10",
+            "log1p", "sin", "cos", "tan", "arcsin", "arccos", "arctan",
+            "sinh", "cosh", "tanh", "rint", "sinc",
+        ]:
+            fn = getattr(np, name)
+            assert fn(i).dtype == np.dtype(np.float64), name
+            assert fn(a).dtype == np.dtype(np.float64), name
+            assert fn(f32).dtype == np.dtype(np.float32), name
+    for name in ["square", "floor", "ceil", "trunc", "sign", "conjugate", "positive", "negative"]:
+        fn = getattr(np, name)
+        assert fn(i).dtype == i.dtype, name
+        assert fn(a).dtype == a.dtype, name
+    for name in ["isfinite", "isinf", "isnan", "signbit", "logical_not"]:
+        assert getattr(np, name)(a).dtype == np.dtype(np.bool_), name
+    assert np.add(a, a).shape == (2, 3)
+    assert (a - a).shape == (2, 3)
+    assert (i - i).dtype == np.dtype(np.int64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        assert (a / a).dtype == np.dtype(np.float64)
+        assert (i / i).dtype == np.dtype(np.float64)
+    assert (a**2).dtype == np.dtype(np.float64)
+    assert (i**2).dtype == np.dtype(np.int64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        assert np.divide(i, i).dtype == np.dtype(np.float64)
+    assert np.hypot(a, a).dtype == np.dtype(np.float64)
+    assert np.equal(a, a).dtype == np.dtype(np.bool_)
+    assert np.minimum(a, 1.0).shape == (2, 3)
+    w = np.where(a > 2, a, -1.0)
+    assert w.shape == (2, 3) and w.dtype == np.dtype(np.float64)
+    assert np.where(a > 2, i, 1).dtype == np.dtype(np.int64)
+    assert np.clip(a, 0.0, 5.0).shape == (2, 3)
+    assert a.clip(0.0, 5.0).shape == (2, 3)
+    assert np.clip(i, 0, 5).dtype == np.dtype(np.int64)
+    assert np.broadcast_to(np.zeros(3), (2, 3)).shape == (2, 3)
+    assert np.asarray(a).shape == (2, 3)
+    assert np.matmul(a, np.arange(12, dtype=np.float64).reshape(3, 4)).shape == (2, 4)
