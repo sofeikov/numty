@@ -51,6 +51,16 @@ c = matmul(np.zeros((2, 3)), np.zeros((3, 4))) + np.zeros((2, 4))  # still known
 np.zeros((2, 3)) + np.zeros((2, 4))  # error: broadcast shapes disagree
 ```
 
+Mixed dtypes promote like NumPy, verified against `np.result_type`
+over the full dtype matrix (plus weak Python scalars):
+
+```python
+f32 + np.zeros((2, 3))   # float64, shape kept
+f32 + 1.5                # float32: weak Python scalars convert
+i32 + 2.5                # float64, shape kept
+f32 * 1j                 # complex64
+```
+
 Reshape with size conservation and `-1` inference:
 
 ```python
@@ -59,7 +69,66 @@ np.zeros((2, 3)).reshape((2, 4))   # error: reshape changes total size: 6 -> 8
 np.zeros((2, 3)).reshape((4, -1))   # error: reshape cannot infer -1
 ```
 
+Rank-changing ops that track the new shape:
+
+```python
+np.zeros((2, 3)).transpose()          # known to be 3x2
+np.zeros((1, 2, 3)).squeeze(0)        # known to be 2x3
+np.expand_dims(np.zeros((3,)), 0)     # known to be 1x3
+np.zeros((2, 3)).sum(axis=1)          # known to be a vector of 2
+np.zeros((2, 3)).transpose(0, 0)      # error: not a permutation
+np.zeros((2, 3)).squeeze(0)          # error: axis 0 has size 2, not 1
+```
+
+No-axis reductions (`.sum()` with no axis) return a scalar, so the plugin
+leaves them to numpy's own stubs; only float/complex dtypes keep their
+dtype through a reduction, anything else bails out.
+
+Subscripts that track shapes through indexing:
+
+```python
+a[0]          # first axis dropped
+a[:, 1]       # mixed int and slice
+a[1:3]        # slice bounds compute the length (via folding: H*2 works too)
+a[::-1]       # reversed, same shape
+a[None, :]    # new axis of size 1
+a[..., 1]     # ellipsis fills the middle
+a[5]          # error: index 5 is out of range for axis 0 with size 2
+a[::0]        # error: slice step is zero
+```
+
+Slicing past the end clips like NumPy (`a[1:99]` on a size-2 axis is
+size 1); boolean masks, fancy indexing, and unknown bounds bail out.
+Indexing every axis with integers yields a scalar, which the plugin
+leaves to the stubs.
+
+Shape builders that compute the result shape:
+
+```python
+np.zeros_like(a)                          # same shape and dtype as a
+np.zeros_like(a, shape=(3, 2))            # override wins, precisely
+np.full((2, 3), 5.0)                      # known 2x3 float64
+np.eye(3)                                 # known 3x3
+np.arange(6)                              # known vector of 6
+np.concatenate((a, b), axis=1)            # dims added on the axis
+np.stack((a, b), axis=0)                  # new axis of stacked count
+np.concatenate((a, b), axis=0)            # error: dimension 1 differs
+```
+
+Tuple displays (`(a, b)`) keep per-item precision; list displays join
+away the item shapes, so stacking from a list bails out. Explicit
+`dtype=` always bails out — the plugin never guesses a dtype you named.
+
 ## Quickstart
+
+Named sizes work too — mark them `Final` and the solver folds names
+and arithmetic (`H * 2`, `W + 1`, `M // 2`) just like literals.
+Plain variables and parameters stay unknown: their values are gone
+from the types before the plugin sees them, so they bail out instead
+of erroring. A generic `int` parameter can never be verified against
+a shape — the contract says "every int", and no annotation (not even
+a `TypeVar` linking the argument to the shape) survives the join to
+`int`.
 
 ```sh
 uv venv
@@ -69,7 +138,7 @@ uv pip install mypy numpy pytest
 ```sh
 PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
 uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: 12 runtime + 11 mypy-driven
+uv run pytest                      # full suite: 22 runtime + 25 mypy-driven
 ```
 
 ## How it works
@@ -80,7 +149,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, `+`/`*`, and `reshape`, solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, `+`/`*` (with promotion), `reshape`, rank-changing ops, and shape builders, folds constant int expressions, solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `Array1D`,
@@ -114,11 +183,16 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error.
-- No broadcasting of matmul batch dims yet — see roadmap. Mixed-dtype
-  `+`/`*` bail out instead of promoting.
+- Explicit `dtype=` always bails out — the plugin never guesses a dtype
+  you named. Same for list-form `concatenate`/`stack` (tuple displays
+  keep per-item precision; lists join it away) and unknown `keepdims`.
 - On lines the solver rejects, mypy may add its own follow-on error next
   to ours (an overload complaint for tuple `reshape`, `Unsupported
   operand` for broadcast ops). Ours is the readable one.
+- Test runs use a dedicated mypy cache dir cleared per suite run (see
+  `test_static.py`): mypy does not reliably invalidate plugin results
+  across plugin edits, so never trust the default cache while hacking
+  on the plugin.
 - The `@` operator is accepted but unchecked: operator dispatch consulted
   the method hook inconsistently in testing, so only the `matmul()`
   wrapper solves. Same for reflected ops and non-`float64` dtypes.
@@ -143,4 +217,8 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 
 ## Roadmap
 
-Broadcasting matmul batch dims, then mixed-dtype promotion.
+Value-dependent frontiers: NEP 50's value-based edge cases (out-of-bound
+Python ints), `dtype=` resolution, and union dtypes currently bail out.
+The `@` operator stays accepted-but-unchecked (mypy consults the method
+hook inconsistently). `ty` and pyright get layers 1–2 — neither offers
+a plugin API to build the solver on.

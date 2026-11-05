@@ -37,16 +37,18 @@ def ident(m: FloatArray[S]) -> FloatArray[S]:
 # narrow(m, np.zeros((2, 3))) -> precisely 2x3, with a runtime assert.
 def narrow(m: LooseArray, witness: FloatArray[S]) -> FloatArray[S]:
     assert m.shape == witness.shape
+    assert m.dtype == witness.dtype
     return cast(FloatArray[S], m)
 
 
 # General matmul solving lives in the mypy plugin (numty_plugin.py), which
-# computes output shapes for any rank. An earlier attempt with axis TypeVars
-# failed silently: ndarray's shape parameter is effectively covariant, so a
-# shared TypeVar joins conflicting literals (e.g. N becomes int for 3 vs 2)
-# instead of erroring. The declared parameters stay loose so any rank reaches
-# the hook; without the plugin this is unchecked (but usable).
-LooseArray = np.ndarray[tuple[Any, ...], np.dtype[np.float64]]
+# computes output shapes for any rank and promotes mixed dtypes. An earlier
+# attempt with axis TypeVars failed silently: ndarray's shape parameter is
+# effectively covariant, so a shared TypeVar joins conflicting literals
+# (e.g. N becomes int for 3 vs 2) instead of erroring. The declared
+# parameters stay loose so any rank and dtype reaches the hook; without the
+# plugin this is unchecked (but usable).
+LooseArray = np.ndarray[tuple[Any, ...], np.dtype[Any]]
 
 
 def matmul(a: LooseArray, b: LooseArray) -> LooseArray:
