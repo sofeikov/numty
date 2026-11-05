@@ -1,9 +1,15 @@
 """Size mismatch: 3x2 passed where 2x3 is required."""
-from numty import Matrix2x3, zeros_3x2
+from typing import Literal
+
+import numpy as np
+
+from numty import FloatArray
+
+A2x3 = FloatArray[tuple[Literal[2], Literal[3]]]
 
 
-def use_2x3(m: Matrix2x3) -> None: ...
+def use_2x3(m: A2x3) -> None: ...
 
 
 def f() -> None:
-    use_2x3(zeros_3x2())
+    use_2x3(np.zeros((3, 2)))

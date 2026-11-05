@@ -9,9 +9,13 @@ What it does:
   ndarray[tuple[Literal[...], ...], ...], even through assignment.
   Anything else (dynamic dims, explicit dtype) bails out to mypy's
   default instead of erroring.
-- matmul (and the @ operator) solve inner dims for any rank and
-  propagate the outer dims. Batch dims must match exactly; broadcasting
-  them is a later pass. Dtype is taken from the left operand.
+- numty.matmul solves inner dims for any rank and propagates the
+  outer dims. Batch dims must match exactly; broadcasting them is a
+  later pass. Dtype is taken from the left operand. The @ operator is
+  accepted but unchecked (see the method-hook note below).
+- __add__/__mul__ unify operand shapes with NumPy broadcast rules, so
+  precision survives whole function bodies. Scalars pass through;
+  unknown dims bail out.
 """
 from __future__ import annotations
 
@@ -54,8 +58,18 @@ class NumtyPlugin(Plugin):
         return None
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
-        if fullname == "numpy.ndarray.__matmul__":
-            return matmul_method_hook
+        # NOTE: no __matmul__ hook. In testing, operator dispatch consulted
+        # the method hook inconsistently across statements for @ (silent
+        # when it should fire, once misattributed to another line), while
+        # the numty.matmul function hook stayed deterministic. @ therefore
+        # uses numpy's default checking; use the wrapper for solving.
+        if fullname in {
+            "numpy.ndarray.__add__",
+            "numpy.ndarray.__radd__",
+            "numpy.ndarray.__mul__",
+            "numpy.ndarray.__rmul__",
+        }:
+            return broadcast_method_hook
         return None
 
 
@@ -192,8 +206,61 @@ def matmul_hook(ctx: FunctionContext) -> Type:
     return _solve_matmul(ctx, args[0], args[1])
 
 
-def matmul_method_hook(ctx: MethodContext) -> Type:
+def _is_numeric_scalar(tp: Type) -> bool:
+    """A Python int/float/complex (or literal), which broadcasts freely."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType):
+        return isinstance(proper.value, (int, float, complex)) and not isinstance(proper.value, bool)
+    if isinstance(proper, Instance):
+        return proper.type.fullname in {"builtins.int", "builtins.float", "builtins.complex"}
+    return False
+
+
+def _broadcast_result(a: list[int], b: list[int]) -> tuple[list[int] | None, str | None]:
+    """Broadcast two known shapes; (None, None) to bail; (None, msg) on error."""
+    out: list[int] = []
+    for k, (x, y) in enumerate(zip(reversed(a), reversed(b))):
+        if x == y:
+            out.append(x)
+        elif x == 1:
+            out.append(y)
+        elif y == 1:
+            out.append(x)
+        else:
+            return None, (
+                f"broadcast shapes disagree at trailing axis {k}: "
+                f"{x} vs {y} (shapes {tuple(a)} vs {tuple(b)})"
+            )
+    shared = min(len(a), len(b))
+    prefix = a[: len(a) - shared] + b[: len(b) - shared]
+    return [*prefix, *reversed(out)], None
+
+
+def _solve_broadcast(ctx: MethodContext, left: Type, right: Type) -> Type:
+    a = _ndarray_parts(left)
+    if a is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = a
+    b = _ndarray_parts(right)
+    if b is None:
+        if _is_numeric_scalar(right):
+            return _ndarray_type(ctx, dims_a, dtype_a)
+        return ctx.default_return_type
+    dims_b, dtype_b = b
+    if str(dtype_a) != str(dtype_b):
+        # Don't invent a precision we can't justify; numpy would promote.
+        return ctx.default_return_type
+    dims, message = _broadcast_result(dims_a, dims_b)
+    if message is not None:
+        ctx.api.fail(message, ctx.context)
+        return ctx.default_return_type
+    if dims is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype_a)
+
+
+def broadcast_method_hook(ctx: MethodContext) -> Type:
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
-    return _solve_matmul(ctx, ctx.type, args[0])
+    return _solve_broadcast(ctx, ctx.type, args[0])

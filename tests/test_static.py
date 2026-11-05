@@ -65,3 +65,33 @@ def test_matmul_batch_mismatch() -> None:
         "(5,)",
         "(4,)",
     )
+
+
+def assert_operator_mismatch(result: "subprocess.CompletedProcess[str]", *fragments: str) -> None:
+    """Our solver message, plus mypy's generic operator error on top."""
+    assert result.returncode == 1, result.stdout
+    ours = [line for line in result.stdout.splitlines() if fragments[0] in line]
+    assert len(ours) == 1, result.stdout
+    for fragment in fragments[1:]:
+        assert fragment in ours[0], result.stdout
+    rest = [line for line in result.stdout.splitlines() if ": error:" in line and line not in ours]
+    assert rest and all("Unsupported operand" in line for line in rest), result.stdout
+
+
+def test_broadcast_mismatch() -> None:
+    assert_operator_mismatch(
+        run_mypy(FIXTURES / "bad_broadcast.py"),
+        "broadcast shapes disagree at trailing axis 0",
+        "3 vs 4",
+        "(2, 3)",
+        "(2, 4)",
+    )
+
+
+def test_good_path_precision_visible() -> None:
+    result = run_mypy(FIXTURES / "static_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 3, result.stdout
+    assert any("tuple[Literal[2], Literal[4]]" in line for line in notes), result.stdout
+    assert any("tuple[Literal[2], Literal[3]]" in line for line in notes), result.stdout

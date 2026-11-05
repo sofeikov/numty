@@ -1,10 +1,18 @@
 """Demo of what the numty micro-MVP catches. Run: uv run mypy demo.py."""
+from typing import Literal
+
 import numpy as np
 
-from numty import Matrix, Matrix2x3, Vector, assert_is_2x3, ident, zeros_2x3, zeros_3x2
+from numty import Array2D, FloatArray, Matrix, Vector, ident, matmul, narrow
+
+A2x3 = FloatArray[tuple[Literal[2], Literal[3]]]
+B2x3 = Array2D[Literal[2], Literal[3]]
 
 
-def use_2x3(m: Matrix2x3) -> None: ...
+def use_2x3(m: A2x3) -> None: ...
+
+
+def use_b(m: B2x3) -> None: ...
 
 
 def row_sums(m: Matrix) -> Vector:
@@ -12,8 +20,9 @@ def row_sums(m: Matrix) -> Vector:
 
 
 def ok() -> None:
-    a = zeros_2x3()
+    a = np.zeros((2, 3))
     use_2x3(a)  # precise -> precise: passes
+    use_b(a)  # same shape via the rank-2 sugar: passes
     row_sums(a)  # precise -> loose rank-only: passes
 
 
@@ -22,7 +31,7 @@ def bad_rank(v: Vector) -> None:
 
 
 def bad_size() -> None:
-    use_2x3(zeros_3x2())  # E: 3x2 is not 2x3
+    use_2x3(np.zeros((3, 2)))  # E: 3x2 is not 2x3
 
 
 def constructor_precision() -> None:
@@ -32,5 +41,5 @@ def constructor_precision() -> None:
 
 
 def narrowed(m: Matrix) -> None:
-    use_2x3(assert_is_2x3(m))  # runtime assert + cast: passes
-    use_2x3(ident(zeros_2x3()))  # shape-preserving generic: passes
+    use_2x3(narrow(m, np.zeros((2, 3))))  # runtime assert + witness: passes
+    use_2x3(ident(np.zeros((2, 3))))  # shape-preserving generic: passes
