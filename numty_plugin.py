@@ -29,6 +29,7 @@ What it does:
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 
 from mypy.nodes import (
     ARG_NAMED,
@@ -117,6 +118,25 @@ class NumtyPlugin(Plugin):
             return concatenate_function_hook
         if fullname.startswith("numpy.") and short == "stack":
             return stack_function_hook
+        if fullname.startswith("numpy.") and short in {
+            "argmax",
+            "argmin",
+            "argsort",
+            "sort",
+            "partition",
+            "argpartition",
+        }:
+            return partial(arg_function_hook, op=short)
+        if fullname.startswith("numpy.random._generator.Generator.") and short in {
+            "normal",
+            "integers",
+            "random",
+            "standard_normal",
+            "uniform",
+            "choice",
+            "permutation",
+        }:
+            return partial(rng_method_hook, op=short)
         return None
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
@@ -140,6 +160,45 @@ class NumtyPlugin(Plugin):
             return squeeze_method_hook
         if fullname == "numpy.ndarray.__getitem__":
             return getitem_method_hook
+        short = fullname.rsplit(".", 1)[-1]
+        if fullname.startswith("numpy.ndarray.") and short in {
+            "__eq__",
+            "__ne__",
+            "__lt__",
+            "__le__",
+            "__gt__",
+            "__ge__",
+        }:
+            return compare_method_hook
+        if fullname.startswith("numpy.ndarray.") and short in {
+            "argmax",
+            "argmin",
+            "argsort",
+            "sort",
+            "partition",
+            "argpartition",
+        }:
+            return partial(arg_method_hook, op=short)
+        if fullname.startswith("numpy.random._generator.Generator.") and short in {
+            "normal",
+            "integers",
+            "random",
+            "standard_normal",
+            "uniform",
+            "choice",
+            "permutation",
+        }:
+            return partial(rng_method_hook, op=short)
+        if fullname.startswith("numpy.random.mtrand.RandomState.") and short in {
+            "normal",
+            "integers",
+            "random",
+            "standard_normal",
+            "uniform",
+            "choice",
+            "permutation",
+        }:
+            return partial(rng_method_hook, op=short)
         short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.ndarray.") and short in {
             "sum",
@@ -981,41 +1040,47 @@ def _solve_reduction(
     return _ndarray_type(ctx, [d for i, d in enumerate(dims) if i not in chosen], dtype)
 
 
-_DTYPE_ALIAS_PARTS = {
-    "numpy.float16": ("numpy.floating", "_16Bit"),
-    "numpy.float32": ("numpy.floating", "_32Bit"),
-    "numpy.complex64": ("numpy.complexfloating", "_32Bit"),
-    "numpy.int8": ("numpy.signedinteger", "_8Bit"),
-    "numpy.int16": ("numpy.signedinteger", "_16Bit"),
-    "numpy.int32": ("numpy.signedinteger", "_32Bit"),
-    "numpy.int64": ("numpy.signedinteger", "_64Bit"),
-    "numpy.uint8": ("numpy.unsignedinteger", "_8Bit"),
-    "numpy.uint16": ("numpy.unsignedinteger", "_16Bit"),
-    "numpy.uint32": ("numpy.unsignedinteger", "_32Bit"),
-    "numpy.uint64": ("numpy.unsignedinteger", "_64Bit"),
+_DTYPE_BASE = {
+    "numpy.float16": "numpy.floating",
+    "numpy.float32": "numpy.floating",
+    "numpy.complex64": "numpy.complexfloating",
+    "numpy.int8": "numpy.signedinteger",
+    "numpy.int16": "numpy.signedinteger",
+    "numpy.int32": "numpy.signedinteger",
+    "numpy.int64": "numpy.signedinteger",
+    "numpy.uint8": "numpy.unsignedinteger",
+    "numpy.uint16": "numpy.unsignedinteger",
+    "numpy.uint32": "numpy.unsignedinteger",
+    "numpy.uint64": "numpy.unsignedinteger",
 }
-
-_NBIT_BASE = "numpy._typing._nbit_base."
 
 
 def _construct_dtype(ctx: FunctionContext | MethodContext, name: str) -> Type | None:
     """A dtype[...] Instance for a promotion result, else None to bail.
 
     Most numpy scalar names are type aliases, which named_generic_type
-    rejects (it asserts on TypeAlias), so expand those through the generic
-    base plus bit-width tag. Never crashes: failure means bail.
+    rejects (it asserts on TypeAlias). Reusable inputs keep their exact
+    dtype; anything else builds the generic base with Any bits. Exact bit
+    widths live behind stub-only tag classes whose loading is not
+    guaranteed in a plugin context, so they are never depended on. Never
+    crashes: failure means bail.
     """
     try:
         if name in ("numpy.float64", "numpy.complex128"):
             element: Type = ctx.api.named_generic_type(name, [])
+        elif name == "numpy.bool":
+            element = ctx.api.named_generic_type(
+                name, [ctx.api.named_generic_type("builtins.bool", [])]
+            )
         else:
-            parts = _DTYPE_ALIAS_PARTS.get(name)
-            if parts is None:
+            base = _DTYPE_BASE.get(name)
+            if base is None:
                 return None
-            base, bit = parts
-            bit_type = ctx.api.named_generic_type(_NBIT_BASE + bit, [])
-            args: list[Type] = [bit_type, bit_type] if base == "numpy.complexfloating" else [bit_type]
-            element = ctx.api.named_generic_type(base, args)
+            any_arg = AnyType(TypeOfAny.explicit)
+            try:
+                element = ctx.api.named_generic_type(base, [any_arg])
+            except AssertionError:
+                element = ctx.api.named_generic_type(base, [any_arg, any_arg])
         return ctx.api.named_generic_type(DTYPE_FULLNAME, [element])
     except AssertionError:
         return None
@@ -1143,18 +1208,36 @@ def arange_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, [count], _default_dtype(ctx))
 
 
-def _sequence_parts(tp: Type) -> list[tuple[list[int], Type]] | None:
-    """Per-array (dims, dtype) of a tuple display, else None to bail."""
+def _sequence_parts(
+    ctx: FunctionContext | MethodContext, tp: Type, expr: Expression | None
+) -> list[tuple[list[int], Type]] | None:
+    """Per-array (dims, dtype) of a tuple display, else None to bail.
+
+    List displays arrive already joined against the ArrayLike formal, so
+    each item's type is re-read from its own expression instead.
+    """
     proper = get_proper_type(tp)
-    if not isinstance(proper, TupleType):
-        return None
-    items: list[tuple[list[int], Type]] = []
-    for item in proper.items:
-        parts = _ndarray_parts(item)
-        if parts is None:
-            return None
-        items.append(parts)
-    return items or None
+    if isinstance(proper, TupleType):
+        items: list[tuple[list[int], Type]] = []
+        for item in proper.items:
+            parts = _ndarray_parts(item)
+            if parts is None:
+                return None
+            items.append(parts)
+        return items or None
+    if isinstance(expr, ListExpr):
+        items = []
+        for item_expr in expr.items:
+            item_tp = ctx.api.get_expression_type(item_expr)
+            if item_tp is None:
+                return None
+            parts = _ndarray_parts(item_tp)
+            if parts is None:
+                return None
+            dims, dtype = parts
+            items.append((list(dims), dtype))
+        return items or None
+    return None
 
 
 def _concat_axis(ctx: FunctionContext, pairs: list[tuple[Type, Expression | None]]) -> int | None | str:
@@ -1183,7 +1266,7 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    items = _sequence_parts(pairs[0][0])
+    items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -1236,7 +1319,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    items = _sequence_parts(pairs[0][0])
+    items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -1478,6 +1561,183 @@ def getitem_method_hook(ctx: MethodContext) -> Type:
     if len(pairs) != 1:
         return ctx.default_return_type
     return _solve_getitem(ctx, dims, dtype, pairs[0])
+
+
+def _broadcast_dims(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> list[int] | None:
+    """Broadcast output dims for two operands, else None to bail or fail."""
+    a = _ndarray_parts(left)
+    if a is None:
+        return None
+    dims_a, _ = a
+    b = _ndarray_parts(right)
+    if b is None:
+        if _scalar_key(right) is None:
+            return None
+        return dims_a
+    dims_b, _ = b
+    dims, message = _broadcast_result(dims_a, dims_b)
+    if message is not None:
+        ctx.api.fail(message, ctx.context)
+        return None
+    return dims
+
+
+def compare_method_hook(ctx: MethodContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    dims = _broadcast_dims(ctx, ctx.type, pairs[0][0])
+    if dims is None:
+        return ctx.default_return_type
+    dtype = _construct_dtype(ctx, "numpy.bool")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def _solve_argdrop(
+    ctx: FunctionContext | MethodContext, dims: list[int], axis: list[int] | None | str
+) -> Type:
+    """argmax/argmin/argpartition: drop the axis, integer positions out."""
+    if not isinstance(axis, list):
+        return ctx.default_return_type
+    ndim = len(dims)
+    normalized: list[int] = []
+    for ax in axis:
+        norm = _normalize_axis(ax, ndim)
+        if norm is None:
+            ctx.api.fail(
+                f"axis {ax} is out of range for {ndim} dimensions "
+                f"(shape {tuple(dims)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        if norm in normalized:
+            ctx.api.fail(f"duplicate axis {ax}", ctx.context)
+            return ctx.default_return_type
+        normalized.append(norm)
+    chosen = set(normalized)
+    return _ndarray_type(ctx, [d for i, d in enumerate(dims) if i not in chosen], _default_dtype(ctx))
+
+
+def _solve_same_or_flat(
+    ctx: FunctionContext | MethodContext,
+    dims: list[int],
+    dtype: Type,
+    axis: list[int] | None | str,
+    int_out: bool,
+) -> Type:
+    """sort/partition (same shape) and argsort/argpartition (integer out)."""
+    if axis == "absent":
+        # The default axis is -1, which never changes the shape.
+        return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
+    if not isinstance(axis, list):
+        if axis == "none":
+            total = 1
+            for d in dims:
+                total *= d
+            return _ndarray_type(ctx, [total], _default_dtype(ctx) if int_out else dtype)
+        return ctx.default_return_type
+    ndim = len(dims)
+    for ax in axis:
+        if _normalize_axis(ax, ndim) is None:
+            ctx.api.fail(
+                f"axis {ax} is out of range for {ndim} dimensions "
+                f"(shape {tuple(dims)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+    return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
+
+
+ARG_DROP = frozenset({"argmax", "argmin", "argpartition"})
+ARG_SAME_INT = frozenset({"argsort"})
+ARG_SAME = frozenset({"sort", "partition"})
+
+
+def _arg_inputs(ctx: FunctionContext | MethodContext, array: Type, op: str) -> Type:
+    parts = _ndarray_parts(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if op in ARG_DROP:
+        return _solve_argdrop(ctx, dims, axis)
+    return _solve_same_or_flat(ctx, dims, dtype, axis, int_out=op in ARG_SAME_INT)
+
+
+def arg_method_hook(ctx: MethodContext, op: str) -> Type:
+    return _arg_inputs(ctx, ctx.type, op)
+
+
+def arg_function_hook(ctx: FunctionContext, op: str) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _arg_inputs(ctx, pairs[0][0], op)
+
+
+RNG_FLOAT_OPS = frozenset({"normal", "random", "standard_normal", "uniform"})
+
+
+def rng_method_hook(ctx: MethodContext, op: str) -> Type:
+    if op in RNG_FLOAT_OPS:
+        size = _parse_axis_arg(_formal_pair(ctx, "size"))
+        if not isinstance(size, list):
+            return ctx.default_return_type
+        dtype = _construct_dtype(ctx, "numpy.float64")
+        if dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, size, dtype)
+    if op == "integers":
+        size = _parse_axis_arg(_formal_pair(ctx, "size"))
+        if not isinstance(size, list):
+            return ctx.default_return_type
+        if _explicit_dtype(ctx):
+            return ctx.default_return_type
+        dtype = _construct_dtype(ctx, "numpy.int64")
+        if dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, size, dtype)
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    first_tp, first_expr = pairs[0]
+    if op == "choice":
+        size = _parse_axis_arg(_formal_pair(ctx, "size"))
+        if not isinstance(size, list):
+            return ctx.default_return_type
+        value = _fold_int(first_expr) if first_expr is not None else None
+        if value is None:
+            value = _int_value(first_tp)
+        if value is not None:
+            dtype = _construct_dtype(ctx, "numpy.int64")
+            if dtype is None:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, size, dtype)
+        parts = _ndarray_parts(first_tp)
+        if parts is None:
+            return ctx.default_return_type
+        _, dtype = parts
+        return _ndarray_type(ctx, size, dtype)
+    if op == "permutation":
+        value = _fold_int(first_expr) if first_expr is not None else None
+        if value is None:
+            value = _int_value(first_tp)
+        if value is not None:
+            dtype = _construct_dtype(ctx, "numpy.int64")
+            if dtype is None:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, [value], dtype)
+        parts = _ndarray_parts(first_tp)
+        if parts is None:
+            return ctx.default_return_type
+        dims, dtype = parts
+        return _ndarray_type(ctx, dims, dtype)
+    return ctx.default_return_type
+
 
 
 def reduction_function_hook(ctx: FunctionContext) -> Type:

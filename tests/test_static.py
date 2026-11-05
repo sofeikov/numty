@@ -174,6 +174,20 @@ def test_slice_step_mismatch() -> None:
     )
 
 
+def test_compare_broadcast_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_compare_broadcast.py"),
+        "broadcast shapes disagree at trailing axis 0: 3 vs 2",
+    )
+
+
+def test_argmax_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_argmax_axis.py"),
+        "axis 9 is out of range for 2 dimensions",
+    )
+
+
 def assert_rank_mismatch(
     result: "subprocess.CompletedProcess[str]", ours: str, native: str, *extra: str
 ) -> None:

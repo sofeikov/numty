@@ -84,6 +84,18 @@ No-axis reductions (`.sum()` with no axis) return a scalar, so the plugin
 leaves them to numpy's own stubs; only float/complex dtypes keep their
 dtype through a reduction, anything else bails out.
 
+Comparisons broadcast shapes and return bool arrays; `argmax` drops the
+axis to integer positions, `sort` keeps the shape:
+
+```python
+probs.argmax(axis=1) == labels        # bool vector, shape tracked
+np.zeros((2, 3)) == np.zeros((3, 2))  # error: broadcast shapes disagree
+```
+
+`Generator` random methods solve from `size=` (`rng.normal(size=(n, d))`,
+`rng.integers`, `choice`, `permutation`); a missing size means a scalar,
+so the plugin bails to the stub.
+
 Subscripts that track shapes through indexing:
 
 ```python
@@ -115,9 +127,11 @@ np.stack((a, b), axis=0)                  # new axis of stacked count
 np.concatenate((a, b), axis=0)            # error: dimension 1 differs
 ```
 
-Tuple displays (`(a, b)`) keep per-item precision; list displays join
-away the item shapes, so stacking from a list bails out. Explicit
-`dtype=` always bails out — the plugin never guesses a dtype you named.
+Tuple displays (`(a, b)`) keep per-item precision; list displays
+`[a, b]` work too — the plugin re-reads each item's type from its
+expression, since lists arrive joined against the `ArrayLike` formal.
+Explicit `dtype=` always bails out — the plugin never guesses a dtype
+you named.
 
 ## Quickstart
 
@@ -138,7 +152,7 @@ uv pip install mypy numpy pytest
 ```sh
 PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
 uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: 22 runtime + 25 mypy-driven
+uv run pytest                      # full suite: runtime + mypy-driven (53 and growing)
 ```
 
 ## How it works
@@ -184,8 +198,7 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error.
 - Explicit `dtype=` always bails out — the plugin never guesses a dtype
-  you named. Same for list-form `concatenate`/`stack` (tuple displays
-  keep per-item precision; lists join it away) and unknown `keepdims`.
+  you named. Same for unknown `keepdims`.
 - On lines the solver rejects, mypy may add its own follow-on error next
   to ours (an overload complaint for tuple `reshape`, `Unsupported
   operand` for broadcast ops). Ours is the readable one.
@@ -195,7 +208,7 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
   on the plugin.
 - The `@` operator is accepted but unchecked: operator dispatch consulted
   the method hook inconsistently in testing, so only the `matmul()`
-  wrapper solves. Same for reflected ops and non-`float64` dtypes.
+  wrapper solves. Same for reflected ops beyond `__radd__`/`__rmul__`.
 - `np.matmul` itself is a gufunc object in the stubs, not a plain function,
   so it cannot be hooked; the plugin solves at our own `matmul` wrapper
   instead.
@@ -208,6 +221,9 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 - [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) — the solver.
 - [demo.py](/home/sofeikov/my/numty/demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.
+- [bench/](/home/sofeikov/my/numty/bench) — realistic benchmark (MLP training,
+  math library, 16 seeded mistakes), with its own scorecard in
+  [bench/README.md](/home/sofeikov/my/numty/bench/README.md).
 - [tests/test_runtime.py](/home/sofeikov/my/numty/tests/test_runtime.py) —
   shapes, values, narrowing accept/reject.
 - [tests/test_static.py](/home/sofeikov/my/numty/tests/test_static.py) — runs

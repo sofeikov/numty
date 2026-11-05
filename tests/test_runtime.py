@@ -102,6 +102,36 @@ def test_full_eye_arange_values() -> None:
     np.testing.assert_array_equal(np.arange(0, 10, 3), [0, 3, 6, 9])
 
 
+def test_comparisons_broadcast_bool() -> None:
+    r = np.zeros((2, 3)) == np.zeros((2, 1))
+    assert r.shape == (2, 3) and r.dtype == np.dtype(bool)
+    assert (np.arange(3) < 2).tolist() == [True, True, False]
+
+
+def test_arg_family_shapes() -> None:
+    a = np.arange(6, dtype=np.float64).reshape(2, 3)
+    np.testing.assert_array_equal(a.argmax(axis=1), [2, 2])
+    assert a.argsort(axis=1).shape == (2, 3)
+    np.testing.assert_array_equal(np.sort(a[:, ::-1], axis=1), a)
+    assert np.partition(a.ravel(), 2)[:3].shape == (3,)
+
+
+def test_list_stack_values() -> None:
+    a = np.zeros((2, 3))
+    assert np.stack([a, a], axis=0).shape == (2, 2, 3)
+    assert np.concatenate([a, np.zeros((2, 4))], axis=1).shape == (2, 7)
+
+
+def test_rng_shapes() -> None:
+    g = np.random.default_rng(0)
+    assert g.normal(size=(2, 3)).shape == (2, 3)
+    assert g.normal(size=(2, 3)).dtype == np.dtype(np.float64)
+    got = g.integers(0, 10, size=(4,))
+    assert got.shape == (4,) and np.issubdtype(got.dtype, np.integer)
+    assert g.choice(np.zeros((5,)), size=(3,)).shape == (3,)
+    assert g.permutation(np.zeros((4, 2))).shape == (4, 2)
+
+
 def test_subscript_tracks_shapes() -> None:
     a = np.arange(12, dtype=np.float64).reshape(4, 3)
     assert a[0].shape == (3,)

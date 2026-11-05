@@ -225,6 +225,59 @@ def subscript_stays_precise() -> None:
     use_1x3(np.zeros((2, 3))[1:99])
 
 
+Ab2x3 = np.ndarray[tuple[Literal[2], Literal[3]], np.dtype[np.bool_]]
+A4x2 = FloatArray[tuple[Literal[4], Literal[2]]]
+Ai4 = np.ndarray[tuple[Literal[4]], np.dtype[np.signedinteger[Any]]]
+Ai2 = np.ndarray[tuple[Literal[2]], np.dtype[np.signedinteger[Any]]]
+Ai3 = np.ndarray[tuple[Literal[3]], np.dtype[np.signedinteger[Any]]]
+Ai2x3 = np.ndarray[tuple[Literal[2], Literal[3]], np.dtype[np.signedinteger[Any]]]
+
+
+def use_i2(m: Ai2) -> None: ...
+
+
+def use_i3(m: Ai3) -> None: ...
+
+
+def use_i2x3(m: Ai2x3) -> None: ...
+
+
+def use_b2x3(m: Ab2x3) -> None: ...
+
+
+def use_4x2(m: A4x2) -> None: ...
+
+
+def use_i4(m: Ai4) -> None: ...
+
+
+def comparisons_stay_precise() -> None:
+    use_b2x3(np.zeros((2, 3)) == np.zeros((2, 3)))
+    use_b2x3(np.zeros((2, 3)) != 1.0)
+    use_b2x3(np.zeros((2, 3)) < np.zeros((2, 1)))
+
+
+def arg_family_stays_precise() -> None:
+    use_i2(np.zeros((2, 3)).argmax(axis=1))
+    use_i3(np.argmax(np.zeros((2, 3)), axis=0))
+    use_i2x3(np.zeros((2, 3)).argsort(axis=1))
+    use_2x3(np.sort(np.zeros((2, 3))))
+    use_3(np.partition(np.zeros((5,)), 2)[:3])
+
+
+def list_stacking_stays_precise() -> None:
+    use_2x2x3(np.stack([np.zeros((2, 3)), np.zeros((2, 3))], axis=0))
+    use_2x7(np.concatenate([np.zeros((2, 3)), np.zeros((2, 4))], axis=1))
+
+
+def rng_stays_precise() -> None:
+    g = np.random.default_rng(0)
+    use_2x3(g.normal(size=(2, 3)))
+    use_i4(g.integers(0, 10, size=(4,)))
+    use_3(g.choice(np.zeros((5,)), size=(3,)))
+    use_4x2(g.permutation(np.zeros((4, 2))))
+
+
 def scalar_reduction_uses_stub_default() -> None:
     reveal_type(np.zeros((2, 3)).sum())
 
