@@ -280,3 +280,20 @@ def test_ufunc_values_and_dtypes() -> None:
     assert np.broadcast_to(np.zeros(3), (2, 3)).shape == (2, 3)
     assert np.asarray(a).shape == (2, 3)
     assert np.matmul(a, np.arange(12, dtype=np.float64).reshape(3, 4)).shape == (2, 4)
+
+
+def test_fancy_index_and_take_values() -> None:
+    a = np.zeros((5, 10, 2))
+    ids = np.zeros((5, 3), dtype=np.int64)
+    assert np.take_along_axis(a, ids[..., None], axis=1).shape == (5, 3, 2)
+    assert np.take_along_axis(np.zeros(10), np.zeros(5, dtype=np.int64), axis=None).shape == (5,)
+    assert (~np.zeros((5, 10), dtype=np.bool_)).dtype == np.dtype(np.bool_)
+    b = np.zeros((5, 22))
+    actor = np.zeros(5, dtype=np.int64)
+    assert b[np.arange(5), actor].shape == (5,)
+    assert b[actor, 1:3].shape == (5, 2)
+    assert b[:, actor].shape == (5, 5)
+    assert np.zeros((7, 4))[np.zeros(5, dtype=np.int64)].shape == (5, 4)
+    assert a[ids].shape == (5, 3, 10, 2)
+    assert a[ids[:, 0]].shape == (5, 10, 2)
+    assert np.zeros((5, 6))[np.array(3)].shape == (6,)

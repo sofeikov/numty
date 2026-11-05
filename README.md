@@ -153,9 +153,20 @@ a[::0]        # error: slice step is zero
 ```
 
 Slicing past the end clips like NumPy (`a[1:99]` on a size-2 axis is
-size 1); boolean masks, fancy indexing, and unknown bounds bail out.
-Indexing every axis with integers yields a scalar, which the plugin
-leaves to the stubs.
+size 1); boolean masks and unknown bounds bail out. Indexing every axis
+with integers yields a scalar, which the plugin leaves to the stubs.
+
+Integer arrays index fancy-style: the index shape replaces the axis,
+broadcast when there are several, `take_along_axis` keeps the indices'
+shape:
+
+```python
+table[ids]                        # (5, 4): index shape + trailing dims
+b[np.arange(5), actor]            # (5,): broadcast (5,) + (5,)
+np.take_along_axis(a, idx, axis=1)  # indices' shape, arr's dtype
+b[np.zeros(3)]                    # error: integer (or boolean) type required
+np.take_along_axis(a, idx2d, axis=1)  # error: same number of dimensions
+```
 
 Shape builders that compute the result shape:
 
@@ -206,7 +217,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape`, rank-changing ops, shape builders, comparisons, the arg family, `einsum`, and `linalg` solvers, folds constant int expressions, solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape`, rank-changing ops, shape builders, comparisons, the arg family, `einsum`, `linalg` solvers, fancy indexing, and `take_along_axis`, folds constant int expressions, solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `Array1D`,

@@ -254,6 +254,28 @@ def test_truediv_broadcast_mismatch() -> None:
     )
 
 
+def test_take_rank_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_take_rank.py"),
+        "must have the same number of dimensions",
+    )
+
+
+def test_take_nonaxis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_take_mismatch.py"),
+        "take_along_axis shapes mismatch at axis 0: 5 vs 4",
+    )
+
+
+def test_fancy_dtype_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_fancy_dtype.py"),
+        "arrays used as indices must be of integer (or boolean) type",
+        "Invalid index type",
+    )
+
+
 def assert_rank_mismatch(
     result: "subprocess.CompletedProcess[str]", ours: str, native: str, *extra: str
 ) -> None:

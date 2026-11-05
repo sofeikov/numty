@@ -27,6 +27,8 @@ What it does:
   Explicit dtype= and unknown dims bail out.
 - comparisons broadcast shapes and return bool arrays; argmax/argsort
   drop or keep the axis; Generator/RandomState methods solve from size=.
+- getitem solves integer-array (fancy) indices and take_along_axis;
+  boolean masks bail (data-dependent count), float indices error.
 - arithmetic operators (-, /, **) and bare ufuncs (np.sqrt, np.add, ...)
   broadcast and promote; the ufuncs are stub variables, reached through
   the Literal name in their generic type (raw np.matmul included).
@@ -150,6 +152,8 @@ class NumtyPlugin(Plugin):
             return broadcast_to_function_hook
         if fullname.startswith("numpy.") and short in {"asarray", "asanyarray"}:
             return asarray_function_hook
+        if fullname.startswith("numpy.") and short == "take_along_axis":
+            return take_along_axis_function_hook
         if fullname.startswith("numpy.") and short in _UFUNC_KEEP:
             return partial(ufunc_function_hook, group="keep")
         if fullname.startswith("numpy.") and short in _UFUNC_ABS:
@@ -228,6 +232,8 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__rtruediv__",
         }:
             return truediv_method_hook
+        if fullname == "numpy.ndarray.__invert__":
+            return invert_method_hook
         if fullname == "numpy.ndarray.reshape":
             return reshape_method_hook
         if fullname == "numpy.ndarray.transpose":
@@ -1542,11 +1548,26 @@ def _fold_index_bound(expr: Expression | None) -> int | None | str:
 
 
 def _parse_index_item(tp: Type, expr: Expression | None) -> tuple | None:
-    """One index: int drops the axis, slice keeps it, None adds one."""
+    """One index: int drops the axis, slice keeps it, None adds one.
+
+    Integer arrays are fancy indices (their shape replaces the axis);
+    0-d integer arrays act like scalars. Bool arrays are masks (bail:
+    the selected count is data-dependent); other dtypes always raise.
+    """
     if _is_none_type(tp):
         return ("newaxis",)
     if isinstance(expr, EllipsisExpr):
         return ("ellipsis",)
+    part = _ndarray_parts(tp)
+    if part is not None:
+        kind = _dtype_base(part[1])
+        if kind is None:
+            return None
+        if kind in ("i", "u"):
+            return ("fancy0d",) if not part[0] else ("fancy", part[0])
+        if kind == "b":
+            return ("mask",)
+        return ("badindex",)
     if isinstance(expr, SliceExpr):
         begin = _fold_index_bound(expr.begin_index)
         end = _fold_index_bound(expr.end_index)
@@ -1589,7 +1610,7 @@ def _solve_getitem(
         ctx.api.fail("only one Ellipsis (...) is allowed in an index", ctx.context)
         return ctx.default_return_type
     ndim = len(dims)
-    consuming = sum(1 for item in items if item[0] in ("int", "slice"))
+    consuming = sum(1 for item in items if item[0] in ("int", "slice", "fancy", "fancy0d"))
     if consuming > ndim:
         ctx.api.fail(
             f"too many indices for {ndim} dimensions "
@@ -1597,8 +1618,32 @@ def _solve_getitem(
             ctx.context,
         )
         return ctx.default_return_type
+    fancy_positions = [n for n, item in enumerate(items) if item[0] == "fancy"]
+    if len(fancy_positions) > 1:
+        between = items[fancy_positions[0] + 1 : fancy_positions[-1]]
+        if any(item[0] not in ("int", "fancy", "fancy0d", "newaxis") for item in between):
+            # Advanced indices separated by a slice/ellipsis broadcast to
+            # the front; that reshuffle is out of scope, so bail out.
+            return ctx.default_return_type
+    fancy_dims: list[int] = []
+    for n in fancy_positions:
+        assert items[n][0] == "fancy"
+        shape = items[n][1]
+        if not fancy_dims:
+            fancy_dims = shape
+            continue
+        merged, cause = _broadcast_result(fancy_dims, shape)
+        if cause is not None:
+            ctx.api.fail(
+                f"indexing arrays could not be broadcast together: {cause}",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        assert merged is not None
+        fancy_dims = merged
     out: list[int] = []
     dim = 0
+    fancy_emitted = False
     for item in items:
         kind = item[0]
         if kind == "newaxis":
@@ -1618,6 +1663,22 @@ def _solve_getitem(
                 )
                 return ctx.default_return_type
             dim += 1
+        elif kind == "fancy0d":
+            dim += 1
+        elif kind == "fancy":
+            if not fancy_emitted:
+                out.extend(fancy_dims)
+                fancy_emitted = True
+            dim += 1
+        elif kind == "mask":
+            # Boolean masks select a data-dependent count: bail out.
+            return ctx.default_return_type
+        elif kind == "badindex":
+            ctx.api.fail(
+                "arrays used as indices must be of integer (or boolean) type",
+                ctx.context,
+            )
+            return ctx.default_return_type
         else:
             _, begin, end, stride = item
             size = dims[dim]
@@ -2489,6 +2550,30 @@ def _kind_of(name: str) -> str | None:
     return None
 
 
+def _dtype_base(dtype: Type) -> str | None:
+    """i/u/f/c/b kind from a dtype's base class, ignoring bit width.
+
+    Constructors like arange produce platform-dependent unions
+    (signedinteger[_32Bit | _64Bit]) that _dtype_kind_size cannot resolve;
+    the kind alone is enough for index/ufunc classification.
+    """
+    proper = get_proper_type(dtype)
+    if not isinstance(proper, Instance) or not proper.args:
+        return None
+    element = get_proper_type(proper.args[0])
+    if not isinstance(element, Instance):
+        return None
+    direct = _DTYPE_INFO.get(element.type.fullname)
+    if direct is not None:
+        return direct[0]
+    return {
+        "numpy.floating": "f",
+        "numpy.complexfloating": "c",
+        "numpy.signedinteger": "i",
+        "numpy.unsignedinteger": "u",
+    }.get(element.type.fullname)
+
+
 def _specs_dtype(
     ctx: FunctionContext | MethodContext,
     specs: list[tuple[str, str]],
@@ -2546,6 +2631,16 @@ def _solve_clip(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
+    # Keyword bounds not already covered positionally still broadcast.
+    for name, position in (("a_min", 2), ("a_max", 3)):
+        if len(pairs) < position:
+            named = _formal_pair(ctx, name)
+            if named is not None and not _is_none_type(named[0]):
+                pairs.append(named)
+    # None bounds mean "no clipping on that side": skip them.
+    pairs = [(tp, expr) for tp, expr in pairs if not _is_none_type(tp)]
+    if not pairs:
+        return ctx.default_return_type
     # clip preserves the first array operand's dtype (bounds cast to it).
     specs = [_operand_spec(tp) for tp, _ in pairs]
     if any(spec is None for spec in specs):
@@ -2567,13 +2662,16 @@ def _solve_clip(ctx: FunctionContext) -> Type:
 
 def _solve_broadcast_to(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
-    if len(pairs) < 2:
+    if not pairs:
         return ctx.default_return_type
     spec = _operand_spec(pairs[0][0])
     if spec is None:
         return ctx.default_return_type
     arr_dims, kind, name = spec
-    dims = _shape_from_arg(pairs[1][0], pairs[1][1])
+    shape_pair = pairs[1] if len(pairs) >= 2 else _formal_pair(ctx, "shape")
+    if shape_pair is None:
+        return ctx.default_return_type
+    dims = _shape_from_arg(shape_pair[0], shape_pair[1])
     if dims is None:
         return ctx.default_return_type
     if any(d < 0 for d in dims):
@@ -2715,6 +2813,80 @@ def truediv_method_hook(ctx: MethodContext) -> Type:
     if args is None:
         return ctx.default_return_type
     return _solve_truediv_pair(ctx, ctx.type, args[0])
+
+
+def invert_method_hook(ctx: MethodContext) -> Type:
+    parts = _ndarray_parts(ctx.type)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2 or len(pairs) > 3:
+        return ctx.default_return_type
+    part_a = _ndarray_parts(pairs[0][0])
+    part_i = _ndarray_parts(pairs[1][0])
+    if part_a is None or part_i is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = part_a
+    dims_i, dtype_i = part_i
+    if _dtype_base(dtype_i) not in ("i", "u"):
+        ctx.api.fail(
+            "take_along_axis `indices` must be an integer array",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis is None:
+        return ctx.default_return_type
+    if axis in ("absent", "none"):
+        # axis=None flattens: indices must be 1-d, result is the indices.
+        if len(dims_i) != 1:
+            ctx.api.fail(
+                "take_along_axis with axis=None needs 1-d `indices`, got "
+                f"shape {tuple(dims_i)}",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims_i, dtype_a)
+    if not isinstance(axis, list) or len(axis) != 1:
+        return ctx.default_return_type
+    norm = _normalize_axis(axis[0], len(dims_a))
+    if norm is None:
+        ctx.api.fail(
+            f"take_along_axis axis {axis[0]} is out of range for "
+            f"{len(dims_a)} dimensions (shape {tuple(dims_a)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    if len(dims_a) != len(dims_i):
+        ctx.api.fail(
+            f"take_along_axis `indices` and `arr` must have the same number "
+            f"of dimensions (shapes {tuple(dims_a)} vs {tuple(dims_i)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out: list[int] = []
+    for d, (x, y) in enumerate(zip(dims_a, dims_i)):
+        if d == norm:
+            out.append(y)
+        elif x == y:
+            out.append(x)
+        elif x == 1:
+            out.append(y)
+        elif y == 1:
+            out.append(x)
+        else:
+            ctx.api.fail(
+                f"take_along_axis shapes mismatch at axis {d}: {x} vs {y} "
+                f"(shapes {tuple(dims_a)} vs {tuple(dims_i)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+    return _ndarray_type(ctx, out, dtype_a)
 
 
 def clip_method_hook(ctx: MethodContext) -> Type:

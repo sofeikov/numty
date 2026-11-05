@@ -231,6 +231,14 @@ Ai4 = np.ndarray[tuple[Literal[4]], np.dtype[np.signedinteger[Any]]]
 Ai2 = np.ndarray[tuple[Literal[2]], np.dtype[np.signedinteger[Any]]]
 Ai3 = np.ndarray[tuple[Literal[3]], np.dtype[np.signedinteger[Any]]]
 Ai2x3 = np.ndarray[tuple[Literal[2], Literal[3]], np.dtype[np.signedinteger[Any]]]
+Ai5x10 = np.ndarray[tuple[Literal[5], Literal[10]], np.dtype[np.signedinteger[Any]]]
+A5 = FloatArray[tuple[Literal[5]]]
+A5x10 = FloatArray[tuple[Literal[5], Literal[10]]]
+A5x3x2 = FloatArray[tuple[Literal[5], Literal[3], Literal[2]]]
+A5x10x2 = FloatArray[tuple[Literal[5], Literal[10], Literal[2]]]
+A5x3x10x2 = FloatArray[tuple[Literal[5], Literal[3], Literal[10], Literal[2]]]
+A5x2 = FloatArray[tuple[Literal[5], Literal[2]]]
+A5x4 = FloatArray[tuple[Literal[5], Literal[4]]]
 A4 = FloatArray[tuple[Literal[4]]]
 A5x3 = FloatArray[tuple[Literal[5], Literal[3]]]
 A5x5 = FloatArray[tuple[Literal[5], Literal[5]]]
@@ -246,6 +254,30 @@ def use_i3(m: Ai3) -> None: ...
 
 
 def use_i2x3(m: Ai2x3) -> None: ...
+
+
+def use_i5x10(m: Ai5x10) -> None: ...
+
+
+def use_5(m: A5) -> None: ...
+
+
+def use_5x10(m: A5x10) -> None: ...
+
+
+def use_5x3x2(m: A5x3x2) -> None: ...
+
+
+def use_5x10x2(m: A5x10x2) -> None: ...
+
+
+def use_5x3x10x2(m: A5x3x10x2) -> None: ...
+
+
+def use_5x2(m: A5x2) -> None: ...
+
+
+def use_5x4(m: A5x4) -> None: ...
 
 
 def use_4(m: A4) -> None: ...
@@ -328,6 +360,24 @@ def linalg_stays_precise() -> None:
     sol, _, _, _ = np.linalg.lstsq(np.zeros((5, 3)), np.zeros(5))
     use_3(sol)
     use_2(np.linalg.norm(np.zeros((2, 3)), axis=1))
+
+
+def indexing_stays_precise() -> None:
+    a = np.zeros((5, 10, 2))
+    ids = np.arange(15).reshape(5, 3)
+    use_5x3x2(np.take_along_axis(a, ids[..., None], axis=1))
+    use_5(np.take_along_axis(np.zeros(10), np.arange(5), axis=None))
+    order = np.argsort(~(np.zeros((5, 10)) > 1.0), axis=1)
+    use_i5x10(order)
+    b = np.zeros((5, 22))
+    actor = np.arange(5)
+    use_5(b[np.arange(5), actor])
+    use_5x2(b[actor, 1:3])
+    use_5x5(b[:, actor])
+    table = np.zeros((7, 4))
+    use_5x4(table[np.arange(5)])
+    use_5x10x2(a[ids[:, 0]])
+    use_5x3x10x2(a[ids])
 
 
 def ufunc_stays_precise() -> None:
