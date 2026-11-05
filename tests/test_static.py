@@ -107,7 +107,7 @@ def test_good_path_precision_visible() -> None:
     result = run_mypy(FIXTURES / "static_ok.py")
     assert result.returncode == 0, result.stdout
     notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
-    assert len(notes) == 24, result.stdout
+    assert len(notes) == 39, result.stdout
     assert any(
         "tuple[Literal[2], Literal[2]]" in line and "|" in line for line in notes
     ), result.stdout
@@ -126,6 +126,54 @@ def test_good_path_precision_visible() -> None:
     assert any("tuple[Literal[2], Literal[1]]" in line for line in notes), result.stdout
     assert any('"numpy.float64"' in line for line in notes), result.stdout
     assert any("tuple[Literal[6]]" in line for line in notes), result.stdout
+    assert any("tuple[Literal[2], Literal[4], Literal[6]]" in line for line in notes), result.stdout
+    assert any("tuple[Literal[2], *Ts]" in line for line in notes), result.stdout
+    assert any(
+        "tuple[Literal[5], Literal[4], *Ts, Literal[5]]" in line for line in notes
+    ), result.stdout
+    assert any("tuple[*Ts, Literal[6]]" in line for line in notes), result.stdout
+    assert any("tuple[Literal[5], *Ts, Literal[6]]" in line for line in notes), result.stdout
+    assert any(
+        "tuple[Literal[5], *Ts, Literal[1], Literal[7]]" in line for line in notes
+    ), result.stdout
+    assert any("tuple[*Ts, Literal[7]]" in line for line in notes), result.stdout
+    assert any(
+        "tuple[Literal[5], Literal[6], Literal[6], Literal[7], *Ts, Literal[8]]" in line
+        for line in notes
+    ), result.stdout
+
+
+def test_matmul_ts_inner_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matmul_ts_inner.py"),
+        "matmul inner dimensions disagree: 5 vs 3",
+    )
+
+
+def test_matmul_ts_batch_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matmul_ts_batch.py"),
+        "matmul batch dimensions disagree",
+        "(5, *Ts)",
+        "(4, *Ts)",
+    )
+
+
+def test_reshape_ts_size_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_reshape_ts_size.py"),
+        "reshape changes total size: 8 is not a multiple of known size 6",
+        "(*Ts, 2, 3)",
+        "(2, 4)",
+    )
+
+
+def test_index_ts_prefix_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_index_ts_prefix.py"),
+        "index 99 is out of range for axis 0 with size 5",
+        "((5, *Ts, 7))",
+    )
 
 
 def test_concat_dim_mismatch() -> None:

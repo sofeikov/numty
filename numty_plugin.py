@@ -11,17 +11,22 @@ What it does:
   default instead of erroring.
 - numty.matmul solves inner dims for any rank, broadcasts the batch
   dims with NumPy rules, and propagates the outer dims. Dtype is taken
-  from the left operand. The @ operator is accepted but unchecked (see
-  the method-hook note below).
+  from the left operand. Over a shared *Ts, (*Ts, N, M) pairs solve the
+  same way (inner dims align, batches broadcast through the unpack; a
+  lone concrete 1-D/2-D operand contributes an empty batch). The @
+  operator is accepted but unchecked (see the method-hook note below).
 - __add__/__mul__ unify operand shapes with NumPy broadcast rules, so
   precision survives whole function bodies. Scalars pass through;
   unknown dims bail out.
 - reshape (method and np.reshape) checks total-size conservation and
-  infers a single -1, returning the precise new shape. Anything dynamic
-  bails out.
-- rank-changing ops (transpose, squeeze, expand_dims, sum/prod/mean and
-  friends) track the new shape; no-axis reductions and non-float dtypes
-  bail out to the stubs.
+  infers a single -1, returning the precise new shape. Over *Ts only
+  block-preserving regroups resolve (the unknown middle stays put; -1
+  would absorb it, so it bails), with provable int-only total clashes
+  failing loudly. Anything dynamic bails out.
+- rank-changing ops (transpose, .T, squeeze, expand_dims, sum/prod/mean
+  and friends) track the new shape; transpose reversal over *Ts keeps
+  the unknown block ordered in place (explicit axes bail). No-axis
+  reductions and non-float dtypes bail out to the stubs.
 - shape builders (*_like from the prototype, full, eye, arange,
   concatenate/stack over tuple or list displays) compute the result shape.
   An explicit, resolvable dtype= is used as-is; unknown dims bail out.
@@ -31,7 +36,9 @@ What it does:
 - comparisons broadcast shapes and return bool arrays; argmax/argsort
   drop or keep the axis; Generator/RandomState methods solve from size=.
 - getitem solves integer-array (fancy) indices and take_along_axis;
-  boolean masks bail (data-dependent count), float indices error.
+  boolean masks bail (data-dependent count), float indices error. Over
+  *Ts, leading items consume the known prefix without an ellipsis
+  (rank-generic bodies still spell the ellipsis for the middle).
 - dims may be symbolic TypeVars: same name unifies, ranks and counts
   still check, and anything needing values bails instead of erroring.
 - arithmetic operators (-, /, **) and bare ufuncs (np.sqrt, np.add, ...)
@@ -301,6 +308,9 @@ class NumtyPlugin(Plugin):
     ) -> Callable[[AttributeContext], Type] | None:
         if fullname == "numpy.ndarray.shape":
             return shape_attribute_hook
+        # T lives on the shared _ArrayOrScalarCommon base in the stubs.
+        if fullname == "numpy._ArrayOrScalarCommon.T":
+            return t_attribute_hook
         return None
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
@@ -764,7 +774,9 @@ def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, Ty
 
 
 def _ndarray_type(
-    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
+    ctx: FunctionContext | MethodContext | AttributeContext,
+    dims: list[int | Type],
+    dtype: Type,
 ) -> Instance:
     checker = ctx.api
     int_instance = checker.named_generic_type(INT_FULLNAME, [])
@@ -883,18 +895,85 @@ def _matmul_result(
     return [*batch, a[-2], b[-1]], None
 
 
-def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
-    parts_a = _ndarray_parts(left)
-    parts_b = _ndarray_parts(right)
-    if parts_a is None or parts_b is None:
-        return ctx.default_return_type
-    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
-    dims, message = _matmul_result(dims_a, dims_b)
-    if message is not None:
-        ctx.api.fail(message, ctx.context)
-        return ctx.default_return_type
-    if dims is None:
-        return ctx.default_return_type
+def _matmul_unpack_dims(
+    left: Type, right: Type
+) -> tuple[list[int | Type] | None, str | None, Type | None, Type | None]:
+    """Batch-broadcast matmul dims when at least one side carries *Ts.
+
+    Returns (dims, message, dtype_a, dtype_b); (None, None, None, None)
+    to bail, (None, msg, None, None) on a provable inner/batch clash.
+    Both unpack sides must share one TypeVarTuple and expose two known
+    trailing dims; a lone concrete 1-D/2-D operand contributes an empty
+    batch. Vectors over *Ts, mixed unpacks, and concrete batches against
+    *Ts stay out of scope and bail.
+    """
+    sa = _unpack_shape(left)
+    sb = _unpack_shape(right)
+    if sa is None and sb is None:
+        return None, None, None, None
+    if sa is not None and sb is not None:
+        (p1, u1, s1), dtype_a = sa
+        (p2, u2, s2), dtype_b = sb
+        if not _same_unpack(u1, u2) or len(s1) < 2 or len(s2) < 2:
+            return None, None, None, None
+        matched, message = _matmul_inner(s1[-1], s2[-2])
+        if message is not None:
+            return None, message, None, None
+        if not matched:
+            return None, None, None, None
+        batch, cause = _merge_unpack_dims(p1, u1, s1[:-2], p2, u2, s2[:-2])
+        if cause is not None:
+            return None, (
+                f"matmul batch dimensions disagree: "
+                f"{_dims_str(p1 + [u1] + s1[:-2])} vs {_dims_str(p2 + [u2] + s2[:-2])} "
+                f"({cause})"
+            ), None, None
+        if batch is None:
+            return None, None, None, None
+        return [*batch, s1[-2], s2[-1]], None, dtype_a, dtype_b
+    sel, other = (sa, right) if sa is not None else (sb, left)
+    assert sel is not None
+    (prefix, unpack, suffix), dtype_u = sel
+    if len(suffix) < 2:
+        return None, None, None, None
+    ob = _ndarray_parts(other)
+    if ob is None or len(ob[0]) > 2:
+        return None, None, None, None
+    dims_o, dtype_o = ob
+    if len(dims_o) == 2:
+        pair = (suffix[-1], dims_o[-2]) if sa is not None else (dims_o[-1], suffix[-2])
+        matched, message = _matmul_inner(*pair)
+        if message is not None:
+            return None, message, None, None
+        if not matched:
+            return None, None, None, None
+        if sa is not None:
+            dims = [*prefix, unpack, *suffix[:-2], suffix[-2], dims_o[-1]]
+            return dims, None, dtype_u, dtype_o
+        dims = [*prefix, unpack, *suffix[:-2], dims_o[-2], suffix[-1]]
+        return dims, None, dtype_o, dtype_u
+    if len(dims_o) == 1:
+        pair = (suffix[-1], dims_o[0]) if sa is not None else (dims_o[0], suffix[-2])
+        matched, message = _matmul_inner(*pair)
+        if message is not None:
+            return None, message, None, None
+        if not matched:
+            return None, None, None, None
+        tail = [suffix[-2]] if sa is not None else [suffix[-1]]
+        dims = [*prefix, unpack, *suffix[:-2], *tail]
+        if sa is not None:
+            return dims, None, dtype_u, dtype_o
+        return dims, None, dtype_o, dtype_u
+    return None, None, None, None
+
+
+def _matmul_promoted(
+    ctx: FunctionContext | MethodContext,
+    dims: list[int | Type],
+    dtype_a: Type,
+    dtype_b: Type,
+) -> Type:
+    """Result array for matmul output dims with promoted dtypes."""
     name = _promote_dtypes(dtype_a, dtype_b)
     if name is None:
         return ctx.default_return_type
@@ -906,6 +985,27 @@ def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type)
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, dims, dtype)
+
+
+def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    parts_a = _ndarray_parts(left)
+    parts_b = _ndarray_parts(right)
+    if parts_a is not None and parts_b is not None:
+        (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+        dims, message = _matmul_result(dims_a, dims_b)
+        if message is not None:
+            ctx.api.fail(message, ctx.context)
+            return ctx.default_return_type
+        if dims is None:
+            return ctx.default_return_type
+        return _matmul_promoted(ctx, dims, dtype_a, dtype_b)
+    dims, message, dtype_a, dtype_b = _matmul_unpack_dims(left, right)
+    if message is not None:
+        ctx.api.fail(message, ctx.context)
+        return ctx.default_return_type
+    if dims is None or dtype_a is None or dtype_b is None:
+        return ctx.default_return_type
+    return _matmul_promoted(ctx, dims, dtype_a, dtype_b)
 
 
 def _positional_actuals(ctx: FunctionContext | MethodContext, n: int) -> list[Type] | None:
@@ -1205,12 +1305,126 @@ def _reshape_new_dims(
     return dims or None
 
 
+def _regroup_run(
+    run_old: list[int | Type], run_new: list[int | TypeVarType]
+) -> list[int | TypeVarType] | None:
+    """Regroup one known run of dims, else None to bail.
+
+    Mirrors the fixed-rank conservation rule on a slice of the shape:
+    int products must match and the TypeVar multisets must agree. The
+    caller keeps -1 out: an inferred dim would absorb the unknown *Ts
+    product, which no annotation can spell.
+    """
+    old_ints = [d for d in run_old if isinstance(d, int)]
+    old_vars = sorted(d.fullname for d in run_old if isinstance(d, TypeVarType))
+    if len(old_ints) + len(old_vars) != len(run_old):
+        return None
+    new_vars = sorted(d.fullname for d in run_new if isinstance(d, TypeVarType))
+    size_old = 1
+    for d in old_ints:
+        size_old *= d
+    size_new = 1
+    for d in run_new:
+        if isinstance(d, int):
+            size_new *= d
+    if -1 in run_new or size_new != size_old or old_vars != new_vars:
+        return None
+    return list(run_new)
+
+
+def _solve_reshape_unpack(
+    ctx: FunctionContext | MethodContext,
+    prefix: list[int | Type],
+    unpack: UnpackType,
+    suffix: list[int | Type],
+    dtype: Type,
+    raw: list[int | TypeVarType],
+) -> Type:
+    """Reshape a (*prefix, *Ts, *suffix) shape, preserving the middle.
+
+    Only block-preserving regroups are expressible: the target keeps
+    the fixed prefix (suffix regroups) or the fixed suffix (prefix
+    regroups), with the unknown block untouched in place. Anything else
+    is unprovable through *Ts and bails — except a total-size clash on
+    purely int dims, which no *Ts can absorb and which fails loudly.
+    """
+    old = prefix + [unpack] + suffix
+    suffix_candidate = len(raw) >= len(prefix) and all(
+        _dim_eq(raw[i], prefix[i]) for i in range(len(prefix))
+    )
+    prefix_candidate = len(raw) >= len(suffix) and (
+        not suffix
+        or all(
+            _dim_eq(raw[len(raw) - len(suffix) + i], suffix[i])
+            for i in range(len(suffix))
+        )
+    )
+    if suffix_candidate:
+        regrouped = _regroup_run(suffix, raw[len(prefix):])
+        if regrouped is not None:
+            return _ndarray_type(ctx, [*prefix, unpack, *regrouped], dtype)
+    if prefix_candidate and not suffix_candidate:
+        regrouped = _regroup_run(prefix, raw[: len(raw) - len(suffix)] if suffix else list(raw))
+        if regrouped is not None:
+            return _ndarray_type(ctx, [*regrouped, unpack, *suffix], dtype)
+    if any(not isinstance(d, int) for d in prefix + suffix):
+        return ctx.default_return_type
+    if any(not isinstance(d, int) for d in raw):
+        return ctx.default_return_type
+    if -1 in raw:
+        return ctx.default_return_type
+    known = 1
+    for d in prefix + suffix:
+        assert isinstance(d, int)
+        known *= d
+    total = 1
+    for d in raw:
+        assert isinstance(d, int)
+        total *= d
+    if known != 0 and total != 0 and total % known != 0:
+        ctx.api.fail(
+            f"reshape changes total size: {total} is not a multiple of "
+            f"known size {known} (shapes {_dims_str(old)} vs {tuple(raw)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    if known == 0 and total != 0:
+        ctx.api.fail(
+            f"reshape changes total size: 0 -> {total} "
+            f"(shapes {_dims_str(old)} vs {tuple(raw)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
 def _solve_reshape(
     ctx: FunctionContext | MethodContext, old: Type, pairs: list[tuple[Type, Expression | None]]
 ) -> Type:
     parts = _ndarray_parts(old)
     if parts is None:
-        return ctx.default_return_type
+        split = _unpack_shape(old)
+        if split is None:
+            return ctx.default_return_type
+        raw = _reshape_new_dims(pairs)
+        if raw is None:
+            return ctx.default_return_type
+        raw_ints = [d for d in raw if isinstance(d, int)]
+        if any(d < -1 for d in raw_ints):
+            ctx.api.fail(
+                f"reshape has invalid dimension {min(raw_ints)}; only -1 may be negative "
+                f"(shape {_dims_str(raw)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        if raw_ints.count(-1) > 1:
+            ctx.api.fail(
+                f"reshape accepts only one -1 dimension (shape {_dims_str(raw)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        (prefix, unpack, suffix), dtype = split
+        return _solve_reshape_unpack(ctx, prefix, unpack, suffix, dtype, raw)
     dims_old, dtype = parts
     raw = _reshape_new_dims(pairs)
     if raw is None:
@@ -1487,6 +1701,43 @@ def _apply_permutation(
         )
         return ctx.default_return_type
     return _ndarray_type(ctx, [dims[ax] for ax in normalized], dtype)
+
+
+def _reverse_unpack_dims(
+    prefix: list[int | Type], unpack: UnpackType, suffix: list[int | Type]
+) -> list[int | Type]:
+    """Full reversal with the unknown block kept in place, in order.
+
+    A true reversal would also reverse *Ts itself, which no annotation
+    can spell, so the block stays ordered: (*Ts, 2) reverses to
+    (2, *Ts). Rank and size multiset stay exact; the order inside *Ts
+    is not tracked (see README limitations).
+    """
+    return [*reversed(suffix), unpack, *reversed(prefix)]
+
+
+def _solve_transpose_unpack(
+    ctx: FunctionContext | MethodContext,
+    prefix: list[int | Type],
+    unpack: UnpackType,
+    suffix: list[int | Type],
+    dtype: Type,
+    rest: list[tuple[Type, Expression | None]],
+) -> Type:
+    """Transpose a (*prefix, *Ts, *suffix) shape.
+
+    Only the default full reversal is expressible (the unknown block
+    stays in place per _reverse_unpack_dims). Explicit axes would pin
+    the rank through the axis count but cannot order the unknown block,
+    so they bail out instead of guessing.
+    """
+    if not rest:
+        return _ndarray_type(ctx, _reverse_unpack_dims(prefix, unpack, suffix), dtype)
+    if len(rest) == 1:
+        single = _shape_from_arg(rest[0][0], rest[0][1])
+        if single is None and _is_none_type(rest[0][0]):
+            return _ndarray_type(ctx, _reverse_unpack_dims(prefix, unpack, suffix), dtype)
+    return ctx.default_return_type
 
 
 _DTYPE_INFO: dict[str, tuple[str, int]] = {
@@ -2379,10 +2630,14 @@ def reshape_function_hook(ctx: FunctionContext) -> Type:
 
 def transpose_method_hook(ctx: MethodContext) -> Type:
     parts = _ndarray_parts(ctx.type)
-    if parts is None:
+    if parts is not None:
+        dims, dtype = parts
+        return _solve_transpose(ctx, dims, dtype, _all_positionals(ctx))
+    split = _unpack_shape(ctx.type)
+    if split is None:
         return ctx.default_return_type
-    dims, dtype = parts
-    return _solve_transpose(ctx, dims, dtype, _all_positionals(ctx))
+    (prefix, unpack, suffix), dtype = split
+    return _solve_transpose_unpack(ctx, prefix, unpack, suffix, dtype, _all_positionals(ctx))
 
 
 def transpose_function_hook(ctx: FunctionContext) -> Type:
@@ -2391,7 +2646,11 @@ def transpose_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     parts = _ndarray_parts(pairs[0][0])
     if parts is None:
-        return ctx.default_return_type
+        split = _unpack_shape(pairs[0][0])
+        if split is None:
+            return ctx.default_return_type
+        (prefix, unpack, suffix), dtype = split
+        return _solve_transpose_unpack(ctx, prefix, unpack, suffix, dtype, pairs[1:])
     dims, dtype = parts
     rest = pairs[1:]
     if not rest:
@@ -2831,9 +3090,11 @@ def _solve_getitem_unpack(
 ) -> Type:
     """Index into a (*prefix, *Ts, *suffix) shape.
 
-    Only an ellipsis can align the index with the unknown middle, so a
-    non-ellipsis index bails out. Items on either side consume the known
-    dims with the same checks as the fixed-rank path.
+    An ellipsis aligns the index with the unknown middle; without one,
+    leading items consume the known prefix (a `None` inserts 1 in
+    place, exactly like the fixed-rank path) and the unknown block plus
+    the suffix pass through. Anything reaching into *Ts bails out, as
+    do fancy indices, which need concrete ranks to place.
     """
     pairs = _index_pairs(ctx, pair)
     if pairs is None:
@@ -2846,7 +3107,10 @@ def _solve_getitem_unpack(
         return ctx.default_return_type
     positions = [n for n, item in enumerate(items) if item[0] == "ellipsis"]
     if not positions:
-        return ctx.default_return_type
+        leading = _consume_prefix(ctx, items, prefix, shape_repr)
+        if leading is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, leading[0] + leading[1] + [unpack] + suffix, dtype)
     pos = positions[0]
     left = _consume_prefix(ctx, items[:pos], prefix, shape_repr)
     if left is None:
@@ -4425,6 +4689,31 @@ def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
         TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
     )
     return TupleType(items, fallback)
+
+
+def t_attribute_hook(ctx: AttributeContext) -> Type:
+    dist = _distribute_solve([ctx.type], lambda t: _t_type(ctx, t))
+    if dist is not None:
+        return dist
+    return _t_type(ctx, ctx.type)
+
+
+def _t_type(ctx: AttributeContext, tp: Type) -> Type:
+    """The .T view: full reversal, concrete or over *Ts.
+
+    Concrete shapes reverse exactly; unpack shapes reverse with the
+    unknown block kept in place per _reverse_unpack_dims. Anything else
+    stays on the stubs.
+    """
+    parts = _ndarray_parts(tp)
+    if parts is not None:
+        dims, dtype = parts
+        return _ndarray_type(ctx, list(reversed(dims)), dtype)
+    split = _unpack_shape(tp)
+    if split is None:
+        return ctx.default_attr_type
+    (prefix, unpack, suffix), dtype = split
+    return _ndarray_type(ctx, _reverse_unpack_dims(prefix, unpack, suffix), dtype)
 
 
 def _enum_member_count(info) -> int | None:
