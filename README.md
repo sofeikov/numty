@@ -96,6 +96,51 @@ stay silent by design — their equality is unprovable, and unknown is not
 an error. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
 `A` — a bare generic alias silently means unknown sizes).
 
+## Coming from jaxtyping? Convert once, check forever
+
+jaxtyping checks shapes at runtime; numty checks them before anything
+runs. A plugin cannot read jaxtyping's dim strings — they ride inside
+`Annotated` metadata, which no mypy type-analyze hook ever sees (probed
+every hook: only jaxtyping's internals fire, the string never arrives).
+So the bridge is a one-time source rewrite instead of a hook:
+[numty_convert.py](/home/sofeikov/my/numty/numty_convert.py) mechanically
+translates the annotations, then gets out of the way:
+
+```sh
+python numty_convert.py mlp.py mlp_static.py   # warnings go to stderr, if any
+```
+
+```python
+# before
+def forward(x: Float[np.ndarray, "batch inp"], ...) -> Float[np.ndarray, "batch out"]: ...
+# after (import of jaxtyping dropped — nothing references it anymore)
+BATCH = TypeVar('BATCH', bound=int)
+INP = TypeVar('INP', bound=int)
+def forward(x: FlexArray[tuple[BATCH, INP], np.dtype[Any]], ...) -> FlexArray[tuple[BATCH, OUT], np.dtype[Any]]: ...
+```
+
+Names become shared TypeVars — the same same-name-unifies rule as above —
+fixed sizes become `Literal`s, `...` and `_` become fresh variables,
+`*name` becomes a named `*Ts`, exact dtypes (`Float64`, `Int32`, …) keep
+their precision, and family heads (`Float`, `Int`, …) keep the shape while
+the dtype stays `Any`. It catches real mistakes: mis-annotate the output
+bias as `"hid"` instead of `"out"` and the converted file fails with
+
+```text
+error: call-site shape conflict for 'HID': 8 (argument 'w1') vs 2 (argument 'b2')
+```
+
+Anything the static solver cannot express is left verbatim with a
+warning, never silently changed: symbolic dims (`"n+1"`), stacked
+subscriptions, non-numpy bases, aliased heads (`Float as F`), and names
+your code already binds (a module-level `BATCH = 5` would be rebound by
+the emitted decl, so that annotation stays jaxtyping). A fully converted
+file runs unchanged — the annotations evaluate — and no longer needs
+jaxtyping installed. The round trip is pinned by
+[tests/test_convert.py](/home/sofeikov/my/numty/tests/test_convert.py):
+goldens for every dim kind plus an end-to-end MLP that checks clean and a
+seeded-bug twin that must fail.
+
 ## Indexing that tracks shapes
 
 ```python
@@ -228,7 +273,7 @@ uv pip install mypy numpy pytest
 ```sh
 PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
 uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: runtime + mypy-driven (85 and growing)
+uv run pytest                      # full suite: runtime + mypy-driven
 ```
 
 ## How it works
@@ -329,6 +374,11 @@ layers.
   real mypy over [fixtures](/home/sofeikov/my/numty/tests/fixtures/static_ok.py):
   each bad one must fail with our message, and `reveal_type` pins must show
   precise shapes on the good paths.
+- [numty_convert.py](/home/sofeikov/my/numty/numty_convert.py) +
+  [tests/test_convert.py](/home/sofeikov/my/numty/tests/test_convert.py) —
+  the jaxtyping bridge: one-time annotation rewrite with goldens for every
+  dim kind and an end-to-end MLP (clean + seeded-bug twins in
+  [fixtures](/home/sofeikov/my/numty/tests/fixtures/jaxtyping_mlp.py)).
 
 ## Roadmap
 
