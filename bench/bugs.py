@@ -97,6 +97,16 @@ def argmax_axis_bug() -> np.ndarray:
     return np.zeros((2, 3)).argmax(axis=9)
 
 
+def einsum_labels_bug() -> np.ndarray:
+    # expect: label 'j' has conflicting sizes
+    return np.einsum("ij,jh->ih", np.zeros((2, 3)), np.zeros((5, 4)))
+
+
+def solve_square_bug() -> np.ndarray:
+    # expect: requires a square matrix
+    return np.linalg.solve(np.zeros((2, 3)), np.zeros(3))
+
+
 def main() -> None:
     x = np.zeros((4, 4))
     cases: list[tuple[str, Callable[[], object]]] = [
@@ -116,6 +126,8 @@ def main() -> None:
         ("batch_matmul_bug", lambda: batch_matmul_bug()),
         ("compare_broadcast_bug", lambda: compare_broadcast_bug()),
         ("argmax_axis_bug", lambda: argmax_axis_bug()),
+        ("einsum_labels_bug", lambda: einsum_labels_bug()),
+        ("solve_square_bug", lambda: solve_square_bug()),
     ]
     for name, run in cases:
         try:

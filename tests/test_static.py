@@ -188,6 +188,51 @@ def test_argmax_axis_mismatch() -> None:
     )
 
 
+def test_einsum_label_conflict() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_einsum_labels.py"),
+        "einsum label 'j' has conflicting sizes: 3 vs 5",
+        '"einsum"',
+    )
+
+
+def test_einsum_rank_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_einsum_rank.py"),
+        "einsum subscript 'ijk' has 3 labels but operand has rank 2",
+        '"einsum"',
+    )
+
+
+def test_solve_square_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_solve_square.py"),
+        "linalg.solve requires a square (..., N, N) array, got shape (2, 3)",
+    )
+
+
+def test_solve_inner_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_solve_inner.py"),
+        "linalg.solve inner dimensions disagree: 4 vs 5",
+    )
+
+
+def test_svd_rank_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_svd_rank.py"),
+        "linalg.svd requires at least 2 dimensions, got shape (5,)",
+        '"svd"',
+    )
+
+
+def test_norm_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_norm_axis.py"),
+        "linalg.norm axis 9 is out of range for 2 dimensions",
+    )
+
+
 def assert_rank_mismatch(
     result: "subprocess.CompletedProcess[str]", ours: str, native: str, *extra: str
 ) -> None:

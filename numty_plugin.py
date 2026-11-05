@@ -23,8 +23,15 @@ What it does:
   friends) track the new shape; no-axis reductions and non-float dtypes
   bail out to the stubs.
 - shape builders (*_like from the prototype, full, eye, arange,
-  concatenate/stack over tuple displays) compute the result shape.
-  Explicit dtype=, unknown dims, and list-form stacking bail out.
+  concatenate/stack over tuple or list displays) compute the result shape.
+  Explicit dtype= and unknown dims bail out.
+- comparisons broadcast shapes and return bool arrays; argmax/argsort
+  drop or keep the axis; Generator/RandomState methods solve from size=.
+- einsum parses the subscript string (explicit/implicit, ellipsis,
+  diagonals) and solves label sizes; linalg solvers (solve, inv,
+  cholesky, eig/eigh, svd, lstsq, norm) check squareness/inner dims,
+  solve output shapes (tuples for eig/svd, solution-only for lstsq),
+  and track result dtypes. Scalar results bail to the stubs.
 """
 from __future__ import annotations
 
@@ -43,6 +50,7 @@ from mypy.nodes import (
     OpExpr,
     SliceExpr,
     StarExpr,
+    StrExpr,
     TupleExpr,
     UnaryExpr,
     Var,
@@ -118,6 +126,19 @@ class NumtyPlugin(Plugin):
             return concatenate_function_hook
         if fullname.startswith("numpy.") and short == "stack":
             return stack_function_hook
+        if fullname.startswith("numpy.") and short == "einsum":
+            return einsum_function_hook
+        if fullname.startswith("numpy.linalg.") and short in {
+            "solve",
+            "inv",
+            "cholesky",
+            "eig",
+            "eigh",
+            "svd",
+            "lstsq",
+            "norm",
+        }:
+            return partial(linalg_function_hook, op=short)
         if fullname.startswith("numpy.") and short in {
             "argmax",
             "argmin",
@@ -1745,4 +1766,538 @@ def reduction_function_hook(ctx: FunctionContext) -> Type:
     if not pairs:
         return ctx.default_return_type
     return _reduction_inputs(ctx, pairs[0][0])
+
+
+def _promoted_result_type(
+    ctx: FunctionContext | MethodContext, dta: Type, dtb: Type
+) -> Type | None:
+    """dtype[...] for the promotion of two dtypes, else None to bail.
+
+    Reuses an input dtype when the promotion matches it, so precision
+    (exact bit widths) survives; constructs only genuinely fresh dtypes.
+    """
+    name = _promote_dtypes(dta, dtb)
+    if name is None:
+        return None
+    if name == _dtype_fullname(dta):
+        return dta
+    if name == _dtype_fullname(dtb):
+        return dtb
+    return _construct_dtype(ctx, name)
+
+
+def _parse_einsum_term(term: str) -> tuple[list[str], list[str], bool] | None:
+    """(leading labels, trailing labels, has_ellipsis) for one operand.
+
+    The ellipsis covers the middle dims; without one, leading holds every
+    label and trailing is empty. None when malformed: bail, never error.
+    """
+    if term.count("...") > 1:
+        return None
+    if "..." in term:
+        pre, post = term.split("...")
+        if "." in pre or "." in post:
+            return None
+    else:
+        if "." in term:
+            return None
+        pre, post = term, ""
+    labels = list(pre + post)
+    if any(c in ",->" or c.isspace() for c in labels):
+        return None
+    return list(pre), list(post), "..." in term
+
+
+def einsum_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    _, eq_expr = pairs[0]
+    if not isinstance(eq_expr, StrExpr):
+        return ctx.default_return_type
+    # An explicit dtype or out means the caller controls the result shape.
+    if _formal_pair(ctx, "dtype") is not None:
+        return ctx.default_return_type
+    if _formal_pair(ctx, "out") is not None:
+        return ctx.default_return_type
+    operands = pairs[1:]
+    parts: list[tuple[list[int], Type]] = []
+    for tp, _ in operands:
+        part = _ndarray_parts(tp)
+        if part is None:
+            return ctx.default_return_type
+        parts.append(part)
+    equation = "".join(eq_expr.value.split())
+    if equation.count("->") > 1:
+        return ctx.default_return_type
+    explicit = "->" in equation
+    lhs, rhs = equation.split("->") if explicit else (equation, None)
+    terms = lhs.split(",")
+    if len(terms) != len(parts):
+        ctx.api.fail(
+            f"einsum subscripts describe {len(terms)} operand(s) but "
+            f"{len(parts)} array(s) given",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    label_size: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    ell_inputs: list[list[int]] = []
+    for (dims, _), term in zip(parts, terms):
+        parsed = _parse_einsum_term(term)
+        if parsed is None:
+            return ctx.default_return_type
+        pre, post, has_ell = parsed
+        shape = tuple(dims)
+        if has_ell:
+            if len(dims) < len(pre) + len(post):
+                ctx.api.fail(
+                    f"einsum subscript '{term}' needs at least "
+                    f"{len(pre) + len(post)} dimensions but operand has "
+                    f"shape {shape}",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            head = dims[: len(pre)]
+            tail = dims[len(dims) - len(post) :] if post else []
+            ell_inputs.append(dims[len(pre) : len(dims) - len(post) if post else len(dims)])
+            bound = list(zip(pre + post, head + tail))
+        else:
+            if len(pre) != len(dims):
+                ctx.api.fail(
+                    f"einsum subscript '{term}' has {len(pre)} labels but "
+                    f"operand has rank {len(dims)} (shape {shape})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            bound = list(zip(pre, dims))
+        for label, size in bound:
+            counts[label] = counts.get(label, 0) + 1
+            known = label_size.get(label)
+            if known is None:
+                label_size[label] = size
+            elif known != size:
+                ctx.api.fail(
+                    f"einsum label '{label}' has conflicting sizes: "
+                    f"{known} vs {size} (shape {shape})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+    broadcast: list[int] | None = None
+    for edims in ell_inputs:
+        if broadcast is None:
+            broadcast = edims
+            continue
+        out, cause = _broadcast_result(broadcast, edims)
+        if cause is not None:
+            ctx.api.fail(
+                f"einsum ellipsis dimensions cannot broadcast: {cause}",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        assert out is not None
+        broadcast = out
+    ell_out = broadcast or []
+    if explicit:
+        assert rhs is not None
+        parsed = _parse_einsum_term(rhs)
+        if parsed is None:
+            return ctx.default_return_type
+        pre, post, has_ell = parsed
+        if not has_ell and ell_inputs:
+            ctx.api.fail(
+                "einsum output omits the ellipsis dimensions present "
+                "in the inputs",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        seen: set[str] = set()
+        for label in pre + post:
+            if label in seen:
+                ctx.api.fail(
+                    f"einsum output subscript '{label}' appears more than once",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            seen.add(label)
+            if label not in label_size:
+                ctx.api.fail(
+                    f"einsum output subscript '{label}' never appeared "
+                    "in an input",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+        out_dims = (
+            [label_size[label] for label in pre]
+            + ell_out
+            + [label_size[label] for label in post]
+        )
+    else:
+        once = sorted(label for label, count in counts.items() if count == 1)
+        out_dims = ell_out + [label_size[label] for label in once]
+    if not out_dims:
+        # Scalar result (trace, full reduction): the stubs own it.
+        return ctx.default_return_type
+    dtype = _promote_all(ctx, [dtype for _, dtype in parts])
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out_dims, dtype)
+
+
+def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Type:
+    fallback = ctx.api.named_generic_type(
+        TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
+    )
+    return TupleType(items, fallback)
+
+
+def _linalg_real_name(kind: str, size: int) -> str | None:
+    """Float dtype for real-valued results: int inputs, norm, svd values."""
+    if kind == "f":
+        return _NAME_OF_KIND_SIZE.get(("f", size))
+    if kind == "c":
+        return _NAME_OF_KIND_SIZE.get(("f", size // 2))
+    if kind in ("i", "u", "b"):
+        return "numpy.float64"
+    return None
+
+
+def _linalg_dtype(ctx: FunctionContext | MethodContext, dtype: Type, name: str) -> Type | None:
+    if name == _dtype_fullname(dtype):
+        return dtype
+    return _construct_dtype(ctx, name)
+
+
+def _linalg_eig_names(kind: str, size: int, hermitian: bool) -> tuple[str, str] | None:
+    """(values, vectors) dtype names for eig/eigh, else None to bail."""
+    if kind == "f" and size in (4, 8):
+        if hermitian:
+            name = _NAME_OF_KIND_SIZE.get(("f", size))
+            assert name is not None
+            return name, name
+        name = _NAME_OF_KIND_SIZE.get(("c", size * 2))
+        assert name is not None
+        return name, name
+    if kind == "c" and size in (8, 16):
+        if hermitian:
+            float_name = _NAME_OF_KIND_SIZE.get(("f", size // 2))
+            complex_name = _NAME_OF_KIND_SIZE.get(("c", size))
+            assert float_name is not None and complex_name is not None
+            return float_name, complex_name
+        name = _NAME_OF_KIND_SIZE.get(("c", size))
+        assert name is not None
+        return name, name
+    if kind in ("i", "u", "b"):
+        if hermitian:
+            return "numpy.float64", "numpy.float64"
+        return "numpy.complex128", "numpy.complex128"
+    return None
+
+
+def _linalg_solve(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    part_a = _ndarray_parts(pairs[0][0])
+    part_b = _ndarray_parts(pairs[1][0])
+    if part_a is None or part_b is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = part_a
+    dims_b, dtype_b = part_b
+    if len(dims_a) < 2 or dims_a[-1] != dims_a[-2]:
+        ctx.api.fail(
+            "linalg.solve requires a square (..., N, N) array, got shape "
+            f"{tuple(dims_a)}",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    size = dims_a[-1]
+    if len(dims_b) == 1:
+        if dims_b[0] != size:
+            ctx.api.fail(
+                f"linalg.solve inner dimensions disagree: {size} vs {dims_b[0]} "
+                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        batch_b: list[int] = []
+        core = [size]
+    else:
+        if dims_b[-2] != size:
+            ctx.api.fail(
+                f"linalg.solve inner dimensions disagree: {size} vs {dims_b[-2]} "
+                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        batch_b = dims_b[:-2]
+        core = dims_b[-2:]
+    batch, cause = _broadcast_result(dims_a[:-2], batch_b)
+    if cause is not None:
+        ctx.api.fail(
+            f"linalg.solve batch dimensions disagree: {tuple(dims_a[:-2])} vs "
+            f"{tuple(batch_b)} ({cause})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    assert batch is not None
+    dtype = _promoted_result_type(ctx, dtype_a, dtype_b)
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [*batch, *core], dtype)
+
+
+def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
+    """inv/cholesky: square in, same shape out, ints become float64."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if len(dims) < 2 or dims[-1] != dims[-2]:
+        ctx.api.fail(
+            f"linalg.{op} requires a square (..., N, N) array, got shape "
+            f"{tuple(dims)}",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, size = ks
+    if kind in ("i", "u", "b"):
+        out_dtype = _construct_dtype(ctx, "numpy.float64")
+    elif kind in ("f", "c"):
+        out_dtype = dtype
+    else:
+        return ctx.default_return_type
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, out_dtype)
+
+
+def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if len(dims) < 2 or dims[-1] != dims[-2]:
+        ctx.api.fail(
+            f"linalg.{op} requires a square (..., M, M) array, got shape "
+            f"{tuple(dims)}",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    names = _linalg_eig_names(*ks, hermitian=op == "eigh")
+    if names is None:
+        return ctx.default_return_type
+    values_dtype = _linalg_dtype(ctx, dtype, names[0])
+    vectors_dtype = _linalg_dtype(ctx, dtype, names[1])
+    if values_dtype is None or vectors_dtype is None:
+        return ctx.default_return_type
+    batch = dims[:-2]
+    size = dims[-1]
+    return _linalg_tuple(
+        ctx,
+        [
+            _ndarray_type(ctx, [*batch, size], values_dtype),
+            _ndarray_type(ctx, [*batch, size, size], vectors_dtype),
+        ],
+    )
+
+
+def _linalg_flag(ctx: FunctionContext, name: str, default: bool) -> bool | None:
+    """Value of an optional bool kwarg (default when absent), else None."""
+    pair = _formal_pair(ctx, name)
+    if pair is None:
+        return default
+    return _fold_flag(pair)
+
+
+def _linalg_svd(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if len(dims) < 2:
+        ctx.api.fail(
+            f"linalg.svd requires at least 2 dimensions, got shape {tuple(dims)}",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    full = _linalg_flag(ctx, "full_matrices", True)
+    compute_uv = _linalg_flag(ctx, "compute_uv", True)
+    if full is None or compute_uv is None:
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, size = ks
+    uv_name: str | None
+    if kind in ("f", "c"):
+        uv_name = _dtype_fullname(dtype)
+    elif kind in ("i", "u", "b"):
+        uv_name = "numpy.float64"
+    else:
+        return ctx.default_return_type
+    s_name = _linalg_real_name(kind, size)
+    if s_name is None:
+        return ctx.default_return_type
+    uv_dtype = _linalg_dtype(ctx, dtype, uv_name)
+    s_dtype = _linalg_dtype(ctx, dtype, s_name)
+    if uv_dtype is None or s_dtype is None:
+        return ctx.default_return_type
+    batch = dims[:-2]
+    rows, cols = dims[-2], dims[-1]
+    inner = min(rows, cols)
+    s_type = _ndarray_type(ctx, [*batch, inner], s_dtype)
+    if not compute_uv:
+        return s_type
+    if full:
+        u_dims, vh_dims = [*batch, rows, rows], [*batch, cols, cols]
+    else:
+        u_dims, vh_dims = [*batch, rows, inner], [*batch, inner, cols]
+    return _linalg_tuple(
+        ctx,
+        [
+            _ndarray_type(ctx, u_dims, uv_dtype),
+            s_type,
+            _ndarray_type(ctx, vh_dims, uv_dtype),
+        ],
+    )
+
+
+def _linalg_lstsq(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    part_a = _ndarray_parts(pairs[0][0])
+    part_b = _ndarray_parts(pairs[1][0])
+    if part_a is None or part_b is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = part_a
+    dims_b, dtype_b = part_b
+    if len(dims_a) < 2:
+        ctx.api.fail(
+            f"linalg.lstsq requires a with at least 2 dimensions, got shape "
+            f"{tuple(dims_a)}",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    rows, cols = dims_a[-2], dims_a[-1]
+    if len(dims_b) == 1:
+        if dims_b[0] != rows:
+            ctx.api.fail(
+                f"linalg.lstsq inner dimensions disagree: {rows} vs {dims_b[0]} "
+                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        batch_b: list[int] = []
+        core = [cols]
+    else:
+        if dims_b[-2] != rows:
+            ctx.api.fail(
+                f"linalg.lstsq inner dimensions disagree: {rows} vs {dims_b[-2]} "
+                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        batch_b = dims_b[:-2]
+        core = [cols, dims_b[-1]]
+    batch, cause = _broadcast_result(dims_a[:-2], batch_b)
+    if cause is not None:
+        ctx.api.fail(
+            f"linalg.lstsq batch dimensions disagree: {tuple(dims_a[:-2])} vs "
+            f"{tuple(batch_b)} ({cause})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    assert batch is not None
+    dtype = _promoted_result_type(ctx, dtype_a, dtype_b)
+    if dtype is None:
+        return ctx.default_return_type
+    # Only the solution is provable (residuals depend on runtime rank),
+    # so the remaining items stay Any.
+    rest = [AnyType(TypeOfAny.explicit)] * 3
+    return _linalg_tuple(ctx, [_ndarray_type(ctx, [*batch, *core], dtype), *rest])
+
+
+def _linalg_norm(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis is None:
+        return ctx.default_return_type
+    keepdims = _linalg_flag(ctx, "keepdims", False)
+    if keepdims is None:
+        return ctx.default_return_type
+    if axis in ("absent", "none") and not keepdims:
+        # Scalar result: the stubs own it.
+        return ctx.default_return_type
+    if axis in ("absent", "none"):
+        axes = list(range(len(dims)))
+    else:
+        assert isinstance(axis, list)
+        axes = []
+        for ax in axis:
+            norm = _normalize_axis(ax, len(dims))
+            if norm is None:
+                ctx.api.fail(
+                    f"linalg.norm axis {ax} is out of range for {len(dims)} "
+                    f"dimensions (shape {tuple(dims)})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            axes.append(norm)
+        if len(set(axes)) != len(axes):
+            return ctx.default_return_type
+    if keepdims:
+        out_dims = [1 if i in axes else d for i, d in enumerate(dims)]
+    else:
+        out_dims = [d for i, d in enumerate(dims) if i not in axes]
+    if not out_dims:
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    name = _linalg_real_name(*ks)
+    if name is None:
+        return ctx.default_return_type
+    out_dtype = _linalg_dtype(ctx, dtype, name)
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out_dims, out_dtype)
+
+
+def linalg_function_hook(ctx: FunctionContext, op: str) -> Type:
+    if op == "solve":
+        return _linalg_solve(ctx)
+    if op in ("inv", "cholesky"):
+        return _linalg_same_shape(ctx, op)
+    if op in ("eig", "eigh"):
+        return _linalg_eig(ctx, op)
+    if op == "svd":
+        return _linalg_svd(ctx)
+    if op == "lstsq":
+        return _linalg_lstsq(ctx)
+    if op == "norm":
+        return _linalg_norm(ctx)
+    return ctx.default_return_type
 

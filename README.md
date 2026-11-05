@@ -96,6 +96,30 @@ np.zeros((2, 3)) == np.zeros((3, 2))  # error: broadcast shapes disagree
 `rng.integers`, `choice`, `permutation`); a missing size means a scalar,
 so the plugin bails to the stub.
 
+`einsum` parses the subscript string and solves label sizes, including
+implicit mode, ellipsis, and diagonals:
+
+```python
+np.einsum("ij,jh->ih", a, b)  # (2, 4), like matmul
+np.einsum("ij,jh", a, b)      # implicit: once-labels, alphabetical
+np.einsum("...ij,j->...i", batched, v)
+np.einsum("ij,jh->ih", a, c)  # error: label 'j' has conflicting sizes
+```
+
+`linalg` solvers check squareness and inner dims, and track dtypes
+(`eig` of float is complex, `eigh` stays real, ints become float64):
+
+```python
+x = np.linalg.solve(a4, b)          # (4,) or (4, K), batch-broadcast
+w, v = np.linalg.eigh(cov)          # (4,) float, (4, 4)
+u, s, vh = np.linalg.svd(m)         # full_matrices=False shrinks U, Vh
+sol, _, _, _ = np.linalg.lstsq(a, y)  # only the solution is provable;
+                                      # residuals depend on runtime rank
+np.linalg.norm(m, axis=1)           # (2,); no-axis norm is a scalar,
+                                    # so the plugin leaves it to the stubs
+np.linalg.solve(non_square, b)      # error: requires a square array
+```
+
 Subscripts that track shapes through indexing:
 
 ```python
@@ -163,7 +187,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, `+`/`*` (with promotion), `reshape`, rank-changing ops, and shape builders, folds constant int expressions, solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, `+`/`*` (with promotion), `reshape`, rank-changing ops, shape builders, comparisons, the arg family, `einsum`, and `linalg` solvers, folds constant int expressions, solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `Array1D`,
@@ -222,7 +246,7 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 - [demo.py](/home/sofeikov/my/numty/demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.
 - [bench/](/home/sofeikov/my/numty/bench) — realistic benchmark (MLP training,
-  math library, 16 seeded mistakes), with its own scorecard in
+  math library, 18 seeded mistakes), with its own scorecard in
   [bench/README.md](/home/sofeikov/my/numty/bench/README.md).
 - [tests/test_runtime.py](/home/sofeikov/my/numty/tests/test_runtime.py) —
   shapes, values, narrowing accept/reject.

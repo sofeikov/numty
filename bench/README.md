@@ -9,7 +9,7 @@ against, not a demo of what works.
 - [mathlib.py](/home/sofeikov/my/numty/bench/mathlib.py) — PCA, least squares,
   FFT denoising, Lorenz integration, k-means, geometry, stats, rankings.
   Runs (`uv run python bench/mathlib.py`), asserts its own shapes.
-- [bugs.py](/home/sofeikov/my/numty/bench/bugs.py) — 16 seeded realistic
+- [bugs.py](/home/sofeikov/my/numty/bench/bugs.py) — 18 seeded realistic
   mistakes, each annotated with the expected static error. `main()` runs
   every bug and records whether it raised at runtime or ran silent.
 
@@ -23,7 +23,7 @@ Scorecard:
 
 - Clean files: **zero diagnostics** on both — correct code stays silent,
   because unknown shapes bail instead of erroring.
-- Seeded bugs: **13 of 16 caught** statically, all before running. Every
+- Seeded bugs: **15 of 18 caught** statically, all before running. Every
   caught bug also raises at runtime, so these are true saves.
 - Misses (3): two use raw `np.matmul`, which resolves to `Any` and has no
   stub definition to hook — unhookable from a plugin, use `numty.matmul`.
@@ -34,4 +34,7 @@ Advance notes from triage went straight into the plugin: comparisons,
 argmax/argsort family, list-form `stack`/`concatenate` (item types are
 re-read from each expression, since lists arrive joined against the
 `ArrayLike` formal), and `Generator` random methods all came from patterns
-in these files.
+in these files. The second round added `einsum` (subscript parsing
+with implicit mode and ellipsis) and `linalg` solvers (square/inner-dim
+checks, tuple outputs, result dtypes) — again driven by `ml.py` and
+`mathlib.py` lines that previously bailed.

@@ -231,6 +231,12 @@ Ai4 = np.ndarray[tuple[Literal[4]], np.dtype[np.signedinteger[Any]]]
 Ai2 = np.ndarray[tuple[Literal[2]], np.dtype[np.signedinteger[Any]]]
 Ai3 = np.ndarray[tuple[Literal[3]], np.dtype[np.signedinteger[Any]]]
 Ai2x3 = np.ndarray[tuple[Literal[2], Literal[3]], np.dtype[np.signedinteger[Any]]]
+A4 = FloatArray[tuple[Literal[4]]]
+A5x3 = FloatArray[tuple[Literal[5], Literal[3]]]
+A5x5 = FloatArray[tuple[Literal[5], Literal[5]]]
+A7x2 = FloatArray[tuple[Literal[7], Literal[2]]]
+Ac4 = np.ndarray[tuple[Literal[4]], np.dtype[np.complexfloating[Any]]]
+Ac4x4 = np.ndarray[tuple[Literal[4], Literal[4]], np.dtype[np.complexfloating[Any]]]
 
 
 def use_i2(m: Ai2) -> None: ...
@@ -240,6 +246,24 @@ def use_i3(m: Ai3) -> None: ...
 
 
 def use_i2x3(m: Ai2x3) -> None: ...
+
+
+def use_4(m: A4) -> None: ...
+
+
+def use_5x3(m: A5x3) -> None: ...
+
+
+def use_5x5(m: A5x5) -> None: ...
+
+
+def use_7x2(m: A7x2) -> None: ...
+
+
+def use_c4(m: Ac4) -> None: ...
+
+
+def use_c4x4(m: Ac4x4) -> None: ...
 
 
 def use_b2x3(m: Ab2x3) -> None: ...
@@ -268,6 +292,42 @@ def arg_family_stays_precise() -> None:
 def list_stacking_stays_precise() -> None:
     use_2x2x3(np.stack([np.zeros((2, 3)), np.zeros((2, 3))], axis=0))
     use_2x7(np.concatenate([np.zeros((2, 3)), np.zeros((2, 4))], axis=1))
+
+
+def einsum_stays_precise() -> None:
+    a = np.zeros((2, 3))
+    b = np.zeros((3, 4))
+    use_2x4(np.einsum("ij,jh->ih", a, b))
+    use_4x2(np.einsum("ij,jh", a, b))
+    use_2(np.einsum("ij,j->i", a, np.zeros(3)))
+    use_3(np.einsum("ii->i", np.zeros((3, 3))))
+    use_7x2(np.einsum("bij,bj->bi", np.zeros((7, 2, 3)), np.zeros((7, 3))))
+    use_7x2(np.einsum("...ij,j->...i", np.zeros((7, 2, 3)), np.zeros(3)))
+    use_7x2(np.einsum("...ij,...j", np.zeros((7, 2, 3)), np.zeros((7, 3))))
+
+
+def linalg_stays_precise() -> None:
+    a4 = np.zeros((4, 4))
+    use_4(np.linalg.solve(a4, np.zeros(4)))
+    use_4x2(np.linalg.solve(a4, np.zeros((4, 2))))
+    use_4x4(np.linalg.inv(a4))
+    use_c4(np.linalg.eig(a4)[0])
+    use_c4x4(np.linalg.eig(a4)[1])
+    w, v = np.linalg.eigh(a4)
+    use_4(w)
+    use_4x4(v)
+    u, s, vh = np.linalg.svd(np.zeros((5, 3)))
+    use_5x5(u)
+    use_3(s)
+    use_3x3(vh)
+    u2, s2, vh2 = np.linalg.svd(np.zeros((5, 3)), full_matrices=False)
+    use_5x3(u2)
+    use_3(s2)
+    use_3x3(vh2)
+    use_3(np.linalg.svd(np.zeros((5, 3)), compute_uv=False))
+    sol, _, _, _ = np.linalg.lstsq(np.zeros((5, 3)), np.zeros(5))
+    use_3(sol)
+    use_2(np.linalg.norm(np.zeros((2, 3)), axis=1))
 
 
 def rng_stays_precise() -> None:
