@@ -6,9 +6,15 @@ Checkable by mypy, pyright, or ty (plugin solving is mypy-only).
 """
 from __future__ import annotations
 
-from typing import Any, TypeVar, cast
+import sys
+from typing import Any, Generic, TypeVar, cast
 
 import numpy as np
+
+if sys.version_info >= (3, 11):
+    from typing import TypeVarTuple, Unpack
+else:  # pragma: no cover
+    from typing_extensions import TypeVarTuple, Unpack
 
 # Rank-only aliases. Catch transposed / flattened mixups.
 Vector = np.ndarray[tuple[int], np.dtype[np.float64]]
@@ -36,6 +42,52 @@ Array2D = np.ndarray[tuple[M, N], np.dtype[np.float64]]
 S2 = TypeVar("S2")
 D2 = TypeVar("D2", bound=np.dtype[Any])
 FlexArray = np.ndarray[S2, D2]
+
+
+# Familiar-style shape heads: jaxtyping's feel, numty's solver. Spell dims
+# flat — TypeVars (or the ready-made ones below), integers, Unpack[Ts] —
+# and the plugin reads them statically, no converter needed:
+# F64[batch, features], F64[BATCH, FEATURES], F64[3, 4].
+# Same-name dims unify; anything else is an error, not a silent Any.
+TsFam = TypeVarTuple("TsFam")
+
+
+class F64(Generic[Unpack[TsFam]]):
+    """float64 array with flat dims, e.g. F64[batch, features]."""
+
+
+class F32(Generic[Unpack[TsFam]]):
+    """float32 array with flat dims, e.g. F32[batch, features]."""
+
+
+class I64(Generic[Unpack[TsFam]]):
+    """int64 array with flat dims, e.g. I64[batch, count]."""
+
+
+class I32(Generic[Unpack[TsFam]]):
+    """int32 array with flat dims, e.g. I32[batch, count]."""
+
+
+class Bool(Generic[Unpack[TsFam]]):
+    """boolean array with flat dims, e.g. Bool[batch, mask]."""
+
+
+# Ready-made dim TypeVars for the heads above: `F64[batch, features]`
+# works with a single import, no declarations. Same name unifies across
+# annotations; declare your own TypeVar for anything not listed here.
+batch = TypeVar("batch", bound=int)
+channel = TypeVar("channel", bound=int)
+height = TypeVar("height", bound=int)
+width = TypeVar("width", bound=int)
+depth = TypeVar("depth", bound=int)
+features = TypeVar("features", bound=int)
+classes = TypeVar("classes", bound=int)
+seq = TypeVar("seq", bound=int)
+hidden = TypeVar("hidden", bound=int)
+hid = TypeVar("hid", bound=int)
+inp = TypeVar("inp", bound=int)
+out = TypeVar("out", bound=int)
+head = TypeVar("head", bound=int)
 
 
 # Shape-preserving pass-through. A generic over the shape keeps the exact

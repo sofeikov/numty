@@ -71,11 +71,13 @@ from mypy.nodes import (
     StarExpr,
     StrExpr,
     TupleExpr,
+    TypeAlias,
     TypeInfo,
     UnaryExpr,
     Var,
 )
 from mypy.plugin import (
+    AnalyzeTypeContext,
     AttributeContext,
     FunctionContext,
     FunctionSigContext,
@@ -85,25 +87,51 @@ from mypy.plugin import (
 from mypy.types import (
     AnyType,
     CallableType,
+    EllipsisType,
     Instance,
     LiteralType,
     NoneType,
     Overloaded,
+    RawExpressionType,
     TupleType,
     Type,
     TypeOfAny,
     TypeVarTupleType,
     TypeVarType,
+    UnboundType,
     UnionType,
     UnpackType,
     get_proper_type,
 )
+
 
 NDARRAY_FULLNAME = "numpy.ndarray"
 INT_FULLNAME = "builtins.int"
 TUPLE_FULLNAME = "builtins.tuple"
 FLOAT64_FULLNAME = "numpy.float64"
 DTYPE_FULLNAME = "numpy.dtype"
+
+# Familiar-style heads (defined in numty.py) and the numpy scalar each one
+# stands for. Bool maps to numpy.bool, matching _DTYPE_STRINGS below.
+_FAM_HEAD_DTYPES = {
+    "numty.F64": "numpy.float64",
+    "numty.F32": "numpy.float32",
+    "numty.I64": "numpy.int64",
+    "numty.I32": "numpy.int32",
+    "numty.Bool": "numpy.bool",
+}
+
+
+class _FamFail(Exception):
+    """Malformed familiar-style annotation: emit api.fail, return Any."""
+
+    def __init__(self, msg: str) -> None:
+        super().__init__(msg)
+        self.msg = msg
+
+
+class _FamBail(Exception):
+    """Default analysis already errored: return Any without piling on."""
 
 
 def plugin(version: str) -> type[Plugin]:
@@ -181,6 +209,208 @@ class NumtyPlugin(Plugin):
                         ctx.api.fail(message, ctx.context)
                     break
         return sig
+
+    # Familiar-style heads (F64, F32, I64, I32, Bool in numty.py): the
+    # dtype rides the head name, dims ride flat args. Hooked here because
+    # mypy resolves `Head[...]` through Annotated-free generic application,
+    # so the raw args (quoted names included) still reach us.
+    def get_type_analyze_hook(
+        self, fullname: str
+    ) -> Callable[[AnalyzeTypeContext], Type] | None:
+        dtype_fullname = _FAM_HEAD_DTYPES.get(fullname)
+        if dtype_fullname is None:
+            return None
+
+        def hook(ctx: AnalyzeTypeContext) -> Type:
+            return self._fam_head(ctx, dtype_fullname)
+
+        return hook
+
+    def _fam_head(self, ctx: AnalyzeTypeContext, dtype_fullname: str) -> Type:
+        """Build the ndarray type for `F64[...]` from flat raw args.
+
+        Every dim must resolve: a TypeVar (reused, so mypy binds it to
+        the function and inference keeps working), a TypeVarTuple via
+        Unpack[Ts], a Final integer, a bare integer, or Literal[...].
+        Anything else fails loudly; anything already errored bails
+        silently to Any.
+        """
+        head = ctx.type.name
+        raw_args = list(ctx.type.args)
+        try:
+            if not raw_args:
+                raise _FamFail(f"{head} takes at least one dim")
+            dims = [self._fam_arg(ctx, head, a) for a in raw_args]
+        except _FamFail as bad:
+            ctx.api.fail(bad.msg, ctx.context)
+            return AnyType(TypeOfAny.from_error)
+        except _FamBail:
+            return AnyType(TypeOfAny.from_error)
+        line, column = ctx.context.line, ctx.context.column
+        int_inst = ctx.api.named_type("builtins.int", [], line, column)
+        items: list[Type] = []
+        for d in dims:
+            if isinstance(d, int):
+                items.append(LiteralType(d, int_inst, line, column))
+            else:
+                items.append(d)
+        shape = TupleType(
+            items,
+            ctx.api.named_type(
+                "builtins.tuple", [AnyType(TypeOfAny.explicit)], line, column
+            ),
+            line=line,
+            column=column,
+        )
+        # The element may be a stub alias (numpy.int32 is), not a class:
+        # use the alias target itself, so formals match what the numpy
+        # stubs produce for the same scalar (e.g. signedinteger[_32Bit]).
+        element: Type | None = None
+        sym = ctx.api.lookup_fully_qualified(dtype_fullname)
+        node = sym.node if sym is not None else None
+        if isinstance(node, TypeInfo):
+            element = ctx.api.named_type(dtype_fullname, [], line, column)
+        elif isinstance(node, TypeAlias):
+            target = get_proper_type(node.target)
+            if isinstance(target, Instance):
+                element = target
+        if element is None:
+            raise _FamFail(f"{head}: cannot resolve dtype {dtype_fullname}")
+        dtype = ctx.api.named_type("numpy.dtype", [element], line, column)
+        return ctx.api.named_type("numpy.ndarray", [shape, dtype], line, column)
+
+    def _fam_arg(
+        self, ctx: AnalyzeTypeContext, head: str, arg: Type
+    ) -> int | Type:
+        """One flat dim: a TypeVar, integer, Unpack[Ts], or Literal[...]."""
+        if isinstance(arg, EllipsisType):
+            raise _FamFail(
+                f"{head} '...' cannot be named for shape solving;"
+                " use Unpack[Ts] with a declared TypeVarTuple"
+            )
+        if isinstance(arg, RawExpressionType):
+            value = arg.literal_value
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise _FamFail(
+                    f"{head} dims must be TypeVars or non-negative integers"
+                )
+            return value
+        if isinstance(arg, UnboundType):
+            if arg.args:
+                return self._fam_applied(ctx, head, arg)
+            return self._fam_bare(ctx, head, arg)
+        # Defensive: hooks see raw args, but accept analyzed nodes too.
+        if isinstance(arg, TypeVarType):
+            return arg
+        if isinstance(arg, TypeVarTupleType):
+            return UnpackType(arg)
+        if isinstance(arg, UnpackType):
+            if arg.from_star_syntax:
+                raise _FamFail(
+                    f"{head} *Ts needs a name for the solver;"
+                    " write Unpack[Ts] instead"
+                )
+            return arg
+        if isinstance(arg, LiteralType):
+            if (
+                isinstance(arg.value, int)
+                and not isinstance(arg.value, bool)
+            ):
+                return arg.value
+            raise _FamFail(f"{head} dims must be integer literals")
+        if isinstance(arg, AnyType):
+            return arg
+        raise _FamFail(
+            f"{head} dims must be TypeVars, integers,"
+            " Unpack[Ts], or Literal[...]"
+        )
+
+    def _fam_bare(
+        self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType
+    ) -> int | Type:
+        """A bare name: it must resolve (a TypeVar, TypeVarTuple, Final).
+
+        mypy's own function-typevar visitor resolves every name in a
+        signature before the hook runs, so an unresolvable name is
+        already an error by the time we see it: analyze, reuse what it
+        denotes, fail clearly on anything else.
+        """
+        if arg.name in ("True", "False", "None", "_", "..."):
+            raise _FamFail(
+                f'{head} dim "{arg.name}" is not a TypeVar or integer;'
+                " declare a TypeVar for it, or use Unpack[Ts]"
+            )
+        analyzed = ctx.api.analyze_type(arg)
+        if isinstance(analyzed, TypeVarType):
+            return analyzed
+        if isinstance(analyzed, TypeVarTupleType):
+            return UnpackType(analyzed)
+        if isinstance(analyzed, AnyType):
+            if analyzed.type_of_any == TypeOfAny.from_error:
+                raise _FamBail
+            return analyzed
+        value = _dim_value(get_proper_type(analyzed))
+        if isinstance(value, int):
+            return value  # Final / literal-valued name
+        raise _FamFail(
+            f'{head} dim "{arg.name}" must be a TypeVar, an integer,'
+            " Unpack[Ts], or Literal[...]"
+        )
+
+    def _fam_applied(
+        self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType
+    ) -> int | Type:
+        """A parameterized dim: `Literal[3]`, `Unpack[Ts]`, never `tuple`."""
+        short = arg.name.rpartition(".")[2]
+        if short == "tuple":
+            raise _FamFail(
+                f"{head} takes flat dims: write {head}[N, M],"
+                f" not {head}[tuple[N, M]]"
+            )
+        if short == "Unpack":
+            if len(arg.args) != 1:
+                raise _FamFail(f"{head} Unpack takes exactly one argument")
+            # Neither the bare name (illegal outside Unpack) nor the
+            # whole Unpack[...] (illegal outside a variadic position)
+            # analyzes alone, so analyze tuple[Unpack[Ts]] and unwrap.
+            wrapped = UnboundType(
+                "tuple", [arg], line=arg.line, column=arg.column
+            )
+            analyzed = ctx.api.analyze_type(wrapped)
+            proper = get_proper_type(analyzed)
+            if isinstance(proper, TupleType) and len(proper.items) == 1:
+                item = get_proper_type(proper.items[0])
+                if isinstance(item, UnpackType):
+                    return item
+            if isinstance(proper, AnyType):
+                if proper.type_of_any == TypeOfAny.from_error:
+                    raise _FamBail
+                return proper
+            raise _FamFail(
+                f"{head} Unpack takes a TypeVarTuple, e.g. Unpack[Ts]"
+            )
+        analyzed = ctx.api.analyze_type(arg)
+        proper = get_proper_type(analyzed)
+        if (
+            isinstance(proper, LiteralType)
+            and isinstance(proper.value, int)
+            and not isinstance(proper.value, bool)
+        ):
+            return proper.value
+        if isinstance(proper, TypeVarTupleType):
+            return UnpackType(proper)
+        if isinstance(proper, AnyType):
+            if proper.type_of_any == TypeOfAny.from_error:
+                raise _FamBail
+            return proper
+        raise _FamFail(
+            f"{head} dims must be TypeVars, integers,"
+            " Unpack[Ts], or Literal[...]"
+        )
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         # numpy re-exports these from private modules (e.g.

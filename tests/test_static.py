@@ -514,3 +514,79 @@ def test_reshape_two_minus1_mismatch() -> None:
         run_mypy(FIXTURES / "bad_reshape_two_minus1.py"),
         "reshape accepts only one -1 dimension",
     )
+
+
+def test_f64_ok_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "f64_ok.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "f64_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == [
+        "(5, 8)",
+        "(3,)",
+        "(4, 3)",
+        "(5,)",
+        "(5, 4)",
+        "(2, 3)",
+    ]
+
+
+def test_f64_callsite_conflict() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_conflict.py"),
+        "call-site shape conflict for 'hid'",
+        "8 (argument 'x') vs 2 (argument 'y')",
+    )
+
+
+def test_f64_return_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_return.py"),
+        "Incompatible return value",
+        "Literal[3], Literal[5]",
+        "Literal[3], Literal[4]",
+    )
+
+
+def test_f64_dtype_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_dtype.py"),
+        "Incompatible return value",
+        "dtype[float64]",
+        "dtype[signedinteger[_32Bit]]",
+    )
+
+
+def test_f64_tuple_spelling_rejected() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_shape.py"),
+        "F64 takes flat dims",
+        "F64[N, M], not F64[tuple[N, M]]",
+    )
+
+
+def test_f64_empty_rejected() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_empty.py"),
+        "F64 takes at least one dim",
+    )
+
+
+def test_f64_undeclared_name() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_undeclared.py"),
+        'Name "batsh" is not defined',
+    )
+
+
+def test_f64_star_redirect() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_star.py"),
+        "F64 *Ts needs a name for the solver",
+        "write Unpack[Ts] instead",
+    )

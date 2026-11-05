@@ -70,6 +70,46 @@ see limitations). Each error names the axes and the shapes, e.g.
 `broadcast shapes disagree at trailing axis 1: 10 vs 2 (shapes (N, 10, 2)
 vs (N, 2, 1))`.
 
+## Familiar shapes: `F64[batch, features]`
+
+If you like jaxtyping's look, write that — no converter, no rewrite.
+The dtype rides the head name, the dims ride flat args, and everything
+below keeps working (matmul, broadcast, reshape, the lot):
+
+```python
+from numty import F64, batch, features, hid, inp, matmul
+
+def forward(
+    x: F64[batch, inp], w: F64[inp, hid], b: F64[hid],
+) -> F64[batch, hid]:
+    return matmul(x, w) + b
+```
+
+Dims are TypeVars: the ready-made ones (`batch`, `channel`, `height`,
+`width`, `depth`, `features`, `classes`, `seq`, `hidden`, `hid`, `inp`,
+`out`, `head`) or your own (`N = TypeVar("N", bound=int)`). Same name
+unifies — the same rule as above — so mis-wiring the bias is caught at
+the call site:
+
+```text
+error: call-site shape conflict for 'hid': 8 (argument 'x') vs 2 (argument 'y')
+```
+
+Fixed sizes spell as integers (`F64[3, 4]`), rank polymorphism as
+`Unpack[Ts]` with a declared TypeVarTuple (one `# type: ignore[type-var]`
+per signature — numpy's own stub bound can't see through `*Ts`, same as
+with `FlexArray`). Heads cover the workhorses: `F64`, `F32`, `I64`,
+`I32`, `Bool`.
+
+Two rules, both honest. First, every name must resolve: mypy binds
+function type variables by looking names up *before* any plugin runs,
+so an undeclared dim is an error, not a silent hole — `"batch"` and
+`batch` mean the same thing, and `batsh` fails the way any typo fails.
+Second, misuse fails loudly with a redirect, never a silent `Any`:
+`F64[tuple[N, M]]` tells you to write `F64[N, M]`, `F64[()]` and `_`
+tell you what's wrong. Quoted or bare is a style choice, not a semantic
+one.
+
 ## Real generic code, checked end to end
 
 Symbolic dimensions ride TypeVars in the shape tuple — same name means same
@@ -98,11 +138,12 @@ an error. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
 
 ## Coming from jaxtyping? Convert once, check forever
 
-jaxtyping checks shapes at runtime; numty checks them before anything
-runs. A plugin cannot read jaxtyping's dim strings — they ride inside
-`Annotated` metadata, which no mypy type-analyze hook ever sees (probed
-every hook: only jaxtyping's internals fire, the string never arrives).
-So the bridge is a one-time source rewrite instead of a hook:
+Already have `Float[np.ndarray, "batch features"]` everywhere? For new
+code, prefer the native spelling above — same feel, no middleman. For
+existing files, a plugin cannot read jaxtyping's dim strings — they ride
+inside `Annotated` metadata, which no mypy type-analyze hook ever sees
+(probed every hook: only jaxtyping's internals fire, the string never
+arrives). So the bridge is a one-time source rewrite instead of a hook:
 [numty_convert.py](/home/sofeikov/my/numty/numty_convert.py) mechanically
 translates the annotations, then gets out of the way:
 
@@ -361,7 +402,8 @@ layers.
 
 - [numty.py](/home/sofeikov/my/numty/numty.py) — rank aliases, generic shape
   bases, `FlexArray` rank-polymorphic base, `narrow` witness helper,
-  shape-preserving `ident`, loose `matmul` fallback.
+  shape-preserving `ident`, loose `matmul` fallback, familiar-style heads
+  (`F64` and friends) with ready-made dims (`batch`, `features`, …).
 - [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) — the solver.
 - [demo.py](/home/sofeikov/my/numty/demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.
@@ -373,7 +415,8 @@ layers.
 - [tests/test_static.py](/home/sofeikov/my/numty/tests/test_static.py) — runs
   real mypy over [fixtures](/home/sofeikov/my/numty/tests/fixtures/static_ok.py):
   each bad one must fail with our message, and `reveal_type` pins must show
-  precise shapes on the good paths.
+  precise shapes on the good paths. The `f64_ok` + `bad_f64_*` fixtures do
+  the same for the familiar-style heads (clean end-to-end MLP included).
 - [numty_convert.py](/home/sofeikov/my/numty/numty_convert.py) +
   [tests/test_convert.py](/home/sofeikov/my/numty/tests/test_convert.py) —
   the jaxtyping bridge: one-time annotation rewrite with goldens for every
