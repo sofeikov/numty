@@ -139,6 +139,31 @@ np.linalg.norm(m, axis=1)           # (2,); no-axis norm is a scalar,
 np.linalg.solve(non_square, b)      # error: requires a square array
 ```
 
+Symbolic dimensions work through TypeVars in the shape tuple — same
+name means same size, and the solver propagates them through bodies:
+
+```python
+from typing import TypeVar
+N = TypeVar("N", bound=int)
+K = TypeVar("K", bound=int)
+C = TypeVar("C", bound=int)
+A = np.ndarray[tuple[N, K, C], np.dtype[np.float64]]
+
+def pack(values: A[N, K, C], present: np.ndarray[tuple[N, K], np.dtype[np.bool_]]) -> A[N, K, C]:
+    order = np.argsort(~present, axis=1, kind="stable")
+    return np.take_along_axis(values, order[..., None], axis=1)
+
+pack(np.zeros((5, 10, 2)), np.zeros((5, 10)) > 0)  # (5, 10, 2), precise
+```
+
+Apply the alias explicitly at each use (`A[N, K, C]`, never bare
+`A` — a bare generic alias silently means unknown sizes). Inside
+bodies, equal names unify, ranks still check, and anything unprovable
+bails: `N` vs `M` never errors (they could match at runtime), but
+`a[0, 1, 2]` on a 2-d symbolic array does. Call-site conflicts also
+stay silent — `f(x_5, y_6)` against `(A[N], A[N])` unifies through
+`int`, exactly like the generic-`int`-parameter limitation below.
+
 Subscripts that track shapes through indexing:
 
 ```python
@@ -196,7 +221,10 @@ from the types before the plugin sees them, so they bail out instead
 of erroring. A generic `int` parameter can never be verified against
 a shape — the contract says "every int", and no annotation (not even
 a `TypeVar` linking the argument to the shape) survives the join to
-`int`.
+`int`. Same for two arguments sharing one shape TypeVar: `f(x_5, y_6)`
+against `(A[N], A[N])` unifies through `int` and stays silent. What the
+symbolic solver does catch is structure: ranks, axis counts, and every
+check that needs no values (see the `pack` example above).
 
 ```sh
 uv venv
@@ -217,7 +245,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape`, rank-changing ops, shape builders, comparisons, the arg family, `einsum`, `linalg` solvers, fancy indexing, and `take_along_axis`, folds constant int expressions, solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape`, rank-changing ops, shape builders, comparisons, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, and symbolic TypeVar dims (same name unifies, ranks check, the rest bails), folds constant int expressions, solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `Array1D`,

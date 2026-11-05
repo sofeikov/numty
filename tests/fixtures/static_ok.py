@@ -1,9 +1,14 @@
 """All good: mypy must report zero errors here."""
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, TypeVar, cast
 
 import numpy as np
 
 from numty import Array2D, FloatArray, Matrix, ident, matmul, narrow
+
+N = TypeVar("N", bound=int)
+K = TypeVar("K", bound=int)
+M = TypeVar("M", bound=int)
+C = TypeVar("C", bound=int)
 
 A2 = FloatArray[tuple[Literal[2]]]
 A3 = FloatArray[tuple[Literal[3]]]
@@ -360,6 +365,53 @@ def linalg_stays_precise() -> None:
     sol, _, _, _ = np.linalg.lstsq(np.zeros((5, 3)), np.zeros(5))
     use_3(sol)
     use_2(np.linalg.norm(np.zeros((2, 3)), axis=1))
+
+
+# Symbolic shapes: TypeVars in the shape tuple, applied explicitly at each
+# use (a bare SNK would silently mean tuple[Any, Any]).
+SNK = np.ndarray[tuple[N, K], np.dtype[np.float64]]
+SNKC = np.ndarray[tuple[N, K, C], np.dtype[np.float64]]
+SNKb = np.ndarray[tuple[N, K], np.dtype[np.bool_]]
+
+
+def pack_like(values: SNKC[N, K, C], present: SNKb[N, K]) -> SNKC[N, K, C]:
+    order = np.argsort(~present, axis=1, kind="stable")
+    return np.take_along_axis(values, order[..., None], axis=1)
+
+
+def symbolic_matmul(
+    a: np.ndarray[tuple[N, K], np.dtype[np.float64]],
+    b: np.ndarray[tuple[K, M], np.dtype[np.float64]],
+) -> np.ndarray[tuple[N, M], np.dtype[np.float64]]:
+    return np.matmul(a, b)
+
+
+def symbolic_broadcast(
+    a: SNK[N, K], v: np.ndarray[tuple[K], np.dtype[np.float64]]
+) -> SNK[N, K]:
+    return a + v
+
+
+def symbolic_einsum(
+    a: np.ndarray[tuple[N, K], np.dtype[np.float64]],
+    b: np.ndarray[tuple[K, M], np.dtype[np.float64]],
+) -> np.ndarray[tuple[N, M], np.dtype[np.float64]]:
+    return np.einsum("ij,jh->ih", a, b)
+
+
+def symbolic_solve(
+    a: np.ndarray[tuple[N, N], np.dtype[np.float64]],
+    b: np.ndarray[tuple[N], np.dtype[np.float64]],
+) -> np.ndarray[tuple[N], np.dtype[np.float64]]:
+    return np.linalg.solve(a, b)
+
+
+def symbolic_calls_stay_precise() -> None:
+    use_5x10x2(pack_like(np.zeros((5, 10, 2)), np.zeros((5, 10)) > 1.0))
+    use_2x4(symbolic_matmul(np.zeros((2, 3)), np.zeros((3, 4))))
+    use_2x3(symbolic_broadcast(np.zeros((2, 3)), np.zeros(3)))
+    use_2x4(symbolic_einsum(np.zeros((2, 3)), np.zeros((3, 4))))
+    use_4(symbolic_solve(np.zeros((4, 4)), np.zeros(4)))
 
 
 def indexing_stays_precise() -> None:

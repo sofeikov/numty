@@ -29,6 +29,8 @@ What it does:
   drop or keep the axis; Generator/RandomState methods solve from size=.
 - getitem solves integer-array (fancy) indices and take_along_axis;
   boolean masks bail (data-dependent count), float indices error.
+- dims may be symbolic TypeVars: same name unifies, ranks and counts
+  still check, and anything needing values bails instead of erroring.
 - arithmetic operators (-, /, **) and bare ufuncs (np.sqrt, np.add, ...)
   broadcast and promote; the ufuncs are stub variables, reached through
   the Literal name in their generic type (raw np.matmul included).
@@ -71,6 +73,7 @@ from mypy.types import (
     TupleType,
     Type,
     TypeOfAny,
+    TypeVarType,
     get_proper_type,
 )
 
@@ -307,12 +310,57 @@ def _int_value(tp: Type) -> int | None:
     return None
 
 
-def _shape_dims(tp: Type) -> list[int] | None:
-    """Literal dims of a shape tuple, or None when any dim is unknown."""
+def _dim_value(tp: Type) -> int | Type | None:
+    """A known axis size: int literal, symbolic TypeVar, or None."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType):
+        value = proper.value
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    if isinstance(proper, Instance):
+        if proper.type.fullname == INT_FULLNAME and proper.last_known_value is not None:
+            return _dim_value(proper.last_known_value)
+    if isinstance(proper, TypeVarType):
+        return proper
+    return None
+
+
+def _dim_eq(a: int | Type, b: int | Type) -> bool:
+    """Provably-equal dims: same ints, or the same TypeVar by fullname."""
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    if isinstance(a, TypeVarType) and isinstance(b, TypeVarType):
+        return a.fullname == b.fullname
+    return False
+
+
+def _dim_str(d: int | Type) -> str:
+    if isinstance(d, int):
+        return str(d)
+    name = getattr(d, "name", None)
+    return str(name) if isinstance(name, str) else "?"
+
+
+def _check_dim_eq(
+    ctx: FunctionContext | MethodContext, x: int | Type, y: int | Type, message: str
+) -> bool:
+    """Provable dim equality for a solver check: True to proceed.
+
+    Fails with message when both dims are ints that differ; bails out
+    silently when symbolic dims cannot be proven equal.
+    """
+    if _dim_eq(x, y):
+        return True
+    if isinstance(x, int) and isinstance(y, int):
+        ctx.api.fail(message, ctx.context)
+    return False
+
+
+def _shape_dims(tp: Type) -> list[int | Type] | None:
+    """Dims of a shape tuple (literals and TypeVars), or None if unknown."""
     proper = get_proper_type(tp)
     if not isinstance(proper, TupleType):
         return None
-    values: list[int | None] = [_int_value(item) for item in proper.items]
+    values: list[int | Type | None] = [_dim_value(item) for item in proper.items]
     if any(v is None for v in values):
         return None
     return [v for v in values if v is not None]
@@ -381,8 +429,11 @@ def _fold_shape_expr(expr: Expression) -> list[int] | None:
     return [value] if value is not None else None
 
 
-def _ndarray_parts(tp: Type) -> tuple[list[int], Type] | None:
-    """(dims, dtype) of a fully known ndarray type, else None."""
+def _ndarray_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
+    """(dims, dtype) of a known-rank ndarray type, else None.
+
+    Dims mix int literals and symbolic TypeVars; anything else bails.
+    """
     proper = get_proper_type(tp)
     if not isinstance(proper, Instance):
         return None
@@ -392,10 +443,14 @@ def _ndarray_parts(tp: Type) -> tuple[list[int], Type] | None:
     return (dims, proper.args[1]) if dims is not None else None
 
 
-def _ndarray_type(ctx: FunctionContext | MethodContext, dims: list[int], dtype: Type) -> Instance:
+def _ndarray_type(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
+) -> Instance:
     checker = ctx.api
     int_instance = checker.named_generic_type(INT_FULLNAME, [])
-    items: list[Type] = [LiteralType(v, fallback=int_instance) for v in dims]
+    items: list[Type] = [
+        LiteralType(v, fallback=int_instance) if isinstance(v, int) else v for v in dims
+    ]
     tuple_fallback = checker.named_generic_type(TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)])
     return checker.named_generic_type(NDARRAY_FULLNAME, [TupleType(items, tuple_fallback), dtype])
 
@@ -450,29 +505,52 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, dims, dtype)
 
 
-def _matmul_result(a: list[int], b: list[int]) -> tuple[list[int] | None, str | None]:
+def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
+    """(match, error) for inner dims: match on equality, error when both
+    ints differ, and (False, None) to bail on anything unprovable."""
+    if _dim_eq(x, y):
+        return True, None
+    if isinstance(x, int) and isinstance(y, int):
+        return False, f"matmul inner dimensions disagree: {x} vs {y}"
+    return False, None
+
+
+def _solve_matmul_inner(
+    dims: list[int | Type] | None, message: str | None, matched: bool
+) -> tuple[list[int | Type] | None, str | None]:
+    if message is not None:
+        return None, message
+    if not matched:
+        return None, None
+    assert dims is not None
+    return dims, None
+
+
+def _matmul_result(
+    a: list[int | Type], b: list[int | Type]
+) -> tuple[list[int | Type] | None, str | None]:
     """Output dims on success; (None, None) to bail; (None, msg) on error."""
     if not a or not b:
         return None, None
     if len(a) == 1 and len(b) == 1:
-        if a[0] != b[0]:
-            return None, f"matmul inner dimensions disagree: {a[0]} vs {b[0]}"
-        return [], None
+        matched, message = _matmul_inner(a[0], b[0])
+        return _solve_matmul_inner([], message, matched)
     if len(a) == 1:
-        if a[0] != b[-2]:
-            return None, f"matmul inner dimensions disagree: {a[0]} vs {b[-2]}"
-        return [*b[:-2], b[-1]], None
+        matched, message = _matmul_inner(a[0], b[-2])
+        return _solve_matmul_inner([*b[:-2], b[-1]], message, matched)
     if len(b) == 1:
-        if a[-1] != b[0]:
-            return None, f"matmul inner dimensions disagree: {a[-1]} vs {b[0]}"
-        return a[:-1], None
-    if a[-1] != b[-2]:
-        return None, f"matmul inner dimensions disagree: {a[-1]} vs {b[-2]}"
+        matched, message = _matmul_inner(a[-1], b[0])
+        return _solve_matmul_inner(a[:-1], message, matched)
+    matched, message = _matmul_inner(a[-1], b[-2])
+    if message is not None:
+        return None, message
+    if not matched:
+        return None, None
     batch_a, batch_b = a[:-2], b[:-2]
     batch, cause = _broadcast_result(batch_a, batch_b)
     if cause is not None:
         return None, (
-            f"matmul batch dimensions disagree: {tuple(batch_a)} vs {tuple(batch_b)}"
+            f"matmul batch dimensions disagree: {_dims_str(batch_a)} vs {_dims_str(batch_b)}"
             f" ({cause})"
         )
     assert batch is not None
@@ -522,21 +600,36 @@ def matmul_hook(ctx: FunctionContext) -> Type:
     return _solve_matmul(ctx, args[0], args[1])
 
 
-def _broadcast_result(a: list[int], b: list[int]) -> tuple[list[int] | None, str | None]:
-    """Broadcast two known shapes; (None, None) to bail; (None, msg) on error."""
-    out: list[int] = []
+def _dims_str(dims: list[int | Type]) -> str:
+    """Shape for messages: tuple-style, symbolic dims by name."""
+    inner = ", ".join(_dim_str(d) for d in dims)
+    if len(dims) == 1:
+        inner += ","
+    return f"({inner})"
+
+
+def _broadcast_result(
+    a: list[int | Type], b: list[int | Type]
+) -> tuple[list[int | Type] | None, str | None]:
+    """Broadcast two known shapes; (None, None) to bail; (None, msg) on error.
+
+    Same-name TypeVars are equal; anything else unprovable bails out.
+    """
+    out: list[int | Type] = []
     for k, (x, y) in enumerate(zip(reversed(a), reversed(b))):
-        if x == y:
+        if _dim_eq(x, y):
             out.append(x)
-        elif x == 1:
+        elif isinstance(x, int) and x == 1:
             out.append(y)
-        elif y == 1:
+        elif isinstance(y, int) and y == 1:
             out.append(x)
-        else:
+        elif isinstance(x, int) and isinstance(y, int):
             return None, (
                 f"broadcast shapes disagree at trailing axis {k}: "
-                f"{x} vs {y} (shapes {tuple(a)} vs {tuple(b)})"
+                f"{x} vs {y} (shapes {_dims_str(a)} vs {_dims_str(b)})"
             )
+        else:
+            return None, None
     shared = min(len(a), len(b))
     prefix = a[: len(a) - shared] + b[: len(b) - shared]
     return [*prefix, *reversed(out)], None
@@ -658,8 +751,12 @@ def _solve_reshape(
             ctx.context,
         )
         return ctx.default_return_type
+    if any(not isinstance(d, int) for d in dims_old):
+        # Symbolic sizes cannot be multiplied for the conservation check.
+        return ctx.default_return_type
     size_old = 1
     for d in dims_old:
+        assert isinstance(d, int)
         size_old *= d
     dims_new: list[int] | None
     if -1 in raw:
@@ -683,7 +780,7 @@ def _solve_reshape(
         if size_new != size_old:
             ctx.api.fail(
                 f"reshape changes total size: {size_old} -> {size_new} "
-                f"(shapes {tuple(dims_old)} vs {tuple(raw)})",
+                f"(shapes {_dims_str(dims_old)} vs {tuple(raw)})",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -841,7 +938,7 @@ REDUCTION_DTYPES = frozenset(
 
 
 def _solve_transpose(
-    ctx: FunctionContext | MethodContext, dims: list[int], dtype: Type, rest: list[tuple[Type, Expression | None]]
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, rest: list[tuple[Type, Expression | None]]
 ) -> Type:
     ndim = len(dims)
     axes: list[int] | None = None
@@ -873,7 +970,7 @@ def _solve_transpose(
 
 
 def _apply_permutation(
-    ctx: FunctionContext | MethodContext, dims: list[int], dtype: Type, axes: list[int]
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, axes: list[int]
 ) -> Type:
     ndim = len(dims)
     normalized: list[int] = []
@@ -882,7 +979,7 @@ def _apply_permutation(
         if norm is None:
             ctx.api.fail(
                 f"transpose axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {tuple(dims)})",
+                f"(shape {_dims_str(dims)})",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -890,7 +987,7 @@ def _apply_permutation(
     if sorted(normalized) != list(range(ndim)):
         ctx.api.fail(
             f"transpose axes {tuple(axes)} are not a permutation of {ndim} "
-            f"dimensions (shape {tuple(dims)})",
+            f"dimensions (shape {_dims_str(dims)})",
             ctx.context,
         )
         return ctx.default_return_type
@@ -1041,11 +1138,17 @@ def _promote_all(ctx: FunctionContext | MethodContext, dtypes: list[Type]) -> Ty
 
 
 def _solve_squeeze(
-    ctx: FunctionContext | MethodContext, dims: list[int], dtype: Type, axis: list[int] | None | str
+    ctx: FunctionContext | MethodContext,
+    dims: list[int | Type],
+    dtype: Type,
+    axis: list[int] | None | str,
 ) -> Type:
     ndim = len(dims)
     if not isinstance(axis, list):
         if axis in ("absent", "none"):
+            if any(not isinstance(d, int) for d in dims):
+                # A symbolic dim could be 1 at runtime: bail out.
+                return ctx.default_return_type
             return _ndarray_type(ctx, [d for d in dims if d != 1], dtype)
         return ctx.default_return_type
     chosen: list[int] = []
@@ -1054,14 +1157,16 @@ def _solve_squeeze(
         if norm is None:
             ctx.api.fail(
                 f"squeeze axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {tuple(dims)})",
+                f"(shape {_dims_str(dims)})",
                 ctx.context,
             )
+            return ctx.default_return_type
+        if not isinstance(dims[norm], int):
             return ctx.default_return_type
         if dims[norm] != 1:
             ctx.api.fail(
                 f"squeeze axis {ax} has size {dims[norm]}, not 1 "
-                f"(shape {tuple(dims)})",
+                f"(shape {_dims_str(dims)})",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -1070,7 +1175,7 @@ def _solve_squeeze(
 
 
 def _solve_expand_dims(
-    ctx: FunctionContext | MethodContext, dims: list[int], dtype: Type, axis: list[int] | None | str
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, axis: list[int] | None | str
 ) -> Type:
     if not isinstance(axis, list):
         return ctx.default_return_type
@@ -1098,7 +1203,7 @@ def _solve_expand_dims(
 
 def _solve_reduction(
     ctx: FunctionContext | MethodContext,
-    dims: list[int],
+    dims: list[int | Type],
     dtype: Type,
     axis: list[int] | None | str,
     keepdims: bool | None,
@@ -1115,7 +1220,7 @@ def _solve_reduction(
         if norm is None:
             ctx.api.fail(
                 f"axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {tuple(dims)})",
+                f"(shape {_dims_str(dims)})",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -1367,9 +1472,12 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     if axis is None:
         return ctx.default_return_type
     if axis == "none":
+        if any(not isinstance(d, int) for dims, _ in items for d in dims):
+            return ctx.default_return_type
         total = 1
         for dims, _ in items:
             for d in dims:
+                assert isinstance(d, int)
                 total *= d
         return _ndarray_type(ctx, [total], dtype)
     if not isinstance(axis, int):
@@ -1378,7 +1486,7 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     if len(ranks) != 1:
         ctx.api.fail(
             "concatenate ranks differ: "
-            + ", ".join(str(tuple(dims)) for dims, _ in items),
+            + ", ".join(_dims_str(dims) for dims, _ in items),
             ctx.context,
         )
         return ctx.default_return_type
@@ -1393,14 +1501,20 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     out = list(items[0][0])
     for dims, _ in items[1:]:
         for i, d in enumerate(dims):
-            if i != norm and out[i] != d:
-                ctx.api.fail(
-                    f"concatenate dimension {i} differs: {out[i]} vs {d} "
-                    f"(shapes {tuple(out)} vs {tuple(dims)})",
-                    ctx.context,
-                )
+            if i != norm and not _dim_eq(out[i], d):
+                if isinstance(out[i], int) and isinstance(d, int):
+                    ctx.api.fail(
+                        f"concatenate dimension {i} differs: {out[i]} vs {d} "
+                        f"(shapes {_dims_str(out)} vs {_dims_str(dims)})",
+                        ctx.context,
+                    )
+                    return ctx.default_return_type
                 return ctx.default_return_type
-        out[norm] += dims[norm]
+        if isinstance(out[norm], int) and isinstance(dims[norm], int):
+            out[norm] = out[norm] + dims[norm]
+        else:
+            # N + N is not representable: bail out.
+            return ctx.default_return_type
     return _ndarray_type(ctx, out, dtype)
 
 
@@ -1421,14 +1535,17 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if not isinstance(axis, int):
         return ctx.default_return_type
-    first = tuple(items[0][0])
-    if any(tuple(dims) != first for dims, _ in items):
-        ctx.api.fail(
-            "stack shapes differ: "
-            + ", ".join(str(tuple(dims)) for dims, _ in items),
-            ctx.context,
-        )
-        return ctx.default_return_type
+    first = items[0][0]
+    for dims, _ in items[1:]:
+        if len(dims) != len(first) or not all(_dim_eq(x, y) for x, y in zip(first, dims)):
+            if all(isinstance(d, int) for d in dims) and all(isinstance(d, int) for d in first):
+                ctx.api.fail(
+                    "stack shapes differ: "
+                    + ", ".join(_dims_str(dims) for dims, _ in items),
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            return ctx.default_return_type
     ndim = len(first)
     norm = axis + ndim + 1 if axis < 0 else axis
     if not 0 <= norm <= ndim:
@@ -1580,13 +1697,27 @@ def _parse_index_item(tp: Type, expr: Expression | None) -> tuple | None:
     value = _fold_int(expr) if expr is not None else None
     if value is None:
         value = _int_value(tp)
-    if value is None or isinstance(value, bool):
+    if isinstance(value, bool):
         return None
-    return ("int", value)
+    if value is not None:
+        return ("int", value)
+    # Unknown-value integer index: consumes the axis, no bounds check.
+    proper_tp = get_proper_type(tp)
+    if isinstance(proper_tp, Instance):
+        if proper_tp.type.fullname == INT_FULLNAME:
+            return ("int_any",)
+        if proper_tp.type.fullname != "builtins.bool":
+            key = _scalar_key(tp)
+            if key is not None and key[0] == "strong" and _kind_of(key[1]) in ("i", "u"):
+                return ("int_any",)
+    return None
 
 
 def _solve_getitem(
-    ctx: MethodContext, dims: list[int], dtype: Type, pair: tuple[Type, Expression | None]
+    ctx: MethodContext,
+    dims: list[int | Type],
+    dtype: Type,
+    pair: tuple[Type, Expression | None],
 ) -> Type:
     tp, expr = pair
     proper = get_proper_type(tp)
@@ -1610,11 +1741,13 @@ def _solve_getitem(
         ctx.api.fail("only one Ellipsis (...) is allowed in an index", ctx.context)
         return ctx.default_return_type
     ndim = len(dims)
-    consuming = sum(1 for item in items if item[0] in ("int", "slice", "fancy", "fancy0d"))
+    consuming = sum(
+        1 for item in items if item[0] in ("int", "int_any", "slice", "fancy", "fancy0d")
+    )
     if consuming > ndim:
         ctx.api.fail(
             f"too many indices for {ndim} dimensions "
-            f"(got {consuming}, shape {tuple(dims)})",
+            f"(got {consuming}, shape {_dims_str(dims)})",
             ctx.context,
         )
         return ctx.default_return_type
@@ -1641,7 +1774,7 @@ def _solve_getitem(
             return ctx.default_return_type
         assert merged is not None
         fancy_dims = merged
-    out: list[int] = []
+    out: list[int | Type] = []
     dim = 0
     fancy_emitted = False
     for item in items:
@@ -1652,16 +1785,17 @@ def _solve_getitem(
             span = ndim - consuming
             out.extend(dims[dim : dim + span])
             dim += span
-        elif kind == "int":
+        elif kind in ("int", "int_any"):
             size = dims[dim]
-            norm = item[1] + size if item[1] < 0 else item[1]
-            if not 0 <= norm < size:
-                ctx.api.fail(
-                    f"index {item[1]} is out of range for axis {dim} "
-                    f"with size {size} (shape {tuple(dims)})",
-                    ctx.context,
-                )
-                return ctx.default_return_type
+            if kind == "int" and isinstance(size, int):
+                norm = item[1] + size if item[1] < 0 else item[1]
+                if not 0 <= norm < size:
+                    ctx.api.fail(
+                        f"index {item[1]} is out of range for axis {dim} "
+                        f"with size {size} (shape {_dims_str(dims)})",
+                        ctx.context,
+                    )
+                    return ctx.default_return_type
             dim += 1
         elif kind == "fancy0d":
             dim += 1
@@ -1682,6 +1816,8 @@ def _solve_getitem(
         else:
             _, begin, end, stride = item
             size = dims[dim]
+            if not isinstance(size, int):
+                return ctx.default_return_type
             bounds = tuple(None if b == "missing" else b for b in (begin, end, stride))
             try:
                 out.append(len(range(*slice(*bounds).indices(size))))
@@ -1754,7 +1890,7 @@ def _solve_argdrop(
         if norm is None:
             ctx.api.fail(
                 f"axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {tuple(dims)})",
+                f"(shape {_dims_str(dims)})",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -1768,7 +1904,7 @@ def _solve_argdrop(
 
 def _solve_same_or_flat(
     ctx: FunctionContext | MethodContext,
-    dims: list[int],
+    dims: list[int | Type],
     dtype: Type,
     axis: list[int] | None | str,
     int_out: bool,
@@ -1789,7 +1925,7 @@ def _solve_same_or_flat(
         if _normalize_axis(ax, ndim) is None:
             ctx.api.fail(
                 f"axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {tuple(dims)})",
+                f"(shape {_dims_str(dims)})",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -1963,21 +2099,20 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
             ctx.context,
         )
         return ctx.default_return_type
-    label_size: dict[str, int] = {}
+    label_size: dict[str, int | Type] = {}
     counts: dict[str, int] = {}
-    ell_inputs: list[list[int]] = []
+    ell_inputs: list[list[int | Type]] = []
     for (dims, _), term in zip(parts, terms):
         parsed = _parse_einsum_term(term)
         if parsed is None:
             return ctx.default_return_type
         pre, post, has_ell = parsed
-        shape = tuple(dims)
         if has_ell:
             if len(dims) < len(pre) + len(post):
                 ctx.api.fail(
                     f"einsum subscript '{term}' needs at least "
                     f"{len(pre) + len(post)} dimensions but operand has "
-                    f"shape {shape}",
+                    f"shape {_dims_str(dims)}",
                     ctx.context,
                 )
                 return ctx.default_return_type
@@ -1989,7 +2124,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
             if len(pre) != len(dims):
                 ctx.api.fail(
                     f"einsum subscript '{term}' has {len(pre)} labels but "
-                    f"operand has rank {len(dims)} (shape {shape})",
+                    f"operand has rank {len(dims)} (shape {_dims_str(dims)})",
                     ctx.context,
                 )
                 return ctx.default_return_type
@@ -1999,12 +2134,15 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
             known = label_size.get(label)
             if known is None:
                 label_size[label] = size
-            elif known != size:
-                ctx.api.fail(
-                    f"einsum label '{label}' has conflicting sizes: "
-                    f"{known} vs {size} (shape {shape})",
-                    ctx.context,
-                )
+            elif not _dim_eq(known, size):
+                if isinstance(known, int) and isinstance(size, int):
+                    ctx.api.fail(
+                        f"einsum label '{label}' has conflicting sizes: "
+                        f"{known} vs {size} (shape {_dims_str(dims)})",
+                        ctx.context,
+                    )
+                    return ctx.default_return_type
+                # Symbolic vs anything unprovable: bail out.
                 return ctx.default_return_type
     broadcast: list[int] | None = None
     for edims in ell_inputs:
@@ -2127,39 +2265,49 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     dims_a, dtype_a = part_a
     dims_b, dtype_b = part_b
-    if len(dims_a) < 2 or dims_a[-1] != dims_a[-2]:
+    if len(dims_a) < 2:
         ctx.api.fail(
             "linalg.solve requires a square (..., N, N) array, got shape "
-            f"{tuple(dims_a)}",
+            f"{_dims_str(dims_a)}",
             ctx.context,
         )
         return ctx.default_return_type
+    if not _check_dim_eq(
+        ctx,
+        dims_a[-1],
+        dims_a[-2],
+        "linalg.solve requires a square (..., N, N) array, got shape "
+        f"{_dims_str(dims_a)}",
+    ):
+        return ctx.default_return_type
     size = dims_a[-1]
     if len(dims_b) == 1:
-        if dims_b[0] != size:
-            ctx.api.fail(
-                f"linalg.solve inner dimensions disagree: {size} vs {dims_b[0]} "
-                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
-                ctx.context,
-            )
+        if not _check_dim_eq(
+            ctx,
+            dims_b[0],
+            size,
+            f"linalg.solve inner dimensions disagree: {_dim_str(size)} vs "
+            f"{_dim_str(dims_b[0])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+        ):
             return ctx.default_return_type
-        batch_b: list[int] = []
+        batch_b: list[int | Type] = []
         core = [size]
     else:
-        if dims_b[-2] != size:
-            ctx.api.fail(
-                f"linalg.solve inner dimensions disagree: {size} vs {dims_b[-2]} "
-                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
-                ctx.context,
-            )
+        if not _check_dim_eq(
+            ctx,
+            dims_b[-2],
+            size,
+            f"linalg.solve inner dimensions disagree: {_dim_str(size)} vs "
+            f"{_dim_str(dims_b[-2])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+        ):
             return ctx.default_return_type
         batch_b = dims_b[:-2]
         core = dims_b[-2:]
     batch, cause = _broadcast_result(dims_a[:-2], batch_b)
     if cause is not None:
         ctx.api.fail(
-            f"linalg.solve batch dimensions disagree: {tuple(dims_a[:-2])} vs "
-            f"{tuple(batch_b)} ({cause})",
+            f"linalg.solve batch dimensions disagree: {_dims_str(dims_a[:-2])} vs "
+            f"{_dims_str(batch_b)} ({cause})",
             ctx.context,
         )
         return ctx.default_return_type
@@ -2179,12 +2327,20 @@ def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
     if part is None:
         return ctx.default_return_type
     dims, dtype = part
-    if len(dims) < 2 or dims[-1] != dims[-2]:
+    if len(dims) < 2:
         ctx.api.fail(
             f"linalg.{op} requires a square (..., N, N) array, got shape "
-            f"{tuple(dims)}",
+            f"{_dims_str(dims)}",
             ctx.context,
         )
+        return ctx.default_return_type
+    if not _check_dim_eq(
+        ctx,
+        dims[-1],
+        dims[-2],
+        f"linalg.{op} requires a square (..., N, N) array, got shape "
+        f"{_dims_str(dims)}",
+    ):
         return ctx.default_return_type
     ks = _dtype_kind_size(dtype)
     if ks is None:
@@ -2209,12 +2365,20 @@ def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
     if part is None:
         return ctx.default_return_type
     dims, dtype = part
-    if len(dims) < 2 or dims[-1] != dims[-2]:
+    if len(dims) < 2:
         ctx.api.fail(
             f"linalg.{op} requires a square (..., M, M) array, got shape "
-            f"{tuple(dims)}",
+            f"{_dims_str(dims)}",
             ctx.context,
         )
+        return ctx.default_return_type
+    if not _check_dim_eq(
+        ctx,
+        dims[-1],
+        dims[-2],
+        f"linalg.{op} requires a square (..., M, M) array, got shape "
+        f"{_dims_str(dims)}",
+    ):
         return ctx.default_return_type
     ks = _dtype_kind_size(dtype)
     if ks is None:
@@ -2255,9 +2419,12 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
     dims, dtype = part
     if len(dims) < 2:
         ctx.api.fail(
-            f"linalg.svd requires at least 2 dimensions, got shape {tuple(dims)}",
+            f"linalg.svd requires at least 2 dimensions, got shape {_dims_str(dims)}",
             ctx.context,
         )
+        return ctx.default_return_type
+    if any(not isinstance(d, int) for d in dims[-2:]):
+        # K = min(M, N) is unknowable with symbolic dims.
         return ctx.default_return_type
     full = _linalg_flag(ctx, "full_matrices", True)
     compute_uv = _linalg_flag(ctx, "compute_uv", True)
@@ -2314,36 +2481,38 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
     if len(dims_a) < 2:
         ctx.api.fail(
             f"linalg.lstsq requires a with at least 2 dimensions, got shape "
-            f"{tuple(dims_a)}",
+            f"{_dims_str(dims_a)}",
             ctx.context,
         )
         return ctx.default_return_type
     rows, cols = dims_a[-2], dims_a[-1]
     if len(dims_b) == 1:
-        if dims_b[0] != rows:
-            ctx.api.fail(
-                f"linalg.lstsq inner dimensions disagree: {rows} vs {dims_b[0]} "
-                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
-                ctx.context,
-            )
+        if not _check_dim_eq(
+            ctx,
+            dims_b[0],
+            rows,
+            f"linalg.lstsq inner dimensions disagree: {_dim_str(rows)} vs "
+            f"{_dim_str(dims_b[0])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+        ):
             return ctx.default_return_type
-        batch_b: list[int] = []
+        batch_b: list[int | Type] = []
         core = [cols]
     else:
-        if dims_b[-2] != rows:
-            ctx.api.fail(
-                f"linalg.lstsq inner dimensions disagree: {rows} vs {dims_b[-2]} "
-                f"(shapes {tuple(dims_a)} vs {tuple(dims_b)})",
-                ctx.context,
-            )
+        if not _check_dim_eq(
+            ctx,
+            dims_b[-2],
+            rows,
+            f"linalg.lstsq inner dimensions disagree: {_dim_str(rows)} vs "
+            f"{_dim_str(dims_b[-2])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+        ):
             return ctx.default_return_type
         batch_b = dims_b[:-2]
         core = [cols, dims_b[-1]]
     batch, cause = _broadcast_result(dims_a[:-2], batch_b)
     if cause is not None:
         ctx.api.fail(
-            f"linalg.lstsq batch dimensions disagree: {tuple(dims_a[:-2])} vs "
-            f"{tuple(batch_b)} ({cause})",
+            f"linalg.lstsq batch dimensions disagree: {_dims_str(dims_a[:-2])} vs "
+            f"{_dims_str(batch_b)} ({cause})",
             ctx.context,
         )
         return ctx.default_return_type
@@ -2384,7 +2553,7 @@ def _linalg_norm(ctx: FunctionContext) -> Type:
             if norm is None:
                 ctx.api.fail(
                     f"linalg.norm axis {ax} is out of range for {len(dims)} "
-                    f"dimensions (shape {tuple(dims)})",
+                    f"dimensions (shape {_dims_str(dims)})",
                     ctx.context,
                 )
                 return ctx.default_return_type
@@ -2674,9 +2843,9 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
     dims = _shape_from_arg(shape_pair[0], shape_pair[1])
     if dims is None:
         return ctx.default_return_type
-    if any(d < 0 for d in dims):
+    if any(isinstance(d, int) and d < 0 for d in dims):
         ctx.api.fail(
-            f"broadcast_to dimensions must be non-negative, got {tuple(dims)}",
+            f"broadcast_to dimensions must be non-negative, got {_dims_str(dims)}",
             ctx.context,
         )
         return ctx.default_return_type
@@ -2847,7 +3016,7 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
         if len(dims_i) != 1:
             ctx.api.fail(
                 "take_along_axis with axis=None needs 1-d `indices`, got "
-                f"shape {tuple(dims_i)}",
+                f"shape {_dims_str(dims_i)}",
                 ctx.context,
             )
             return ctx.default_return_type
@@ -2858,33 +3027,35 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
     if norm is None:
         ctx.api.fail(
             f"take_along_axis axis {axis[0]} is out of range for "
-            f"{len(dims_a)} dimensions (shape {tuple(dims_a)})",
+            f"{len(dims_a)} dimensions (shape {_dims_str(dims_a)})",
             ctx.context,
         )
         return ctx.default_return_type
     if len(dims_a) != len(dims_i):
         ctx.api.fail(
             f"take_along_axis `indices` and `arr` must have the same number "
-            f"of dimensions (shapes {tuple(dims_a)} vs {tuple(dims_i)})",
+            f"of dimensions (shapes {_dims_str(dims_a)} vs {_dims_str(dims_i)})",
             ctx.context,
         )
         return ctx.default_return_type
-    out: list[int] = []
+    out: list[int | Type] = []
     for d, (x, y) in enumerate(zip(dims_a, dims_i)):
         if d == norm:
             out.append(y)
-        elif x == y:
+        elif _dim_eq(x, y):
             out.append(x)
-        elif x == 1:
+        elif isinstance(x, int) and x == 1:
             out.append(y)
-        elif y == 1:
+        elif isinstance(y, int) and y == 1:
             out.append(x)
-        else:
+        elif isinstance(x, int) and isinstance(y, int):
             ctx.api.fail(
                 f"take_along_axis shapes mismatch at axis {d}: {x} vs {y} "
-                f"(shapes {tuple(dims_a)} vs {tuple(dims_i)})",
+                f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_i)})",
                 ctx.context,
             )
+            return ctx.default_return_type
+        else:
             return ctx.default_return_type
     return _ndarray_type(ctx, out, dtype_a)
 

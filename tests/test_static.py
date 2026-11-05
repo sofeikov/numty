@@ -276,6 +276,21 @@ def test_fancy_dtype_mismatch() -> None:
     )
 
 
+def test_symbolic_take_rank_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_sym_take_rank.py"),
+        "must have the same number of dimensions",
+    )
+
+
+def test_symbolic_too_many_indices() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_sym_too_many.py"),
+        "too many indices for 2 dimensions",
+        "Invalid index type",
+    )
+
+
 def assert_rank_mismatch(
     result: "subprocess.CompletedProcess[str]", ours: str, native: str, *extra: str
 ) -> None:
