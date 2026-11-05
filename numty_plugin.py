@@ -94,6 +94,7 @@ from mypy.types import (
     TypeOfAny,
     TypeVarTupleType,
     TypeVarType,
+    UnionType,
     UnpackType,
     get_proper_type,
 )
@@ -657,6 +658,80 @@ def _has_unpack(dims: list[int | Type]) -> bool:
     return any(isinstance(d, UnpackType) for d in dims)
 
 
+def _union_members(tp: Type) -> list[Type] | None:
+    """Array members of a union type, else None.
+
+    Only pure unions of ndarray types distribute: anything else
+    (non-unions, unions with None/scalars) stays out, and the caller
+    keeps today's behavior for it. Members may themselves carry *Ts;
+    the unpack-aware paths handle those.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, UnionType):
+        return None
+    members = []
+    for item in proper.items:
+        item_proper = get_proper_type(item)
+        if not isinstance(item_proper, Instance):
+            return None
+        if item_proper.type.fullname != NDARRAY_FULLNAME or len(item_proper.args) != 2:
+            return None
+        members.append(item)
+    if len(members) < 2:
+        return None
+    return members
+
+
+def _distribute_pairings(types: list[Type]) -> list[list[Type]] | None:
+    """Per-operand member lists when union distribution applies.
+
+    Returns one member list per operand position: the union's members
+    where that operand is a pure array union, else the single type.
+    Requires at least one union and equal member counts everywhere
+    (members pair index-wise, which is exact for co-derived unions —
+    the overwhelmingly common source of multi-union operands).
+    Anything else yields None and the caller keeps today's behavior.
+    """
+    member_lists: list[list[Type]] = []
+    count = 0
+    for tp in types:
+        members = _union_members(tp)
+        if members is None:
+            member_lists.append([tp])
+        else:
+            if count == 0:
+                count = len(members)
+            elif len(members) != count:
+                return None
+            member_lists.append(members)
+    if count == 0:
+        return None
+    return member_lists
+
+
+def _union_results(results: list[Type]) -> Type:
+    """Union of per-member results (collapses when they coincide)."""
+    if len(results) == 1:
+        return results[0]
+    return UnionType.make_union(results)
+
+
+def _distribute_solve(types: list[Type], solve: Callable[..., Type]) -> Type | None:
+    """Solve per union pairing, unioning results; None when no union.
+
+    `solve` takes one type per operand position. Union members pair
+    index-wise (see _distribute_pairings) while single-type positions
+    broadcast across every combination; per-pair bails join the union
+    as the stub's default, exactly as honest as solving alone.
+    """
+    pairings = _distribute_pairings(types)
+    if pairings is None:
+        return None
+    width = max(len(members) for members in pairings)
+    full = [members if len(members) == width else members * width for members in pairings]
+    return _union_results([solve(*combo) for combo in zip(*full)])
+
+
 def _split_flat(
     dims: list[int | Type],
 ) -> tuple[list[int | Type], UnpackType, list[int | Type]] | None:
@@ -1042,6 +1117,13 @@ def _solve_broadcast_unpack(
 
 
 def _solve_broadcast(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    dist = _distribute_solve([left, right], lambda l, r: _broadcast_types(ctx, l, r))
+    if dist is not None:
+        return dist
+    return _broadcast_types(ctx, left, right)
+
+
+def _broadcast_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
     if a is None or b is None:
@@ -1651,10 +1733,6 @@ def _solve_reduction(
 
 def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) -> Type:
     """any/all: same axis rules as reductions, but the output is bool."""
-    parts = _parts_or_unpack(array)
-    if parts is None:
-        return ctx.default_return_type
-    dims, _ = parts
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     keep_pair = _formal_pair(ctx, "keepdims")
     keepdims = False if keep_pair is None else _fold_flag(keep_pair)
@@ -1663,6 +1741,26 @@ def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) ->
     dtype = _construct_dtype(ctx, "numpy.bool")
     if dtype is None:
         return ctx.default_return_type
+    dist = _distribute_solve(
+        [array], lambda t: _reduction_bool_types(ctx, t, axis, keepdims, has_dtype, dtype)
+    )
+    if dist is not None:
+        return dist
+    return _reduction_bool_types(ctx, array, axis, keepdims, has_dtype, dtype)
+
+
+def _reduction_bool_types(
+    ctx: FunctionContext | MethodContext,
+    array: Type,
+    axis: list[int] | None | str,
+    keepdims: bool | None,
+    has_dtype: bool,
+    dtype: Type,
+) -> Type:
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
     if _has_unpack(dims):
         split = _split_flat(dims)
         if split is None:
@@ -1928,7 +2026,14 @@ def like_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
+    dist = _distribute_solve([pairs[0][0]], lambda t: _like_types(ctx, t))
+    if dist is not None:
+        return dist
+    return _like_types(ctx, pairs[0][0])
+
+
+def _like_types(ctx: FunctionContext, tp: Type) -> Type:
+    parts = _parts_or_unpack(tp)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -2386,15 +2491,30 @@ def _solve_reduction_unpack(
 def _reduction_inputs(
     ctx: FunctionContext | MethodContext, array: Type
 ) -> Type:
-    parts = _parts_or_unpack(array)
-    if parts is None:
-        return ctx.default_return_type
-    dims, dtype = parts
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     keep_pair = _formal_pair(ctx, "keepdims")
     keepdims = False if keep_pair is None else _fold_flag(keep_pair)
     dtype_pair = _formal_pair(ctx, "dtype")
     has_dtype = dtype_pair is not None and not _is_none_type(dtype_pair[0])
+    dist = _distribute_solve(
+        [array], lambda t: _reduction_types(ctx, t, axis, keepdims, has_dtype)
+    )
+    if dist is not None:
+        return dist
+    return _reduction_types(ctx, array, axis, keepdims, has_dtype)
+
+
+def _reduction_types(
+    ctx: FunctionContext | MethodContext,
+    array: Type,
+    axis: list[int] | None | str,
+    keepdims: bool | None,
+    has_dtype: bool,
+) -> Type:
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
     if _has_unpack(dims):
         split = _split_flat(dims)
         if split is None:
@@ -2864,22 +2984,28 @@ def _unpack_shape(tp: Type) -> tuple[tuple[list[int | Type], UnpackType, list[in
 
 
 def getitem_method_hook(ctx: MethodContext) -> Type:
-    parts = _ndarray_parts(ctx.type)
-    if parts is not None:
-        dims, dtype = parts
-        pairs = _all_positionals(ctx)
-        if len(pairs) != 1:
-            return ctx.default_return_type
-        return _solve_getitem(ctx, dims, dtype, pairs[0])
-    split = _unpack_shape(ctx.type)
-    if split is None:
-        return ctx.default_return_type
-    (prefix, unpack, suffix), dtype = split
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
+    dist = _distribute_solve([ctx.type], lambda t: _getitem_types(ctx, t, pairs[0]))
+    if dist is not None:
+        return dist
+    return _getitem_types(ctx, ctx.type, pairs[0])
+
+
+def _getitem_types(
+    ctx: MethodContext, tp: Type, pair: tuple[Type, Expression | None]
+) -> Type:
+    parts = _ndarray_parts(tp)
+    if parts is not None:
+        dims, dtype = parts
+        return _solve_getitem(ctx, dims, dtype, pair)
+    split = _unpack_shape(tp)
+    if split is None:
+        return ctx.default_return_type
+    (prefix, unpack, suffix), dtype = split
     shape_repr = f"({_dims_str(prefix + [unpack] + suffix)})"
-    return _solve_getitem_unpack(ctx, prefix, unpack, suffix, dtype, pairs[0], shape_repr)
+    return _solve_getitem_unpack(ctx, prefix, unpack, suffix, dtype, pair, shape_repr)
 
 
 def _broadcast_dims_unpack(
@@ -2938,7 +3064,14 @@ def compare_method_hook(ctx: MethodContext) -> Type:
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
-    dims = _broadcast_dims(ctx, ctx.type, pairs[0][0])
+    dist = _distribute_solve([ctx.type, pairs[0][0]], lambda l, r: _compare_types(ctx, l, r))
+    if dist is not None:
+        return dist
+    return _compare_types(ctx, ctx.type, pairs[0][0])
+
+
+def _compare_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    dims = _broadcast_dims(ctx, left, right)
     if dims is None:
         return ctx.default_return_type
     dtype = _construct_dtype(ctx, "numpy.bool")
@@ -2953,19 +3086,26 @@ def logical_method_hook(ctx: MethodContext) -> Type:
     Anything else (int arrays, exotic scalars) bails to the stubs,
     exactly like before this hook existed.
     """
-    parts = _parts_or_unpack(ctx.type)
-    if parts is None or _dtype_base(parts[1]) != "b":
-        return ctx.default_return_type
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
-    other = _parts_or_unpack(pairs[0][0])
+    dist = _distribute_solve([ctx.type, pairs[0][0]], lambda l, r: _logical_types(ctx, l, r))
+    if dist is not None:
+        return dist
+    return _logical_types(ctx, ctx.type, pairs[0][0])
+
+
+def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    parts = _parts_or_unpack(left)
+    if parts is None or _dtype_base(parts[1]) != "b":
+        return ctx.default_return_type
+    other = _parts_or_unpack(right)
     if other is not None:
         if _dtype_base(other[1]) != "b":
             return ctx.default_return_type
-    elif _bool_value(pairs[0][0]) is None:
+    elif _bool_value(right) is None:
         return ctx.default_return_type
-    dims = _broadcast_dims(ctx, ctx.type, pairs[0][0])
+    dims = _broadcast_dims(ctx, left, right)
     if dims is None:
         return ctx.default_return_type
     dtype = _construct_dtype(ctx, "numpy.bool")
@@ -3907,7 +4047,14 @@ def _solve_where(ctx: FunctionContext) -> Type:
     if args is None:
         # Single-argument where(cond) returns indices: the stubs own it.
         return ctx.default_return_type
-    specs = [_operand_spec(tp) for tp in args]
+    dist = _distribute_solve(args, lambda c, x, y: _where_types(ctx, c, x, y))
+    if dist is not None:
+        return dist
+    return _where_types(ctx, args[0], args[1], args[2])
+
+
+def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: Type) -> Type:
+    specs = [_operand_spec(tp) for tp in (cond, x, y)]
     if any(spec is None for spec in specs):
         return ctx.default_return_type
     assert all(spec is not None for spec in specs)
@@ -3919,8 +4066,8 @@ def _solve_where(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     branches = [(specs[1][1], specs[1][2]), (specs[2][1], specs[2][2])]
     array_dtypes = []
-    for tp in args[1:]:
-        part = _ndarray_parts(tp)
+    for tp in (x, y):
+        part = _parts_or_unpack(tp)
         if part is not None:
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, branches, array_dtypes)
@@ -3943,8 +4090,16 @@ def _solve_clip(ctx: FunctionContext) -> Type:
     pairs = [(tp, expr) for tp, expr in pairs if not _is_none_type(tp)]
     if not pairs:
         return ctx.default_return_type
+    types = [tp for tp, _ in pairs]
+    dist = _distribute_solve(types, lambda *ts: _clip_types(ctx, list(ts)))
+    if dist is not None:
+        return dist
+    return _clip_types(ctx, types)
+
+
+def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type:
     # clip preserves the first array operand's dtype (bounds cast to it).
-    specs = [_operand_spec(tp) for tp, _ in pairs]
+    specs = [_operand_spec(tp) for tp in types]
     if any(spec is None for spec in specs):
         return ctx.default_return_type
     assert all(spec is not None for spec in specs)
@@ -3954,7 +4109,7 @@ def _solve_clip(ctx: FunctionContext) -> Type:
     dims = _broadcast_shapes(ctx, shapes, "clip")
     if dims is None:
         return ctx.default_return_type
-    for (tp, _), (arr_dims, _, _) in zip(pairs, specs):
+    for tp, (arr_dims, _, _) in zip(types, specs):
         if arr_dims is not None:
             part = _parts_or_unpack(tp)
             assert part is not None
@@ -3966,10 +4121,6 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    spec = _operand_spec(pairs[0][0])
-    if spec is None:
-        return ctx.default_return_type
-    arr_dims, kind, name = spec
     shape_pair = pairs[1] if len(pairs) >= 2 else _formal_pair(ctx, "shape")
     if shape_pair is None:
         return ctx.default_return_type
@@ -3982,11 +4133,22 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
             ctx.context,
         )
         return ctx.default_return_type
+    dist = _distribute_solve([pairs[0][0]], lambda t: _broadcast_to_types(ctx, t, dims))
+    if dist is not None:
+        return dist
+    return _broadcast_to_types(ctx, pairs[0][0], dims)
+
+
+def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int]) -> Type:
+    spec = _operand_spec(tp)
+    if spec is None:
+        return ctx.default_return_type
+    arr_dims, kind, name = spec
     if arr_dims is not None:
         if _has_unpack(arr_dims):
             # Compatibility with the target shape is unprovable.
             return ctx.default_return_type
-        part = _ndarray_parts(pairs[0][0])
+        part = _ndarray_parts(tp)
         if part is None:
             return ctx.default_return_type
         return _ndarray_type(ctx, dims, part[1])
@@ -4022,6 +4184,16 @@ def _display_element_kind(tp: Type, expr: Expression | None) -> str | None:
     return None
 
 
+def _asarray_array_type(
+    ctx: FunctionContext | MethodContext, tp: Type, named: Type | None
+) -> Type:
+    """asarray over one array operand: same shape, optional new dtype."""
+    part = _parts_or_unpack(tp)
+    if part is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, part[0], named if named is not None else part[1])
+
+
 def _solve_asarray(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -4029,6 +4201,11 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
     named = _named_dtype(ctx) if _explicit_dtype(ctx) else None
     if _explicit_dtype(ctx) and named is None:
         return ctx.default_return_type
+    dist = _distribute_solve(
+        [pairs[0][0]], lambda t: _asarray_array_type(ctx, t, named)
+    )
+    if dist is not None:
+        return dist
     part = _parts_or_unpack(pairs[0][0])
     if part is not None:
         return _ndarray_type(ctx, part[0], named if named is not None else part[1])
@@ -4071,7 +4248,14 @@ def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
     for name in ("out", "where", "dtype"):
         if _formal_pair(ctx, name) is not None:
             return ctx.default_return_type
-    part = _parts_or_unpack(pairs[0][0])
+    dist = _distribute_solve([pairs[0][0]], lambda t: _ufunc_types(ctx, group, t))
+    if dist is not None:
+        return dist
+    return _ufunc_types(ctx, group, pairs[0][0])
+
+
+def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> Type:
+    part = _parts_or_unpack(tp)
     if part is None:
         return ctx.default_return_type
     dims, dtype = part
@@ -4131,6 +4315,15 @@ def asarray_function_hook(ctx: FunctionContext) -> Type:
 def _solve_truediv_pair(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
+    dist = _distribute_solve([left, right], lambda l, r: _truediv_types(ctx, l, r))
+    if dist is not None:
+        return dist
+    return _truediv_types(ctx, left, right)
+
+
+def _truediv_types(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> Type:
     specs = [_operand_spec(left), _operand_spec(right)]
     if any(spec is None for spec in specs):
         return ctx.default_return_type
@@ -4177,7 +4370,14 @@ def truediv_method_hook(ctx: MethodContext) -> Type:
 
 
 def identity_method_hook(ctx: MethodContext) -> Type:
-    parts = _parts_or_unpack(ctx.type)
+    dist = _distribute_solve([ctx.type], lambda t: _identity_type(ctx, t))
+    if dist is not None:
+        return dist
+    return _identity_type(ctx, ctx.type)
+
+
+def _identity_type(ctx: FunctionContext | MethodContext, tp: Type) -> Type:
+    parts = _parts_or_unpack(tp)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -4185,20 +4385,35 @@ def identity_method_hook(ctx: MethodContext) -> Type:
 
 
 def astype_method_hook(ctx: MethodContext) -> Type:
-    parts = _parts_or_unpack(ctx.type)
-    if parts is None:
-        return ctx.default_return_type
-    dims, _ = parts
     # dtype is the first positional or the named formal; _formal_pair
-    # covers both through the callee's argument names.
+    # covers both through the callee's argument names. Shared by all
+    # members, so it resolves once outside distribution.
     named = _named_dtype(ctx)
     if named is None:
         return ctx.default_return_type
+    dist = _distribute_solve([ctx.type], lambda t: _astype_type(ctx, t, named))
+    if dist is not None:
+        return dist
+    return _astype_type(ctx, ctx.type, named)
+
+
+def _astype_type(ctx: FunctionContext | MethodContext, tp: Type, named: Type) -> Type:
+    parts = _parts_or_unpack(tp)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
     return _ndarray_type(ctx, dims, named)
 
 
 def shape_attribute_hook(ctx: AttributeContext) -> Type:
-    parts = _parts_or_unpack(ctx.type)
+    dist = _distribute_solve([ctx.type], lambda t: _shape_type(ctx, t))
+    if dist is not None:
+        return dist
+    return _shape_type(ctx, ctx.type)
+
+
+def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
+    parts = _parts_or_unpack(tp)
     if parts is None:
         return ctx.default_attr_type
     dims, _ = parts
@@ -4339,19 +4554,11 @@ def clip_method_hook(ctx: MethodContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    specs = [_operand_spec(ctx.type)] + [_operand_spec(tp) for tp, _ in pairs]
-    if any(spec is None for spec in specs):
-        return ctx.default_return_type
-    assert all(spec is not None for spec in specs)
-    shapes = [dims for dims, _, _ in specs if dims is not None]
-    if not shapes:
-        return ctx.default_return_type
-    dims = _broadcast_shapes(ctx, shapes, "clip")
-    if dims is None:
-        return ctx.default_return_type
-    part = _parts_or_unpack(ctx.type)
-    assert part is not None
-    return _ndarray_type(ctx, dims, part[1])
+    types = [ctx.type] + [tp for tp, _ in pairs]
+    dist = _distribute_solve(types, lambda *ts: _clip_types(ctx, list(ts)))
+    if dist is not None:
+        return dist
+    return _clip_types(ctx, types)
 
 
 _UFUNC_BINARY_PROMOTE = frozenset(
@@ -4447,6 +4654,15 @@ def ufunc_call_hook(ctx: MethodContext) -> Type:
 def _solve_ufunc_binary_float(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
+    dist = _distribute_solve([left, right], lambda l, r: _ufunc_float_types(ctx, l, r))
+    if dist is not None:
+        return dist
+    return _ufunc_float_types(ctx, left, right)
+
+
+def _ufunc_float_types(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> Type:
     specs = [_operand_spec(left), _operand_spec(right)]
     if any(spec is None for spec in specs):
         return ctx.default_return_type
@@ -4478,6 +4694,15 @@ def _solve_ufunc_binary_float(
 
 
 def _solve_ufunc_binary_bool(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> Type:
+    dist = _distribute_solve([left, right], lambda l, r: _ufunc_bool_types(ctx, l, r))
+    if dist is not None:
+        return dist
+    return _ufunc_bool_types(ctx, left, right)
+
+
+def _ufunc_bool_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
     specs = [_operand_spec(left), _operand_spec(right)]

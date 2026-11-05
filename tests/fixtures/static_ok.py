@@ -582,6 +582,40 @@ def ts_bail_stays_silent(
     _ = v[0]  # no ellipsis to align with: silent
 
 
+Bool2x2 = np.ndarray[tuple[Literal[2], Literal[2]], np.dtype[np.bool_]]
+Bool2x3x2 = np.ndarray[tuple[Literal[2], Literal[3], Literal[2]], np.dtype[np.bool_]]
+
+
+def union_body_stays_precise(
+    cond: Bool2x2 | Bool2x3x2,
+    v: A2x2 | A2x3x2,
+) -> None:
+    reveal_type(np.where(cond, v, 0.0))
+    reveal_type(np.isfinite(v))
+    reveal_type(np.sqrt(v))
+    reveal_type(v == 0.0)
+    reveal_type(np.clip(v, 0.0, 1.0))
+    reveal_type(v.shape)
+
+
+def union_genexp_stays_precise(a: A2x2, b: A2x3x2) -> None:
+    out = [np.where(np.isfinite(x), x, 0.0) for x in (a, b)]
+    reveal_type(out)
+
+
+def unpack_display_stays_precise() -> None:
+    a, b = (np.zeros((2, 2)), np.zeros((2, 3, 2)))
+    reveal_type(a)
+    reveal_type(b)
+    use_2x2(a)
+    use_2x3x2(b)
+
+
+def unpack_genexp_stays_union(a: A2x2, b: A2x3x2) -> None:
+    x, y = (np.where(np.isfinite(v), v, 0.0) for v in (a, b))
+    reveal_type(x)
+
+
 def named_dtype_stays_precise() -> None:
     use_f2x3(np.zeros((2, 3), dtype=np.float32))
     use_i2x3(np.zeros((2, 3), dtype=np.int64))

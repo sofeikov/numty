@@ -3,151 +3,77 @@
 Wrong-shaped arrays are the `null` of numerical code: everything type-checks,
 everything imports, and it blows up three functions later — or worse, silently
 computes garbage. [jaxtyping](https://docs.kidger.site/jaxtyping/) solved this
-at runtime. numty explores how far you can get *statically*, before anything
-runs, using only what type checkers already understand plus one small mypy
-plugin.
+at runtime. numty catches it *before anything runs*, using only what type
+checkers already understand plus one small mypy plugin.
 
-## What it catches
+## One signature, every rank
 
-You define the shapes you care about in one line — no pre-baked list from
-the library:
+The headline: rank-generic helpers with no overloads, no per-rank copies.
+mypy solves `*Ts` from each call site, and the body checks once,
+rank-generically:
 
 ```python
 from typing import Literal
-from numty import FloatArray
+from typing_extensions import TypeVarTuple, Unpack
+from numty import FlexArray
 
-A2x3 = FloatArray[tuple[Literal[2], Literal[3]]]
+Ts = TypeVarTuple("Ts")
 
-def use_2x3(m: A2x3) -> None: ...
+def squared_norm(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return v[..., 0] ** 2 + v[..., 1] ** 2
 
-def bad_rank(v: Vector) -> None:
-    use_2x3(v)  # error: 1-D is not 2-D
+squared_norm(np.zeros((5, 7, 2)))  # (5, 7)
+squared_norm(np.zeros((5, 2)))     # (5,)
+squared_norm(np.zeros((5, 7, 3)))  # error: expected (..., 2), got (..., 3)
 ```
 
-```
-demo.py:21: error: Argument 1 to "use_2x3" has incompatible type
-"ndarray[tuple[int], dtype[float64]]";
-expected "ndarray[tuple[Literal[2], Literal[3]], dtype[float64]]"  [arg-type]
-```
+Two honest `type: ignore[type-var]` notes per signature (NumPy's stubs bind
+the shape to `tuple[int, ...]`, which an unsolved `*Ts` cannot satisfy) buy
+all of this: inside, the solver threads `*Ts` through ellipsis indexing
+(`v[..., 0]` on `(*Ts, 2)` is `(*Ts,)`, and out-of-range indices still
+error against the known suffix), same-`*Ts` broadcasts, unary ufuncs,
+`astype`/`asarray`, `.shape`, `&`/`|` on bool pairs, `where`/`clip`,
+comparisons, and reductions along axes that resolve to a known dim
+(`.all(axis=-1)` on `(*Ts, 2)` is `(*Ts,)`). Anything that would need the
+unknown length — fancy indexing, a non-ellipsis index, reducing over `*Ts`
+itself, mixing different `Ts` declarations, `matmul`, `transpose`,
+`reshape` — bails out instead of guessing.
 
-Mixing up sizes:
+## Bugs, caught while you type
+
+A weight matrix passed transposed — the classic silent killer:
 
 ```python
-def bad_size() -> None:
-    use_2x3(np.zeros((3, 2)))  # error: 3x2 is not 2x3
+logits = np.matmul(batch, weights) + bias
+# weights came in as (10, 28) instead of (28, 10)?
+# error: matmul inner dimensions disagree: 28 vs 10
 ```
 
-Mismatched matmul, for any rank — with the output shape propagated:
+A bias that broadcasts today and breaks tomorrow:
 
 ```python
-c = matmul(np.zeros((2, 3)), np.zeros((3, 5)))  # c is known to be 2x5
-matmul(np.zeros((2, 3)), np.zeros((2, 3)))  # error: inner dimensions disagree: 3 vs 2
+np.zeros((2, 4)) + np.zeros((3, 4))  # error: broadcast shapes disagree
 ```
 
-Broadcasting that keeps precision through whole expressions:
+A reshape that silently drops a column:
 
 ```python
-c = matmul(np.zeros((2, 3)), np.zeros((3, 4))) + np.zeros((2, 4))  # still known 2x4
-np.zeros((2, 3)) + np.zeros((2, 4))  # error: broadcast shapes disagree
-```
-
-Mixed dtypes promote like NumPy, verified against `np.result_type`
-over the full dtype matrix (plus weak Python scalars):
-
-```python
-f32 + np.zeros((2, 3))   # float64, shape kept
-f32 + 1.5                # float32: weak Python scalars convert
-i32 + 2.5                # float64, shape kept
-f32 * 1j                 # complex64
-```
-
-Reshape with size conservation and `-1` inference:
-
-```python
-np.zeros((2, 3)).reshape((3, -1))  # known to be 3x2
 np.zeros((2, 3)).reshape((2, 4))   # error: reshape changes total size: 6 -> 8
-np.zeros((2, 3)).reshape((4, -1))   # error: reshape cannot infer -1
 ```
 
-Rank-changing ops that track the new shape:
+These are not cherry-picked: [bench/](/home/sofeikov/my/numty/bench) seeds 18
+realistic mistakes into MLP-training and math-library code, and the checker
+flags 17 of them before anything runs (the 18th is unprovable on purpose —
+see limitations). Each error names the axes and the shapes, e.g.
+`broadcast shapes disagree at trailing axis 1: 10 vs 2 (shapes (N, 10, 2)
+vs (N, 2, 1))`.
 
-```python
-np.zeros((2, 3)).transpose()          # known to be 3x2
-np.zeros((1, 2, 3)).squeeze(0)        # known to be 2x3
-np.expand_dims(np.zeros((3,)), 0)     # known to be 1x3
-np.zeros((2, 3)).sum(axis=1)          # known to be a vector of 2
-np.zeros((2, 3)).transpose(0, 0)      # error: not a permutation
-np.zeros((2, 3)).squeeze(0)          # error: axis 0 has size 2, not 1
-```
+## Real generic code, checked end to end
 
-No-axis reductions (`.sum()` with no axis) return a scalar, so the plugin
-leaves them to numpy's own stubs; only float/complex dtypes keep their
-dtype through a reduction, anything else bails out.
-
-Comparisons broadcast shapes and return bool arrays; `argmax` drops the
-axis to integer positions, `sort` keeps the shape:
-
-```python
-probs.argmax(axis=1) == labels        # bool vector, shape tracked
-np.zeros((2, 3)) == np.zeros((3, 2))  # error: broadcast shapes disagree
-```
-
-`Generator` random methods solve from `size=` (`rng.normal(size=(n, d))`,
-`rng.integers`, `choice`, `permutation`); a missing size means a scalar,
-so the plugin bails to the stub.
-
-Elementwise ops broadcast shapes and promote dtypes — including the bare
-`np.*` ufunc forms, which the plugin reaches through the ufunc's own
-generic type (the stubs declare them as variables, not functions):
-
-```python
-np.sqrt(a)                 # same shape; ints become float64
-np.abs(c)                  # complex becomes real (float)
-np.isfinite(a)             # bool, same shape
-np.add(a, b)               # same as a + b, with promotion
-np.where(cond, x, 0.0)     # broadcast of all three, promoted branches
-np.equal(a, b)             # bool, broadcast
-a - b; a / b; a**2         # operators too; int / int is float64
-np.clip(a, 0.0, 1.0)       # same shape and dtype as a (method too)
-np.broadcast_to(v, (2, 3)) # new shape, same dtype
-np.asarray(a)              # identity on known arrays
-np.asarray(a, dtype=np.float32)  # named dtype used as-is
-np.array([105.0, 68.0])    # (2,) from the display
-a.astype(np.float32)       # same shape, named dtype
-len(a)                     # first dim: literal, or the TypeVar itself
-len(Slots)                 # member count of an IntEnum (aliases count once)
-a.shape                    # precise tuple, literals and TypeVars
-np.matmul(a, b)            # raw np.matmul solves now, errors included
-a & mask; a.any(axis=1)    # bool logic and reductions, same axis rules
-np.zeros((2, 3)) / np.zeros((4,))  # error: true_divide shapes disagree
-```
-
-`einsum` parses the subscript string and solves label sizes, including
-implicit mode, ellipsis, and diagonals:
-
-```python
-np.einsum("ij,jh->ih", a, b)  # (2, 4), like matmul
-np.einsum("ij,jh", a, b)      # implicit: once-labels, alphabetical
-np.einsum("...ij,j->...i", batched, v)
-np.einsum("ij,jh->ih", a, c)  # error: label 'j' has conflicting sizes
-```
-
-`linalg` solvers check squareness and inner dims, and track dtypes
-(`eig` of float is complex, `eigh` stays real, ints become float64):
-
-```python
-x = np.linalg.solve(a4, b)          # (4,) or (4, K), batch-broadcast
-w, v = np.linalg.eigh(cov)          # (4,) float, (4, 4)
-u, s, vh = np.linalg.svd(m)         # full_matrices=False shrinks U, Vh
-sol, _, _, _ = np.linalg.lstsq(a, y)  # only the solution is provable;
-                                      # residuals depend on runtime rank
-np.linalg.norm(m, axis=1)           # (2,); no-axis norm is a scalar,
-                                    # so the plugin leaves it to the stubs
-np.linalg.solve(non_square, b)      # error: requires a square array
-```
-
-Symbolic dimensions work through TypeVars in the shape tuple — same
-name means same size, and the solver propagates them through bodies:
+Symbolic dimensions ride TypeVars in the shape tuple — same name means same
+size — and the solver propagates them through whole function bodies:
 
 ```python
 from typing import TypeVar
@@ -163,15 +89,14 @@ def pack(values: A[N, K, C], present: np.ndarray[tuple[N, K], np.dtype[np.bool_]
 pack(np.zeros((5, 10, 2)), np.zeros((5, 10)) > 0)  # (5, 10, 2), precise
 ```
 
-Apply the alias explicitly at each use (`A[N, K, C]`, never bare
-`A` — a bare generic alias silently means unknown sizes). Inside
-bodies, equal names unify, ranks still check, and anything unprovable
-bails: `N` vs `M` never errors (they could match at runtime), but
-`a[0, 1, 2]` on a 2-d symbolic array does. Call-site conflicts also
-stay silent — `f(x_5, y_6)` against `(A[N], A[N])` unifies through
-`int`, exactly like the generic-`int`-parameter limitation below.
+Two arguments sharing one shape TypeVar are checked at the call site,
+where the actual shapes are still visible: `f(x_5, y_6)` against `(A[N],
+A[N])` errors with the two sizes named. Different TypeVars (`N` vs `M`)
+stay silent by design — their equality is unprovable, and unknown is not
+an error. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
+`A` — a bare generic alias silently means unknown sizes).
 
-Subscripts that track shapes through indexing:
+## Indexing that tracks shapes
 
 ```python
 a[0]          # first axis dropped
@@ -206,82 +131,94 @@ b[np.zeros(3)]                    # error: integer (or boolean) type required
 np.take_along_axis(a, idx2d, axis=1)  # error: same number of dimensions
 ```
 
-Shape builders that compute the result shape:
+## Unions that check every member
+
+A union-typed array (`(N, K, M) | (N, 1, M)`, or a loop variable over
+mixed shapes) solves once per member and unions the results, so bodies
+that used to dissolve to `Any` now check each shape:
 
 ```python
-np.zeros_like(a)                          # same shape and dtype as a
-np.zeros_like(a, shape=(3, 2))            # override wins, precisely
-np.full((2, 3), 5.0)                      # known 2x3 float64
-np.eye(3)                                 # known 3x3
-np.arange(6)                              # known vector of 6
-np.concatenate((a, b), axis=1)            # dims added on the axis
-np.stack((a, b), axis=0)                  # new axis of stacked count
-np.stack([blocks[c] for c in Kinds], -1)  # enum-driven stacks too
-np.concatenate((a, b), axis=0)            # error: dimension 1 differs
+b = np.where(valid, distance, np.inf)  # union in, union of precise out
+clean = [np.where(np.isfinite(v), v, np.nan) for v in (p1, p2)]
 ```
 
-Reshape conserves the total with symbolic sizes: int products must
-match and the TypeVar multisets must agree (`(N, 10, 2)` to `(N, 20)`
-is fine; `(N, 10, 2)` to `(N, 21)` errors; `(N, 10)` to `(M, 10)`
-bails — unprovable, not wrong):
+Members pair index-wise, which is exact for co-derived unions (the same
+value mapped through ops — the overwhelmingly common source). Unrelated
+unions of different member counts bail out instead of guessing, and
+dunder ops with unions on both sides (`u + u`) still go through mypy's
+native cartesian matching, so cross terms may dissolve.
+
+Unpacking is the one place precision does not follow the members: a
+generator, list comprehension, `tuple(...)` call, starred target, or
+`map` assigns the union to every name (mypy semantics — `map` dissolves
+further to `Any`). Only the tuple display unpacks per name:
 
 ```python
-a.reshape(a.shape[0], 20)  # (N, 20): TypeVar sizes compare by name
-np.arange(len(a))          # (N,): arange of a symbolic count
+a, b = (clean(p1), clean(p2))   # (N, 2) and (N, K, 2): precise
+a, b = (clean(v) for v in (p1, p2))  # both: the union (body still checked)
 ```
 
-Tuple displays (`(a, b)`) keep per-item precision; list displays
-`[a, b]` work too — the plugin re-reads each item's type from its
-expression, since lists arrive joined against the `ArrayLike` formal.
-An explicit `dtype=` you name is used as-is when it resolves to a
-concrete dtype (`np.float32`, `np.int64`, `"float64"`, ...); anything
-exotic bails out instead of guessing.
+So when the shapes must reach the code below, spell the display; when
+only the per-member checking matters, the generator form is fine.
 
-One signature for every rank. NumPy's stubs bound the shape to
-`tuple[int, ...]`, which an unsolved `*Ts` cannot satisfy — so
-rank-generic helpers spell the shape through `FlexArray` and carry two
-honest `type: ignore[type-var]` notes on the signature. mypy still
-solves `*Ts` from the actual argument, so call sites stay fully
-checked and bodies check rank-generically:
+## The rest of the catalog
+
+Constructors compute result shapes (`zeros_like` keeps shape and dtype,
+`full((2, 3), 5.0)` is a known 2x3 float64, `eye(3)`, `arange(6)`,
+`concatenate` adds dims on the axis, `stack` adds the stacked axis —
+including enum-driven stacks; mismatches error). Reshape conserves the
+total with symbolic sizes and infers `-1` (`(N, 10, 2)` to `(N, 20)` is
+fine, `(N, 10, 2)` to `(N, 21)` errors, `(N, 10)` to `(M, 10)` bails).
+Rank-changing ops track the new shape (`transpose`, `squeeze`,
+`expand_dims`, `sum(axis=1)`; bad permutations and non-1 squeeze axes
+error). Comparisons broadcast and return bool arrays; `argmax` drops the
+axis, `sort` keeps the shape. Elementwise ops — operators and bare
+`np.*` ufuncs alike — broadcast shapes and promote dtypes exactly like
+NumPy (verified against `np.result_type` over the full dtype matrix,
+plus weak Python scalars). `einsum` parses the subscript string
+(explicit, implicit, ellipsis, diagonals) and `linalg` checks squareness
+and inner dims while tracking dtypes (`eigh` stays real, `svd` shrinks
+with `full_matrices=False`). `Generator` random methods solve from
+`size=`. Tuple and list displays keep per-item precision. An explicit
+`dtype=` you name is used as-is when it resolves; anything exotic bails
+out instead of guessing.
+
+## Your own sizes, in one line
+
+No pre-baked list from the library — exact sizes live in your code,
+one line each, and they work under mypy, pyright, and ty with no
+plugin at all:
 
 ```python
-Ts = TypeVarTuple("Ts")
+from typing import Literal
+from numty import FloatArray
 
-def squared_norm(
-    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
-) -> FlexArray[tuple[Unpack[Ts]], np.dtype[np.float64]]:  # type: ignore[type-var]
-    return v[..., 0] ** 2 + v[..., 1] ** 2
+A2x3 = FloatArray[tuple[Literal[2], Literal[3]]]
 
-squared_norm(np.zeros((5, 7, 2)))  # (5, 7)
-squared_norm(np.zeros((5, 2)))     # (5,)
-squared_norm(np.zeros((5, 7, 3)))  # error: expected (..., 2), got (..., 3)
+def use_2x3(m: A2x3) -> None: ...
+
+use_2x3(np.zeros((3, 2)))  # error: 3x2 is not 2x3
 ```
 
-Inside, the solver threads `*Ts` through ellipsis indexing (`v[...,
-0]` on `(*Ts, 2)` is `(*Ts,)` — out-of-range indices still error
-against the known suffix), same-`*Ts` broadcasts, unary ufuncs,
-`astype`/`asarray`, `.shape`, `&`/`|` on bool pairs, `where`/`clip`,
-comparisons, and reductions along axes that resolve to a known dim
-(`.all(axis=-1)` on `(*Ts, 2)` is `(*Ts,)`). Anything that would need
-the unknown length — fancy indexing, a non-ellipsis index, reducing
-over `*Ts` itself, mixing different `Ts` declarations, `matmul`,
-`transpose`, `reshape` — bails out instead of guessing.
+Rank-only aliases (`Vector`, `Matrix`) catch transposed/flattened
+mixups even more cheaply. Named sizes work too — mark them `Final`
+and the solver folds names and arithmetic (`H * 2`, `W + 1`, `M //
+2`) just like literals, and `len()` of an `IntEnum` class folds to
+its member count (aliases share one value, so they count once). Plain
+variables and parameters stay unknown: their values are gone from the
+types before the plugin sees them, so they bail out instead of
+erroring. A generic `int` parameter can never be verified against a
+shape — the contract says "every int", and no annotation survives
+the join to `int`.
+
+Narrowing a dynamically-shaped value uses a witness instead of a
+per-shape helper:
+
+```python
+use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
+```
 
 ## Quickstart
-
-Named sizes work too — mark them `Final` and the solver folds names
-and arithmetic (`H * 2`, `W + 1`, `M // 2`) just like literals, and
-`len()` of an `IntEnum` class folds to its member count (aliases share
-one value, so they count once). Plain variables and parameters stay
-unknown: their values are gone from the types before the plugin sees
-them, so they bail out instead of erroring. A generic `int` parameter
-can never be verified against a shape — the contract says "every
-int", and no annotation survives the join to `int`. But two arguments
-sharing one shape TypeVar are checked at the call site, where the
-actual shapes are still visible: `f(x_5, y_6)` against `(A[N], A[N])`
-errors with the two sizes named. Different TypeVars (`N` vs `M`) stay
-silent by design — their equality is unprovable, and unknown is not
-an error.
 
 ```sh
 uv venv
@@ -291,7 +228,7 @@ uv pip install mypy numpy pytest
 ```sh
 PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
 uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: runtime + mypy-driven (83 and growing)
+uv run pytest                      # full suite: runtime + mypy-driven (85 and growing)
 ```
 
 ## How it works
@@ -305,10 +242,11 @@ Three layers, each building on the previous one:
 | Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape` (incl. symbolic conservation), rank-changing ops, shape builders, comparisons, bool logic (`&`/`\|`), `any`/`all`, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, symbolic TypeVar dims (same name unifies, ranks check, the rest bails), call-site TypeVar conflicts, enum-driven stacks, folds constant int expressions and `len()` (`Final` arithmetic, enum member counts), solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
-The library ships only the generic bases (`FloatArray`, `Array1D`,
-`Array2D`) plus rank aliases; exact sizes live in your code, one line each.
-Plain constructors just work: `np.zeros((2, 3))` already has a precise type,
-and the plugin keeps it precise even through assignment.
+The library ships only the generic bases (`FloatArray`, `FlexArray`,
+`Array1D`, `Array2D`) plus rank aliases; exact sizes live in your code,
+one line each. Plain constructors just work: `np.zeros((2, 3))` already
+has a precise type, and the plugin keeps it precise even through
+assignment.
 
 Layers 1–2 hit a wall at cross-argument checks: `ndarray`'s shape parameter is
 effectively covariant, so a shared `TypeVar` silently joins conflicting
@@ -322,13 +260,6 @@ The plugin is registered in [mypy.ini](/home/sofeikov/my/numty/mypy.ini) and
 needs `PYTHONPATH=.` so mypy can import it (`MYPYPATH` does not work for
 plugins). Without the plugin, checking degrades gracefully to the first two
 layers.
-
-Narrowing a dynamically-shaped value uses a witness instead of a per-shape
-helper:
-
-```python
-use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
-```
 
 ## Limitations, stated plainly
 
@@ -360,9 +291,12 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
   overloaded numpy call dissolves to `Any` (mypy keeps the
   overload-inferred type over the hook result): hoist it to a local
   first (`kernel = gaussian_kernel(...); np.where(cond, kernel, 0.0)`).
-- Union-typed array inputs (`(N, K, M) | (N, 1, M)`) bail out: the
-  solver tracks one shape per value, so bodies over unions stay
-  unchecked (call sites still check each concrete shape).
+- Union-typed array inputs (`(N, K, M) | (N, 1, M)`) distribute per
+  member: each member solves with the full solver and the results
+  union. Members pair index-wise (exact for co-derived unions);
+  unrelated unions of different member counts, and dunder ops with
+  unions on both sides (mypy matches those cartesianly), bail out
+  instead of guessing.
 - Rank-polymorphic helpers (`(..., 2)` → `...`) spell the shape
   through `FlexArray` with one `*Ts` signature: each signature carries
   two `type: ignore[type-var]` notes (the `tuple[int, ...]` stub bound
@@ -370,8 +304,11 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
   check fully. A provable `*Ts` error may draw the stubs' own echo next
   to ours (an `[index]` complaint on unpack shapes); ours names the
   axis, the size, and the `(*Ts, ...)` shape.
-- Heterogeneous generator unpacking (`a, b = (f(p) for p in (p1, p2))`
-  with different shapes) joins to `Any`: spell the lines out.
+- Heterogeneous unpacking (`a, b = (f(p) for p in (p1, p2))` with
+  different shapes) assigns the whole union to every name — genexp,
+  list comprehension, `tuple(...)`, starred targets, and `map` (which
+  dissolves to `Any`) all behave this way. The body still checks per
+  member; per-name precision needs the tuple display.
 - Different TypeVars (`N` vs `M`) never conflict, even when provably
   different at a call site — only same-name TypeVars are unified.
 
@@ -395,10 +332,13 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 
 ## Roadmap
 
-Value-dependent frontiers: NEP 50's value-based edge cases (out-of-bound
-Python ints) and union dtypes currently bail out. The `@` operator stays
-accepted-but-unchecked (mypy consults the method hook inconsistently).
-`ty` and pyright get layers 1–2 — neither offers a plugin API to build
-the solver on. Rank polymorphism wants `TypeVarTuple` (`tuple[*Ts, 2]`)
-instead of per-rank overloads; a union-distributing solver would check
-bodies over union-typed inputs instead of bailing.
+Frontiers, ordered by value: per-name precision past lazy unpacks
+(a tuple display is the only form mypy's binder distributes — genexp,
+listcomp, `tuple(...)`, starred, and `map` all assign the union);
+`matmul`/`transpose`/`reshape`
+over `*Ts` (needs rank reasoning, not just suffix matching);
+unpack-vs-concrete merges (provably unknowable today, but narrower bails
+are possible); NEP 50's value-based edge cases (out-of-bound Python ints)
+and union dtypes; the `@` operator (mypy consults the method hook
+inconsistently); `ty` and pyright (neither offers a plugin API to build
+the solver on).

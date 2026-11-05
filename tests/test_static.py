@@ -107,9 +107,16 @@ def test_good_path_precision_visible() -> None:
     result = run_mypy(FIXTURES / "static_ok.py")
     assert result.returncode == 0, result.stdout
     notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
-    assert len(notes) == 14, result.stdout
+    assert len(notes) == 24, result.stdout
+    assert any(
+        "tuple[Literal[2], Literal[2]]" in line and "|" in line for line in notes
+    ), result.stdout
     assert any("tuple[Literal[5]]" in line for line in notes), result.stdout
     assert any("tuple[Literal[5], Literal[2]]" in line for line in notes), result.stdout
+    assert any("tuple[Literal[2], Literal[2]]" in line for line in notes), result.stdout
+    assert any(
+        "tuple[Literal[2], Literal[3], Literal[2]]" in line for line in notes
+    ), result.stdout
     assert any("tuple[Literal[2], Literal[3]]" in line for line in notes), result.stdout
     assert any("tuple[Literal[3]]" in line for line in notes), result.stdout
     assert any("tuple[Literal[2], Literal[4]]" in line for line in notes), result.stdout
@@ -185,6 +192,24 @@ def test_tail2_range_mismatch() -> None:
     assert result.returncode == 1, result.stdout
     assert "index 99 is out of range for axis -1 with size 2" in result.stdout, result.stdout
     assert "((*Ts, 2))" in result.stdout, result.stdout
+
+
+def test_where_union_member_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_where_union_member.py"),
+        "trailing axis 0: 3 vs 2",
+        "(2, 3)",
+        "(2, 2)",
+    )
+
+
+def test_union_genexp_member_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_union_genexp_member.py"),
+        "trailing axis 0: 2 vs 3",
+        "(2, 2)",
+        "(2, 3)",
+    )
 
 
 def test_index_too_many_mismatch() -> None:
