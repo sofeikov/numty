@@ -3,13 +3,15 @@ from enum import IntEnum
 from typing import Any, Final, Literal, TypeVar, cast
 
 import numpy as np
+from typing_extensions import TypeVarTuple, Unpack
 
-from numty import Array2D, FloatArray, Matrix, ident, matmul, narrow
+from numty import Array2D, FloatArray, FlexArray, Matrix, ident, matmul, narrow
 
 N = TypeVar("N", bound=int)
 K = TypeVar("K", bound=int)
 M = TypeVar("M", bound=int)
 C = TypeVar("C", bound=int)
+Ts = TypeVarTuple("Ts")
 
 
 class Slots(IntEnum):
@@ -24,6 +26,7 @@ A1x4 = FloatArray[tuple[Literal[4]]]
 A2x1 = FloatArray[tuple[Literal[2], Literal[1]]]
 A2x2 = FloatArray[tuple[Literal[2], Literal[2]]]
 A2x3 = FloatArray[tuple[Literal[2], Literal[3]]]
+A2x3x2 = FloatArray[tuple[Literal[2], Literal[3], Literal[2]]]
 A2x4 = FloatArray[tuple[Literal[2], Literal[4]]]
 A2x5 = FloatArray[tuple[Literal[2], Literal[5]]]
 A3x2 = FloatArray[tuple[Literal[3], Literal[2]]]
@@ -58,6 +61,9 @@ def use_2x2(m: A2x2) -> None: ...
 
 
 def use_2x3(m: A2x3) -> None: ...
+
+
+def use_2x3x2(m: A2x3x2) -> None: ...
 
 
 def use_b(m: B2x3) -> None: ...
@@ -543,6 +549,37 @@ def enum_index_stays_precise() -> None:
     use_5x2(table[:, COL])
     use_4(table[Slots.VX - 1, :])
     use_5(np.zeros((5, 4))[np.arange(5), Slots.Y - 1])
+
+
+def tail2_sq(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    """Sum of squares over a trailing pair, at any rank."""
+    return v[..., 0] ** 2 + v[..., 1] ** 2
+
+
+def tail2_present(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts]], np.dtype[np.bool_]]:  # type: ignore[type-var]
+    """Both trailing-pair entries finite, at any rank."""
+    return np.asarray(np.isfinite(v).all(axis=-1), dtype=np.bool_)
+
+
+def ts_poly_stays_precise() -> None:
+    reveal_type(tail2_sq(np.zeros((2, 3, 2))))
+    reveal_type(tail2_sq(np.zeros((3, 2))))
+    use_2x3(tail2_sq(np.zeros((2, 3, 2))))
+    use_3(tail2_sq(np.zeros((3, 2))))
+    use_2x3x2(tail2_sq(np.zeros((2, 3, 2, 2))) + tail2_sq(np.zeros((2, 3, 2, 2))))
+    use_b2x3(tail2_present(np.zeros((2, 3, 2))))
+
+
+def ts_bail_stays_silent(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    _ = v + np.zeros((2, 3))  # unprovable against *Ts: silent, not an error
+    _ = v.sum(axis=0)  # empty prefix: silent
+    _ = v[0]  # no ellipsis to align with: silent
 
 
 def named_dtype_stays_precise() -> None:

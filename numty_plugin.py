@@ -92,7 +92,9 @@ from mypy.types import (
     TupleType,
     Type,
     TypeOfAny,
+    TypeVarTupleType,
     TypeVarType,
+    UnpackType,
     get_proper_type,
 )
 
@@ -452,6 +454,10 @@ def _dim_eq(a: int | Type, b: int | Type) -> bool:
 def _dim_str(d: int | Type) -> str:
     if isinstance(d, int):
         return str(d)
+    if isinstance(d, UnpackType):
+        inner = d.type
+        name = getattr(inner, "name", None)
+        return f"*{name}" if isinstance(name, str) else "*Ts"
     name = getattr(d, "name", None)
     return str(name) if isinstance(name, str) else "?"
 
@@ -480,6 +486,35 @@ def _shape_dims(tp: Type) -> list[int | Type] | None:
     if any(v is None for v in values):
         return None
     return [v for v in values if v is not None]
+
+
+def _shape_dims_unpack(tp: Type) -> tuple[list[int | Type], UnpackType, list[int | Type]] | None:
+    """Split a *Ts shape into (known prefix, unpack, known suffix).
+
+    Only a single unpack with otherwise known dims (int literals and
+    TypeVars) qualifies; anything else bails with None.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, TupleType):
+        return None
+    prefix: list[int | Type] = []
+    suffix: list[int | Type] = []
+    unpack: UnpackType | None = None
+    seen = False
+    for item in proper.items:
+        if isinstance(item, UnpackType):
+            if seen:
+                return None
+            seen = True
+            unpack = item
+            continue
+        value = _dim_value(item)
+        if value is None:
+            return None
+        (suffix if seen else prefix).append(value)
+    if unpack is None:
+        return None
+    return prefix, unpack, suffix
 
 
 def _fold_int(expr: Expression) -> int | None:
@@ -599,6 +634,39 @@ def _ndarray_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
         return None
     dims = _shape_dims(proper.args[0])
     return (dims, proper.args[1]) if dims is not None else None
+
+
+def _parts_or_unpack(tp: Type) -> tuple[list[int | Type], Type] | None:
+    """(dims, dtype), preserving a *Ts shape as an Unpack item.
+
+    Same-shape consumers thread the dims through untouched; anything
+    rank-sensitive must keep using _ndarray_parts and bail out.
+    """
+    parts = _ndarray_parts(tp)
+    if parts is not None:
+        return parts
+    split = _unpack_shape(tp)
+    if split is None:
+        return None
+    (prefix, unpack, suffix), dtype = split
+    return prefix + [unpack] + suffix, dtype
+
+
+def _has_unpack(dims: list[int | Type]) -> bool:
+    """Whether a dims list carries a *Ts unpack item."""
+    return any(isinstance(d, UnpackType) for d in dims)
+
+
+def _split_flat(
+    dims: list[int | Type],
+) -> tuple[list[int | Type], UnpackType, list[int | Type]] | None:
+    """Split a flat dims list at its single unpack, else None."""
+    found = [i for i, d in enumerate(dims) if isinstance(d, UnpackType)]
+    if len(found) != 1:
+        return None
+    item = dims[found[0]]
+    assert isinstance(item, UnpackType)
+    return dims[: found[0]], item, dims[found[0] + 1 :]
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
@@ -818,33 +886,168 @@ def _broadcast_result(
     return [*prefix, *reversed(out)], None
 
 
-def _solve_broadcast(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
-    a = _ndarray_parts(left)
-    if a is None:
-        return ctx.default_return_type
-    dims_a, dtype_a = a
-    b = _ndarray_parts(right)
-    if b is None:
-        key = _scalar_key(right)
-        if key is None:
-            return ctx.default_return_type
-        strong = _dtype_fullname(dtype_a)
-        if strong is None:
-            return ctx.default_return_type
-        kind, scalar_name = key
-        name = (
-            _promote_weak(scalar_name, strong)
-            if kind == "weak"
-            else _promote_strong(scalar_name, strong)
+def _same_unpack(a: UnpackType, b: UnpackType) -> bool:
+    """Both unpacks draw from the same TypeVarTuple declaration."""
+    t1 = get_proper_type(a.type)
+    t2 = get_proper_type(b.type)
+    return (
+        isinstance(t1, TypeVarTupleType)
+        and isinstance(t2, TypeVarTupleType)
+        and t1.fullname == t2.fullname
+    )
+
+
+def _merge_known_pair(
+    x: int | Type, y: int | Type, axis: str, full: str
+) -> tuple[int | Type | None, str | None]:
+    """One pairwise broadcast step: (merged dim, None), or (None, msg).
+
+    (None, None) bails out silently; (None, msg) records a provable
+    int clash for the caller to fail with.
+    """
+    if _dim_eq(x, y):
+        return x, None
+    if isinstance(x, int) and x == 1:
+        return y, None
+    if isinstance(y, int) and y == 1:
+        return x, None
+    if isinstance(x, int) and isinstance(y, int):
+        return None, (
+            f"broadcast shapes disagree at {axis}: {x} vs {y} (shapes {full})"
         )
+    return None, None
+
+
+def _merge_unpack_dims(
+    p1: list[int | Type],
+    u1: UnpackType,
+    s1: list[int | Type],
+    p2: list[int | Type],
+    u2: UnpackType,
+    s2: list[int | Type],
+) -> tuple[list[int | Type] | None, str | None]:
+    """Broadcast two (*prefix, *Ts, *suffix) shapes, or None to bail.
+
+    The unpacks must draw from the same TypeVarTuple (equal unknown
+    length, so they consume each other); suffixes must match in count
+    (extras would align against *Ts); prefixes right-align with leading
+    extras passing through, exactly like standard broadcasting.
+    Returns (dims, None), (None, msg) on a provable clash, or
+    (None, None) to bail out silently.
+    """
+    if not _same_unpack(u1, u2):
+        return None, None
+    if len(s1) != len(s2):
+        return None, None
+    full = f"{_dims_str(p1 + [u1] + s1)} vs {_dims_str(p2 + [u2] + s2)}"
+    suf: list[int | Type] = []
+    for k, (x, y) in enumerate(zip(reversed(s1), reversed(s2))):
+        merged, message = _merge_known_pair(x, y, f"trailing axis {k}", full)
+        if message is not None or merged is None:
+            return None, message
+        suf.append(merged)
+    suf.reverse()
+    shared = min(len(p1), len(p2))
+    pre: list[int | Type] = []
+    for k, (x, y) in enumerate(zip(reversed(p1), reversed(p2))):
+        axis = f"axis {len(p1) - 1 - k}" if len(p1) == len(p2) else "leading dims"
+        merged, message = _merge_known_pair(x, y, axis, full)
+        if message is not None or merged is None:
+            return None, message
+        pre.append(merged)
+    pre.reverse()
+    dims = p1[: len(p1) - shared] + p2[: len(p2) - shared] + pre + [u1] + suf
+    return dims, None
+
+
+def _solve_broadcast_scalar(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, other: Type
+) -> Type:
+    """Array/scalar promotion keeping the array dims, or default."""
+    key = _scalar_key(other)
+    if key is None:
+        return ctx.default_return_type
+    strong = _dtype_fullname(dtype)
+    if strong is None:
+        return ctx.default_return_type
+    kind, scalar_name = key
+    name = (
+        _promote_weak(scalar_name, strong)
+        if kind == "weak"
+        else _promote_strong(scalar_name, strong)
+    )
+    if name is None:
+        return ctx.default_return_type
+    if name == strong:
+        return _ndarray_type(ctx, dims, dtype)
+    promoted = _construct_dtype(ctx, name)
+    if promoted is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, promoted)
+
+
+def _solve_broadcast_unpack(
+    ctx: FunctionContext | MethodContext,
+    left: Type,
+    right: Type,
+    a: tuple[list[int | Type], Type] | None,
+    b: tuple[list[int | Type], Type] | None,
+) -> Type:
+    """Broadcast where _ndarray_parts bailed on at least one side."""
+    sa = _unpack_shape(left) if a is None else None
+    sb = _unpack_shape(right) if b is None else None
+    if sa is None and sb is None:
+        if a is None:
+            return ctx.default_return_type
+        return _solve_broadcast_scalar(ctx, a[0], a[1], right)
+    if sa is not None and sb is not None:
+        (p1, u1, s1), dtype_a = sa
+        (p2, u2, s2), dtype_b = sb
+        dims, message = _merge_unpack_dims(p1, u1, s1, p2, u2, s2)
+        if message is not None:
+            ctx.api.fail(message, ctx.context)
+            return ctx.default_return_type
+        if dims is None:
+            return ctx.default_return_type
+        name = _promote_dtypes(dtype_a, dtype_b)
         if name is None:
             return ctx.default_return_type
-        if name == strong:
-            return _ndarray_type(ctx, dims_a, dtype_a)
+        if name == _dtype_fullname(dtype_a):
+            return _ndarray_type(ctx, dims, dtype_a)
+        if name == _dtype_fullname(dtype_b):
+            return _ndarray_type(ctx, dims, dtype_b)
         dtype = _construct_dtype(ctx, name)
         if dtype is None:
             return ctx.default_return_type
-        return _ndarray_type(ctx, dims_a, dtype)
+        return _ndarray_type(ctx, dims, dtype)
+    sel, other = (sa, right) if sa is not None else (sb, left)
+    assert sel is not None
+    (prefix, unpack, suffix), dtype_u = sel
+    if _scalar_key(other) is not None:
+        return _solve_broadcast_scalar(ctx, prefix + [unpack] + suffix, dtype_u, other)
+    ob = _ndarray_parts(other)
+    if ob is not None and ob[0] == []:
+        name = _promote_dtypes(dtype_u, ob[1])
+        if name is None:
+            return ctx.default_return_type
+        if name == _dtype_fullname(dtype_u):
+            return _ndarray_type(ctx, prefix + [unpack] + suffix, dtype_u)
+        if name == _dtype_fullname(ob[1]):
+            return _ndarray_type(ctx, prefix + [unpack] + suffix, ob[1])
+        dtype = _construct_dtype(ctx, name)
+        if dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, prefix + [unpack] + suffix, dtype)
+    return ctx.default_return_type
+
+
+def _solve_broadcast(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    a = _ndarray_parts(left)
+    b = _ndarray_parts(right)
+    if a is None or b is None:
+        return _solve_broadcast_unpack(ctx, left, right, a, b)
+    dims_a, dtype_a = a
+    dims_b, dtype_b = b
     dims_b, dtype_b = b
     name = _promote_dtypes(dtype_a, dtype_b)
     if name is None:
@@ -1448,7 +1651,7 @@ def _solve_reduction(
 
 def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) -> Type:
     """any/all: same axis rules as reductions, but the output is bool."""
-    parts = _ndarray_parts(array)
+    parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
     dims, _ = parts
@@ -1460,6 +1663,11 @@ def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) ->
     dtype = _construct_dtype(ctx, "numpy.bool")
     if dtype is None:
         return ctx.default_return_type
+    if _has_unpack(dims):
+        split = _split_flat(dims)
+        if split is None:
+            return ctx.default_return_type
+        return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype, dtype)
     return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, dtype)
 
 
@@ -2128,10 +2336,57 @@ def expand_dims_function_hook(ctx: FunctionContext) -> Type:
     return _solve_expand_dims(ctx, dims, dtype, _parse_axis_arg(_formal_pair(ctx, "axis")))
 
 
+def _solve_reduction_unpack(
+    ctx: FunctionContext | MethodContext,
+    prefix: list[int | Type],
+    unpack: UnpackType,
+    suffix: list[int | Type],
+    dtype: Type,
+    axis: list[int] | None | str,
+    keepdims: bool | None,
+    has_dtype: bool,
+    force_dtype: Type | None = None,
+) -> Type:
+    """Reduce a (*prefix, *Ts, *suffix) shape along provable axes.
+
+    Only axes that resolve to a known dim reduce: non-negative axes
+    into the prefix, negative axes into the suffix. Anything reaching
+    into *Ts bails out, as do absent/None axes, exactly like the
+    fixed-rank path.
+    """
+    if not isinstance(axis, list) or keepdims is None or has_dtype:
+        return ctx.default_return_type
+    if force_dtype is None and _dtype_fullname(dtype) not in REDUCTION_DTYPES:
+        return ctx.default_return_type
+    out_dtype = force_dtype if force_dtype is not None else dtype
+    flat = prefix + [unpack] + suffix
+    chosen: set[int] = set()
+    for ax in axis:
+        if isinstance(ax, bool) or not isinstance(ax, int):
+            return ctx.default_return_type
+        if ax < 0:
+            if -ax > len(suffix):
+                return ctx.default_return_type
+            pos = len(flat) + ax
+        else:
+            if ax >= len(prefix):
+                return ctx.default_return_type
+            pos = ax
+        if pos in chosen:
+            ctx.api.fail(f"duplicate axis {ax}", ctx.context)
+            return ctx.default_return_type
+        chosen.add(pos)
+    if keepdims:
+        out = [1 if i in chosen else d for i, d in enumerate(flat)]
+    else:
+        out = [d for i, d in enumerate(flat) if i not in chosen]
+    return _ndarray_type(ctx, out, out_dtype)
+
+
 def _reduction_inputs(
     ctx: FunctionContext | MethodContext, array: Type
 ) -> Type:
-    parts = _ndarray_parts(array)
+    parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -2140,6 +2395,11 @@ def _reduction_inputs(
     keepdims = False if keep_pair is None else _fold_flag(keep_pair)
     dtype_pair = _formal_pair(ctx, "dtype")
     has_dtype = dtype_pair is not None and not _is_none_type(dtype_pair[0])
+    if _has_unpack(dims):
+        split = _split_flat(dims)
+        if split is None:
+            return ctx.default_return_type
+        return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype)
     return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype)
 
 
@@ -2313,30 +2573,183 @@ def _parse_index_item(
     return None
 
 
+def _index_pairs(
+    ctx: MethodContext, pair: tuple[Type, Expression | None]
+) -> list[tuple[Type, Expression | None]] | None:
+    """One (type, expr) pair per index position, else None to bail."""
+    tp, expr = pair
+    proper = get_proper_type(tp)
+    if isinstance(expr, TupleExpr) and isinstance(proper, TupleType) and len(expr.items) == len(proper.items):
+        return list(zip(proper.items, expr.items))
+    if isinstance(proper, TupleType) and not isinstance(expr, TupleExpr):
+        # Stored tuple variable: ints and None from types, rest bails.
+        return [(item, None) for item in proper.items]
+    if isinstance(expr, TupleExpr) or isinstance(proper, TupleType):
+        return None
+    return [(tp, expr)]
+
+
+def _parse_index_items(
+    ctx: MethodContext, pairs: list[tuple[Type, Expression | None]]
+) -> list[tuple] | None:
+    """Parse each index position, else None to bail."""
+    items: list[tuple] = []
+    for itp, iexpr in pairs:
+        item = _parse_index_item(ctx, itp, iexpr)
+        if item is None:
+            return None
+        items.append(item)
+    return items
+
+
+def _consume_one(
+    ctx: MethodContext, item: tuple, size: int | Type, axis: str, shape_repr: str
+) -> list[int | Type] | None:
+    """Apply one parsed index item to a known dim: kept dims, or None.
+
+    None means bail out silently, except provable errors (out-of-range
+    int, zero step, bad index type), which fail inside and also yield
+    None. Dropped dims contribute nothing.
+    """
+    kind = item[0]
+    if kind in ("int", "int_any"):
+        if kind == "int" and isinstance(size, int):
+            norm = item[1] + size if item[1] < 0 else item[1]
+            if not 0 <= norm < size:
+                ctx.api.fail(
+                    f"index {item[1]} is out of range for axis {axis} "
+                    f"with size {size} (shape {shape_repr})",
+                    ctx.context,
+                )
+        return []
+    if kind == "fancy0d":
+        return []
+    if kind in ("fancy", "mask"):
+        # Needs concrete ranks to place; with *Ts that is unknowable.
+        return None
+    if kind == "badindex":
+        ctx.api.fail(
+            "arrays used as indices must be of integer (or boolean) type",
+            ctx.context,
+        )
+        return None
+    _, begin, end, stride = item
+    if not isinstance(size, int):
+        if begin == "missing" and end == "missing" and stride == "missing":
+            return [size]
+        return None
+    bounds = tuple(None if b == "missing" else b for b in (begin, end, stride))
+    try:
+        return [len(range(*slice(*bounds).indices(size)))]
+    except ValueError:
+        ctx.api.fail("slice step is zero", ctx.context)
+        return None
+
+
+def _consume_prefix(
+    ctx: MethodContext,
+    items: list[tuple],
+    prefix: list[int | Type],
+    shape_repr: str,
+) -> tuple[list[int | Type], list[int | Type]] | None:
+    """Items before ... consume the known prefix; (kept, unmatched)."""
+    out: list[int | Type] = []
+    i = 0
+    for item in items:
+        if item[0] == "newaxis":
+            out.append(1)
+            continue
+        if i >= len(prefix):
+            # Reaches into *Ts: the dim is unknowable, so bail out.
+            return None
+        frag = _consume_one(ctx, item, prefix[i], str(i), shape_repr)
+        if frag is None:
+            return None
+        out.extend(frag)
+        i += 1
+    return out, prefix[i:]
+
+
+def _consume_suffix(
+    ctx: MethodContext,
+    items: list[tuple],
+    suffix: list[int | Type],
+    shape_repr: str,
+) -> tuple[list[int | Type], list[int | Type]] | None:
+    """Items after ... consume the known suffix; (unmatched, kept)."""
+    slot: list[list[int | Type] | None] = [None] * len(items)
+    p = len(suffix) - 1
+    for idx in range(len(items) - 1, -1, -1):
+        item = items[idx]
+        if item[0] == "newaxis":
+            continue
+        if p < 0:
+            return None
+        frag = _consume_one(ctx, item, suffix[p], f"-{len(suffix) - p}", shape_repr)
+        if frag is None:
+            return None
+        slot[idx] = frag
+        p -= 1
+    out: list[int | Type] = []
+    for idx, item in enumerate(items):
+        if item[0] == "newaxis":
+            out.append(1)
+        else:
+            assert slot[idx] is not None
+            out.extend(slot[idx])
+    return suffix[: p + 1], out
+
+
+def _solve_getitem_unpack(
+    ctx: MethodContext,
+    prefix: list[int | Type],
+    unpack: UnpackType,
+    suffix: list[int | Type],
+    dtype: Type,
+    pair: tuple[Type, Expression | None],
+    shape_repr: str,
+) -> Type:
+    """Index into a (*prefix, *Ts, *suffix) shape.
+
+    Only an ellipsis can align the index with the unknown middle, so a
+    non-ellipsis index bails out. Items on either side consume the known
+    dims with the same checks as the fixed-rank path.
+    """
+    pairs = _index_pairs(ctx, pair)
+    if pairs is None:
+        return ctx.default_return_type
+    items = _parse_index_items(ctx, pairs)
+    if items is None:
+        return ctx.default_return_type
+    if sum(1 for item in items if item[0] == "ellipsis") > 1:
+        ctx.api.fail("only one Ellipsis (...) is allowed in an index", ctx.context)
+        return ctx.default_return_type
+    positions = [n for n, item in enumerate(items) if item[0] == "ellipsis"]
+    if not positions:
+        return ctx.default_return_type
+    pos = positions[0]
+    left = _consume_prefix(ctx, items[:pos], prefix, shape_repr)
+    if left is None:
+        return ctx.default_return_type
+    right = _consume_suffix(ctx, items[pos + 1 :], suffix, shape_repr)
+    if right is None:
+        return ctx.default_return_type
+    out = left[0] + left[1] + [unpack] + right[0] + right[1]
+    return _ndarray_type(ctx, out, dtype)
+
+
 def _solve_getitem(
     ctx: MethodContext,
     dims: list[int | Type],
     dtype: Type,
     pair: tuple[Type, Expression | None],
 ) -> Type:
-    tp, expr = pair
-    proper = get_proper_type(tp)
-    pairs: list[tuple[Type, Expression | None]]
-    if isinstance(expr, TupleExpr) and isinstance(proper, TupleType) and len(expr.items) == len(proper.items):
-        pairs = list(zip(proper.items, expr.items))
-    elif isinstance(proper, TupleType) and not isinstance(expr, TupleExpr):
-        # Stored tuple variable: ints and None from types, rest bails.
-        pairs = [(item, None) for item in proper.items]
-    elif isinstance(expr, TupleExpr) or isinstance(proper, TupleType):
+    pairs = _index_pairs(ctx, pair)
+    if pairs is None:
         return ctx.default_return_type
-    else:
-        pairs = [(tp, expr)]
-    items: list[tuple] = []
-    for itp, iexpr in pairs:
-        item = _parse_index_item(ctx, itp, iexpr)
-        if item is None:
-            return ctx.default_return_type
-        items.append(item)
+    items = _parse_index_items(ctx, pairs)
+    if items is None:
+        return ctx.default_return_type
     if sum(1 for item in items if item[0] == "ellipsis") > 1:
         ctx.api.fail("only one Ellipsis (...) is allowed in an index", ctx.context)
         return ctx.default_return_type
@@ -2437,15 +2850,71 @@ def _solve_getitem(
     return _ndarray_type(ctx, out, dtype)
 
 
+def _unpack_shape(tp: Type) -> tuple[tuple[list[int | Type], UnpackType, list[int | Type]], Type] | None:
+    """A (*prefix, *Ts, *suffix) ndarray shape with its dtype, else None."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance):
+        return None
+    if proper.type.fullname != NDARRAY_FULLNAME or len(proper.args) != 2:
+        return None
+    split = _shape_dims_unpack(proper.args[0])
+    if split is None:
+        return None
+    return split, proper.args[1]
+
+
 def getitem_method_hook(ctx: MethodContext) -> Type:
     parts = _ndarray_parts(ctx.type)
-    if parts is None:
+    if parts is not None:
+        dims, dtype = parts
+        pairs = _all_positionals(ctx)
+        if len(pairs) != 1:
+            return ctx.default_return_type
+        return _solve_getitem(ctx, dims, dtype, pairs[0])
+    split = _unpack_shape(ctx.type)
+    if split is None:
         return ctx.default_return_type
-    dims, dtype = parts
+    (prefix, unpack, suffix), dtype = split
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
-    return _solve_getitem(ctx, dims, dtype, pairs[0])
+    shape_repr = f"({_dims_str(prefix + [unpack] + suffix)})"
+    return _solve_getitem_unpack(ctx, prefix, unpack, suffix, dtype, pairs[0], shape_repr)
+
+
+def _broadcast_dims_unpack(
+    ctx: FunctionContext | MethodContext,
+    left: Type,
+    right: Type,
+    a: tuple[list[int | Type], Type] | None,
+    b: tuple[list[int | Type], Type] | None,
+) -> list[int | Type] | None:
+    """Dims-only broadcast where _ndarray_parts bailed on a side."""
+    sa = _unpack_shape(left) if a is None else None
+    sb = _unpack_shape(right) if b is None else None
+    if sa is None and sb is None:
+        if a is None:
+            return None
+        if _scalar_key(right) is None:
+            return None
+        return a[0]
+    if sa is not None and sb is not None:
+        (p1, u1, s1), _ = sa
+        (p2, u2, s2), _ = sb
+        dims, message = _merge_unpack_dims(p1, u1, s1, p2, u2, s2)
+        if message is not None:
+            ctx.api.fail(message, ctx.context)
+            return None
+        return dims
+    sel, other = (sa, right) if sa is not None else (sb, left)
+    assert sel is not None
+    (prefix, unpack, suffix), _ = sel
+    if _scalar_key(other) is not None:
+        return prefix + [unpack] + suffix
+    parts = _ndarray_parts(other)
+    if parts is not None and parts[0] == []:
+        return prefix + [unpack] + suffix
+    return None
 
 
 def _broadcast_dims(
@@ -2453,14 +2922,10 @@ def _broadcast_dims(
 ) -> list[int] | None:
     """Broadcast output dims for two operands, else None to bail or fail."""
     a = _ndarray_parts(left)
-    if a is None:
-        return None
-    dims_a, _ = a
     b = _ndarray_parts(right)
-    if b is None:
-        if _scalar_key(right) is None:
-            return None
-        return dims_a
+    if a is None or b is None:
+        return _broadcast_dims_unpack(ctx, left, right, a, b)
+    dims_a, _ = a
     dims_b, _ = b
     dims, message = _broadcast_result(dims_a, dims_b)
     if message is not None:
@@ -2488,13 +2953,13 @@ def logical_method_hook(ctx: MethodContext) -> Type:
     Anything else (int arrays, exotic scalars) bails to the stubs,
     exactly like before this hook existed.
     """
-    parts = _ndarray_parts(ctx.type)
+    parts = _parts_or_unpack(ctx.type)
     if parts is None or _dtype_base(parts[1]) != "b":
         return ctx.default_return_type
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
-    other = _ndarray_parts(pairs[0][0])
+    other = _parts_or_unpack(pairs[0][0])
     if other is not None:
         if _dtype_base(other[1]) != "b":
             return ctx.default_return_type
@@ -3280,13 +3745,13 @@ _UFUNC_BOOL = frozenset(
 )
 
 
-def _operand_spec(tp: Type) -> tuple[list[int] | None, str, str] | None:
+def _operand_spec(tp: Type) -> tuple[list[int | Type] | None, str, str] | None:
     """(dims, kind, name) for an array or scalar operand, else None to bail.
 
     dims is None for scalars (broadcast-neutral); kind is "strong" for
     array dtypes and numpy scalars, "weak" for Python scalars.
     """
-    part = _ndarray_parts(tp)
+    part = _parts_or_unpack(tp)
     if part is not None:
         name = _dtype_fullname(part[1])
         if name is None:
@@ -3323,19 +3788,54 @@ def _combine_specs(
     return _promote_weak(weak, strong)
 
 
+def _merge_shape_lists(
+    a: list[int | Type], b: list[int | Type]
+) -> tuple[list[int | Type] | None, str | None]:
+    """Pairwise merge where at least one side carries *Ts.
+
+    Both unpacks merge through _merge_unpack_dims; a concrete empty
+    shape (0-d, neutral in broadcasting) yields the other side;
+    anything else against *Ts is unknowable and bails out silently.
+    """
+    sa = _split_flat(a) if _has_unpack(a) else None
+    sb = _split_flat(b) if _has_unpack(b) else None
+    if sa is None or sb is None:
+        if sa is not None and b == []:
+            return sa[0] + [sa[1]] + sa[2], None
+        if sb is not None and a == []:
+            return sb[0] + [sb[1]] + sb[2], None
+        return None, None
+    (p1, u1, s1), (p2, u2, s2) = sa, sb
+    return _merge_unpack_dims(p1, u1, s1, p2, u2, s2)
+
+
 def _broadcast_shapes(
     ctx: FunctionContext | MethodContext, shapes: list[list[int | Type]], op: str
 ) -> list[int | Type] | None:
     """Broadcast known shapes pairwise; None (after failing) on conflict."""
     dims: list[int | Type] = []
+    first = True
     for other in shapes:
-        out, cause = _broadcast_result(dims, other)
-        if cause is not None:
-            ctx.api.fail(f"{op} shapes disagree: {cause}", ctx.context)
+        if first:
+            dims = list(other)
+            first = False
+            continue
+        if not _has_unpack(dims) and not _has_unpack(other):
+            out, cause = _broadcast_result(dims, other)
+            if cause is not None:
+                ctx.api.fail(f"{op} shapes disagree: {cause}", ctx.context)
+                return None
+            if out is None:
+                return None
+            dims = out
+            continue
+        merged, message = _merge_shape_lists(dims, other)
+        if message is not None:
+            ctx.api.fail(f"{op} shapes disagree: {message}", ctx.context)
             return None
-        if out is None:
+        if merged is None:
             return None
-        dims = out
+        dims = merged
     return dims
 
 
@@ -3456,7 +3956,7 @@ def _solve_clip(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     for (tp, _), (arr_dims, _, _) in zip(pairs, specs):
         if arr_dims is not None:
-            part = _ndarray_parts(tp)
+            part = _parts_or_unpack(tp)
             assert part is not None
             return _ndarray_type(ctx, dims, part[1])
     return ctx.default_return_type
@@ -3483,8 +3983,12 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     if arr_dims is not None:
+        if _has_unpack(arr_dims):
+            # Compatibility with the target shape is unprovable.
+            return ctx.default_return_type
         part = _ndarray_parts(pairs[0][0])
-        assert part is not None
+        if part is None:
+            return ctx.default_return_type
         return _ndarray_type(ctx, dims, part[1])
     dtype = _construct_dtype(ctx, _WEAK_DEFAULT.get(name, name))
     if dtype is None:
@@ -3525,7 +4029,7 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
     named = _named_dtype(ctx) if _explicit_dtype(ctx) else None
     if _explicit_dtype(ctx) and named is None:
         return ctx.default_return_type
-    part = _ndarray_parts(pairs[0][0])
+    part = _parts_or_unpack(pairs[0][0])
     if part is not None:
         return _ndarray_type(ctx, part[0], named if named is not None else part[1])
     tp, expr = pairs[0]
@@ -3567,7 +4071,7 @@ def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
     for name in ("out", "where", "dtype"):
         if _formal_pair(ctx, name) is not None:
             return ctx.default_return_type
-    part = _ndarray_parts(pairs[0][0])
+    part = _parts_or_unpack(pairs[0][0])
     if part is None:
         return ctx.default_return_type
     dims, dtype = part
@@ -3673,7 +4177,7 @@ def truediv_method_hook(ctx: MethodContext) -> Type:
 
 
 def identity_method_hook(ctx: MethodContext) -> Type:
-    parts = _ndarray_parts(ctx.type)
+    parts = _parts_or_unpack(ctx.type)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -3681,7 +4185,7 @@ def identity_method_hook(ctx: MethodContext) -> Type:
 
 
 def astype_method_hook(ctx: MethodContext) -> Type:
-    parts = _ndarray_parts(ctx.type)
+    parts = _parts_or_unpack(ctx.type)
     if parts is None:
         return ctx.default_return_type
     dims, _ = parts
@@ -3694,7 +4198,7 @@ def astype_method_hook(ctx: MethodContext) -> Type:
 
 
 def shape_attribute_hook(ctx: AttributeContext) -> Type:
-    parts = _ndarray_parts(ctx.type)
+    parts = _parts_or_unpack(ctx.type)
     if parts is None:
         return ctx.default_attr_type
     dims, _ = parts
@@ -3845,7 +4349,7 @@ def clip_method_hook(ctx: MethodContext) -> Type:
     dims = _broadcast_shapes(ctx, shapes, "clip")
     if dims is None:
         return ctx.default_return_type
-    part = _ndarray_parts(ctx.type)
+    part = _parts_or_unpack(ctx.type)
     assert part is not None
     return _ndarray_type(ctx, dims, part[1])
 

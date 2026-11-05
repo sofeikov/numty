@@ -237,6 +237,36 @@ An explicit `dtype=` you name is used as-is when it resolves to a
 concrete dtype (`np.float32`, `np.int64`, `"float64"`, ...); anything
 exotic bails out instead of guessing.
 
+One signature for every rank. NumPy's stubs bound the shape to
+`tuple[int, ...]`, which an unsolved `*Ts` cannot satisfy — so
+rank-generic helpers spell the shape through `FlexArray` and carry two
+honest `type: ignore[type-var]` notes on the signature. mypy still
+solves `*Ts` from the actual argument, so call sites stay fully
+checked and bodies check rank-generically:
+
+```python
+Ts = TypeVarTuple("Ts")
+
+def squared_norm(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return v[..., 0] ** 2 + v[..., 1] ** 2
+
+squared_norm(np.zeros((5, 7, 2)))  # (5, 7)
+squared_norm(np.zeros((5, 2)))     # (5,)
+squared_norm(np.zeros((5, 7, 3)))  # error: expected (..., 2), got (..., 3)
+```
+
+Inside, the solver threads `*Ts` through ellipsis indexing (`v[...,
+0]` on `(*Ts, 2)` is `(*Ts,)` — out-of-range indices still error
+against the known suffix), same-`*Ts` broadcasts, unary ufuncs,
+`astype`/`asarray`, `.shape`, `&`/`|` on bool pairs, `where`/`clip`,
+comparisons, and reductions along axes that resolve to a known dim
+(`.all(axis=-1)` on `(*Ts, 2)` is `(*Ts,)`). Anything that would need
+the unknown length — fancy indexing, a non-ellipsis index, reducing
+over `*Ts` itself, mixing different `Ts` declarations, `matmul`,
+`transpose`, `reshape` — bails out instead of guessing.
+
 ## Quickstart
 
 Named sizes work too — mark them `Final` and the solver folds names
@@ -261,7 +291,7 @@ uv pip install mypy numpy pytest
 ```sh
 PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
 uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: runtime + mypy-driven (80 and growing)
+uv run pytest                      # full suite: runtime + mypy-driven (83 and growing)
 ```
 
 ## How it works
@@ -333,10 +363,13 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 - Union-typed array inputs (`(N, K, M) | (N, 1, M)`) bail out: the
   solver tracks one shape per value, so bodies over unions stay
   unchecked (call sites still check each concrete shape).
-- Rank-polymorphic helpers (`(..., 2)` → `...`) need `@overload` per
-  rank: mypy cannot express a `*Ts, 2` implementation whose body still
-  checks, so the implementation carries an explicit narrow ignore while
-  its body verifies at the max rank.
+- Rank-polymorphic helpers (`(..., 2)` → `...`) spell the shape
+  through `FlexArray` with one `*Ts` signature: each signature carries
+  two `type: ignore[type-var]` notes (the `tuple[int, ...]` stub bound
+  cannot see through an unsolved `*Ts`), while bodies and call sites
+  check fully. A provable `*Ts` error may draw the stubs' own echo next
+  to ours (an `[index]` complaint on unpack shapes); ours names the
+  axis, the size, and the `(*Ts, ...)` shape.
 - Heterogeneous generator unpacking (`a, b = (f(p) for p in (p1, p2))`
   with different shapes) joins to `Any`: spell the lines out.
 - Different TypeVars (`N` vs `M`) never conflict, even when provably
@@ -345,8 +378,8 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 ## Layout
 
 - [numty.py](/home/sofeikov/my/numty/numty.py) — rank aliases, generic shape
-  bases, `narrow` witness helper, shape-preserving `ident`, loose `matmul`
-  fallback.
+  bases, `FlexArray` rank-polymorphic base, `narrow` witness helper,
+  shape-preserving `ident`, loose `matmul` fallback.
 - [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) — the solver.
 - [demo.py](/home/sofeikov/my/numty/demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.

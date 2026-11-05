@@ -25,6 +25,18 @@ N = TypeVar("N", bound=int)
 Array1D = np.ndarray[tuple[M], np.dtype[np.float64]]
 Array2D = np.ndarray[tuple[M, N], np.dtype[np.float64]]
 
+# Rank-polymorphic base. S2 is intentionally unbounded so a shape containing
+# ``*Ts`` (e.g. ``tuple[Unpack[Ts], Literal[2]]``) passes the bound check
+# that numpy's ``tuple[int, ...]``-bounded stubs reject. mypy's solver still
+# unifies ``*Ts`` from the actual argument, so call sites stay precise.
+# D2 carries the dtype the same way: spell both at use sites, e.g.
+# ``FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[NP_FLOAT]]``. The
+# two ``type: ignore[type-var]`` notes each rank-generic signature needs
+# are the only cost; bodies and call sites check fully.
+S2 = TypeVar("S2")
+D2 = TypeVar("D2", bound=np.dtype[Any])
+FlexArray = np.ndarray[S2, D2]
+
 
 # Shape-preserving pass-through. A generic over the shape keeps the exact
 # shape instead of widening it to a rank-only alias.
