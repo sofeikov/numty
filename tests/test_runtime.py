@@ -27,6 +27,10 @@ def test_matmul_of_wrappers_has_chained_shape() -> None:
     assert matmul(zeros_2x3(), zeros_3x4()).shape == (2, 4)
 
 
+def test_matmul_solves_unblessed_shapes_at_runtime() -> None:
+    assert matmul(np.zeros((2, 3)), np.zeros((3, 2))).shape == (2, 2)
+
+
 def test_assert_narrower_accepts_matching() -> None:
     assert assert_is_2x3(np.zeros((2, 3))).shape == (2, 3)
 

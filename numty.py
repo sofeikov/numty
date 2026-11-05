@@ -6,7 +6,7 @@ Checkable by mypy, pyright, or ty.
 """
 from __future__ import annotations
 
-from typing import Literal, TypeVar, cast, overload
+from typing import Any, Literal, TypeVar, cast
 
 import numpy as np
 
@@ -25,15 +25,15 @@ Matrix2x4 = np.ndarray[tuple[Literal[2], Literal[4]], np.dtype[np.float64]]
 # ndarray[tuple[int, ...], ...] that fits no Literal alias, so precision
 # must be recovered at the source with thin wrappers.
 def zeros_2x3() -> Matrix2x3:
-    return cast(Matrix2x3, np.zeros((2, 3)))
+    return np.zeros((2, 3))
 
 
 def zeros_3x2() -> Matrix3x2:
-    return cast(Matrix3x2, np.zeros((3, 2)))
+    return np.zeros((3, 2))
 
 
 def zeros_3x4() -> Matrix3x4:
-    return cast(Matrix3x4, np.zeros((3, 4)))
+    return np.zeros((3, 4))
 
 
 # Narrowing for values whose shape is only known at runtime.
@@ -51,21 +51,15 @@ def ident(m: np.ndarray[S, np.dtype[np.float64]]) -> np.ndarray[S, np.dtype[np.f
     return m
 
 
-# Option 3 (smallest step): blessed-shape matmul overloads. The inner
-# dimensions must agree and the outer dimensions propagate to the result.
-#
-# Why overloads and not axis TypeVars: ndarray's shape parameter is
-# effectively covariant, so a shared TypeVar across arguments silently
-# joins conflicting literals (e.g. N becomes int for 3 vs 2) instead of
-# erroring. Overloads force exact matches. Cost: only listed shape
-# combinations check; everything else is rejected until the plugin step.
-@overload
-def matmul(a: Matrix2x3, b: Matrix3x4) -> Matrix2x4: ...
+# Option 3 (bold step): general matmul solving lives in the mypy plugin
+# (numty_plugin.py), which computes output shapes for any rank. An earlier
+# attempt with axis TypeVars failed silently: ndarray's shape parameter is
+# effectively covariant, so a shared TypeVar joins conflicting literals
+# (e.g. N becomes int for 3 vs 2) instead of erroring. The declared
+# parameters stay loose so any rank reaches the hook; without the plugin
+# this is unchecked (but usable).
+LooseArray = np.ndarray[tuple[Any, ...], np.dtype[np.float64]]
 
 
-@overload
-def matmul(a: Matrix3x2, b: Matrix2x4) -> Matrix3x4: ...
-
-
-def matmul(a: Matrix, b: Matrix) -> Matrix:
+def matmul(a: LooseArray, b: LooseArray) -> Matrix:
     return cast(Matrix, np.matmul(a, b))
