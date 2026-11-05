@@ -56,6 +56,7 @@ from mypy.nodes import (
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
+    AssignmentStmt,
     CallExpr,
     EllipsisExpr,
     Expression,
@@ -525,6 +526,21 @@ def _fold_int(expr: Expression) -> int | None:
         node = expr.node
         if isinstance(node, Var) and node.type is not None:
             return _int_value(node.type)
+    if isinstance(expr, MemberExpr):
+        # Enum members (PlayerFeat.x) carry their int value in the
+        # member's type; anything else bails out. The member node
+        # itself is often unset, so resolve through the enum base.
+        node = expr.node
+        if isinstance(node, Var) and node.type is not None:
+            return _int_value(node.type)
+        base = expr.expr
+        if isinstance(base, NameExpr) and isinstance(base.node, TypeInfo):
+            info = base.node
+            if info.is_enum and expr.name in info.names:
+                member = info.names[expr.name].node
+                if isinstance(member, Var) and member.type is not None:
+                    return _int_value(member.type)
+        return None
     if (
         isinstance(expr, CallExpr)
         and isinstance(expr.callee, NameExpr)
@@ -2131,7 +2147,38 @@ def reduction_method_hook(ctx: MethodContext) -> Type:
     return _reduction_inputs(ctx, ctx.type)
 
 
-def _fold_index_bound(expr: Expression | None) -> int | None | str:
+def _enum_member_value(modules: dict, tp: Type) -> int | None:
+    """Int value of an enum member literal (F.x -> 0), else None.
+
+    The literal carries the member name; the value comes from the
+    member's own type in the enum. Anything non-conforming bails out.
+    """
+    proper = get_proper_type(tp)
+    name: str | None = None
+    info = None
+    if isinstance(proper, LiteralType) and isinstance(proper.value, str):
+        fallback = get_proper_type(proper.fallback)
+        if isinstance(fallback, Instance) and fallback.type.is_enum:
+            name, info = proper.value, fallback.type
+    elif (
+        isinstance(proper, Instance)
+        and proper.type.is_enum
+        and proper.last_known_value is not None
+    ):
+        inner = get_proper_type(proper.last_known_value)
+        if isinstance(inner, LiteralType) and isinstance(inner.value, str):
+            name, info = inner.value, proper.type
+    if name is None or info is None or name not in info.names:
+        return None
+    node = info.names[name].node
+    if not isinstance(node, Var) or node.type is None:
+        return None
+    return _int_value(node.type)
+
+
+def _fold_index_bound(
+    ctx: FunctionContext | MethodContext, expr: Expression | None
+) -> int | None | str:
     """Slice bound: 'missing' for omitted/None, value, or None to bail."""
     if expr is None:
         return "missing"
@@ -2139,10 +2186,64 @@ def _fold_index_bound(expr: Expression | None) -> int | None | str:
         return "missing"
     if isinstance(expr, MemberExpr) and expr.name == "newaxis":
         return "missing"
-    return _fold_int(expr)
+    value = _fold_int(expr)
+    if value is None and isinstance(expr, MemberExpr):
+        try:
+            bound_tp = ctx.api.get_expression_type(expr)
+        except Exception:
+            bound_tp = None
+        if bound_tp is not None:
+            modules = getattr(ctx.api, "modules", None) or {}
+            value = _enum_member_value(modules, bound_tp)
+    return value
 
 
-def _parse_index_item(tp: Type, expr: Expression | None) -> tuple | None:
+def _final_slice_call(
+    ctx: FunctionContext | MethodContext, expr: Expression
+) -> CallExpr | None:
+    """slice(...) behind a Final slice-valued name, else None.
+
+    The value lives in the defining module's assignment, reached
+    through the Var's fullname; anything else (locals, non-slice
+    initializers, shadowed builtins) bails out.
+    """
+    if not isinstance(expr, NameExpr):
+        return None
+    node = expr.node
+    if not isinstance(node, Var) or not node.is_final:
+        return None
+    fullname = node.fullname
+    if not fullname or "." not in fullname:
+        return None
+    modname, _, attr = fullname.rpartition(".")
+    modules = getattr(ctx.api, "modules", None) or {}
+    mod = modules.get(modname)
+    # api.modules maps names to MypyFile (older mypy used State).
+    tree = getattr(mod, "tree", None) or mod
+    names = getattr(tree, "names", None)
+    if names is None or attr not in names or names[attr].node is not node:
+        return None
+    for stmt in getattr(tree, "defs", []):
+        if not isinstance(stmt, AssignmentStmt):
+            continue
+        for target in stmt.lvalues:
+            if isinstance(target, NameExpr) and target.node is node:
+                init = stmt.rvalue
+                if not isinstance(init, CallExpr):
+                    return None
+                callee = init.callee
+                if (
+                    isinstance(callee, NameExpr)
+                    and getattr(callee.node, "fullname", "") == "builtins.slice"
+                ):
+                    return init
+                return None
+    return None
+
+
+def _parse_index_item(
+    ctx: FunctionContext | MethodContext, tp: Type, expr: Expression | None
+) -> tuple | None:
     """One index: int drops the axis, slice keeps it, None adds one.
 
     Integer arrays are fancy indices (their shape replaces the axis);
@@ -2164,17 +2265,38 @@ def _parse_index_item(tp: Type, expr: Expression | None) -> tuple | None:
             return ("mask",)
         return ("badindex",)
     if isinstance(expr, SliceExpr):
-        begin = _fold_index_bound(expr.begin_index)
-        end = _fold_index_bound(expr.end_index)
-        stride = _fold_index_bound(expr.stride)
+        begin = _fold_index_bound(ctx, expr.begin_index)
+        end = _fold_index_bound(ctx, expr.end_index)
+        stride = _fold_index_bound(ctx, expr.stride)
         if begin is None or end is None or stride is None:
             return None
         return ("slice", begin, end, stride)
+    if expr is not None:
+        init = _final_slice_call(ctx, expr)
+        if init is not None and all(k == ARG_POS for k in init.arg_kinds):
+            if len(init.args) == 1:
+                raw = (None, init.args[0], None)
+            elif len(init.args) == 2:
+                raw = (init.args[0], init.args[1], None)
+            elif len(init.args) == 3:
+                raw = (init.args[0], init.args[1], init.args[2])
+            else:
+                return None
+            bounds = tuple(
+                "missing" if b is None else _fold_int(b) for b in raw
+            )
+            if any(b is None for b in bounds):
+                return None
+            begin, end, stride = bounds
+            return ("slice", begin, end, stride)
     if isinstance(expr, StarExpr):
         return None
     value = _fold_int(expr) if expr is not None else None
     if value is None:
         value = _int_value(tp)
+    if value is None:
+        modules = getattr(ctx.api, "modules", None) or {}
+        value = _enum_member_value(modules, tp)
     if isinstance(value, bool):
         return None
     if value is not None:
@@ -2211,7 +2333,7 @@ def _solve_getitem(
         pairs = [(tp, expr)]
     items: list[tuple] = []
     for itp, iexpr in pairs:
-        item = _parse_index_item(itp, iexpr)
+        item = _parse_index_item(ctx, itp, iexpr)
         if item is None:
             return ctx.default_return_type
         items.append(item)

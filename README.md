@@ -182,6 +182,9 @@ a[None, :]    # new axis of size 1
 a[..., 1]     # ellipsis fills the middle
 a[5]          # error: index 5 is out of range for axis 0 with size 2
 a[::0]        # error: slice step is zero
+a[..., Slots.X]   # IntEnum members index by their value
+a[:, COL]         # a Final slice(Slots.X, Slots.Y + 1) object, same thing
+a[Slots.VX]       # error: index 2 is out of range for axis 0 with size 2
 ```
 
 Slicing past the end clips like NumPy (`a[1:99]` on a size-2 axis is

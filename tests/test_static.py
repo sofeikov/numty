@@ -107,7 +107,9 @@ def test_good_path_precision_visible() -> None:
     result = run_mypy(FIXTURES / "static_ok.py")
     assert result.returncode == 0, result.stdout
     notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
-    assert len(notes) == 10, result.stdout
+    assert len(notes) == 12, result.stdout
+    assert any("tuple[Literal[5]]" in line for line in notes), result.stdout
+    assert any("tuple[Literal[5], Literal[2]]" in line for line in notes), result.stdout
     assert any("tuple[Literal[2], Literal[4]]" in line for line in notes), result.stdout
     assert any("tuple[Literal[2], Literal[3]]" in line for line in notes), result.stdout
     assert any("tuple[Literal[3], Literal[2]]" in line for line in notes), result.stdout
@@ -156,6 +158,13 @@ def test_index_range_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_index_range.py"),
         "index 5 is out of range for axis 0 with size 2",
+    )
+
+
+def test_index_enum_range_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_index_enum_range.py"),
+        "index 2 is out of range for axis 0 with size 2",
     )
 
 

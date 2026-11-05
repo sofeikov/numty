@@ -36,6 +36,7 @@ B2x3 = Array2D[Literal[2], Literal[3]]
 
 H: Final = 2
 W: Final = 3
+COL: Final = slice(Slots.X, Slots.Y + 1)
 
 
 def use_2(m: A2) -> None: ...
@@ -532,6 +533,16 @@ def indexing_stays_precise() -> None:
     use_5x4(table[np.arange(5)])
     use_5x10x2(a[ids[:, 0]])
     use_5x3x10x2(a[ids])
+
+
+def enum_index_stays_precise() -> None:
+    table = np.zeros((5, 4))
+    reveal_type(table[..., Slots.X])
+    reveal_type(table[:, COL])
+    use_5(table[..., Slots.X])
+    use_5x2(table[:, COL])
+    use_4(table[Slots.VX - 1, :])
+    use_5(np.zeros((5, 4))[np.arange(5), Slots.Y - 1])
 
 
 def named_dtype_stays_precise() -> None:
