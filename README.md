@@ -51,6 +51,14 @@ c = matmul(np.zeros((2, 3)), np.zeros((3, 4))) + np.zeros((2, 4))  # still known
 np.zeros((2, 3)) + np.zeros((2, 4))  # error: broadcast shapes disagree
 ```
 
+Reshape with size conservation and `-1` inference:
+
+```python
+np.zeros((2, 3)).reshape((3, -1))  # known to be 3x2
+np.zeros((2, 3)).reshape((2, 4))   # error: reshape changes total size: 6 -> 8
+np.zeros((2, 3)).reshape((4, -1))   # error: reshape cannot infer -1
+```
+
 ## Quickstart
 
 ```sh
@@ -61,7 +69,7 @@ uv pip install mypy numpy pytest
 ```sh
 PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
 uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: 10 runtime + 7 mypy-driven
+uv run pytest                      # full suite: 12 runtime + 11 mypy-driven
 ```
 
 ## How it works
@@ -72,7 +80,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, and `+`/`*`, solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, `+`/`*`, and `reshape`, solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `Array1D`,
@@ -106,8 +114,11 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error.
-- No broadcasting of matmul batch dims yet, no `reshape` validation —
-  see roadmap. Mixed-dtype `+`/`*` bail out instead of promoting.
+- No broadcasting of matmul batch dims yet — see roadmap. Mixed-dtype
+  `+`/`*` bail out instead of promoting.
+- On lines the solver rejects, mypy may add its own follow-on error next
+  to ours (an overload complaint for tuple `reshape`, `Unsupported
+  operand` for broadcast ops). Ours is the readable one.
 - The `@` operator is accepted but unchecked: operator dispatch consulted
   the method hook inconsistently in testing, so only the `matmul()`
   wrapper solves. Same for reflected ops and non-`float64` dtypes.
@@ -132,5 +143,4 @@ use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
 
 ## Roadmap
 
-`reshape` validation (size conservation, `-1` inference), then broadcasting
-matmul batch dims and mixed-dtype promotion.
+Broadcasting matmul batch dims, then mixed-dtype promotion.

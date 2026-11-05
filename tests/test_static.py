@@ -92,6 +92,52 @@ def test_good_path_precision_visible() -> None:
     result = run_mypy(FIXTURES / "static_ok.py")
     assert result.returncode == 0, result.stdout
     notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
-    assert len(notes) == 3, result.stdout
+    assert len(notes) == 4, result.stdout
     assert any("tuple[Literal[2], Literal[4]]" in line for line in notes), result.stdout
     assert any("tuple[Literal[2], Literal[3]]" in line for line in notes), result.stdout
+    assert any("tuple[Literal[3], Literal[2]]" in line for line in notes), result.stdout
+
+
+def assert_reshape_mismatch(result: "subprocess.CompletedProcess[str]", *fragments: str) -> None:
+    """Our solver message, plus mypy's own overload error on top."""
+    assert result.returncode == 1, result.stdout
+    ours = [line for line in result.stdout.splitlines() if fragments[0] in line]
+    assert len(ours) == 1, result.stdout
+    for fragment in fragments[1:]:
+        assert fragment in ours[0], result.stdout
+    rest = [line for line in result.stdout.splitlines() if ": error:" in line and line not in ours]
+    assert rest and all('"reshape"' in line for line in rest), result.stdout
+
+
+def test_reshape_size_mismatch() -> None:
+    assert_reshape_mismatch(
+        run_mypy(FIXTURES / "bad_reshape_size.py"),
+        "reshape changes total size: 6 -> 8",
+        "(2, 3)",
+        "(2, 4)",
+    )
+
+
+def test_reshape_minus1_mismatch() -> None:
+    assert_reshape_mismatch(
+        run_mypy(FIXTURES / "bad_reshape_minus1.py"),
+        "reshape cannot infer -1",
+        "6",
+        "4",
+    )
+
+
+def test_reshape_varargs_mismatch() -> None:
+    # Varargs match the (size1, size2) overload cleanly, so only our
+    # solver speaks up; the tuple form also draws mypy's overload blame.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_reshape_varargs.py"),
+        "reshape changes total size: 8 -> 10",
+    )
+
+
+def test_reshape_two_minus1_mismatch() -> None:
+    assert_reshape_mismatch(
+        run_mypy(FIXTURES / "bad_reshape_two_minus1.py"),
+        "reshape accepts only one -1 dimension",
+    )

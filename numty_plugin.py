@@ -1,4 +1,4 @@
-"""mypy plugin: precise numpy shapes for constructors and matmul.
+"""mypy plugin: precise numpy shapes for constructors, matmul, and friends.
 
 mypy-only, registered in mypy.ini. Without the plugin, numty.py still
 checks with plain annotations; only the general solving below is lost
@@ -16,6 +16,9 @@ What it does:
 - __add__/__mul__ unify operand shapes with NumPy broadcast rules, so
   precision survives whole function bodies. Scalars pass through;
   unknown dims bail out.
+- reshape (method and np.reshape) checks total-size conservation and
+  infers a single -1, returning the precise new shape. Anything dynamic
+  bails out.
 """
 from __future__ import annotations
 
@@ -55,6 +58,10 @@ class NumtyPlugin(Plugin):
         # Any), so solve at our own wrapper instead.
         if fullname == "numty.matmul":
             return matmul_hook
+        # np.reshape lives in numpy._core.fromnumeric; match the tail like
+        # the constructors above.
+        if fullname.startswith("numpy.") and short == "reshape":
+            return reshape_function_hook
         return None
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
@@ -70,6 +77,8 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__rmul__",
         }:
             return broadcast_method_hook
+        if fullname == "numpy.ndarray.reshape":
+            return reshape_method_hook
         return None
 
 
@@ -264,3 +273,107 @@ def broadcast_method_hook(ctx: MethodContext) -> Type:
     if args is None:
         return ctx.default_return_type
     return _solve_broadcast(ctx, ctx.type, args[0])
+
+
+STR_FULLNAME = "builtins.str"
+
+
+def _reshape_new_dims(positionals: list[Type]) -> list[int] | None:
+    """Target dims from leading positional reshape args, else None to bail.
+
+    Accepts one tuple (reshape((2, 4))), one int (reshape(6)), or several
+    ints (reshape(2, 4)). A positional order= string (np.reshape(a, shape,
+    "F")) ends the scan; anything else unknown bails out.
+    """
+    if not positionals:
+        return None
+    first = get_proper_type(positionals[0])
+    if isinstance(first, TupleType):
+        return _shape_dims(first)
+    dims: list[int] = []
+    for tp in positionals:
+        proper = get_proper_type(tp)
+        if isinstance(proper, Instance) and proper.type.fullname == STR_FULLNAME:
+            break
+        value = _int_value(tp)
+        if value is None:
+            return None
+        dims.append(value)
+    return dims or None
+
+
+def _solve_reshape(
+    ctx: FunctionContext | MethodContext, old: Type, positionals: list[Type]
+) -> Type:
+    parts = _ndarray_parts(old)
+    if parts is None:
+        return ctx.default_return_type
+    dims_old, dtype = parts
+    raw = _reshape_new_dims(positionals)
+    if raw is None:
+        return ctx.default_return_type
+    if any(d < -1 for d in raw):
+        ctx.api.fail(
+            f"reshape has invalid dimension {min(raw)}; only -1 may be negative "
+            f"(shape {tuple(raw)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    if raw.count(-1) > 1:
+        ctx.api.fail(
+            f"reshape accepts only one -1 dimension (shape {tuple(raw)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    size_old = 1
+    for d in dims_old:
+        size_old *= d
+    dims_new: list[int] | None
+    if -1 in raw:
+        known = 1
+        for d in raw:
+            if d != -1:
+                known *= d
+        if known == 0 or size_old % known != 0:
+            ctx.api.fail(
+                f"reshape cannot infer -1: total size {size_old} is not divisible "
+                f"by {known} (shape {tuple(raw)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        inferred = size_old // known
+        dims_new = [inferred if d == -1 else d for d in raw]
+    else:
+        size_new = 1
+        for d in raw:
+            size_new *= d
+        if size_new != size_old:
+            ctx.api.fail(
+                f"reshape changes total size: {size_old} -> {size_new} "
+                f"(shapes {tuple(dims_old)} vs {tuple(raw)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        dims_new = raw
+    return _ndarray_type(ctx, dims_new, dtype)
+
+
+def _all_positionals(ctx: FunctionContext | MethodContext) -> list[Type]:
+    """Every positional actual in call order (formals after / keep order)."""
+    out: list[Type] = []
+    for kinds, types in zip(ctx.arg_kinds, ctx.arg_types):
+        for kind, tp in zip(kinds, types):
+            if kind == ARG_POS:
+                out.append(tp)
+    return out
+
+
+def reshape_method_hook(ctx: MethodContext) -> Type:
+    return _solve_reshape(ctx, ctx.type, _all_positionals(ctx))
+
+
+def reshape_function_hook(ctx: FunctionContext) -> Type:
+    positionals = _all_positionals(ctx)
+    if len(positionals) < 2:
+        return ctx.default_return_type
+    return _solve_reshape(ctx, positionals[0], positionals[1:])

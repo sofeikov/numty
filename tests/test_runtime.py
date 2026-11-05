@@ -52,3 +52,16 @@ def test_narrow_rejects_mismatch() -> None:
 def test_ident_returns_same_object() -> None:
     a = np.zeros((2, 3))
     assert ident(a) is a
+
+
+def test_reshape_keeps_values() -> None:
+    a = np.arange(6, dtype=np.float64).reshape(2, 3)
+    np.testing.assert_array_equal(a.reshape((3, 2)), np.arange(6, dtype=np.float64).reshape(3, 2))
+    assert a.reshape(3, 2).shape == (3, 2)
+    assert np.reshape(a, (6,)).shape == (6,)
+
+
+def test_reshape_minus1_infers() -> None:
+    a = np.zeros((2, 3))
+    assert a.reshape((3, -1)).shape == (3, 2)
+    assert a.reshape(-1).shape == (6,)
