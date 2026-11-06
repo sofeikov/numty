@@ -740,6 +740,13 @@ def test_concat_dynamic_length_targeted() -> None:
     )
 
 
+def test_mask_dynamic_count_targeted() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mask_dynamic.py"),
+        "boolean mask indexing selects a data-dependent count",
+    )
+
+
 def test_sklearn_gnb_stack_dynamic_length() -> None:
     # Correct code hitting a solver gap (see #1 triage → #12): np.stack
     # over a loop-built list has no statically known length, so the hook

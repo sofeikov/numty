@@ -3666,8 +3666,15 @@ def _solve_getitem(
                 fancy_emitted = True
             dim += 1
         elif kind == "mask":
-            # Boolean masks select a data-dependent count: bail out.
-            return ctx.default_return_type
+            # Boolean masks select a data-dependent count, unknowable
+            # statically: fail loudly at the indexing site instead of
+            # poisoning downstream with a silent Any.
+            ctx.api.fail(
+                "boolean mask indexing selects a data-dependent count "
+                "(preallocate or ignore)",
+                ctx.context,
+            )
+            return AnyType(TypeOfAny.from_error)
         elif kind == "badindex":
             ctx.api.fail(
                 "arrays used as indices must be of integer (or boolean) type",
