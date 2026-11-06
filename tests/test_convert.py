@@ -276,4 +276,4 @@ def test_e2e_seeded_bias_bug_is_caught(tmp_path: Path) -> None:
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 1, result.stdout
     assert "call-site shape conflict for 'HID'" in errors[0], result.stdout
-    assert "8 (argument 'w1') vs 2 (argument 'b2')" in errors[0], result.stdout
+    assert "8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)" in errors[0], result.stdout

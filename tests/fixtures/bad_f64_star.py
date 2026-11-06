@@ -1,4 +1,4 @@
-"""Misuse: jaxtyping-style *Ts needs a name the solver can see."""
+"""Misuse: jaxtyping-style *Ts star syntax; the solver needs Unpack[Ts]."""
 from typing import TypeVarTuple
 
 import numpy as np

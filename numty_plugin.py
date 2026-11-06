@@ -197,7 +197,7 @@ class NumtyPlugin(Plugin):
         formals = _shape_tvar_formals(sig)
         if not formals or len(ctx.args) != len(sig.arg_types):
             return sig
-        by_var: dict[str, tuple[str, list[tuple[str, int]]]] = {}
+        by_var: dict[str, tuple[str, list[tuple[str, int, int]]]] = {}
         for i, positions in formals:
             actuals = ctx.args[i]
             if len(actuals) != 1:
@@ -215,16 +215,16 @@ class NumtyPlugin(Plugin):
                 if dim >= len(adims) or not isinstance(adims[dim], int):
                     continue
                 name, occs = by_var.get(tvar.fullname, (tvar.name, []))
-                occs.append((formal_name, adims[dim]))
+                occs.append((formal_name, dim, adims[dim]))
                 by_var[tvar.fullname] = (name, occs)
         for _, (name, occs) in by_var.items():
             first = occs[0]
             for other in occs[1:]:
-                if other[1] != first[1]:
+                if other[2] != first[2]:
                     message = (
                         f"call-site shape conflict for '{name}': "
-                        f"{first[1]} (argument '{first[0]}') vs "
-                        f"{other[1]} (argument '{other[0]}')"
+                        f"{first[2]} (argument '{first[0]}', axis {first[1]}) vs "
+                        f"{other[2]} (argument '{other[0]}', axis {other[1]})"
                     )
                     key = (ctx.api.path, ctx.context.line, message)
                     if key not in self._seen_conflicts:
@@ -369,7 +369,7 @@ class NumtyPlugin(Plugin):
         if isinstance(arg, UnpackType):
             if arg.from_star_syntax:
                 raise _FamFail(
-                    f"{head} *Ts needs a name for the solver;"
+                    f"{head} star syntax (*Ts) is not supported;"
                     " write Unpack[Ts] instead"
                 )
             return arg
@@ -539,6 +539,18 @@ class NumtyPlugin(Plugin):
             )
         analyzed = ctx.api.analyze_type(arg)
         if isinstance(analyzed, TypeVarType):
+            upper = get_proper_type(analyzed.upper_bound)
+            if (
+                not analyzed.values
+                and isinstance(upper, Instance)
+                and upper.type.fullname == "builtins.object"
+            ):
+                # numpy bounds the shape at tuple[int, ...]: an unbounded
+                # TypeVar can never fit, and mypy's own error blames numpy.
+                raise _FamFail(
+                    f'{head} dim "{arg.name}" is a TypeVar without an int bound;'
+                    f' declare it as TypeVar("{arg.name}", bound=int)'
+                )
             return analyzed
         if isinstance(analyzed, TypeVarTupleType):
             return UnpackType(analyzed)
@@ -546,6 +558,17 @@ class NumtyPlugin(Plugin):
             if analyzed.type_of_any == TypeOfAny.from_error:
                 raise _FamBail
             return analyzed
+        if isinstance(analyzed, UnboundType):
+            analyzer = cast(TypeAnalyser, ctx.api)
+            sym = analyzer.lookup_qualified(arg.name, arg, suppress_errors=True)
+            if (
+                sym is not None
+                and isinstance(sym.node, TypeVarLikeExpr)
+                and not analyzer.allow_unbound_tvars
+            ):
+                # A TypeVar used outside any scope that binds it: mypy has
+                # already said 'Type variable "X" is unbound', with hints.
+                raise _FamBail
         value = _dim_value(get_proper_type(analyzed))
         if isinstance(value, int):
             return value  # Final / literal-valued name
@@ -1050,7 +1073,9 @@ def _expr_str(form: _LinForm | _DivForm) -> str:
         return out
     parts = []
     for fullname, coeff in form.coeffs:
-        short = fullname.rsplit(".", 1)[-1]
+        # Unknowns carry a display name (?U@line); their fullname is an
+        # internal site key that must never reach a message.
+        short = _unknown_names.get(fullname) or fullname.rsplit(".", 1)[-1]
         if coeff == 1:
             parts.append(short)
         elif coeff == -1:
@@ -3309,8 +3334,8 @@ def split_function_hook(ctx: FunctionContext) -> Type:
         if isinstance(dim, int):
             if dim % sections != 0:
                 ctx.api.fail(
-                    "split array split does not result in an equal division "
-                    f"(size {dim} into {sections})",
+                    f"split cannot divide axis {target} of size {dim} into "
+                    f"{sections} equal sections (shape {_dims_str(dims)})",
                     ctx.context,
                 )
                 return ctx.default_return_type
@@ -3955,6 +3980,33 @@ def _regroup_run(
 
 
 _unknown_ids: dict[str, TypeVarId] = {}
+# Display names of unknowns by fullname, and how many distinct unknowns
+# each (module, line) has minted. Names only: identity stays the id.
+_unknown_names: dict[str, str] = {}
+_unknown_per_line: dict[tuple[str, int], int] = {}
+
+
+def _unknown_display_name(module: str, line: int, fullname: str) -> str:
+    """Readable, per-site name for an unknown: ?U@14, then ?U@14b, ...
+
+    Named after the line that minted it, so unrelated unknowns print
+    differently and the name points at its source; a second distinct
+    site on the same line gets a letter suffix. Stable per site, like
+    the id, so re-checks and overload candidates print identically.
+    """
+    name = _unknown_names.get(fullname)
+    if name is None:
+        n = _unknown_per_line.get((module, line), 0)
+        _unknown_per_line[(module, line)] = n + 1
+        if n == 0:
+            suffix = ""
+        elif n < 26:
+            suffix = chr(ord("a") + n)
+        else:
+            suffix = f"_{n + 1}"
+        name = f"?U@{line}{suffix}"
+        _unknown_names[fullname] = name
+    return name
 
 
 def _fresh_unknown(
@@ -3981,10 +4033,11 @@ def _fresh_unknown(
     if vid is None:
         vid = TypeVarId.new(0)
         _unknown_ids[key] = vid
+    fullname = f"__numty_unknown__.{key}"
     upper = ctx.api.named_generic_type("builtins.int", [])
     return TypeVarType(
-        name=f"?U{index}",
-        fullname=f"__numty_unknown__.{key}",
+        name=_unknown_display_name(module, line, fullname),
+        fullname=fullname,
         id=vid,
         values=[],
         upper_bound=upper,

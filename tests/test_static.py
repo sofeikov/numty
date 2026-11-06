@@ -589,8 +589,19 @@ def test_f64_callsite_conflict() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_conflict.py"),
         "call-site shape conflict for 'hid'",
-        "8 (argument 'x') vs 2 (argument 'y')",
+        "8 (argument 'x', axis 0) vs 2 (argument 'y', axis 0)",
     )
+
+
+def test_f64_callsite_same_argument_names_axes() -> None:
+    # One argument, two axes: the axes are what tell the sides apart.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_callsite_same_arg.py"),
+        "call-site shape conflict for 'seq'",
+        "4 (argument 'x', axis 0) vs 5 (argument 'x', axis 1)",
+    )
+    # numpy runs it anyway: the square annotation is what is violated.
+    assert _run_fixture("bad_callsite_same_arg.py") == ["(4,)"]
 
 
 def test_f64_return_mismatch() -> None:
@@ -636,9 +647,25 @@ def test_f64_undeclared_name() -> None:
 def test_f64_star_redirect() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_star.py"),
-        "F64 *Ts needs a name for the solver",
+        "F64 star syntax (*Ts) is not supported",
         "write Unpack[Ts] instead",
     )
+
+
+def test_f64_unbounded_typevar() -> None:
+    # numpy's own [type-var] error would blame its tuple[int, ...] bound.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_unbounded.py"),
+        'F64 dim "M" is a TypeVar without an int bound',
+        'declare it as TypeVar("M", bound=int)',
+    )
+
+
+def test_f64_unbound_typevar_reported_once() -> None:
+    # mypy already explains the unbound TypeVar; no second, wrong reason.
+    result = run_mypy(FIXTURES / "bad_f64_unbound.py")
+    assert_single_error(result, 'Type variable "numty.batch" is unbound')
+    assert "must be a TypeVar" not in result.stdout, result.stdout
 
 
 def test_f64_str_ok_clean_and_runs() -> None:
@@ -664,7 +691,7 @@ def test_f64_str_callsite_conflict() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_str_conflict.py"),
         "call-site shape conflict for 'hid'",
-        "8 (argument 'x') vs 2 (argument 'y')",
+        "8 (argument 'x', axis 0) vs 2 (argument 'y', axis 0)",
     )
 
 
@@ -672,7 +699,7 @@ def test_f64_str_matmul_dim_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_str_matmul.py"),
         "call-site shape conflict for 'dim2'",
-        "4 (argument 'x') vs 5 (argument 'y')",
+        "4 (argument 'x', axis 1) vs 5 (argument 'y', axis 0)",
     )
 
 
@@ -765,9 +792,47 @@ def test_unknown_concrete_boundary() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_unknown_concrete.py"),
         "Incompatible types in assignment",
-        "tuple[?U0, M]",
+        "tuple[?U@13, M]",
         "tuple[Literal[3], M]",
     )
+
+
+def _run_fixture(name: str) -> list[str]:
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / name)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    return run.stdout.strip().splitlines()
+
+
+def test_unknown_names_distinct_and_readable() -> None:
+    # Unrelated unknowns are named after the line that minted them, and
+    # formulas over them never print the internal site key.
+    result = run_mypy(FIXTURES / "unknown_names_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 2, result.stdout
+    assert "tuple[?U@17, ?U@18]" in notes[0], result.stdout
+    assert "tuple[?U@24+2]" in notes[1], result.stdout
+    assert "_mask_" not in result.stdout and "__numty" not in result.stdout
+    # numpy agrees the outer product is not square.
+    assert _run_fixture("unknown_names_ok.py") == ["(4, 3)", "(5,)"]
+
+
+def test_unknown_formula_in_error_is_readable() -> None:
+    result = run_mypy(FIXTURES / "bad_unknown_pad_return.py")
+    assert_single_error(
+        result,
+        "Incompatible return value",
+        "tuple[?U@12+2, Literal[3]]",
+        "tuple[N, Literal[3]]",
+    )
+    assert "_mask_" not in result.stdout, result.stdout
+    # The annotation really is violated: 4 rows in, 6 out.
+    assert _run_fixture("bad_unknown_pad_return.py") == ["(6, 3)"]
 
 
 def test_sklearn_gnb_stack_dynamic_length() -> None:
@@ -1108,7 +1173,7 @@ def test_pad_len_mismatch() -> None:
 def test_split_equal_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_split_equal.py"),
-        "split array split does not result in an equal division (size 4 into 3)",
+        "split cannot divide axis 0 of size 4 into 3 equal sections (shape (4,))",
     )
 
 
