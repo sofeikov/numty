@@ -692,6 +692,56 @@ def test_f64_str_empty_rejected() -> None:
     )
 
 
+def test_sklearn_nmf_clean_and_runs() -> None:
+    pytest.importorskip("sklearn")
+    result = run_mypy(FIXTURES / "sklearn_nmf.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "sklearn_nmf.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(30, 5)"]
+
+
+def test_sklearn_normalize_clean_and_runs() -> None:
+    pytest.importorskip("sklearn")
+    result = run_mypy(FIXTURES / "sklearn_normalize.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "sklearn_normalize.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(25, 7)"]
+
+
+def test_sklearn_gnb_known_stack_gap() -> None:
+    # Correct code hitting a solver gap (see #1 triage): np.stack over a
+    # loop-built list has no statically known length, so the hook bails
+    # to Any and the imprecise result errors at assignment + return.
+    # Pinned as the known signature of that gap, not as desired behavior.
+    pytest.importorskip("sklearn")
+    result = run_mypy(FIXTURES / "sklearn_gnb.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert "Incompatible types in assignment" in errors[0], result.stdout
+    assert "Incompatible return value type" in errors[1], result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "sklearn_gnb.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(40, 3)"]
+
+
 def test_sklearn_ridge_clean_and_runs() -> None:
     # Optional corpus dependency: the annotated sklearn excerpt only runs
     # where sklearn is installed; elsewhere the dogfood is skipped, never red.

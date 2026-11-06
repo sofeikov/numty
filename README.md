@@ -33,16 +33,16 @@ def solve_cholesky(
     n_features = X.shape[1]
     n_targets = y.shape[1]
 
-    A = np.matmul(X.transpose(), X)     # (n_features, n_features)
-    Xy = np.matmul(X.transpose(), y)    # (n_features, n_targets)
+    A = np.matmul(X.T, X)     # (n_features, n_features)
+    Xy = np.matmul(X.T, y)    # (n_features, n_targets)
 
     one_alpha = np.array_equal(alpha, len(alpha) * [alpha[0]])
 
     if one_alpha:
         A.flat[:: n_features + 1] += alpha[0]
-        return np.linalg.solve(A, Xy).transpose()
+        return np.linalg.solve(A, Xy).T
     coefs = np.empty([n_targets, n_features], dtype=X.dtype)
-    for coef, target, current_alpha in zip(coefs, Xy.transpose(), alpha):
+    for coef, target, current_alpha in zip(coefs, Xy.T, alpha):
         A.flat[:: n_features + 1] += current_alpha
         coef[:] = np.linalg.solve(A, target).ravel()
         A.flat[:: n_features + 1] -= current_alpha
@@ -61,7 +61,7 @@ Success: no issues found in 1 source file
 Adaptations, all documented in the file: dense path only,
 `safe_sparse_dot` → `np.matmul` (plain `@` is unchecked by design —
 only the named call solves), `scipy.linalg.solve` →
-`numpy.linalg.solve`, `.T` → `.transpose()`, unweighted means. Pass a
+`numpy.linalg.solve`, unweighted means. Pass a
 wrongly-sized target and the mistake sklearn raises `ValueError` for at
 runtime is caught before anything runs:
 

@@ -9,7 +9,6 @@ Adaptations, dense path only (identical results on dense float64 input):
 - `safe_sparse_dot(a, b)` -> `np.matmul(a, b)` (same product on
   dense arrays; plain `@` is unchecked, only the named call solves)
 - `scipy.linalg.solve` -> `numpy.linalg.solve` (same LAPACK driver)
-- `.T` -> `.transpose()` (numpy's own stub doesn't track `.T` yet)
 - unweighted means instead of sample-weighted `_average`
 - `y` is always 2D here (sklearn reshapes 1D `y` first; same code)
 - `solve` kwargs (`assume_a`, `overwrite_a`) dropped (perf hints only)
@@ -54,16 +53,16 @@ def solve_cholesky(
     n_features = X.shape[1]
     n_targets = y.shape[1]
 
-    A = np.matmul(X.transpose(), X)
-    Xy = np.matmul(X.transpose(), y)
+    A = np.matmul(X.T, X)
+    Xy = np.matmul(X.T, y)
 
     one_alpha = np.array_equal(alpha, len(alpha) * [alpha[0]])
 
     if one_alpha:
         A.flat[:: n_features + 1] += alpha[0]
-        return np.linalg.solve(A, Xy).transpose()
+        return np.linalg.solve(A, Xy).T
     coefs = np.empty([n_targets, n_features], dtype=X.dtype)
-    for coef, target, current_alpha in zip(coefs, Xy.transpose(), alpha):
+    for coef, target, current_alpha in zip(coefs, Xy.T, alpha):
         A.flat[:: n_features + 1] += current_alpha
         coef[:] = np.linalg.solve(A, target).ravel()
         A.flat[:: n_features + 1] -= current_alpha
@@ -77,7 +76,7 @@ def fit_ridge(
 ) -> tuple[F64["n_targets n_features"], F64["n_targets"]]:
     Xc, yc, X_offset, y_offset = center(X, y)
     coef = solve_cholesky(Xc, yc, alpha)
-    intercept = y_offset - np.matmul(X_offset, coef.transpose())
+    intercept = y_offset - np.matmul(X_offset, coef.T)
     return coef, intercept
 
 
