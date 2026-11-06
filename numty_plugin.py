@@ -19,10 +19,12 @@ What it does:
   precision survives whole function bodies. Scalars pass through;
   unknown dims bail out.
 - reshape (method and np.reshape) checks total-size conservation and
-  infers a single -1, returning the precise new shape. Over *Ts only
-  block-preserving regroups resolve (the unknown middle stays put; -1
-  would absorb it, so it bails), with provable int-only total clashes
-  failing loudly. Anything dynamic bails out.
+  infers a single -1, returning the precise new shape. A -1 over
+  symbolic sizes mints an unknown for the inferred dim, and same-total
+  renames track as-is (legality stays unchecked, never an error). Over
+  *Ts only block-preserving regroups resolve (the unknown middle stays
+  put; -1 would absorb it, so it bails), with provable int-only total
+  clashes failing loudly. Anything dynamic bails out.
 - rank-changing ops (transpose, .T, squeeze, expand_dims, sum/prod/mean
   and friends) track the new shape; transpose reversal over *Ts keeps
   the unknown block ordered in place (explicit axes bail). No-axis
@@ -36,9 +38,9 @@ What it does:
 - comparisons broadcast shapes and return bool arrays; argmax/argsort
   drop or keep the axis; Generator/RandomState methods solve from size=.
 - getitem solves integer-array (fancy) indices and take_along_axis;
-  boolean masks bail (data-dependent count), float indices error. Over
-  *Ts, leading items consume the known prefix without an ellipsis
-  (rank-generic bodies still spell the ellipsis for the middle).
+  boolean masks track the axis with a fresh unknown (?U), float indices
+  error. Over *Ts, leading items consume the known prefix without an
+  ellipsis (rank-generic bodies still spell the ellipsis for the middle).
 - dims may be symbolic TypeVars: same name unifies, ranks and counts
   still check, and anything needing values bails instead of erroring.
 - arithmetic operators (-, /, **) and bare ufuncs (np.sqrt, np.add, ...)
@@ -110,6 +112,7 @@ from mypy.types import (
     TupleType,
     Type,
     TypeOfAny,
+    TypeVarId,
     TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
@@ -2138,6 +2141,46 @@ def _regroup_run(
     return list(run_new)
 
 
+_unknown_ids: dict[str, TypeVarId] = {}
+
+
+def _fresh_unknown(
+    ctx: FunctionContext | MethodContext, role: str, index: int
+) -> TypeVarType:
+    """A fresh unknown dim, stable per source site across passes.
+
+    Data-dependent sizes (mask counts, dynamic lengths, uninferable
+    reshapes) cannot be spelled, but their positions are known: mint a
+    variable for the position instead of failing or bailing. Site-keyed
+    (target + line + column + role + index) so overload candidates and
+    re-checks mint the identical variable — differing ids would look
+    like disagreement to overload resolution and collapse to Any.
+    Unknowns unify with anything, so they dissolve precision but can
+    never produce a false error; ranks and known dims keep checking
+    around them.
+    """
+    tree = getattr(ctx.api, "tree", None)
+    module = getattr(tree, "fullname", "") or ""
+    line = ctx.context.line
+    column = ctx.context.column
+    key = f"{module}_{line}_{column}_{role}_{index}"
+    vid = _unknown_ids.get(key)
+    if vid is None:
+        vid = TypeVarId.new(0)
+        _unknown_ids[key] = vid
+    upper = ctx.api.named_generic_type("builtins.int", [])
+    return TypeVarType(
+        name=f"?U{index}",
+        fullname=f"__numty_unknown__.{key}",
+        id=vid,
+        values=[],
+        upper_bound=upper,
+        default=AnyType(TypeOfAny.from_omitted_generics),
+        line=line,
+        column=column,
+    )
+
+
 def _solve_reshape_unpack(
     ctx: FunctionContext | MethodContext,
     prefix: list[int | Type],
@@ -2268,8 +2311,14 @@ def _solve_reshape(
                 known *= d
         if old_vars != new_vars:
             # The inferred dim would absorb a symbolic size (N * 50 is not
-            # expressible), so this stays out of scope instead of erroring.
-            return ctx.default_return_type
+            # expressible): track it with a fresh unknown instead of
+            # bailing. Requested ints stay (they hold by construction);
+            # only the -1 is unknowable.
+            return _ndarray_type(
+                ctx,
+                [_fresh_unknown(ctx, "reshape", j) if d == -1 else d for j, d in enumerate(raw)],
+                dtype,
+            )
         if known == 0 or size_old % known != 0:
             detail = (
                 f"(shape {_dims_str(dims_old)} vs {raw_str})"
@@ -2297,8 +2346,10 @@ def _solve_reshape(
             return ctx.default_return_type
         if old_vars != new_vars:
             # Same int total but different symbolic factors (N vs M): the
-            # equality is unprovable, so bail out instead of erroring.
-            return ctx.default_return_type
+            # equality is unprovable, but the requested shape holds by
+            # construction when it is legal at all, so track it instead
+            # of bailing. Legality itself stays unchecked, never an error.
+            return _ndarray_type(ctx, list(raw), dtype)
         dims_new = raw
     return _ndarray_type(ctx, dims_new, dtype)
 
@@ -3333,6 +3384,23 @@ def _single_axis_value(pair: tuple[Type, Expression | None]) -> int | None | str
     return vals[0]
 
 
+def _dynamic_sequence_element(tp: Type) -> tuple[list[int | Type], Type] | None:
+    """(dims, dtype) of a homogeneous dynamically-built sequence's items.
+
+    A loop-built list[T] has unknowable length but a known element
+    type; anything else (bare lists, generators, unknown elements)
+    stays unprovable.
+    """
+    proper = get_proper_type(tp)
+    if not (
+        isinstance(proper, Instance)
+        and proper.type.fullname == "builtins.list"
+        and proper.args
+    ):
+        return None
+    return _ndarray_parts(proper.args[0])
+
+
 def concatenate_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -3340,6 +3408,9 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
+            elem = _dynamic_sequence_element(pairs[0][0])
+            if elem is not None:
+                return _concat_dynamic(ctx, pairs, elem)
             ctx.api.fail(
                 "concatenate needs a sequence of known length "
                 "(built dynamically; preallocate or ignore)",
@@ -3405,6 +3476,73 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, dtype)
 
 
+def _dynamic_explicit_dtype(
+    ctx: FunctionContext, fallback: Type
+) -> Type | None:
+    """User's explicit dtype when given and resolvable, else fallback."""
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return None
+        return named
+    return fallback
+
+
+def _concat_dynamic(
+    ctx: FunctionContext,
+    pairs: list[tuple[Type, Expression | None]],
+    elem: tuple[list[int | Type], Type],
+) -> Type:
+    """Concatenate of a homogeneous dynamic sequence: rank is known
+    from the element type, only the axis length is unknowable."""
+    dims_e, dtype_e = elem
+    dtype = _dynamic_explicit_dtype(ctx, dtype_e)
+    if dtype is None:
+        return ctx.default_return_type
+    axis = _concat_axis(ctx, pairs)
+    if axis is None or not isinstance(axis, int):
+        if axis == "none":
+            return _ndarray_type(ctx, [_fresh_unknown(ctx, "concat", 0)], dtype)
+        return ctx.default_return_type
+    norm = _normalize_axis(axis, len(dims_e))
+    if norm is None:
+        ctx.api.fail(
+            f"concatenate axis {axis} is out of range for {len(dims_e)} dimensions",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out = list(dims_e)
+    out[norm] = _fresh_unknown(ctx, "concat", norm)
+    return _ndarray_type(ctx, out, dtype)
+
+
+def _stack_dynamic(
+    ctx: FunctionContext,
+    pairs: list[tuple[Type, Expression | None]],
+    elem: tuple[list[int | Type], Type],
+) -> Type:
+    """Stack of a homogeneous dynamic sequence: the new axis holds the
+    unknowable sequence length, every other dim rides the element."""
+    dims_e, dtype_e = elem
+    dtype = _dynamic_explicit_dtype(ctx, dtype_e)
+    if dtype is None:
+        return ctx.default_return_type
+    axis = _concat_axis(ctx, pairs)
+    if axis is None or axis == "none" or not isinstance(axis, int):
+        return ctx.default_return_type
+    ndim = len(dims_e)
+    norm = axis + ndim + 1 if axis < 0 else axis
+    if not 0 <= norm <= ndim:
+        ctx.api.fail(
+            f"stack axis {axis} is out of range for {ndim} dimensions",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out = list(dims_e)
+    out.insert(norm, _fresh_unknown(ctx, "stack", norm))
+    return _ndarray_type(ctx, out, dtype)
+
+
 def stack_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -3412,6 +3550,9 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
+            elem = _dynamic_sequence_element(pairs[0][0])
+            if elem is not None:
+                return _stack_dynamic(ctx, pairs, elem)
             ctx.api.fail(
                 "stack needs a sequence of known length "
                 "(built dynamically; preallocate or ignore)",
@@ -3754,7 +3895,7 @@ def _parse_index_item(
         if kind in ("i", "u"):
             return ("fancy0d",) if not part[0] else ("fancy", part[0])
         if kind == "b":
-            return ("mask",)
+            return ("mask", len(part[0]))
         return ("badindex",)
     if isinstance(expr, SliceExpr):
         begin = _fold_index_bound(ctx, expr.begin_index)
@@ -4055,15 +4196,19 @@ def _solve_getitem(
                 fancy_emitted = True
             dim += 1
         elif kind == "mask":
-            # Boolean masks select a data-dependent count, unknowable
-            # statically: fail loudly at the indexing site instead of
-            # poisoning downstream with a silent Any.
-            ctx.api.fail(
-                "boolean mask indexing selects a data-dependent count "
-                "(preallocate or ignore)",
-                ctx.context,
-            )
-            return AnyType(TypeOfAny.from_error)
+            # Boolean masks select a data-dependent count: track the axis
+            # with a fresh unknown instead of failing. A 0-d mask adds a
+            # leading axis (newaxis); combined advanced indices collapse
+            # to one block whose rank is unknowable, so bail there.
+            if sum(1 for it in items if it[0] in ("fancy", "mask")) > 1:
+                return ctx.default_return_type
+            if item[1] == 0:
+                out.append(1)
+            else:
+                if dim >= len(dims):
+                    return ctx.default_return_type
+                out.append(_fresh_unknown(ctx, "mask", dim))
+                dim += 1
         elif kind == "badindex":
             ctx.api.fail(
                 "arrays used as indices must be of integer (or boolean) type",

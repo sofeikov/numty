@@ -733,17 +733,39 @@ def test_chained_block_clean_and_runs() -> None:
     assert run.stdout.strip().splitlines() == ["(5, 7, 16)"]
 
 
-def test_concat_dynamic_length_targeted() -> None:
+def test_unknown_ok_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "unknown_ok.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "unknown_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["ok"]
+
+
+def test_unknown_rank_still_errors() -> None:
     assert_single_error(
-        run_mypy(FIXTURES / "bad_concat_dynamic.py"),
-        "concatenate needs a sequence of known length",
+        run_mypy(FIXTURES / "bad_unknown_rank.py"),
+        "matmul inner dimensions disagree: 4 vs 5",
     )
 
 
-def test_mask_dynamic_count_targeted() -> None:
+def test_dynamic_concat_axis_oob() -> None:
     assert_single_error(
-        run_mypy(FIXTURES / "bad_mask_dynamic.py"),
-        "boolean mask indexing selects a data-dependent count",
+        run_mypy(FIXTURES / "bad_dynamic_concat_axis.py"),
+        "concatenate axis 5 is out of range for 2 dimensions",
+    )
+
+
+def test_unknown_concrete_boundary() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_unknown_concrete.py"),
+        "Incompatible types in assignment",
+        "tuple[?U0, M]",
+        "tuple[Literal[3], M]",
     )
 
 

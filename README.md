@@ -331,6 +331,34 @@ runs to `(128,) (127, 6)`); the two errors are pinned by
 `tests/fixtures/bad_diff_size.py` and
 `tests/fixtures/bad_named_dims_weights.py`.
 
+## Unknown dims: dynamic shapes stay checkable
+
+Some sizes are unknowable statically — a mask's hit count, a
+loop-built list's length, a `-1` over symbolic dims. Instead of
+failing or dissolving to `Any`, the checker mints a fresh unknown
+per unknowable axis (`?U`) and keeps checking everything around it:
+ranks, known dims, and downstream ops.
+
+```python
+def masked_mean(y: F64[N, M], keep: Bool[N]) -> F64[M]:
+    return np.mean(y[keep], axis=0)   # (?U, M) -> (M,) ✓
+
+def dyn_concat_mean(blocks: list[F64[N, M]]) -> F64[M]:
+    return np.mean(np.concatenate(blocks, axis=0), axis=0)
+```
+
+A rank clash on a *known* dim still fires with the unknown next to it,
+and asserting a concrete size for dynamic data is correctly rejected:
+
+```text
+error: matmul inner dimensions disagree: 4 vs 5
+error: Incompatible types in assignment (expression has type "ndarray[tuple[?U0, M], dtype[float64]]", variable has type "ndarray[tuple[Literal[3], M], dtype[float64]]")
+```
+
+The boundary is principled: unknowns flow through bodies but cannot be
+named in signatures — there is no spelling for "somebody else's count".
+Reduce them, or leave the position to inference.
+
 ## Real generic code, checked end to end
 
 Symbolic dimensions ride TypeVars in the shape tuple — same name means same
