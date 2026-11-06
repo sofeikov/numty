@@ -636,6 +636,18 @@ class NumtyPlugin(Plugin):
             return reduction_function_hook
         if fullname.startswith("numpy.") and short == "average":
             return average_function_hook
+        if fullname.startswith("numpy.") and short == "dot":
+            return dot_function_hook
+        if fullname.startswith("numpy.") and short == "tensordot":
+            return tensordot_function_hook
+        if fullname.startswith("numpy.") and short == "inner":
+            return inner_function_hook
+        if fullname.startswith("numpy.") and short == "outer":
+            return outer_function_hook
+        if fullname.startswith("numpy.") and short == "vdot":
+            return vdot_function_hook
+        if fullname.startswith("numpy.") and short == "take":
+            return take_function_hook
         if fullname.startswith("numpy.") and short in {"cumsum", "cumprod"}:
             return cumsum_function_hook
         if fullname.startswith("numpy.") and short == "diff":
@@ -845,6 +857,8 @@ class NumtyPlugin(Plugin):
             return reduction_method_hook
         if fullname.startswith("numpy.ndarray.") and short in {"cumsum", "cumprod"}:
             return cumsum_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "take":
+            return take_method_hook
         return None
 
 
@@ -1463,6 +1477,359 @@ def matmul_hook(ctx: FunctionContext) -> Type:
     if args is None:
         return ctx.default_return_type
     return _solve_matmul(ctx, args[0], args[1])
+
+
+def _two_arrays(ctx: FunctionContext) -> tuple[Type, Type] | None:
+    """Two array actuals, formal-mapped when possible, raw otherwise.
+
+    Under overload fallback mypy replays the hook against an erased
+    callee whose formal mapping can be unusual; the actuals are still
+    ours, so read them raw as a last resort. Errors recorded here must
+    survive: the filtered candidate passes discard them.
+    """
+    args = _positional_actuals(ctx, 2)
+    if args is not None:
+        return args[0], args[1]
+    raw: list[Type] = []
+    for kinds, types in zip(ctx.arg_kinds, ctx.arg_types):
+        for kind, tp in zip(kinds, types):
+            if kind == ARG_POS:
+                raw.append(tp)
+    if len(raw) < 2:
+        return None
+    return raw[0], raw[1]
+
+
+def _contract_pair(
+    op: str, x: int | Type, y: int | Type
+) -> tuple[bool, str | None]:
+    """(match, error) for one contracted dim pair.
+
+    Match on equality, error when both ints differ, and (False, None)
+    to bail on anything unprovable. Mirrors _matmul_inner with an
+    op-specific message.
+    """
+    if _dim_eq(x, y):
+        return True, None
+    if isinstance(x, int) and isinstance(y, int):
+        return False, f"{op} contracted dimensions disagree: {x} vs {y}"
+    return False, None
+
+
+def _promoted_scalar(
+    ctx: FunctionContext | MethodContext, dtype_a: Type, dtype_b: Type
+) -> Type:
+    """Scalar of the promoted dtype, else the default return."""
+    promoted = _promoted_result_type(ctx, dtype_a, dtype_b)
+    if promoted is None:
+        return ctx.default_return_type
+    scalar = _scalar_of_dtype(promoted)
+    if scalar is None:
+        return ctx.default_return_type
+    return scalar
+
+
+def dot_function_hook(ctx: FunctionContext) -> Type:
+    pair = _two_arrays(ctx)
+    if pair is None:
+        return ctx.default_return_type
+    parts_a = _ndarray_parts(pair[0])
+    parts_b = _ndarray_parts(pair[1])
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if len(dims_a) == 1 and len(dims_b) == 1:
+        # Vector inner product is a scalar (the stubs agree).
+        matched, message = _contract_pair("dot", dims_a[0], dims_b[0])
+        if message is not None:
+            ctx.api.fail(message, ctx.context)
+            return ctx.default_return_type
+        if not matched:
+            return ctx.default_return_type
+        return _promoted_scalar(ctx, dtype_a, dtype_b)
+    if max(len(dims_a), len(dims_b)) <= 2:
+        # Rank <= 2 is otherwise exactly matmul: reuse its solver.
+        return _solve_matmul(ctx, pair[0], pair[1])
+    if len(dims_b) == 1:
+        contracted, out = (dims_a[-1], dims_b[0]), dims_a[:-1]
+    else:
+        contracted = (dims_a[-1], dims_b[-2])
+        out = dims_a[:-1] + dims_b[:-2] + dims_b[-1:]
+    matched, message = _contract_pair("dot", *contracted)
+    if message is not None:
+        ctx.api.fail(message, ctx.context)
+        return ctx.default_return_type
+    if not matched:
+        return ctx.default_return_type
+    return _matmul_promoted(ctx, out, dtype_a, dtype_b)
+
+
+def inner_function_hook(ctx: FunctionContext) -> Type:
+    pair = _two_arrays(ctx)
+    if pair is None:
+        return ctx.default_return_type
+    parts_a = _ndarray_parts(pair[0])
+    parts_b = _ndarray_parts(pair[1])
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    matched, message = _contract_pair("inner", dims_a[-1], dims_b[-1])
+    if message is not None:
+        ctx.api.fail(message, ctx.context)
+        return ctx.default_return_type
+    if not matched:
+        return ctx.default_return_type
+    out = dims_a[:-1] + dims_b[:-1]
+    if not out:
+        return _promoted_scalar(ctx, dtype_a, dtype_b)
+    return _matmul_promoted(ctx, out, dtype_a, dtype_b)
+
+
+def _total_size(dims: list[int | Type]) -> int | None:
+    """Product of concrete dims, else None (unspellable, not an error)."""
+    total = 1
+    for d in dims:
+        if not isinstance(d, int) or isinstance(d, bool):
+            return None
+        total *= d
+    return total
+
+
+def outer_function_hook(ctx: FunctionContext) -> Type:
+    pair = _two_arrays(ctx)
+    if pair is None:
+        return ctx.default_return_type
+    parts_a = _ndarray_parts(pair[0])
+    parts_b = _ndarray_parts(pair[1])
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    total_a = _total_size(dims_a)
+    total_b = _total_size(dims_b)
+    if total_a is None or total_b is None:
+        return ctx.default_return_type
+    return _matmul_promoted(ctx, [total_a, total_b], dtype_a, dtype_b)
+
+
+def vdot_function_hook(ctx: FunctionContext) -> Type:
+    pair = _two_arrays(ctx)
+    if pair is None:
+        return ctx.default_return_type
+    parts_a = _ndarray_parts(pair[0])
+    parts_b = _ndarray_parts(pair[1])
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, _), (dims_b, _) = parts_a, parts_b
+    total_a = _total_size(dims_a)
+    total_b = _total_size(dims_b)
+    if total_a is not None and total_b is not None and total_a != total_b:
+        ctx.api.fail(
+            f"vdot operands have different sizes: {total_a} vs {total_b}",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    return _promoted_scalar(ctx, parts_a[1], parts_b[1])
+
+
+def _tensordot_axes(
+    pair: tuple[Type, Expression | None] | None,
+) -> int | tuple[list[int], list[int]] | None:
+    """int k, or a pair of axis lists; None when unparseable.
+
+    Mirrors numpy: an int contracts the last k of a with the first k
+    of b; otherwise a pair of axis lists, each entry an int or a list
+    of ints.
+    """
+    if pair is None:
+        return 2  # numpy's default
+    tp, expr = pair
+    k = _int_value(tp)
+    if k is None and expr is not None:
+        k = _fold_int(expr)
+    if k is not None:
+        return k
+    if not isinstance(expr, (TupleExpr, ListExpr)) or len(expr.items) != 2:
+        return None
+    sides: list[list[int]] = []
+    for item in expr.items:
+        if isinstance(item, (TupleExpr, ListExpr)):
+            values = [_fold_int(e) for e in item.items]
+            if any(v is None for v in values):
+                return None
+            sides.append([v for v in values if v is not None])
+        else:
+            v = _fold_int(item)
+            if v is None:
+                return None
+            sides.append([v])
+    return (sides[0], sides[1])
+
+
+def tensordot_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        raw: list[tuple[Type, Expression | None]] = []
+        for kinds, types, exprs in zip(ctx.arg_kinds, ctx.arg_types, ctx.args):
+            for kind, tp, expr in zip(kinds, types, exprs):
+                if kind == ARG_POS:
+                    raw.append((tp, expr))
+        pairs = raw
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    parts_a = _ndarray_parts(pairs[0][0])
+    parts_b = _ndarray_parts(pairs[1][0])
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    form = _tensordot_axes(_formal_pair(ctx, "axes"))
+    if form is None:
+        return ctx.default_return_type
+    if isinstance(form, int):
+        if form < 0:
+            return ctx.default_return_type
+        if form > len(dims_a) or form > len(dims_b):
+            ctx.api.fail(
+                f"tensordot axes {form} contracts more axes than the operands "
+                f"have (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        contract = list(zip(range(len(dims_a) - form, len(dims_a)), range(form)))
+    else:
+        axes_a, axes_b = form
+        if len(axes_a) != len(axes_b):
+            ctx.api.fail(
+                f"tensordot axes have different lengths: {len(axes_a)} vs "
+                f"{len(axes_b)}",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        contract = []
+        seen_a: set[int] = set()
+        seen_b: set[int] = set()
+        for ia, ib in zip(axes_a, axes_b):
+            na = ia + len(dims_a) if ia < 0 else ia
+            nb = ib + len(dims_b) if ib < 0 else ib
+            if not 0 <= na < len(dims_a):
+                ctx.api.fail(
+                    f"tensordot axis {ia} is out of range for {len(dims_a)} "
+                    f"dimensions (shape {_dims_str(dims_a)})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            if not 0 <= nb < len(dims_b):
+                ctx.api.fail(
+                    f"tensordot axis {ib} is out of range for {len(dims_b)} "
+                    f"dimensions (shape {_dims_str(dims_b)})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            if na in seen_a or nb in seen_b:
+                bad = ia if na in seen_a else ib
+                ctx.api.fail(
+                    f"duplicate axis {bad} in tensordot axes", ctx.context
+                )
+                return ctx.default_return_type
+            seen_a.add(na)
+            seen_b.add(nb)
+            contract.append((na, nb))
+    drop_a = {i for i, _ in contract}
+    drop_b = {j for _, j in contract}
+    for i, j in contract:
+        matched, message = _contract_pair("tensordot", dims_a[i], dims_b[j])
+        if message is not None:
+            ctx.api.fail(message, ctx.context)
+            return ctx.default_return_type
+        if not matched:
+            return ctx.default_return_type
+    out = [d for i, d in enumerate(dims_a) if i not in drop_a] + [
+        d for j, d in enumerate(dims_b) if j not in drop_b
+    ]
+    return _matmul_promoted(ctx, out, dtype_a, dtype_b)
+
+
+def _take_indices(
+    pair: tuple[Type, Expression | None],
+) -> tuple[list[int | Type] | None, bool]:
+    """(index dims, is_scalar) for take indices; (None, False) to bail.
+
+    Arrays keep their dims, flat int displays spell [len], and a bare
+    int selects one entry (dropping the axis).
+    """
+    tp, expr = pair
+    parts = _parts_or_unpack(tp)
+    if parts is not None:
+        dims, _ = parts
+        if _has_unpack(dims):
+            return None, False
+        return list(dims), False
+    if (
+        isinstance(expr, (TupleExpr, ListExpr))
+        and expr.items
+        and all(isinstance(e, IntExpr) for e in expr.items)
+    ):
+        return [len(expr.items)], False
+    if _int_value(tp) is not None or (
+        expr is not None and _fold_int(expr) is not None
+    ):
+        return [], True
+    return None, False
+
+
+def _take_solve(
+    ctx: FunctionContext | MethodContext,
+    array: Type,
+    pair: tuple[Type, Expression | None] | None,
+) -> Type:
+    if pair is None:
+        return ctx.default_return_type
+    parts = _ndarray_parts(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    idx_dims, is_scalar = _take_indices(pair)
+    if idx_dims is None:
+        return ctx.default_return_type
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis == "absent" or axis == "none":
+        # axis=None flattens: the result is exactly the index shape,
+        # or a scalar for a scalar index.
+        if is_scalar:
+            scalar = _scalar_of_dtype(dtype)
+            return scalar if scalar is not None else ctx.default_return_type
+        return _ndarray_type(ctx, idx_dims, dtype)
+    if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
+        ctx.api.fail("np.take axis must be an integer or None", ctx.context)
+        return ctx.default_return_type
+    norm = _normalize_axis(axis[0], len(dims))
+    if norm is None:
+        ctx.api.fail(
+            f"axis {axis[0]} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    if is_scalar:
+        out = dims[:norm] + dims[norm + 1 :]
+        if not out:
+            scalar = _scalar_of_dtype(dtype)
+            return scalar if scalar is not None else ctx.default_return_type
+        return _ndarray_type(ctx, out, dtype)
+    return _ndarray_type(ctx, dims[:norm] + idx_dims + dims[norm + 1 :], dtype)
+
+
+def take_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    return _take_solve(ctx, pairs[0][0], pairs[1])
+
+
+def take_method_hook(ctx: MethodContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _take_solve(ctx, ctx.type, pairs[0])
 
 
 def _dims_str(dims: list[int | Type]) -> str:

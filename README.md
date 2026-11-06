@@ -189,6 +189,22 @@ np.diff(np.zeros((4, 3)), axis=2)  # error: axis 2 is out of range for 2 dimensi
 np.diff(y, n=2, axis=0)             # clean: a (129, 4) input is (127, 4) out
 ```
 
+A `dot` that silently misaligns past rank 2 — no batch broadcast to
+hide behind, the contracted pair is checked directly:
+
+```python
+np.dot(np.zeros((5, 2, 3)), np.zeros((5, 4, 5)))
+# error: dot contracted dimensions disagree: 3 vs 4
+```
+
+A `tensordot` whose axes don't line up:
+
+```python
+np.tensordot(np.zeros((2, 3)), np.zeros((4, 5)), axes=1)
+# error: tensordot contracted dimensions disagree: 3 vs 4
+np.tensordot(np.zeros((2, 3)), np.zeros((3, 2)), axes=([1], [0]))  # clean: (2, 2)
+```
+
 These are not cherry-picked: [bench/](/home/sofeikov/my/numty/bench) seeds 18
 realistic mistakes into MLP-training and math-library code, and the checker
 flags 17 of them before anything runs (the 18th is unprovable on purpose —
@@ -470,7 +486,10 @@ and negative orders error), `cumsum`/`cumprod` (shape-preserving);
 bad permutations and non-1 squeeze axes error). `matmul` solves inner
 dims and batch broadcasts
 through shared `*Ts` (a lone concrete 1-D/2-D operand contributes an
-empty batch). Indexing consumes leading dims without an ellipsis
+empty batch). The rest of the family solves through the same inner-dim
+machinery: `dot` (no batch broadcast past rank 2), `tensordot` (int or
+pair-of-lists axes), `inner`/`outer`/`vdot` (scalars included), and
+`take` (the axis is swapped for the index shape). Indexing consumes leading dims without an ellipsis
 (`v[0]`, `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax` drops the
 axis, `sort` keeps the shape. Elementwise ops — operators and bare
 `np.*` ufuncs alike — broadcast shapes and promote dtypes exactly like

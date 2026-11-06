@@ -864,3 +864,56 @@ def test_named_dims_weights_mismatch() -> None:
         "tuple[Literal[5]]",
         "tuple[Literal[6]]",
     )
+
+
+def test_dot18_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "dot18_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_dot_nd_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_dot_nd.py"),
+        "dot contracted dimensions disagree: 3 vs 4",
+        "incompatible type",
+    )
+
+
+def test_tensordot_size_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_tensordot_size.py"),
+        "tensordot contracted dimensions disagree: 3 vs 4",
+    )
+
+
+def test_tensordot_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_tensordot_axis.py"),
+        "tensordot axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
+    )
+
+
+def test_inner_size_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_inner_size.py"),
+        "inner contracted dimensions disagree: 3 vs 4",
+        "incompatible type",
+    )
+
+
+def test_vdot_size_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_vdot_size.py"),
+        "vdot operands have different sizes: 6 vs 4",
+        "incompatible type",
+    )
+
+
+def test_take_oob_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_take_oob.py"),
+        "axis 5 is out of range for 2 dimensions",
+        "(2, 2)",
+    )
