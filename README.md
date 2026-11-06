@@ -66,7 +66,7 @@ wrongly-sized target and the mistake sklearn raises `ValueError` for at
 runtime is caught before anything runs:
 
 ```text
-error: call-site shape conflict for 'n_samples': 50 (argument 'X') vs 40 (argument 'y')
+error: call-site shape conflict for 'n_samples': 50 (argument 'X', axis 0) vs 40 (argument 'y', axis 0)
 ```
 
 ## Chains compose: reshape, project, slice, reduce, return
@@ -234,7 +234,7 @@ unifies — the same rule as above — so mis-wiring the bias is caught at
 the call site:
 
 ```text
-error: call-site shape conflict for 'hid': 8 (argument 'w') vs 2 (argument 'b')
+error: call-site shape conflict for 'hid': 8 (argument 'w', axis 1) vs 2 (argument 'b', axis 0)
 ```
 
 Fixed sizes spell as integers (`F64[3, 4]`), rank polymorphism as
@@ -263,7 +263,7 @@ Seed a bug — `mm(zeros((2, 4)), zeros((5, 3)))` — and the shared `dim2`
 is caught at the call site:
 
 ```text
-error: call-site shape conflict for 'dim2': 4 (argument 'x') vs 5 (argument 'y')
+error: call-site shape conflict for 'dim2': 4 (argument 'x', axis 1) vs 5 (argument 'y', axis 0)
 ```
 
 String words resolve exactly like bare dims, so the styles mix freely:
@@ -336,7 +336,7 @@ runs to `(128,) (127, 6)`); the two errors are pinned by
 Some sizes are unknowable statically — a mask's hit count, a
 loop-built list's length, a `-1` over symbolic dims. Instead of
 failing or dissolving to `Any`, the checker mints a fresh unknown
-per unknowable axis (`?U`) and keeps checking everything around it:
+per unknowable axis (`?U@line`) and keeps checking everything around it:
 ranks, known dims, and downstream ops.
 
 ```python
@@ -352,8 +352,17 @@ and asserting a concrete size for dynamic data is correctly rejected:
 
 ```text
 error: matmul inner dimensions disagree: 4 vs 5
-error: Incompatible types in assignment (expression has type "ndarray[tuple[?U0, M], dtype[float64]]", variable has type "ndarray[tuple[Literal[3], M], dtype[float64]]")
+error: Incompatible types in assignment (expression has type "ndarray[tuple[?U@13, M], dtype[float64]]", variable has type "ndarray[tuple[Literal[3], M], dtype[float64]]")
 ```
+
+Each unknown is named after the line that minted it (`?U@13` is the
+mask on line 13 of `tests/fixtures/bad_unknown_concrete.py`), so
+unrelated unknowns print differently. In
+`tests/fixtures/unknown_names_ok.py`, two masks on lines 17 and 18 give
+an outer product of `tuple[?U@17, ?U@18]`, not a square, and padding a
+mask taken on line 24 gives `?U@24+2`. A second unknown minted on the
+same line gets a letter: `np.nonzero(y)` over a 2-d `y` on line 17
+returns `?U@17` and `?U@17b` arrays.
 
 The boundary is principled: unknowns flow through bodies but cannot be
 named in signatures — there is no spelling for "somebody else's count".
@@ -417,7 +426,7 @@ the dtype stays `Any`. It catches real mistakes: mis-annotate the output
 bias as `"hid"` instead of `"out"` and the converted file fails with
 
 ```text
-error: call-site shape conflict for 'HID': 8 (argument 'w1') vs 2 (argument 'b2')
+error: call-site shape conflict for 'HID': 8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)
 ```
 
 Anything the static solver cannot express is left verbatim with a
@@ -721,7 +730,9 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   Same for unknown `keepdims`.
 - On lines the solver rejects, mypy may add its own follow-on error next
   to ours (an overload complaint for tuple `reshape`, `Unsupported
-  operand` for broadcast ops). Ours is the readable one.
+  operand` for broadcast ops, `Invalid index type` for an out-of-range
+  tuple index, a `DTypeT` type-var complaint for `fft` with a bad `n`).
+  Ours is the readable one.
 - Test runs use a dedicated mypy cache dir cleared per suite run (see
   `test_static.py`): mypy does not reliably invalidate plugin results
   across plugin edits, so never trust the default cache while hacking
