@@ -959,3 +959,16 @@ def test_atleast_ok_clean() -> None:
     result = run_mypy(FIXTURES / "atleast_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
+
+
+def test_stack_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "stack_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_hstack_rank_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_hstack_rank.py"),
+        "hstack ranks differ: (3,), (2, 2)",
+    )

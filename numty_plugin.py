@@ -666,6 +666,14 @@ class NumtyPlugin(Plugin):
             "atleast_3d",
         }:
             return partial(atleast_function_hook, rank=int(short[-2]))
+        if fullname.startswith("numpy.") and short == "vstack":
+            return vstack_function_hook
+        if fullname.startswith("numpy.") and short == "hstack":
+            return hstack_function_hook
+        if fullname.startswith("numpy.") and short == "dstack":
+            return dstack_function_hook
+        if fullname.startswith("numpy.") and short == "column_stack":
+            return column_stack_function_hook
         if fullname.startswith("numpy.") and short in {
             "cumsum",
             "cumprod",
@@ -3503,13 +3511,43 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
             ctx.context,
         )
         return ctx.default_return_type
+    return _concat_merge(ctx, "concatenate", items, dtype, norm)
+
+
+def _stack_promote(dims: list[int | Type], kind: str) -> list[int | Type]:
+    """atleast-style promotion each stacking helper applies per item."""
+    if kind in ("vstack", "column_stack"):
+        if not dims:
+            return [1, 1]
+        if len(dims) == 1:
+            return [1, *dims] if kind == "vstack" else [*dims, 1]
+        return list(dims)
+    if kind == "hstack":
+        return [1] if not dims else list(dims)
+    if not dims:
+        return [1, 1, 1]
+    if len(dims) == 1:
+        return [1, dims[0], 1]
+    if len(dims) == 2:
+        return [1, *dims]
+    return list(dims)
+
+
+def _concat_merge(
+    ctx: FunctionContext,
+    op: str,
+    items: list[tuple[list[int | Type], Type]],
+    dtype: Type,
+    norm: int,
+) -> Type:
+    """Merge rank-checked items along norm; mismatches fail with op."""
     out = list(items[0][0])
     for dims, _ in items[1:]:
         for i, d in enumerate(dims):
             if i != norm and not _dim_eq(out[i], d):
                 if isinstance(out[i], int) and isinstance(d, int):
                     ctx.api.fail(
-                        f"concatenate dimension {i} differs: {out[i]} vs {d} "
+                        f"{op} dimension {i} differs: {out[i]} vs {d} "
                         f"(shapes {_dims_str(out)} vs {_dims_str(dims)})",
                         ctx.context,
                     )
@@ -3521,6 +3559,93 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
             # N + N is not representable: bail out.
             return ctx.default_return_type
     return _ndarray_type(ctx, out, dtype)
+
+
+def _stack_solve(
+    ctx: FunctionContext,
+    pairs: list[tuple[Type, Expression | None]],
+    kind: str,
+    axis: int,
+) -> Type:
+    """Shared vstack/hstack/dstack/column_stack solver after promotion."""
+    items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
+    if items is None:
+        if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
+            elem = _dynamic_sequence_element(pairs[0][0])
+            if elem is None:
+                ctx.api.fail(
+                    f"{kind} needs a sequence of known length "
+                    "(built dynamically; preallocate or ignore)",
+                    ctx.context,
+                )
+                return AnyType(TypeOfAny.from_error)
+            dims_e, dtype_e = elem
+            dtype = _dynamic_explicit_dtype(ctx, dtype_e)
+            if dtype is None:
+                return ctx.default_return_type
+            promoted = _stack_promote(dims_e, kind)
+            norm = axis
+            if kind == "hstack":
+                norm = 0 if len(promoted) == 1 else 1
+            out = list(promoted)
+            if norm >= len(out):
+                return ctx.default_return_type
+            out[norm] = _fresh_unknown(ctx, kind, norm)
+            return _ndarray_type(ctx, out, dtype)
+        return ctx.default_return_type
+    if _explicit_dtype(ctx):
+        dtype = _named_dtype(ctx)
+        if dtype is None:
+            return ctx.default_return_type
+    else:
+        dtype = _promote_all(ctx, [dtype for _, dtype in items])
+        if dtype is None:
+            return ctx.default_return_type
+    promoted = [_stack_promote(dims, kind) for dims, _ in items]
+    ranks = {len(dims) for dims in promoted}
+    if len(ranks) != 1:
+        ctx.api.fail(
+            f"{kind} ranks differ: "
+            + ", ".join(_dims_str(dims) for dims in promoted),
+            ctx.context,
+        )
+        return ctx.default_return_type
+    norm = axis
+    if kind == "hstack":
+        norm = 0 if len(promoted[0]) == 1 else 1
+    if norm >= len(promoted[0]):
+        return ctx.default_return_type
+    return _concat_merge(
+        ctx, kind, list(zip(promoted, [dtype] * len(promoted))), dtype, norm
+    )
+
+
+def vstack_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _stack_solve(ctx, pairs, "vstack", 0)
+
+
+def hstack_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _stack_solve(ctx, pairs, "hstack", 1)
+
+
+def dstack_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _stack_solve(ctx, pairs, "dstack", 2)
+
+
+def column_stack_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _stack_solve(ctx, pairs, "column_stack", 1)
 
 
 def _dynamic_explicit_dtype(
