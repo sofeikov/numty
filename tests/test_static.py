@@ -720,18 +720,36 @@ def test_sklearn_normalize_clean_and_runs() -> None:
     assert run.stdout.strip().splitlines() == ["(25, 7)"]
 
 
-def test_sklearn_gnb_known_stack_gap() -> None:
-    # Correct code hitting a solver gap (see #1 triage): np.stack over a
-    # loop-built list has no statically known length, so the hook bails
-    # to Any and the imprecise result errors at assignment + return.
-    # Pinned as the known signature of that gap, not as desired behavior.
+def test_chained_block_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "chained_block.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "chained_block.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(5, 7, 16)"]
+
+
+def test_concat_dynamic_length_targeted() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_concat_dynamic.py"),
+        "concatenate needs a sequence of known length",
+    )
+
+
+def test_sklearn_gnb_stack_dynamic_length() -> None:
+    # Correct code hitting a solver gap (see #1 triage → #12): np.stack
+    # over a loop-built list has no statically known length, so the hook
+    # fails once at the call instead of poisoning downstream.
     pytest.importorskip("sklearn")
     result = run_mypy(FIXTURES / "sklearn_gnb.py")
-    assert result.returncode == 1, result.stdout
-    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    assert len(errors) == 2, result.stdout
-    assert "Incompatible types in assignment" in errors[0], result.stdout
-    assert "Incompatible return value type" in errors[1], result.stdout
+    assert_single_error(
+        result,
+        "stack needs a sequence of known length",
+    )
     run = subprocess.run(
         [sys.executable, str(FIXTURES / "sklearn_gnb.py")],
         capture_output=True,

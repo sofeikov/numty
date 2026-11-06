@@ -69,6 +69,7 @@ from mypy.nodes import (
     CallExpr,
     EllipsisExpr,
     Expression,
+    GeneratorExpr,
     IntExpr,
     ListComprehension,
     ListExpr,
@@ -2916,6 +2917,25 @@ def _sequence_parts(
     return None
 
 
+def _is_dynamic_sequence(tp: Type, expr: Expression | None) -> bool:
+    """A sequence whose length is unknowable statically.
+
+    A list-typed name or attribute (built dynamically, e.g. by appending
+    in a loop), a generator, or a non-enum comprehension. Fixed-length
+    forms (tuple displays and types, list literals, enum comprehensions)
+    are solved elsewhere, so they never reach this check.
+    """
+    if isinstance(expr, (GeneratorExpr, ListComprehension)):
+        return True
+    if not isinstance(expr, (NameExpr, MemberExpr)):
+        return False
+    proper = get_proper_type(tp)
+    return (
+        isinstance(proper, Instance)
+        and proper.type.fullname == "builtins.list"
+    )
+
+
 def _concat_axis(ctx: FunctionContext, pairs: list[tuple[Type, Expression | None]]) -> int | None | str:
     pair = _formal_pair(ctx, "axis")
     if pair is None:
@@ -2944,6 +2964,13 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
+        if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
+            ctx.api.fail(
+                "concatenate needs a sequence of known length "
+                "(built dynamically; preallocate or ignore)",
+                ctx.context,
+            )
+            return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
@@ -3009,6 +3036,13 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
+        if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
+            ctx.api.fail(
+                "stack needs a sequence of known length "
+                "(built dynamically; preallocate or ignore)",
+                ctx.context,
+            )
+            return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
