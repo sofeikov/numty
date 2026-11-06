@@ -660,6 +660,30 @@ class NumtyPlugin(Plugin):
             return vdot_function_hook
         if fullname.startswith("numpy.") and short == "take":
             return take_function_hook
+        if fullname.startswith("numpy.") and short == "convolve":
+            return convolve_function_hook
+        if fullname.startswith("numpy.") and short == "correlate":
+            return correlate_function_hook
+        if fullname.startswith("numpy.") and short == "flip":
+            return flip_function_hook
+        if fullname.startswith("numpy.") and short == "fliplr":
+            return fliplr_function_hook
+        if fullname.startswith("numpy.") and short == "flipud":
+            return flipud_function_hook
+        if fullname.startswith("numpy.") and short == "roll":
+            return roll_function_hook
+        if fullname.startswith("numpy.") and short == "rot90":
+            return rot90_function_hook
+        if fullname.startswith("numpy.") and short == "gradient":
+            return gradient_function_hook
+        if fullname.startswith("numpy.fft.") and short in {"fft", "ifft"}:
+            return fft_function_hook
+        if fullname.startswith("numpy.fft.") and short == "fftn":
+            return fftn_function_hook
+        if fullname.startswith("numpy.fft.") and short == "rfft":
+            return rfft_function_hook
+        if fullname.startswith("numpy.fft.") and short == "rfftn":
+            return rfftn_function_hook
         if fullname.startswith("numpy.") and short in {
             "atleast_1d",
             "atleast_2d",
@@ -1863,6 +1887,529 @@ def take_method_hook(ctx: MethodContext) -> Type:
     if not pairs:
         return ctx.default_return_type
     return _take_solve(ctx, ctx.type, pairs[0])
+
+
+def _positionals_only(ctx: FunctionContext | MethodContext) -> bool:
+    """True when every actual is positional: nothing hides behind keywords."""
+    return all(kind == ARG_POS for kinds in ctx.arg_kinds for kind in kinds)
+
+
+def _picture_complete(ctx: FunctionContext | MethodContext, first: str) -> bool:
+    """True when every actual is visible to the hook.
+
+    Overload fallback erases formal names, so keyword actuals become
+    unreadable; a mixed call under erasure bails instead of misreading.
+    All-positional calls are always fully visible.
+    """
+    if _positionals_only(ctx):
+        return True
+    return _formal_pair(ctx, first) is not None
+
+
+def _int_or_none(pair: tuple[Type, Expression | None] | None) -> int | None | str:
+    """A folded int, None when absent/None, 'bail' when unprovable."""
+    if pair is None:
+        return None
+    tp, expr = pair
+    if _is_none_type(tp):
+        return None
+    value = _int_value(tp)
+    if value is None and expr is not None:
+        value = _fold_int(expr)
+    return value if value is not None else "bail"
+
+
+def _fft_pair(
+    ctx: FunctionContext, names: tuple[str, str], indices: tuple[int, int]
+) -> list[tuple[Type, Expression | None] | None] | None:
+    """Two optional actuals: raw positionals when complete, formals when live."""
+    if _positionals_only(ctx):
+        pos = _all_positionals(ctx)
+        return [pos[i] if i < len(pos) else None for i in indices]
+    if _formal_pair(ctx, "a") is None:
+        return None
+    return [_formal_pair(ctx, name) for name in names]
+
+
+def _check_each_axis(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], axes: list[int], op: str
+) -> bool:
+    """True when every axis is in range, else a loud error."""
+    for ax in axes:
+        if _normalize_axis(ax, len(dims)) is None:
+            ctx.api.fail(
+                f"{op} axis {ax} is out of range for {len(dims)} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return False
+    return True
+
+
+def _same_shape_hook(
+    ctx: FunctionContext,
+    op: str,
+    first: str,
+    axis_index: int | None,
+    rank_min: int = 0,
+) -> Type:
+    """Shape-preserving ops: optional axis validated, input returned.
+
+    The returned array object is the input type itself, so overload
+    candidates always agree. The axis reads from its formal, falling back
+    to the positional slot when the call is positional-only.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if len(dims) < rank_min:
+        ctx.api.fail(
+            f"{op} requires at least {rank_min} dimensions, got {len(dims)} "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    if not _picture_complete(ctx, first):
+        return ctx.default_return_type
+    pair = _formal_pair(ctx, "axis")
+    if pair is None and axis_index is not None and _positionals_only(ctx):
+        pos = _all_positionals(ctx)
+        pair = pos[axis_index] if axis_index < len(pos) else None
+    axis = _parse_axis_arg(pair)
+    if isinstance(axis, list) and not _check_each_axis(ctx, dims, axis, op):
+        return ctx.default_return_type
+    if axis is not None and not isinstance(axis, (list, str)):
+        return ctx.default_return_type
+    return pairs[0][0]
+
+
+def flip_function_hook(ctx: FunctionContext) -> Type:
+    return _same_shape_hook(ctx, "flip", first="m", axis_index=1)
+
+
+def fliplr_function_hook(ctx: FunctionContext) -> Type:
+    return _same_shape_hook(ctx, "fliplr", first="m", axis_index=None, rank_min=2)
+
+
+def flipud_function_hook(ctx: FunctionContext) -> Type:
+    return _same_shape_hook(ctx, "flipud", first="m", axis_index=None, rank_min=1)
+
+
+def roll_function_hook(ctx: FunctionContext) -> Type:
+    return _same_shape_hook(ctx, "roll", first="a", axis_index=2)
+
+
+def gradient_function_hook(ctx: FunctionContext) -> Type:
+    """gradient: one resolved axis keeps the shape, else a tuple of arrays.
+
+    axis=None (or absent) differentiates along every axis, returning a
+    tuple for ndim > 1; an int or single-element tuple resolves one axis
+    and keeps the shape. Multi-axis tuples bail to the stub type.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if not _picture_complete(ctx, "f"):
+        return ctx.default_return_type
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis is None:
+        return ctx.default_return_type
+    if isinstance(axis, str):
+        if len(dims) == 1:
+            return pairs[0][0]
+        return ctx.default_return_type
+    if len(axis) != 1 or not _check_each_axis(ctx, dims, axis, "gradient"):
+        return ctx.default_return_type
+    return pairs[0][0]
+
+
+def _parse_int_pair(
+    expr: Expression | None,
+) -> tuple[int, int] | None:
+    """A pair of ints from a 2-tuple/list display, else None."""
+    if not isinstance(expr, (TupleExpr, ListExpr)) or len(expr.items) != 2:
+        return None
+    values = [_fold_int(e) for e in expr.items]
+    if any(v is None for v in values):
+        return None
+    assert values[0] is not None and values[1] is not None
+    return (values[0], values[1])
+
+
+def rot90_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if _positionals_only(ctx):
+        k_pair = pairs[1] if len(pairs) > 1 else None
+        axes_pair = pairs[2] if len(pairs) > 2 else None
+    elif _formal_pair(ctx, "m") is None:
+        return ctx.default_return_type
+    else:
+        k_pair = _formal_pair(ctx, "k")
+        axes_pair = _formal_pair(ctx, "axes")
+    k = 1
+    if k_pair is not None:
+        folded = _int_value(k_pair[0])
+        if folded is None and k_pair[1] is not None:
+            folded = _fold_int(k_pair[1])
+        if folded is None:
+            return ctx.default_return_type
+        k = folded
+    ia, ib = 0, 1
+    if axes_pair is not None:
+        parsed = _parse_int_pair(axes_pair[1])
+        if parsed is None:
+            return ctx.default_return_type
+        ia, ib = parsed
+    for ax in (ia, ib):
+        if _normalize_axis(ax, len(dims)) is None:
+            ctx.api.fail(
+                f"rot90 axis {ax} is out of range for {len(dims)} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+    out = list(dims)
+    if k % 4 in (1, 3):
+        na = ia + len(dims) if ia < 0 else ia
+        nb = ib + len(dims) if ib < 0 else ib
+        out[na], out[nb] = out[nb], out[na]
+    return _ndarray_type(ctx, out, dtype)
+
+
+def _string_value(tp: Type) -> str | None:
+    """String of a literal mode/kind argument, else None."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType) and isinstance(proper.value, str):
+        return proper.value
+    return None
+
+
+def _convolve_solve(
+    ctx: FunctionContext, op: str, a: Type, b: Type, mode: str | None
+) -> Type:
+    parts_a = _ndarray_parts(a)
+    parts_b = _ndarray_parts(b)
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if len(dims_a) != 1 or len(dims_b) != 1:
+        ctx.api.fail(
+            f"{op} only supports 1-dimensional arrays "
+            f"(shapes {_dims_str(dims_a)} and {_dims_str(dims_b)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    if mode not in ("full", "valid", "same"):
+        return ctx.default_return_type
+    na, nb = dims_a[0], dims_b[0]
+    if not isinstance(na, int) or not isinstance(nb, int):
+        return _matmul_promoted(
+            ctx, [_fresh_unknown(ctx, op, 0)], dtype_a, dtype_b
+        )
+    if mode == "full":
+        n = na + nb - 1
+    elif mode == "same":
+        n = max(na, nb)
+    else:
+        n = max(na, nb) - min(na, nb) + 1
+    return _matmul_promoted(ctx, [n], dtype_a, dtype_b)
+
+
+def convolve_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    mode_pair = _formal_pair(ctx, "mode")
+    mode = "full" if mode_pair is None else _string_value(mode_pair[0])
+    return _convolve_solve(ctx, "convolve", pairs[0][0], pairs[1][0], mode)
+
+
+def correlate_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    mode_pair = _formal_pair(ctx, "mode")
+    mode = "valid" if mode_pair is None else _string_value(mode_pair[0])
+    return _convolve_solve(ctx, "correlate", pairs[0][0], pairs[1][0], mode)
+
+
+def _complex_dtype(ctx: FunctionContext, dtype: Type) -> Type:
+    """complex128 for an fft-family input, complex64 for float32."""
+    name = _dtype_fullname(dtype)
+    if name is None:
+        return _default_dtype(ctx)
+    out = "numpy.complex64" if name == "numpy.float32" else "numpy.complex128"
+    built = _construct_dtype(ctx, out)
+    return built if built is not None else _default_dtype(ctx)
+
+
+def fft_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    parsed = _fft_axis_n(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    n, axis = parsed
+    target = _normalize_axis(axis, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"fft axis {axis} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    if isinstance(n, int):
+        out[target] = n
+    return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
+
+
+def _rfft_size(dim: int | Type) -> int | Type:
+    if isinstance(dim, int):
+        return dim // 2 + 1
+    return dim
+
+
+def _rfft_solve(
+    ctx: FunctionContext, op: str, arg: Type, axis: int, n: int | None
+) -> Type:
+    parts = _ndarray_parts(arg)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    target = _normalize_axis(axis, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"{op} axis {axis} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    if isinstance(n, int):
+        out[target] = n // 2 + 1
+    else:
+        out[target] = _rfft_size(out[target])
+    return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
+
+
+def rfft_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parsed = _fft_axis_n(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    n, axis = parsed
+    return _rfft_solve(ctx, "rfft", pairs[0][0], axis, n)
+
+
+def _fft_axis_n(ctx: FunctionContext) -> tuple[int | None, int] | None:
+    """(n, axis) for fft/rfft: None to bail, axis defaulting to -1."""
+    found = _fft_pair(ctx, ("n", "axis"), (1, 2))
+    if found is None:
+        return None
+    n = _int_or_none(found[0])
+    axis = _int_or_none(found[1])
+    if n == "bail" or axis == "bail":
+        return None
+    assert not isinstance(n, str) and not isinstance(axis, str)
+    if isinstance(n, int) and n < 1:
+        ctx.api.fail(
+            f"fft n must be a positive number of data points, got {n}",
+            ctx.context,
+        )
+        return None
+    return (n, -1 if axis is None else axis)
+
+
+def _fft_seq_entry(expr: Expression, tp: Type | None) -> int | None | str:
+    """An s/axes entry: int, None for keep, 'bad' when unprovable."""
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+    if tp is not None and _is_none_type(tp):
+        return None
+    if isinstance(expr, NameExpr) and expr.name == "None":
+        return None
+    return "bad"
+
+
+def _fft_seq_arg(
+    pair: tuple[Type, Expression | None] | None,
+) -> list[int | None] | None | str:
+    """An s/axes argument: None absent, parsed list, 'scalar', or 'bail'."""
+    if pair is None:
+        return None
+    tp, expr = pair
+    if _is_none_type(tp):
+        return None
+    if expr is not None and isinstance(expr, (TupleExpr, ListExpr)):
+        proper = get_proper_type(tp)
+        types: list[Type | None]
+        if isinstance(proper, TupleType) and len(proper.items) == len(expr.items):
+            types = list(proper.items)
+        else:
+            types = [None] * len(expr.items)
+        out = [_fft_seq_entry(e, t) for e, t in zip(expr.items, types)]
+        return out if all(v != "bad" for v in out) else "bail"
+    proper = get_proper_type(tp)
+    if isinstance(proper, TupleType):
+        out2: list[int | None] = []
+        for item in proper.items:
+            if _is_none_type(item):
+                out2.append(None)
+                continue
+            value = _dim_value(item)
+            if not isinstance(value, int) or isinstance(value, bool):
+                return "bail"
+            out2.append(value)
+        return out2
+    if _int_value(tp) is not None:
+        return "scalar"
+    return "bail"
+
+
+def _fft_s_axes(
+    ctx: FunctionContext,
+) -> tuple[list[int | None] | None | str, list[int | None] | None | str] | None:
+    """(s, axes) for fftn/rfftn: None to bail on an unreadable call."""
+    found = _fft_pair(ctx, ("s", "axes"), (1, 2))
+    if found is None:
+        return None
+    s = _fft_seq_arg(found[0])
+    axes = _fft_seq_arg(found[1])
+    if s == "bail" or axes == "bail":
+        return None
+    return (s, axes)
+
+
+def _fftn_solve(
+    ctx: FunctionContext,
+    op: str,
+    arg: Type,
+    axes: list[int | None] | None,
+    s: list[int | None] | None,
+    rfft: bool,
+) -> Type:
+    """fftn/rfftn output shape: s resizes, the last listed axis halves for rfft.
+
+    axes=None with s aligns s to the trailing axes. Unlisted dims keep
+    their size; None entries in s keep too. Duplicate axes bail: the
+    runtime result follows application order, which has no static shape.
+    """
+    parts = _ndarray_parts(arg)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    ndim = len(dims)
+    if s is None and axes is None:
+        out = list(dims)
+        if rfft and out:
+            out[-1] = _rfft_size(out[-1])
+        return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
+    sizes: list[int | None]
+    if axes is None:
+        assert s is not None
+        if len(s) > ndim:
+            ctx.api.fail(
+                f"{op} s has {len(s)} entries for {ndim} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        eff = list(range(ndim - len(s), ndim))
+        sizes = list(s)
+    else:
+        if any(ax is None for ax in axes):
+            return ctx.default_return_type
+        raw = [ax for ax in axes if ax is not None]
+        assert len(raw) == len(axes)
+        eff = []
+        for ax in raw:
+            target = _normalize_axis(ax, ndim)
+            if target is None:
+                ctx.api.fail(
+                    f"{op} axis {ax} is out of range for {ndim} dimensions "
+                    f"(shape {_dims_str(dims)})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            eff.append(target)
+        if len(set(eff)) != len(eff):
+            return ctx.default_return_type
+        if s is not None and len(s) != len(eff):
+            ctx.api.fail(
+                f"{op} Shape and axes have different lengths "
+                f"({len(s)} vs {len(eff)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        sizes = list(s) if s is not None else [None] * len(eff)
+    out = list(dims)
+    for ax, size in zip(eff, sizes):
+        if size is None:
+            continue
+        if size < 1:
+            ctx.api.fail(
+                f"{op} s entries must be positive, got {size}",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        out[ax] = size
+    if rfft and eff:
+        last = eff[-1]
+        out[last] = out[last] // 2 + 1 if isinstance(out[last], int) else out[last]
+    return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
+
+
+def fftn_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parsed = _fft_s_axes(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    s, axes = parsed
+    if isinstance(s, str) or isinstance(axes, str):
+        # A bare scalar matches no stub overload, so the native
+        # call-overload error already fires; bail silently here.
+        return ctx.default_return_type
+    return _fftn_solve(ctx, "fftn", pairs[0][0], axes, s, False)
+
+
+def rfftn_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parsed = _fft_s_axes(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    s, axes = parsed
+    if isinstance(s, str) or isinstance(axes, str):
+        # A bare scalar matches no stub overload, so the native
+        # call-overload error already fires; bail silently here.
+        return ctx.default_return_type
+    return _fftn_solve(ctx, "rfftn", pairs[0][0], axes, s, True)
 
 
 def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:

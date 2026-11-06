@@ -522,7 +522,13 @@ machinery: `dot` (no batch broadcast past rank 2), `tensordot` (int or
 pair-of-lists axes), `inner`/`outer`/`vdot` (scalars included), and
 `take` (the axis is swapped for the index shape). Indexing consumes leading dims without an ellipsis
 (`v[0]`, `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax` drops the
-axis, `sort` keeps the shape. Elementwise ops — operators and bare
+axis, `sort` keeps the shape. Shape math keeps its promises too:
+`flip`/`fliplr`/`flipud`/`roll` preserve (with rank floors and axis
+checks), `rot90` swaps dims on odd turns, `gradient` keeps the shape for
+one resolved axis, `convolve`/`correlate` compute full/valid/same lengths,
+and the fft family tracks complex dtypes — `rfft` halves (`N→N//2+1`),
+`fftn`/`rfftn` apply `s` over `axes` with trailing alignment; bad axes
+and non-positive sizes error. Elementwise ops — operators and bare
 `np.*` ufuncs alike — broadcast shapes and promote dtypes exactly like
 NumPy (verified against `np.result_type` over the full dtype matrix,
 plus weak Python scalars). `einsum` parses the subscript string

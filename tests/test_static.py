@@ -972,3 +972,90 @@ def test_hstack_rank_mismatch() -> None:
         run_mypy(FIXTURES / "bad_hstack_rank.py"),
         "hstack ranks differ: (3,), (2, 2)",
     )
+
+
+def test_shapemath_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "shapemath_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_flip_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_flip_axis.py"),
+        "flip axis 5 is out of range for 2 dimensions",
+        "(3, 4)",
+    )
+
+
+def test_fliplr_rank_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_fliplr_rank.py"),
+        "fliplr requires at least 2 dimensions, got 1",
+        "(8,)",
+    )
+
+
+def test_rot90_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_rot90_axis.py"),
+        "rot90 axis 5 is out of range for 2 dimensions",
+        "(3, 4)",
+    )
+
+
+def test_gradient_axis_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_gradient_axis.py"),
+        "gradient axis 5 is out of range for 2 dimensions",
+        '"gradient"',
+    )
+
+
+def test_convolve_dim_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_convolve_dim.py"),
+        "convolve only supports 1-dimensional arrays",
+        "(3, 4)",
+        "(8,)",
+    )
+
+
+def test_fft_n_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_fft_n.py"),
+        "fft n must be a positive number of data points, got 0",
+        '"fft"',
+    )
+
+
+def test_rfft_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_rfft_axis.py"),
+        "rfft axis 3 is out of range for 1 dimensions",
+        "(8,)",
+    )
+
+
+def test_fftn_len_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_fftn_len.py"),
+        "fftn Shape and axes have different lengths (1 vs 2)",
+        '"fftn"',
+    )
+
+
+def test_fftn_size_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_fftn_size.py"),
+        "fftn s entries must be positive, got 0",
+        '"fftn"',
+    )
+
+
+def test_fftn_long_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_fftn_long.py"),
+        "fftn s has 3 entries for 2 dimensions",
+        '"fftn"',
+    )
