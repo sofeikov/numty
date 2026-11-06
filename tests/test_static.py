@@ -1572,3 +1572,23 @@ def test_targeted_ignores() -> None:
     assert 'Error code "numty-shape" not covered by "type: ignore[numty-bail]"' in (
         result.stdout
     ), result.stdout
+
+
+def test_every_plugin_fail_site_passes_an_error_code() -> None:
+    # Static guard: fixtures only reach some fail sites, so check them all
+    # in the source. A new ctx.api.fail without code= would print [misc].
+    import ast
+
+    tree = ast.parse((ROOT / "numty_plugin.py").read_text())
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fail"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "api"
+    ]
+    assert len(sites) > 100, len(sites)
+    missing = [n.lineno for n in sites if not any(k.arg == "code" for k in n.keywords)]
+    assert not missing, f"ctx.api.fail without code= at numty_plugin.py lines {missing}"
