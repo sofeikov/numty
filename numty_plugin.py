@@ -59,7 +59,7 @@ from __future__ import annotations
 import keyword
 from collections.abc import Callable, Iterator
 from functools import partial
-from typing import cast
+from typing import NamedTuple, cast
 
 from mypy.nodes import (
     ARG_NAMED,
@@ -966,11 +966,20 @@ def _dim_value(tp: Type) -> int | Type | None:
 
 
 def _dim_eq(a: int | Type, b: int | Type) -> bool:
-    """Provably-equal dims: same ints, or the same TypeVar by fullname."""
+    """Provably-equal dims: same ints, same TypeVar, or same canonical form.
+
+    Expression variables resolve through the registry, so N*2 built at two
+    sites compares equal; anything unresolvable falls back to False.
+    """
     if isinstance(a, int) and isinstance(b, int):
         return a == b
     if isinstance(a, TypeVarType) and isinstance(b, TypeVarType):
-        return a.fullname == b.fullname
+        if a.fullname == b.fullname:
+            return True
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if fa is not None and fb is not None:
+        return fa == fb
     return False
 
 
@@ -981,8 +990,252 @@ def _dim_str(d: int | Type) -> str:
         inner = d.type
         name = getattr(inner, "name", None)
         return f"*{name}" if isinstance(name, str) else "*Ts"
+    if isinstance(d, TypeVarType):
+        form = _expr_forms.get(d.fullname)
+        if form is not None:
+            return _expr_str(form)
     name = getattr(d, "name", None)
     return str(name) if isinstance(name, str) else "?"
+
+
+class _LinForm(NamedTuple):
+    """Canonical linear dim: sum(coeff * var) + const, coeffs sorted by var."""
+
+    coeffs: tuple[tuple[str, int], ...]
+    const: int
+
+
+class _DivForm(NamedTuple):
+    """Floored division of a linear dim: inner // div + plus."""
+
+    inner: _LinForm
+    div: int
+    plus: int
+
+
+_expr_forms: dict[str, _LinForm | _DivForm] = {}
+_expr_ids: dict[str, TypeVarId] = {}
+
+
+def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | None:
+    """Canonical form of a dim: ints and TypeVars (expressions included).
+
+    Plain TypeVars read as single-term linears, so N and N*1 compare
+    equal; anything else is unresolvable.
+    """
+    if isinstance(d, int):
+        return _LinForm((), d)
+    if isinstance(d, TypeVarType):
+        form = _expr_forms.get(d.fullname)
+        if form is not None:
+            return form
+        return _LinForm(((d.fullname, 1),), 0)
+    return None
+
+
+def _expr_str(form: _LinForm | _DivForm) -> str:
+    """Readable dim formula: 2*N+3, N-1, (N+1)//2, N//2+1."""
+    if isinstance(form, _DivForm):
+        inner = _expr_str(form.inner)
+        compound = len(form.inner.coeffs) + (form.inner.const != 0) > 1
+        out = f"({inner})" if compound else inner
+        out += f"//{form.div}"
+        if form.plus:
+            out += f"+{form.plus}"
+        return out
+    parts = []
+    for fullname, coeff in form.coeffs:
+        short = fullname.rsplit(".", 1)[-1]
+        if coeff == 1:
+            parts.append(short)
+        elif coeff == -1:
+            parts.append(f"-{short}")
+        else:
+            parts.append(f"{coeff}*{short}")
+    if form.const or not parts:
+        parts.append(str(form.const))
+    return "+".join(parts).replace("+-", "-")
+
+
+def _expr_var(
+    ctx: FunctionContext | MethodContext, op: str, index: int, form: _LinForm | _DivForm
+) -> TypeVarType:
+    """Mint (or reuse) the site-keyed variable denoting a dim expression.
+
+    Same site keying as _fresh_unknown, so overload candidates mint the
+    identical variable; the registry maps it back to the canonical form.
+    """
+    tree = getattr(ctx.api, "tree", None)
+    module = getattr(tree, "fullname", "") or ""
+    line = ctx.context.line
+    column = ctx.context.column
+    key = f"{module}_{line}_{column}_{op}_{index}"
+    fullname = f"__numty_expr__.{key}"
+    vid = _expr_ids.get(key)
+    if vid is None:
+        vid = TypeVarId.new(0)
+        _expr_ids[key] = vid
+    _expr_forms[fullname] = form
+    upper = ctx.api.named_generic_type("builtins.int", [])
+    return TypeVarType(
+        name=f"?E{index}",
+        fullname=fullname,
+        id=vid,
+        values=[],
+        upper_bound=upper,
+        default=AnyType(TypeOfAny.from_omitted_generics),
+        line=line,
+        column=column,
+    )
+
+
+def _lin_add(a: _LinForm, b: _LinForm) -> _LinForm:
+    merged: dict[str, int] = {}
+    for name, coeff in a.coeffs + b.coeffs:
+        merged[name] = merged.get(name, 0) + coeff
+    return _LinForm(
+        tuple(sorted((n, c) for n, c in merged.items() if c != 0)),
+        a.const + b.const,
+    )
+
+
+def _lin_scale(form: _LinForm, c: int) -> _LinForm:
+    if c == 0:
+        return _LinForm((), 0)
+    return _LinForm(tuple((n, k * c) for n, k in form.coeffs), form.const * c)
+
+
+def _lin_mul(a: _LinForm, b: _LinForm) -> _LinForm | None:
+    """Product, or None when nonlinear (var times var)."""
+    if not a.coeffs:
+        return _lin_scale(b, a.const)
+    if not b.coeffs:
+        return _lin_scale(a, b.const)
+    return None
+
+
+def _materialize_dim(
+    ctx: FunctionContext | MethodContext,
+    op: str,
+    index: int,
+    form: _LinForm | _DivForm,
+    prefer: int | Type | None = None,
+) -> int | Type:
+    """A dim for a canonical form: int, the preferred original, or a fresh var."""
+    if isinstance(form, _LinForm) and not form.coeffs:
+        return form.const
+    if prefer is not None and _resolve_dim(prefer) == form:
+        return prefer
+    return _expr_var(ctx, op, index, form)
+
+
+def _dim_add_const(
+    ctx: FunctionContext | MethodContext, op: str, index: int, a: int | Type, b: int
+) -> int | Type:
+    """a + b for a constant b: exact linear form, else a fresh unknown."""
+    if isinstance(a, int) and isinstance(b, int):
+        return a + b
+    fa = _resolve_dim(a)
+    if fa is None or isinstance(fa, _DivForm):
+        return _fresh_unknown(ctx, op, index)
+    return _materialize_dim(ctx, op, index, _lin_add(fa, _LinForm((), b)), prefer=a)
+
+
+def _dim_add2(
+    ctx: FunctionContext | MethodContext,
+    op: str,
+    index: int,
+    a: int | Type,
+    b: int | Type,
+) -> int | Type:
+    """a + b: exact linear form, else a fresh unknown."""
+    if isinstance(a, int) and isinstance(b, int):
+        return a + b
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if fa is None or fb is None or isinstance(fa, _DivForm) or isinstance(fb, _DivForm):
+        return _fresh_unknown(ctx, op, index)
+    return _materialize_dim(ctx, op, index, _lin_add(fa, fb))
+
+
+def _dim_mul_const(
+    ctx: FunctionContext | MethodContext, op: str, index: int, a: int | Type, c: int
+) -> int | Type:
+    """a * c for a constant c: exact linear form, else a fresh unknown."""
+    if isinstance(a, int):
+        return a * c
+    if c == 1:
+        return a
+    if c == 0:
+        return 0
+    fa = _resolve_dim(a)
+    if fa is None or isinstance(fa, _DivForm):
+        return _fresh_unknown(ctx, op, index)
+    return _materialize_dim(ctx, op, index, _lin_scale(fa, c))
+
+
+def _dim_div(
+    ctx: FunctionContext | MethodContext,
+    op: str,
+    index: int,
+    a: int | Type,
+    div: int,
+    plus: int,
+) -> int | Type:
+    """a // div + plus: simplified to linear when exact, else a Div node."""
+    if div == 0:
+        return _fresh_unknown(ctx, op, index)
+    fa = _resolve_dim(a)
+    if fa is None or isinstance(fa, _DivForm):
+        return _fresh_unknown(ctx, op, index)
+    if isinstance(fa, _LinForm) and not fa.coeffs:
+        return fa.const // div + plus
+    if all(c % div == 0 for _, c in fa.coeffs) and fa.const % div == 0:
+        base = _LinForm(tuple((n, c // div) for n, c in fa.coeffs), fa.const // div)
+        if plus:
+            base = _lin_add(base, _LinForm((), plus))
+        return _materialize_dim(ctx, op, index, base, prefer=a)
+    return _materialize_dim(ctx, op, index, _DivForm(fa, div, plus))
+
+
+def _mul_dims(
+    ctx: FunctionContext | MethodContext, op: str, index: int, dims: list[int | Type]
+) -> int | Type:
+    """Product of dims: exact linear form, else a fresh unknown."""
+    acc: _LinForm | None = _LinForm((), 1)
+    for d in dims:
+        f = _resolve_dim(d)
+        if acc is None or f is None or isinstance(f, _DivForm):
+            return _fresh_unknown(ctx, op, index)
+        acc = _lin_mul(acc, f)
+        if acc is None:
+            return _fresh_unknown(ctx, op, index)
+    assert acc is not None
+    return _materialize_dim(ctx, op, index, acc)
+
+
+def _linear_product(dims: list[int | Type]) -> _LinForm | None:
+    """Canonical linear product of dims, else None (nonlinear or opaque)."""
+    acc: _LinForm | None = _LinForm((), 1)
+    for d in dims:
+        f = _resolve_dim(d)
+        if acc is None or f is None or isinstance(f, _DivForm):
+            return None
+        acc = _lin_mul(acc, f)
+        if acc is None:
+            return None
+    return acc
+
+
+def _div_lin_exact(form: _LinForm, known: int) -> _LinForm | None:
+    """form / known when exactly divisible, else None."""
+    if known == 0:
+        return None
+    if not all(c % known == 0 for _, c in form.coeffs):
+        return None
+    if form.const % known != 0:
+        return None
+    return _LinForm(tuple((n, c // known) for n, c in form.coeffs), form.const // known)
 
 
 def _check_dim_eq(
@@ -2137,9 +2390,8 @@ def _convolve_solve(
         return ctx.default_return_type
     na, nb = dims_a[0], dims_b[0]
     if not isinstance(na, int) or not isinstance(nb, int):
-        return _matmul_promoted(
-            ctx, [_fresh_unknown(ctx, op, 0)], dtype_a, dtype_b
-        )
+        size = _dim_add_const(ctx, op, 0, _dim_add2(ctx, op, 0, na, nb), -1)
+        return _matmul_promoted(ctx, [size], dtype_a, dtype_b)
     if mode == "full":
         n = na + nb - 1
     elif mode == "same":
@@ -2203,10 +2455,10 @@ def fft_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
 
 
-def _rfft_size(dim: int | Type) -> int | Type:
-    if isinstance(dim, int):
-        return dim // 2 + 1
-    return dim
+def _rfft_size(
+    ctx: FunctionContext, op: str, index: int, dim: int | Type
+) -> int | Type:
+    return _dim_div(ctx, op, index, dim, 2, 1)
 
 
 def _rfft_solve(
@@ -2228,7 +2480,7 @@ def _rfft_solve(
     if isinstance(n, int):
         out[target] = n // 2 + 1
     else:
-        out[target] = _rfft_size(out[target])
+        out[target] = _rfft_size(ctx, op, target, out[target])
     return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
 
 
@@ -2345,7 +2597,7 @@ def _fftn_solve(
     if s is None and axes is None:
         out = list(dims)
         if rfft and out:
-            out[-1] = _rfft_size(out[-1])
+            out[-1] = _rfft_size(ctx, op, len(out) - 1, out[-1])
         return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
     sizes: list[int | None]
     if axes is None:
@@ -2398,7 +2650,7 @@ def _fftn_solve(
         out[ax] = size
     if rfft and eff:
         last = eff[-1]
-        out[last] = out[last] // 2 + 1 if isinstance(out[last], int) else out[last]
+        out[last] = _dim_div(ctx, op, last, out[last], 2, 1)
     return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
 
 
@@ -2511,8 +2763,8 @@ def tile_function_hook(ctx: FunctionContext) -> Type:
         reps = [1] * (len(eff) - len(reps)) + reps
     out: list[int | Type] = []
     for i, (d, r) in enumerate(zip(eff, reps)):
-        if isinstance(d, int) and isinstance(r, int):
-            out.append(d * r)
+        if isinstance(r, int):
+            out.append(_dim_mul_const(ctx, "tile", i, d, r))
         else:
             out.append(_fresh_unknown(ctx, "tile", i))
     return _ndarray_type(ctx, out, dtype)
@@ -2566,12 +2818,10 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     if axis is None:
-        if isinstance(count, int) and all(isinstance(d, int) for d in dims):
-            total = 1
-            for d in dims:
-                assert isinstance(d, int)
-                total *= d
-            return _ndarray_type(ctx, [total * count], dtype)
+        if isinstance(count, int):
+            return _ndarray_type(
+                ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
+            )
         return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
     target = _normalize_axis(axis, len(dims))
     if target is None:
@@ -2582,8 +2832,8 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     out = list(dims)
-    if isinstance(count, int) and isinstance(out[target], int):
-        out[target] = out[target] * count
+    if isinstance(count, int):
+        out[target] = _dim_mul_const(ctx, "repeat", target, out[target], count)
     else:
         out[target] = _fresh_unknown(ctx, "repeat", target)
     return _ndarray_type(ctx, out, dtype)
@@ -2750,12 +3000,8 @@ def pad_function_hook(ctx: FunctionContext) -> Type:
                 ctx.context,
             )
             return ctx.default_return_type
-        if (
-            isinstance(d, int)
-            and isinstance(before, int)
-            and isinstance(after, int)
-        ):
-            out.append(d + before + after)
+        if isinstance(before, int) and isinstance(after, int):
+            out.append(_dim_add_const(ctx, "pad", i, d, before + after))
         else:
             out.append(_fresh_unknown(ctx, "pad", i))
     return _ndarray_type(ctx, out, dtype)
@@ -2810,7 +3056,7 @@ def split_function_hook(ctx: FunctionContext) -> Type:
                 return ctx.default_return_type
             out[target] = dim // sections
         else:
-            out[target] = _fresh_unknown(ctx, "split", target)
+            out[target] = _dim_div(ctx, "split", target, dim, sections, 0)
     elif sections == "bail":
         seq = _fft_seq_arg(found_sections)
         if seq == "bail" or isinstance(seq, str):
@@ -3508,6 +3754,28 @@ def _solve_reshape(
         for d in raw_ints:
             if d != -1:
                 known *= d
+        if known != 0:
+            # Exact division of the canonical product (N*2 / 2 = N):
+            # beats the ?U below when the quotient is a plain dim.
+            old_form = _linear_product(dims_old)
+            quot = _div_lin_exact(old_form, known) if old_form is not None else None
+            if quot is not None and (
+                not quot.coeffs
+                or (
+                    len(quot.coeffs) == 1
+                    and quot.coeffs[0][1] == 1
+                    and quot.const == 0
+                )
+            ):
+                # A quotient that is just N resolves equal to any N
+                # spelled by the caller, so a fresh variable for the form
+                # is as good as the original object.
+                inferred = _materialize_dim(ctx, "reshape", 0, quot)
+                return _ndarray_type(
+                    ctx,
+                    [inferred if d == -1 else d for d in raw],
+                    dtype,
+                )
         if old_vars != new_vars:
             # The inferred dim would absorb a symbolic size (N * 50 is not
             # expressible): track it with a fresh unknown instead of
@@ -3536,12 +3804,29 @@ def _solve_reshape(
         size_new = 1
         for d in raw_ints:
             size_new *= d
-        if size_new != size_old:
-            ctx.api.fail(
-                f"reshape changes total size: {size_old} -> {size_new} "
-                f"(shapes {_dims_str(dims_old)} vs {raw_str})",
-                ctx.context,
-            )
+        old_form = _linear_product(dims_old)
+        new_form = _linear_product(raw)
+        forms_equal = (
+            old_form is not None
+            and new_form is not None
+            and old_form == new_form
+        )
+        # Canonical equality only ever silences: N*2 vs 2*N is proven, and
+        # every loud below also fired before (or shows the same numbers).
+        if size_new != size_old and not forms_equal:
+            if old_form is not None and new_form is not None:
+                ctx.api.fail(
+                    f"reshape changes total size: {_expr_str(old_form)} -> "
+                    f"{_expr_str(new_form)} "
+                    f"(shapes {_dims_str(dims_old)} vs {raw_str})",
+                    ctx.context,
+                )
+            else:
+                ctx.api.fail(
+                    f"reshape changes total size: {size_old} -> {size_new} "
+                    f"(shapes {_dims_str(dims_old)} vs {raw_str})",
+                    ctx.context,
+                )
             return ctx.default_return_type
         if old_vars != new_vars:
             # Same int total but different symbolic factors (N vs M): the

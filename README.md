@@ -537,7 +537,11 @@ they can: `unique` keeps the dtype with a `?U` length (rank kept for
 `axis=`), `nonzero`/`where` with one argument return per-dim `?U`
 tuples (`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the
 input shape with a bool dtype, and `searchsorted` follows the values
-shape; 0-d nonzero errors. Elementwise ops — operators and bare
+shape; 0-d nonzero errors. Symbolic dims stay exact through arithmetic:
+`repeat`/`tile` multiply (`N*2`), `pad` adds (`N+2`), `convolve` adds
+lengths (`N+M-1`), `rfft` halves (`N//2+1`), `split` divides (`N//2`),
+and reshape proves `N*2` vs `2*N` (dividing `-1` exactly); mismatches
+error with readable formulas. Elementwise ops — operators and bare
 `np.*` ufuncs alike — broadcast shapes and promote dtypes exactly like
 NumPy (verified against `np.result_type` over the full dtype matrix,
 plus weak Python scalars). `einsum` parses the subscript string

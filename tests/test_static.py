@@ -396,7 +396,7 @@ def test_any_axis_out_of_range() -> None:
 def test_reshape_symbolic_size() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_reshape_sym_size.py"),
-        "reshape changes total size: 20 -> 21",
+        "reshape changes total size: 20*N -> 21*N",
         "(N, 10, 2)",
         "(N, 21)",
     )
@@ -1153,4 +1153,19 @@ def test_where_rank_mismatch() -> None:
         run_mypy(FIXTURES / "bad_where_rank.py"),
         "where on 0d arrays is not allowed",
         '"where"',
+    )
+
+
+def test_symexpr_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "symexpr_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_symexpr_product_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_symexpr_product.py"),
+        "reshape changes total size: 2*N -> 3*N",
+        "(2*N,)",
+        "(3, N)",
     )
