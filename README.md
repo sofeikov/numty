@@ -673,20 +673,20 @@ compare `x.shape` for dims. `issubclass(np.ndarray, F64)` stays false.
 
 ```sh
 uv venv
-uv pip install mypy numpy pytest
+uv pip install mypy numpy pytest ty==0.0.97
 ```
 
 ```sh
 PYTHONPATH=. uv run mypy demo.py      # expect 2 errors: rank, size
-uvx ty@0.0.97 check numty.py demo.py  # the same 2 in demo.py, plus 2 in numty.py itself
-uv run pytest                         # full suite: runtime + mypy-driven
+uvx ty@0.0.97 check numty.py demo.py  # the same 2 errors, none in numty.py
+uv run pytest                         # full suite: runtime, mypy- and ty-driven
 ```
 
-The two `numty.py` diagnostics are ty rejecting the `FlexArray` alias's
-shape bound (`FlexArray` annotations break under ty,
-[#36](https://github.com/sofeikov/numty/issues/36)) and the string-spec
-`__class_getitem__`. `uvx ty@0.0.97 check demo.py` alone reports just
-the 2 demo errors.
+The ty run ends in `Found 2 diagnostics`, both `invalid-argument-type`
+on `demo.py:30` and `demo.py:34`; `uvx pyright@1.1.408 --pythonpath
+.venv/bin/python numty.py demo.py` reports the same two (without
+`--pythonpath` it cannot find numpy). ty 0.0.97 is pinned in the dev group,
+and `tests/test_ty.py` holds the ty line to exactly those two.
 
 mypy skips the bodies of unannotated functions by default, so a script
 or notebook cell written as `def main():` gets no shape checking at all.
@@ -799,6 +799,30 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   rejects correct calls into head-annotated functions too (a `(2, 3)`
   array passed to `F64[batch, features]` is an `invalid-argument-type`
   error; [#5](https://github.com/sofeikov/numty/issues/5)).
+- **Adopting numty in a repo that gates on ty (or pyright) alone:** the
+  heads give that gate no shape checking at all. Every call into an
+  `F64[...]` signature is an error there, correct or not, so the heads
+  cost the full annotation effort and catch nothing. Shapes that must
+  hold under such a gate go in layers 1–2 or `FlexArray`, which are
+  plain `ndarray` types to every checker:
+
+  ```python
+  # fixed rank: either spelling works under mypy+plugin, ty and pyright
+  def f(x: FlexArray[tuple[N, T, C], np.dtype[np.float16]]) -> ...: ...
+  def f(x: np.ndarray[tuple[N, T, C], np.dtype[np.float16]]) -> ...: ...
+  ```
+
+  ty checks rank, `Literal` sizes and dtype through these, and the
+  rank-generic `squared_norm` above also works there: ty 0.0.97 reveals
+  `(5, 7)` for a `(5, 7, 2)` input and rejects `(5, 7, 3)` with
+  `invalid-argument-type` (the two `type: ignore[type-var]` notes are
+  for mypy; ty does not need them). pyright 1.1.408 flags the same two
+  bugs in [tests/fixtures/flex_portable.py](tests/fixtures/flex_portable.py),
+  which the suite checks under mypy+plugin and ty. Neither does any
+  solving: `matmul` inner dims, broadcasts and call-site `TypeVar`
+  conflicts pass silently and stay mypy+plugin only. Making the heads
+  themselves rank-check without the plugin is still open in
+  [#5](https://github.com/sofeikov/numty/issues/5).
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error.
@@ -889,6 +913,10 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   each bad one must fail with our message, and `reveal_type` pins must show
   precise shapes on the good paths. The `f64_ok` + `bad_f64_*` fixtures do
   the same for the familiar-style heads (clean end-to-end MLP included).
+- [tests/test_ty.py](tests/test_ty.py) — runs the pinned ty over
+  `numty.py demo.py` (exactly the 2 demo errors) and over
+  [flex_portable.py](tests/fixtures/flex_portable.py) (`FlexArray`
+  keeps its rank checks without the plugin).
 - [numty_convert.py](numty_convert.py) +
   [tests/test_convert.py](tests/test_convert.py) —
   the jaxtyping bridge: one-time annotation rewrite with goldens for every
