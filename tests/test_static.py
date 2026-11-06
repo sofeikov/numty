@@ -789,3 +789,78 @@ def test_f64_str_bad_token_rejected() -> None:
         'F64 string dim "3" is not a name',
         'space-separated names like "batch features"',
     )
+
+
+def test_reduce15_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "reduce15_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_average_weights_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_average_weights.py"),
+        "average weights length 5 does not match axis 1 size 6",
+        "(128, 6)",
+    )
+
+
+def test_diff_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_diff_axis.py"),
+        "axis 2 is out of range for 2 dimensions",
+        "(4, 3)",
+    )
+
+
+def test_diff_none_axis_rejected() -> None:
+    # The stubs reject axis=None before our hook runs; lock that in.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_diff_none_axis.py"),
+        'No overload variant of "diff" matches argument types',
+    )
+
+
+def test_diff_negative_order() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_diff_neg_n.py"),
+        "np.diff order n=-1 must be non-negative",
+    )
+
+
+def test_cumsum_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_cumsum_axis.py"),
+        "axis 5 is out of range for 2 dimensions",
+        "(2, 2)",
+    )
+
+
+def test_diff_size_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_diff_size.py"),
+        "tuple[Literal[127], Literal[6]]",
+        "tuple[Literal[126], Literal[6]]",
+    )
+
+
+def test_named_dims_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "named_dims.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "named_dims.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(128,) (127, 6)"]
+
+
+def test_named_dims_weights_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_named_dims_weights.py"),
+        'Argument 2 to "profile" has incompatible type',
+        "tuple[Literal[5]]",
+        "tuple[Literal[6]]",
+    )

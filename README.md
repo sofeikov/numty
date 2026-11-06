@@ -173,6 +173,22 @@ A reshape that silently drops a column:
 np.zeros((2, 3)).reshape((2, 4))   # error: reshape changes total size: 6 -> 8
 ```
 
+Per-channel weights that do not match the axis they average over —
+a classic silent-wrong-answer in sensor and finance code:
+
+```python
+np.average(np.zeros((128, 6)), axis=1, weights=np.zeros(5))
+# error: average weights length 5 does not match axis 1 size 6 (shape (128, 6))
+```
+
+A difference along an axis that is not there — and the length math,
+checked instead of trusted:
+
+```python
+np.diff(np.zeros((4, 3)), axis=2)  # error: axis 2 is out of range for 2 dimensions (shape (4, 3))
+np.diff(y, n=2, axis=0)             # clean: a (129, 4) input is (127, 4) out
+```
+
 These are not cherry-picked: [bench/](/home/sofeikov/my/numty/bench) seeds 18
 realistic mistakes into MLP-training and math-library code, and the checker
 flags 17 of them before anything runs (the 18th is unprovable on purpose —
@@ -262,6 +278,42 @@ Second, misuse fails loudly with a redirect, never a silent `Any`:
 `F64[tuple[N, M]]` tells you to write `F64[N, M]`, `F64[()]` and `_`
 tell you what's wrong. Quoted or bare is a style choice, not a semantic
 one.
+
+## Named sizes: one name, everywhere it matters
+
+Magic numbers in two places drift apart. A `Literal` alias gives a
+size one name that works in every annotation, and every message still
+spells the resolved numbers:
+
+```python
+from typing import Literal
+import numpy as np
+from numty import F64
+
+N = Literal[128]  # samples in
+M = Literal[127]  # samples out: one difference (the checker verifies this)
+C = Literal[6]    # channels
+
+def profile(frames: F64[N, C], mix: F64[C]) -> F64[N]:
+    return np.average(frames, axis=1, weights=mix)
+
+def step_back(y: F64[N, C]) -> F64[M, C]:
+    return np.diff(y, axis=0)   # checked: 128 - 1 = 127
+```
+
+Rename `M` to 126 and the return no longer lines up; pass five
+weights where six channels are named and the call fails with the
+numbers, not the names:
+
+```text
+error: Incompatible return value type (got "ndarray[tuple[Literal[127], Literal[6]], dtype[float64]]", expected "ndarray[tuple[Literal[126], Literal[6]], dtype[float64]]")
+error: Argument 2 to "profile" has incompatible type "ndarray[tuple[Literal[5]], dtype[float64]]"; expected "ndarray[tuple[Literal[6]], dtype[float64]]"
+```
+
+The clean file is `tests/fixtures/named_dims.py` (checked clean,
+runs to `(128,) (127, 6)`); the two errors are pinned by
+`tests/fixtures/bad_diff_size.py` and
+`tests/fixtures/bad_named_dims_weights.py`.
 
 ## Real generic code, checked end to end
 
@@ -412,8 +464,11 @@ and regroups block-preserving runs over `*Ts` (`(*Ts, 2, 3)` to
 `(*Ts, 6)` is fine; a `-1` that would absorb `*Ts`, or a total no
 `*Ts` can absorb, bails or errors respectively). Rank-changing ops
 track the new shape (`transpose`/`.T` — reversal included over `*Ts`
-— `squeeze`, `expand_dims`, `sum(axis=1)`; bad permutations and non-1
-squeeze axes error). `matmul` solves inner dims and batch broadcasts
+— `squeeze`, `expand_dims`, `sum(axis=1)`, `average` (1-D weights must
+match the averaged axis), `diff` (concrete lengths subtract, bad axes
+and negative orders error), `cumsum`/`cumprod` (shape-preserving);
+bad permutations and non-1 squeeze axes error). `matmul` solves inner
+dims and batch broadcasts
 through shared `*Ts` (a lone concrete 1-D/2-D operand contributes an
 empty batch). Indexing consumes leading dims without an ellipsis
 (`v[0]`, `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax` drops the

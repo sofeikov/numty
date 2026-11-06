@@ -634,6 +634,12 @@ class NumtyPlugin(Plugin):
             "var",
         }:
             return reduction_function_hook
+        if fullname.startswith("numpy.") and short == "average":
+            return average_function_hook
+        if fullname.startswith("numpy.") and short in {"cumsum", "cumprod"}:
+            return cumsum_function_hook
+        if fullname.startswith("numpy.") and short == "diff":
+            return diff_function_hook
         if fullname.startswith("numpy.") and short in {"any", "all"}:
             return allany_function_hook
         if fullname.startswith("numpy.") and short in {
@@ -837,6 +843,8 @@ class NumtyPlugin(Plugin):
             "var",
         }:
             return reduction_method_hook
+        if fullname.startswith("numpy.ndarray.") and short in {"cumsum", "cumprod"}:
+            return cumsum_method_hook
         return None
 
 
@@ -3243,6 +3251,20 @@ def _reduction_types(
         if split is None:
             return ctx.default_return_type
         return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype)
+    if axis == "none":
+        # Explicit axis=None reduces every axis: keepdims keeps them all
+        # as 1s, otherwise the result is a scalar of the output dtype
+        # (the stubs leave explicit None as Any).
+        if keepdims is None or has_dtype:
+            return ctx.default_return_type
+        if _dtype_fullname(dtype) not in REDUCTION_DTYPES:
+            return ctx.default_return_type
+        if keepdims:
+            return _solve_reduction(
+                ctx, dims, dtype, list(range(len(dims))), True, has_dtype
+            )
+        scalar = _scalar_of_dtype(dtype)
+        return scalar if scalar is not None else ctx.default_return_type
     return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype)
 
 
@@ -3999,6 +4021,183 @@ def reduction_function_hook(ctx: FunctionContext) -> Type:
     return _reduction_inputs(ctx, pairs[0][0])
 
 
+def _scalar_of_dtype(dtype: Type) -> Type | None:
+    """The numpy scalar Instance carried by a dtype[...], else None."""
+    proper = get_proper_type(dtype)
+    if isinstance(proper, Instance) and proper.args:
+        inner = get_proper_type(proper.args[0])
+        if isinstance(inner, Instance):
+            return inner
+    return None
+
+
+def _same_dims(a: list[int | Type], b: list[int | Type]) -> bool:
+    """Provably-equal dim lists: same ints, same TypeVars by fullname."""
+    return len(a) == len(b) and all(_dim_eq(x, y) for x, y in zip(a, b))
+
+
+def _check_average_weights(
+    ctx: FunctionContext, array: Type, weights: Type
+) -> str | None:
+    """Mismatch message when 1-D weights provably disagree with average.
+
+    NumPy accepts 1-D weights only when their length matches the averaged
+    axis, or weights shaped exactly like the input. Anything else is left
+    alone: no false positives on shapes we cannot judge.
+    """
+    wparts = _ndarray_parts(weights)
+    aparts = _ndarray_parts(array)
+    if wparts is None or aparts is None:
+        return None
+    wdims, _ = wparts
+    adims, _ = aparts
+    if len(wdims) != 1 or _same_dims(wdims, adims):
+        return None
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if not isinstance(axis, list) or len(axis) != 1:
+        return None
+    norm = _normalize_axis(axis[0], len(adims))
+    if norm is None:
+        return None
+    size = adims[norm]
+    if not isinstance(size, int) or not isinstance(wdims[0], int):
+        # Symbolic sizes cannot be compared: unknown dims (#14) will make
+        # this exact instead of silent.
+        return None
+    if size == wdims[0]:
+        return None
+    return (
+        f"average weights length {wdims[0]} does not match "
+        f"axis {axis[0]} size {size} (shape {_dims_str(adims)})"
+    )
+
+
+def average_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    weights = _formal_pair(ctx, "weights")
+    if weights is not None and not _is_none_type(weights[0]):
+        message = _check_average_weights(ctx, pairs[0][0], weights[0])
+        if message is not None:
+            ctx.api.fail(message, ctx.context)
+            return ctx.default_return_type
+    return _reduction_inputs(ctx, pairs[0][0])
+
+
+def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
+    """cumsum/cumprod keep the input shape; only axis=None flattens.
+
+    The flattened size is a products of dims we cannot spell, so
+    axis=None (the default) stays with the stubs. dtype is whatever the
+    stubs claim: only the shape is solved here.
+    """
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
+        return ctx.default_return_type
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    norm = _normalize_axis(axis[0], len(dims))
+    if norm is None:
+        ctx.api.fail(
+            f"axis {axis[0]} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    dtype_pair = _formal_pair(ctx, "dtype")
+    if dtype_pair is not None and not _is_none_type(dtype_pair[0]):
+        return ctx.default_return_type
+    # Accumulate promotes small ints (verified against the runtime:
+    # bool/signed -> int64, unsigned -> uint64, float/complex keep).
+    # Solving from the input keeps every overload candidate identical,
+    # which keeps mypy's overload resolution from discarding it.
+    name = _dtype_fullname(dtype)
+    if name in ("numpy.bool", "numpy.int8", "numpy.int16", "numpy.int32", "numpy.int64"):
+        promoted = _construct_dtype(ctx, "numpy.int64")
+        if promoted is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, list(dims), promoted)
+    if name in ("numpy.uint8", "numpy.uint16", "numpy.uint32", "numpy.uint64"):
+        promoted = _construct_dtype(ctx, "numpy.uint64")
+        if promoted is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, list(dims), promoted)
+    if name is None or name not in REDUCTION_DTYPES:
+        # Non-numeric dtypes (strings, datetime64, ...): the stubs own it.
+        return ctx.default_return_type
+    return _ndarray_type(ctx, list(dims), dtype)
+
+
+def cumsum_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _cumsum_solve(ctx, pairs[0][0])
+
+
+def cumsum_method_hook(ctx: MethodContext) -> Type:
+    return _cumsum_solve(ctx, ctx.type)
+
+
+def diff_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _parts_or_unpack(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    ndim = len(dims)
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis == "absent":
+        ax = ndim - 1
+    elif isinstance(axis, list) and len(axis) == 1 and isinstance(axis[0], int):
+        norm = _normalize_axis(axis[0], ndim)
+        if norm is None:
+            ctx.api.fail(
+                f"axis {axis[0]} is out of range for {ndim} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        ax = norm
+    else:
+        return ctx.default_return_type
+    n_pair = _formal_pair(ctx, "n")
+    n = 1 if n_pair is None else _int_value(n_pair[0])
+    if n is None:
+        return ctx.default_return_type
+    if n < 0:
+        ctx.api.fail(f"np.diff order n={n} must be non-negative", ctx.context)
+        return ctx.default_return_type
+    for name in ("prepend", "append"):
+        pair = _formal_pair(ctx, name)
+        if pair is not None and not _is_none_type(pair[0]):
+            return ctx.default_return_type
+    if _dtype_fullname(dtype) == "numpy.datetime64":
+        # Datetime diffs change dtype (datetime64 -> timedelta64), which
+        # only the stubs' dedicated overload tracks.
+        return ctx.default_return_type
+    size = dims[ax]
+    if not isinstance(size, int):
+        # Symbolic dims cannot spell a subtraction: track rank and dtype
+        # only (exactly what the stubs claim); concrete dims solve exactly.
+        return _ndarray_type(ctx, list(dims), dtype)
+    out = list(dims)
+    out[ax] = max(0, size - n)
+    # Diff preserves dtype exactly, so solve from the input: the result
+    # is identical for every overload candidate, which keeps mypy's
+    # overload resolution from discarding it as ambiguous.
+    return _ndarray_type(ctx, out, dtype)
+
+
 def _promoted_result_type(
     ctx: FunctionContext | MethodContext, dta: Type, dtb: Type
 ) -> Type | None:
@@ -4512,9 +4711,6 @@ def _linalg_norm(ctx: FunctionContext) -> Type:
     keepdims = _linalg_flag(ctx, "keepdims", False)
     if keepdims is None:
         return ctx.default_return_type
-    if axis in ("absent", "none") and not keepdims:
-        # Scalar result: the stubs own it.
-        return ctx.default_return_type
     if axis in ("absent", "none"):
         axes = list(range(len(dims)))
     else:
@@ -4536,8 +4732,6 @@ def _linalg_norm(ctx: FunctionContext) -> Type:
         out_dims = [1 if i in axes else d for i, d in enumerate(dims)]
     else:
         out_dims = [d for i, d in enumerate(dims) if i not in axes]
-    if not out_dims:
-        return ctx.default_return_type
     ks = _dtype_kind_size(dtype)
     if ks is None:
         return ctx.default_return_type
@@ -4547,6 +4741,11 @@ def _linalg_norm(ctx: FunctionContext) -> Type:
     out_dtype = _linalg_dtype(ctx, dtype, name)
     if out_dtype is None:
         return ctx.default_return_type
+    if not out_dims:
+        # Fully reduced: a scalar of the real dtype, which the stubs
+        # leave as Any.
+        scalar = _scalar_of_dtype(out_dtype)
+        return scalar if scalar is not None else ctx.default_return_type
     return _ndarray_type(ctx, out_dims, out_dtype)
 
 
