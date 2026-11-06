@@ -660,11 +660,14 @@ so it still runs under `python -O`.
 
 At runtime the heads are annotations, not array classes: calling
 `F64()` raises `TypeError`. `isinstance(x, F64)` is true exactly when
-`x` is an `ndarray` with dtype float64 (likewise `F32`, `I64`, `I32`,
-`Bool`), which backs up mypy narrowing `x` to an array in that branch.
-Rank and dims are not checked at runtime, and a subscripted head
+`x` is an `ndarray` whose dtype equals native float64 (likewise `F32`,
+`I64`, `I32`, `Bool`; a byte-swapped `'>f8'` array is not an `F64`), so
+when mypy narrows a union of arrays by head, the runtime branch agrees.
+Rank and dims are not checked at runtime. A subscripted head
 (`isinstance(x, F64[3])`) raises `TypeError` like any subscripted
-generic; use `narrow` or compare `x.shape` for those.
+generic, except a multi-word string spec, which erases to the bare head
+(`isinstance(x, F64["a b"])` is the dtype check alone); use `narrow` or
+compare `x.shape` for dims. `issubclass(np.ndarray, F64)` stays false.
 
 ## Quickstart
 
