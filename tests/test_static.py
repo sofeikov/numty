@@ -692,6 +692,22 @@ def test_f64_str_empty_rejected() -> None:
     )
 
 
+def test_sklearn_ridge_clean_and_runs() -> None:
+    # Optional corpus dependency: the annotated sklearn excerpt only runs
+    # where sklearn is installed; elsewhere the dogfood is skipped, never red.
+    pytest.importorskip("sklearn")
+    result = run_mypy(FIXTURES / "sklearn_ridge.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "sklearn_ridge.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(3, 8) (3,)"]
+
+
 def test_f64_str_bad_token_rejected() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_str_token.py"),

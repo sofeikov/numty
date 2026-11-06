@@ -6,6 +6,69 @@ computes garbage. [jaxtyping](https://docs.kidger.site/jaxtyping/) solved this
 at runtime. numty catches it *before anything runs*, using only what type
 checkers already understand plus one small mypy plugin.
 
+## It works on real code: ridge regression from sklearn
+
+This is scikit-learn 1.9.1's dense Cholesky solver
+(`_ridge.py::_solve_cholesky`, plus dense centering from
+`_base.py::_preprocess_data`), annotated jaxtyping-style and checked
+clean — no `type: ignore`, two `TypeVar` lines in the whole file,
+everything else minted implicitly from the strings:
+
+```python
+from typing import TypeVar
+
+import numpy as np
+
+from numty import F64
+
+n_features = TypeVar("n_features", bound=int)
+n_targets = TypeVar("n_targets", bound=int)
+
+def solve_cholesky(
+    X: F64["n_samples n_features"],
+    y: F64["n_samples n_targets"],
+    alpha: F64["n_targets"],
+) -> F64["n_targets n_features"]:
+    # w = inv(X'X + alpha*Id) X'y
+    n_features = X.shape[1]
+    n_targets = y.shape[1]
+
+    A = np.matmul(X.transpose(), X)     # (n_features, n_features)
+    Xy = np.matmul(X.transpose(), y)    # (n_features, n_targets)
+
+    one_alpha = np.array_equal(alpha, len(alpha) * [alpha[0]])
+
+    if one_alpha:
+        A.flat[:: n_features + 1] += alpha[0]
+        return np.linalg.solve(A, Xy).transpose()
+    coefs = np.empty([n_targets, n_features], dtype=X.dtype)
+    for coef, target, current_alpha in zip(coefs, Xy.transpose(), alpha):
+        A.flat[:: n_features + 1] += current_alpha
+        coef[:] = np.linalg.solve(A, target).ravel()
+        A.flat[:: n_features + 1] -= current_alpha
+    return coefs
+```
+
+The full file (`tests/fixtures/sklearn_ridge.py`) adds mean-centering,
+intercept recovery, and a run that asserts `allclose` agreement with
+`Ridge(alpha=1.0, solver="cholesky")`:
+
+```text
+Success: no issues found in 1 source file
+(3, 8) (3,)
+```
+
+Adaptations, all documented in the file: dense path only,
+`safe_sparse_dot` → `np.matmul` (plain `@` is unchecked by design —
+only the named call solves), `scipy.linalg.solve` →
+`numpy.linalg.solve`, `.T` → `.transpose()`, unweighted means. Pass a
+wrongly-sized target and the mistake sklearn raises `ValueError` for at
+runtime is caught before anything runs:
+
+```text
+error: call-site shape conflict for 'n_samples': 50 (argument 'X') vs 40 (argument 'y')
+```
+
 ## One signature, every rank
 
 The headline: rank-generic helpers with no overloads, no per-rank copies.
