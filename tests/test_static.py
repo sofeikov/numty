@@ -1,5 +1,6 @@
 """Static checks: each bad fixture must fail mypy with exactly one error."""
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -1213,4 +1214,222 @@ def test_swv_axis_mismatch() -> None:
         run_mypy(FIXTURES / "bad_swv_axis.py"),
         "sliding_window_view axis 5 is out of range for 2 dimensions",
         "(10, 8)",
+    )
+
+
+def test_validations_ok_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "validations_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "validations_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    # Every shape the checker solved (the annotations) is numpy's too.
+    assert run.stdout.strip().splitlines() == [
+        "(4, 3)",
+        "(2, 4, 3)",
+        "(2, 3, 4)",
+        "(2, 3, 4)",
+        "(2, 3)",
+        "(3, 3)",
+        "(6,)",
+        "(3, 4)",
+        "(12,)",
+        "(3,)",
+        "(3, 2)",
+        "(3,)",
+        "(1,)",
+        "(1099511627776, 0)",
+    ]
+
+
+# Each fixture's f() is a call numpy always rejects; the static error
+# must be backed by the runtime one.
+NUMPY_REJECTS = [
+    "bad_rot90_same_axes",
+    "bad_flip_dup_axis",
+    "bad_squeeze_dup_axis",
+    "bad_gradient_dup_axis",
+    "bad_roll_shift_len",
+    "bad_repeat_list_len",
+    "bad_repeat_flat_len",
+    "bad_norm_ord_rank",
+    "bad_norm_ord_fro",
+    "bad_norm_fro_display",
+    "bad_partition_kth",
+    "bad_argpartition_kth",
+    "bad_take_index_oob",
+    "bad_take_flat_oob",
+    "bad_matmul_scalar",
+    "bad_matmul_0d",
+    "bad_convolve_empty",
+    "bad_correlate_empty",
+    "bad_huge_dim",
+    "bad_sum_dup_axis",
+]
+
+
+@pytest.mark.parametrize("name", NUMPY_REJECTS)
+def test_numpy_rejects_at_runtime(name: str) -> None:
+    f = runpy.run_path(str(FIXTURES / f"{name}.py"))["f"]
+    with pytest.raises((ValueError, IndexError)):
+        f()
+
+
+def test_rot90_same_axes() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_rot90_same_axes.py"),
+        "rot90 axes must be different (got (2, -1)",
+        "(2, 3, 4)",
+    )
+
+
+def test_flip_duplicate_axis() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_flip_dup_axis.py"),
+        "flip has duplicate axis -2 in (0, -2)",
+        "(3, 4)",
+    )
+
+
+def test_squeeze_duplicate_axis() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_squeeze_dup_axis.py"),
+        "squeeze has duplicate axis -2 in (1, -2)",
+        "(2, 1, 3)",
+    )
+
+
+def test_gradient_duplicate_axis() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_gradient_dup_axis.py"),
+        "gradient has duplicate axis 0 in (0, 0)",
+        '"gradient"',
+    )
+
+
+def test_roll_shift_length_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_roll_shift_len.py"),
+        "roll shift has 2 entries for 3 axes",
+        "shift (1, 2), axis (0, 1, 2)",
+    )
+
+
+def test_repeat_list_length_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_repeat_list_len.py"),
+        "repeat repeats has 3 entries for axis 0 of size 2",
+        "(2, 3)",
+    )
+
+
+def test_repeat_flat_length_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_repeat_flat_len.py"),
+        "repeat repeats has 2 entries for the flattened size 6",
+    )
+
+
+def test_norm_ord_rank_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_norm_ord_rank.py"),
+        "linalg.norm with ord=2 reduces 3 dimensions",
+        "(2, 3, 4)",
+    )
+
+
+def test_norm_fro_on_one_axis() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_norm_ord_fro.py"),
+        "linalg.norm ord='fro' is a matrix norm and needs 2 axes, got 1",
+        "(2, 3, 4)",
+    )
+
+
+def test_norm_fro_display_on_one_axis() -> None:
+    # Spelled inline, "fro" is only a literal inside each overload
+    # candidate. Once the hook rejects them all, mypy's fallback infers
+    # plain str, finds no erased target, and reports its own overload
+    # error instead of ours. The call still fails, as numpy's does.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_norm_fro_display.py"),
+        'No overload variant of "norm" matches argument types',
+    )
+
+
+def test_partition_kth_out_of_bounds() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_partition_kth.py"),
+        "partition kth 4 is out of bounds for axis -1 of size 4",
+    )
+
+
+def test_argpartition_kth_out_of_bounds() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_argpartition_kth.py"),
+        "argpartition kth -5 is out of bounds for axis 1 of size 4",
+    )
+
+
+def test_take_index_out_of_bounds() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_take_index_oob.py"),
+        "take index 7 is out of bounds for axis 1 of size 4",
+    )
+
+
+def test_take_flat_index_out_of_bounds() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_take_flat_oob.py"),
+        "take index 12 is out of bounds for the flattened size 12",
+    )
+
+
+def test_matmul_scalar_operand() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matmul_scalar.py"),
+        "matmul operand 1 has no dimensions (a scalar builtins.float)",
+    )
+
+
+def test_matmul_0d_operand() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matmul_0d.py"),
+        "matmul operand 0 has no dimensions (a 0-d array)",
+    )
+
+
+def test_convolve_empty_operand() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_convolve_empty.py"),
+        "convolve first array argument cannot be empty",
+        "(0,) and (3,)",
+    )
+
+
+def test_correlate_empty_operand() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_correlate_empty.py"),
+        "correlate second array argument cannot be empty",
+        "(3,) and (0,)",
+    )
+
+
+def test_huge_dim_rejected() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_huge_dim.py"),
+        "dimension 1000000000000000000000000000000 exceeds the maximum "
+        "allowed dimension 9223372036854775807",
+    )
+
+
+def test_sum_duplicate_axis() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_sum_dup_axis.py"),
+        "duplicate axis -2",
     )

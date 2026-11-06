@@ -1630,12 +1630,30 @@ def _default_float_dtype(ctx: FunctionContext | MethodContext) -> Type:
     )
 
 
+INTP_MAX = 2**63 - 1
+
+
+def _dims_fit_intp(ctx: FunctionContext | MethodContext, dims: list[int]) -> bool:
+    """numpy stores dims as intp: a larger literal dim always raises."""
+    for d in dims:
+        if d > INTP_MAX:
+            ctx.api.fail(
+                f"dimension {d} exceeds the maximum allowed dimension "
+                f"{INTP_MAX} (shape {_dims_str(list(dims))})",
+                ctx.context,
+            )
+            return False
+    return True
+
+
 def zeros_like_hook(ctx: FunctionContext) -> Type:
     shape_arg = _single_shape_arg(ctx)
     if shape_arg is None:
         return ctx.default_return_type
     dims = _shape_from_arg(shape_arg, _single_shape_expr(ctx))
     if dims is None:
+        return ctx.default_return_type
+    if not _dims_fit_intp(ctx, dims):
         return ctx.default_return_type
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
@@ -1821,9 +1839,34 @@ def _positional_actuals(ctx: FunctionContext | MethodContext, n: int) -> list[Ty
     return [group[0] for group in groups]
 
 
+def _matmul_has_dims(ctx: FunctionContext | MethodContext, operands: list[Type]) -> bool:
+    """matmul rejects 0-d operands (scalars, shape-() arrays) outright.
+
+    Only matmul itself: dot treats a 0-d operand as multiplication.
+    """
+    for i, tp in enumerate(operands):
+        parts = _ndarray_parts(tp)
+        key = _scalar_key(tp)
+        if parts is not None and not parts[0]:
+            what = "a 0-d array"
+        elif key is not None:
+            what = f"a scalar {key[1]}"
+        else:
+            continue
+        ctx.api.fail(
+            f"matmul operand {i} has no dimensions ({what}); "
+            "matmul needs arrays with at least 1 dimension",
+            ctx.context,
+        )
+        return False
+    return True
+
+
 def matmul_hook(ctx: FunctionContext) -> Type:
     args = _positional_actuals(ctx, 2)
     if args is None:
+        return ctx.default_return_type
+    if not _matmul_has_dims(ctx, args):
         return ctx.default_return_type
     return _solve_matmul(ctx, args[0], args[1])
 
@@ -2125,6 +2168,50 @@ def _take_indices(
     return None, False
 
 
+def _take_index_values(pair: tuple[Type, Expression | None]) -> list[int] | None:
+    """Literal take indices (an int or a flat int display), else None."""
+    tp, expr = pair
+    if isinstance(expr, (TupleExpr, ListExpr)):
+        values = [_fold_int(e) for e in expr.items]
+        if any(v is None for v in values):
+            return None
+        return [v for v in values if v is not None]
+    value = _int_value(tp)
+    if value is None and expr is not None:
+        value = _fold_int(expr)
+    return [value] if value is not None else None
+
+
+def _take_in_bounds(
+    ctx: FunctionContext | MethodContext,
+    pair: tuple[Type, Expression | None],
+    size: int | Type,
+    where: str,
+    dims: list[int | Type],
+) -> bool:
+    """take with mode='raise' (the default): literal indices must exist.
+
+    clip/wrap remap any index, so only a literal 'raise' mode, or one
+    provably absent (the callee names a mode formal left unbound), is
+    checked.
+    """
+    if not isinstance(size, int) or "mode" not in ctx.callee_arg_names:
+        return True
+    mode = _formal_pair(ctx, "mode")
+    if mode is not None and _string_value(mode[0]) != "raise":
+        return True
+    values = _take_index_values(pair)
+    for value in values or []:
+        if not -size <= value < size:
+            ctx.api.fail(
+                f"take index {value} is out of bounds for {where} "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return False
+    return True
+
+
 def _take_solve(
     ctx: FunctionContext | MethodContext,
     array: Type,
@@ -2143,6 +2230,13 @@ def _take_solve(
     if axis == "absent" or axis == "none":
         # axis=None flattens: the result is exactly the index shape,
         # or a scalar for a scalar index.
+        total: int | None = 1
+        for d in dims:
+            total = total * d if isinstance(d, int) and total is not None else None
+        if total is not None and not _take_in_bounds(
+            ctx, pair, total, f"the flattened size {total}", dims
+        ):
+            return ctx.default_return_type
         if is_scalar:
             scalar = _scalar_of_dtype(dtype)
             return scalar if scalar is not None else ctx.default_return_type
@@ -2157,6 +2251,10 @@ def _take_solve(
             f"(shape {_dims_str(dims)})",
             ctx.context,
         )
+        return ctx.default_return_type
+    if not _take_in_bounds(
+        ctx, pair, dims[norm], f"axis {axis[0]} of size {dims[norm]}", dims
+    ):
         return ctx.default_return_type
     if is_scalar:
         out = dims[:norm] + dims[norm + 1 :]
@@ -2238,18 +2336,65 @@ def _check_each_axis(
     return True
 
 
+def _check_unique_axes(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], axes: list[int], op: str
+) -> bool:
+    """True when the in-range axes name distinct dims, else a loud error."""
+    seen: list[int] = []
+    for ax in axes:
+        norm = _normalize_axis(ax, len(dims))
+        if norm is None:
+            continue
+        if norm in seen:
+            ctx.api.fail(
+                f"{op} has duplicate axis {ax} in {tuple(axes)} "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return False
+        seen.append(norm)
+    return True
+
+
+def _roll_shift_matches(
+    ctx: FunctionContext, dims: list[int | Type], axis: list[int] | None | str
+) -> bool:
+    """roll: shift and axis sequences must broadcast, else a loud error.
+
+    numpy broadcasts shift against axis, so equal lengths or a length of
+    one on either side pass; anything else always raises.
+    """
+    if not isinstance(axis, list):
+        return True
+    found = _hook_pair(ctx, "a", "shift", 1)
+    if found is None or isinstance(found, str):
+        return True
+    tp, expr = found
+    shift = _shape_from_arg(tp, expr)
+    if shift is None or len(shift) == len(axis) or 1 in (len(shift), len(axis)):
+        return True
+    ctx.api.fail(
+        f"roll shift has {len(shift)} entries for {len(axis)} axes "
+        f"(shift {tuple(shift)}, axis {tuple(axis)}, shape {_dims_str(dims)})",
+        ctx.context,
+    )
+    return False
+
+
 def _same_shape_hook(
     ctx: FunctionContext,
     op: str,
     first: str,
     axis_index: int | None,
     rank_min: int = 0,
+    unique_axes: bool = False,
 ) -> Type:
     """Shape-preserving ops: optional axis validated, input returned.
 
     The returned array object is the input type itself, so overload
     candidates always agree. The axis reads from its formal, falling back
-    to the positional slot when the call is positional-only.
+    to the positional slot when the call is positional-only. unique_axes
+    rejects an axis named twice (flip); roll legitimately allows it.
     """
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -2274,13 +2419,21 @@ def _same_shape_hook(
     axis = _parse_axis_arg(pair)
     if isinstance(axis, list) and not _check_each_axis(ctx, dims, axis, op):
         return ctx.default_return_type
+    if (
+        unique_axes
+        and isinstance(axis, list)
+        and not _check_unique_axes(ctx, dims, axis, op)
+    ):
+        return ctx.default_return_type
+    if op == "roll" and not _roll_shift_matches(ctx, dims, axis):
+        return ctx.default_return_type
     if axis is not None and not isinstance(axis, (list, str)):
         return ctx.default_return_type
     return pairs[0][0]
 
 
 def flip_function_hook(ctx: FunctionContext) -> Type:
-    return _same_shape_hook(ctx, "flip", first="m", axis_index=1)
+    return _same_shape_hook(ctx, "flip", first="m", axis_index=1, unique_axes=True)
 
 
 def fliplr_function_hook(ctx: FunctionContext) -> Type:
@@ -2300,7 +2453,8 @@ def gradient_function_hook(ctx: FunctionContext) -> Type:
 
     axis=None (or absent) differentiates along every axis, returning a
     tuple for ndim > 1; an int or single-element tuple resolves one axis
-    and keeps the shape. Multi-axis tuples bail to the stub type.
+    and keeps the shape. Multi-axis tuples bail to the stub type once
+    their axes are checked to be in range and distinct.
     """
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -2318,7 +2472,11 @@ def gradient_function_hook(ctx: FunctionContext) -> Type:
         if len(dims) == 1:
             return pairs[0][0]
         return ctx.default_return_type
-    if len(axis) != 1 or not _check_each_axis(ctx, dims, axis, "gradient"):
+    if not _check_each_axis(ctx, dims, axis, "gradient") or not _check_unique_axes(
+        ctx, dims, axis, "gradient"
+    ):
+        return ctx.default_return_type
+    if len(axis) != 1:
         return ctx.default_return_type
     return pairs[0][0]
 
@@ -2374,10 +2532,18 @@ def rot90_function_hook(ctx: FunctionContext) -> Type:
                 ctx.context,
             )
             return ctx.default_return_type
+    na = ia + len(dims) if ia < 0 else ia
+    nb = ib + len(dims) if ib < 0 else ib
+    if na == nb:
+        # numpy checks this before looking at k, so every k raises.
+        ctx.api.fail(
+            f"rot90 axes must be different (got ({ia}, {ib}) on shape "
+            f"{_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
     out = list(dims)
     if k % 4 in (1, 3):
-        na = ia + len(dims) if ia < 0 else ia
-        nb = ib + len(dims) if ib < 0 else ib
         out[na], out[nb] = out[nb], out[na]
     return _ndarray_type(ctx, out, dtype)
 
@@ -2405,6 +2571,14 @@ def _convolve_solve(
             ctx.context,
         )
         return ctx.default_return_type
+    for which, dim in (("first", dims_a[0]), ("second", dims_b[0])):
+        if isinstance(dim, int) and dim == 0:
+            ctx.api.fail(
+                f"{op} {which} array argument cannot be empty "
+                f"(shapes {_dims_str(dims_a)} and {_dims_str(dims_b)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
     if mode not in ("full", "valid", "same"):
         return ctx.default_return_type
     na, nb = dims_a[0], dims_b[0]
@@ -2804,6 +2978,57 @@ def _repeat_count(pair: tuple[Type, Expression | None] | None) -> int | str | No
     return "bail"
 
 
+def _repeat_display(
+    pair: tuple[Type, Expression | None] | None,
+) -> list[int | None] | None:
+    """Entries of a list/tuple repeats display (None = unknown), else None."""
+    if pair is None or not isinstance(pair[1], (TupleExpr, ListExpr)):
+        return None
+    if any(isinstance(e, StarExpr) for e in pair[1].items):
+        return None
+    return [_fold_int(e) for e in pair[1].items]
+
+
+def _repeat_display_size(
+    ctx: FunctionContext,
+    dims: list[int | Type],
+    axis: int | None,
+    entries: list[int | None],
+) -> int | str | None:
+    """New size for a multi-entry repeats display; 'bail', or None on error.
+
+    numpy broadcasts the counts against the repeated axis (or the
+    flattened array for axis=None), so a display of more than one entry
+    needs exactly one per element. Known non-negative counts add up to
+    the new size.
+    """
+    target: int | Type
+    if axis is None:
+        total = 1
+        for d in dims:
+            if not isinstance(d, int):
+                return "bail"
+            total *= d
+        target, where = total, f"the flattened size {total}"
+    else:
+        norm = _normalize_axis(axis, len(dims))
+        if norm is None:
+            # The hook's axis range check reports this.
+            return "bail"
+        target, where = dims[norm], f"axis {axis} of size {dims[norm]}"
+    if not isinstance(target, int):
+        return "bail"
+    if len(entries) != target:
+        ctx.api.fail(
+            f"repeat repeats has {len(entries)} entries for {where} "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return None
+    counts = [e for e in entries if e is not None and e >= 0]
+    return sum(counts) if len(counts) == len(entries) else "bail"
+
+
 def repeat_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -2836,7 +3061,18 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
             f"repeat repeats must be non-negative, got {count}", ctx.context
         )
         return ctx.default_return_type
+    # A multi-entry display fixes the new size outright (or proves the
+    # call raises); a single entry broadcasts and stays unknown below.
+    size: int | str = "bail"
+    entries = _repeat_display(found_repeats)
+    if entries is not None and len(entries) != 1:
+        checked = _repeat_display_size(ctx, dims, axis, entries)
+        if checked is None:
+            return ctx.default_return_type
+        size = checked
     if axis is None:
+        if isinstance(size, int):
+            return _ndarray_type(ctx, [size], dtype)
         if isinstance(count, int):
             return _ndarray_type(
                 ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
@@ -2851,7 +3087,9 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     out = list(dims)
-    if isinstance(count, int):
+    if isinstance(size, int):
+        out[target] = size
+    elif isinstance(count, int):
         out[target] = _dim_mul_const(ctx, "repeat", target, out[target], count)
     else:
         out[target] = _fresh_unknown(ctx, "repeat", target)
@@ -4364,6 +4602,8 @@ def _solve_squeeze(
                 # A symbolic dim could be 1 at runtime: bail out.
                 return ctx.default_return_type
             return _ndarray_type(ctx, [d for d in dims if d != 1], dtype)
+        return ctx.default_return_type
+    if not _check_unique_axes(ctx, dims, axis, "squeeze"):
         return ctx.default_return_type
     chosen: list[int] = []
     for ax in axis:
@@ -6166,6 +6406,64 @@ def _solve_same_or_flat(
     return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
 
 
+def _kth_in_bounds(
+    ctx: FunctionContext | MethodContext,
+    dims: list[int | Type],
+    axis: list[int] | None | str,
+    op: str,
+) -> bool:
+    """partition/argpartition: every literal kth must index the axis.
+
+    kth may be negative (counted from the end) but must land in
+    [-size, size) of the partitioned axis, or of the flattened array
+    for axis=None. Anything unproven passes. The method spells kth
+    positional-only, so it reads from the first positional there, as
+    long as the callee's formals (axis) are visible at all.
+    """
+    pair = _formal_pair(ctx, "kth")
+    if pair is None and isinstance(ctx, MethodContext) and "axis" in ctx.callee_arg_names:
+        pos = _all_positionals(ctx)
+        pair = pos[0] if pos else None
+    if pair is None or not dims:
+        return True
+    kths = _shape_from_arg(*pair)
+    if not kths:
+        return True
+    size: int | Type
+    if axis == "none":
+        total = 1
+        for d in dims:
+            if not isinstance(d, int):
+                return True
+            total *= d
+        size = total
+        where = f"the flattened size {size}"
+    else:
+        if axis == "absent":
+            ax = -1
+        elif isinstance(axis, list) and len(axis) == 1:
+            ax = axis[0]
+        else:
+            return True
+        norm = _normalize_axis(ax, len(dims))
+        if norm is None:
+            # The axis range check reports this.
+            return True
+        size = dims[norm]
+        where = f"axis {ax} of size {size}"
+    if not isinstance(size, int):
+        return True
+    for k in kths:
+        if not -size <= k < size:
+            ctx.api.fail(
+                f"{op} kth {k} is out of bounds for {where} "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return False
+    return True
+
+
 ARG_DROP = frozenset({"argmax", "argmin", "nanargmax", "nanargmin", "argpartition"})
 ARG_SAME_INT = frozenset({"argsort"})
 ARG_SAME = frozenset({"sort", "partition"})
@@ -6177,6 +6475,8 @@ def _arg_inputs(ctx: FunctionContext | MethodContext, array: Type, op: str) -> T
         return ctx.default_return_type
     dims, dtype = parts
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if op in ("partition", "argpartition") and not _kth_in_bounds(ctx, dims, axis, op):
+        return ctx.default_return_type
     if op in ARG_DROP:
         return _solve_argdrop(ctx, dims, axis)
     return _solve_same_or_flat(ctx, dims, dtype, axis, int_out=op in ARG_SAME_INT)
@@ -6937,6 +7237,44 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
     return _linalg_tuple(ctx, [_ndarray_type(ctx, [*batch, *core], dtype), *rest])
 
 
+def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -> bool:
+    """linalg.norm: an explicit ord needs a vector or matrix norm.
+
+    With ord=None numpy flattens any rank; any other ord picks a vector
+    norm (one reduced axis) or a matrix norm (two), and string orders
+    ('fro', 'nuc') exist only for matrices. An ord of unknown value
+    passes.
+    """
+    pair = _formal_pair(ctx, "ord")
+    if pair is None or _is_none_type(pair[0]):
+        return True
+    order = _string_value(pair[0])
+    if order is None and _weak_name(pair[0]) not in ("builtins.int", "builtins.float"):
+        return True
+    number = _int_value(pair[0])
+    if order is not None:
+        shown = f"ord={order!r}"
+    elif number is not None:
+        shown = f"ord={number}"
+    else:
+        shown = "an explicit ord"
+    if reduced > 2:
+        ctx.api.fail(
+            f"linalg.norm with {shown} reduces {reduced} dimensions; only "
+            f"vector (1) or matrix (2) norms exist (shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return False
+    if order is not None and reduced == 1:
+        ctx.api.fail(
+            f"linalg.norm ord={order!r} is a matrix norm and needs 2 axes, "
+            f"got 1 (shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return False
+    return True
+
+
 def _linalg_norm(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -6968,6 +7306,8 @@ def _linalg_norm(ctx: FunctionContext) -> Type:
             axes.append(norm)
         if len(set(axes)) != len(axes):
             return ctx.default_return_type
+    if not _norm_ord_fits(ctx, dims, len(axes)):
+        return ctx.default_return_type
     if keepdims:
         out_dims = [1 if i in axes else d for i, d in enumerate(dims)]
     else:
@@ -7828,6 +8168,8 @@ def ufunc_call_hook(ctx: MethodContext) -> Type:
     if name == "matmul":
         pairs = _all_positionals(ctx)
         if len(pairs) != 2:
+            return ctx.default_return_type
+        if not _matmul_has_dims(ctx, [pairs[0][0], pairs[1][0]]):
             return ctx.default_return_type
         return _solve_matmul(ctx, pairs[0][0], pairs[1][0])
     if name in {"divide", "true_divide"}:
