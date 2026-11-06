@@ -660,201 +660,18 @@ class NumtyPlugin(Plugin):
         )
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
-        # numpy re-exports these from private modules (e.g.
-        # numpy._core.multiarray), so match the public tail.
-        short = fullname.rsplit(".", 1)[-1]
         if fullname == "builtins.len":
             return len_function_hook
-        if fullname.startswith("numpy.") and short in {"zeros", "ones", "empty"}:
-            return zeros_like_hook
         # Raw np.matmul solves through the ufunc __call__ hook; the
         # numty.matmul wrapper below stays as a convenience alias.
         if fullname == "numty.matmul":
             return matmul_hook
-        # np.reshape lives in numpy._core.fromnumeric; match the tail like
-        # the constructors above.
-        if fullname.startswith("numpy.") and short == "reshape":
-            return reshape_function_hook
-        if fullname.startswith("numpy.") and short == "transpose":
-            return transpose_function_hook
-        if fullname.startswith("numpy.") and short == "squeeze":
-            return squeeze_function_hook
-        if fullname.startswith("numpy.") and short == "expand_dims":
-            return expand_dims_function_hook
-        if fullname.startswith("numpy.") and short in {
-            "sum",
-            "prod",
-            "mean",
-            "min",
-            "max",
-            "std",
-            "var",
-            "median",
-            "nansum",
-            "nanprod",
-            "nanmean",
-            "nanmin",
-            "nanmax",
-            "nanstd",
-            "nanvar",
-            "nanmedian",
-        }:
-            return reduction_function_hook
-        if fullname.startswith("numpy.") and short == "average":
-            return average_function_hook
-        if fullname.startswith("numpy.") and short == "dot":
-            return dot_function_hook
-        if fullname.startswith("numpy.") and short == "tensordot":
-            return tensordot_function_hook
-        if fullname.startswith("numpy.") and short == "inner":
-            return inner_function_hook
-        if fullname.startswith("numpy.") and short == "outer":
-            return outer_function_hook
-        if fullname.startswith("numpy.") and short == "vdot":
-            return vdot_function_hook
-        if fullname.startswith("numpy.") and short == "take":
-            return take_function_hook
-        if fullname.startswith("numpy.") and short == "tile":
-            return tile_function_hook
-        if fullname.startswith("numpy.") and short == "repeat":
-            return repeat_function_hook
-        if fullname.startswith("numpy.") and short == "pad":
-            return pad_function_hook
-        if fullname.startswith("numpy.") and short == "split":
-            return split_function_hook
-        if fullname.startswith("numpy.") and short == "sliding_window_view":
-            return sliding_window_view_function_hook
-        if fullname.startswith("numpy.") and short == "nonzero":
-            return nonzero_function_hook
-        if fullname.startswith("numpy.") and short == "flatnonzero":
-            return flatnonzero_function_hook
-        if fullname.startswith("numpy.") and short == "argwhere":
-            return argwhere_function_hook
-        if fullname.startswith("numpy.") and short == "unique":
-            return unique_function_hook
-        if fullname.startswith("numpy.") and short == "isin":
-            return isin_function_hook
-        if fullname.startswith("numpy.") and short == "searchsorted":
-            return searchsorted_function_hook
-        if fullname.startswith("numpy.") and short == "convolve":
-            return convolve_function_hook
-        if fullname.startswith("numpy.") and short == "correlate":
-            return correlate_function_hook
-        if fullname.startswith("numpy.") and short == "flip":
-            return flip_function_hook
-        if fullname.startswith("numpy.") and short == "fliplr":
-            return fliplr_function_hook
-        if fullname.startswith("numpy.") and short == "flipud":
-            return flipud_function_hook
-        if fullname.startswith("numpy.") and short == "roll":
-            return roll_function_hook
-        if fullname.startswith("numpy.") and short == "rot90":
-            return rot90_function_hook
-        if fullname.startswith("numpy.") and short == "gradient":
-            return gradient_function_hook
-        if fullname.startswith("numpy.fft.") and short in {"fft", "ifft"}:
-            return fft_function_hook
-        if fullname.startswith("numpy.fft.") and short == "fftn":
-            return fftn_function_hook
-        if fullname.startswith("numpy.fft.") and short == "rfft":
-            return rfft_function_hook
-        if fullname.startswith("numpy.fft.") and short == "rfftn":
-            return rfftn_function_hook
-        if fullname.startswith("numpy.") and short in {
-            "atleast_1d",
-            "atleast_2d",
-            "atleast_3d",
-        }:
-            return partial(atleast_function_hook, rank=int(short[-2]))
-        if fullname.startswith("numpy.") and short == "vstack":
-            return vstack_function_hook
-        if fullname.startswith("numpy.") and short == "hstack":
-            return hstack_function_hook
-        if fullname.startswith("numpy.") and short == "dstack":
-            return dstack_function_hook
-        if fullname.startswith("numpy.") and short == "column_stack":
-            return column_stack_function_hook
-        if fullname.startswith("numpy.") and short in {
-            "cumsum",
-            "cumprod",
-            "nancumsum",
-            "nancumprod",
-        }:
-            return cumsum_function_hook
-        if fullname.startswith("numpy.") and short == "diff":
-            return diff_function_hook
-        if fullname.startswith("numpy.") and short in {"any", "all"}:
-            return allany_function_hook
-        if fullname.startswith("numpy.") and short in {
-            "zeros_like",
-            "ones_like",
-            "empty_like",
-            "full_like",
-        }:
-            return like_function_hook
-        if fullname.startswith("numpy.") and short == "full":
-            return full_function_hook
-        if fullname.startswith("numpy.") and short == "eye":
-            return eye_function_hook
-        if fullname.startswith("numpy.") and short == "arange":
-            return arange_function_hook
-        if fullname.startswith("numpy.") and short == "concatenate":
-            return concatenate_function_hook
-        if fullname.startswith("numpy.") and short == "stack":
-            return stack_function_hook
-        if fullname.startswith("numpy.") and short == "einsum":
-            return einsum_function_hook
-        if fullname.startswith("numpy.") and short in {
-            "add",
-            "multiply",
-            "subtract",
-            "power",
-        }:
-            return broadcast_function_hook
-        if fullname.startswith("numpy.") and short in {"divide", "true_divide"}:
-            return truediv_function_hook
-        if fullname.startswith("numpy.") and short == "where":
-            return where_function_hook
-        if fullname.startswith("numpy.") and short == "clip":
-            return clip_function_hook
-        if fullname.startswith("numpy.") and short == "broadcast_to":
-            return broadcast_to_function_hook
-        if fullname.startswith("numpy.") and short in {"asarray", "asanyarray", "array"}:
-            return asarray_function_hook
-        if fullname.startswith("numpy.") and short == "take_along_axis":
-            return take_along_axis_function_hook
-        if fullname.startswith("numpy.") and short in _UFUNC_KEEP:
-            return partial(ufunc_function_hook, group="keep")
-        if fullname.startswith("numpy.") and short in _UFUNC_ABS:
-            return partial(ufunc_function_hook, group="abs")
-        if fullname.startswith("numpy.") and short in _UFUNC_FLOAT:
-            return partial(ufunc_function_hook, group="float")
-        if fullname.startswith("numpy.") and short in _UFUNC_REAL:
-            return partial(ufunc_function_hook, group="real")
-        if fullname.startswith("numpy.") and short in _UFUNC_BOOL:
-            return partial(ufunc_function_hook, group="bool")
-        if fullname.startswith("numpy.linalg.") and short in {
-            "solve",
-            "inv",
-            "cholesky",
-            "eig",
-            "eigh",
-            "svd",
-            "lstsq",
-            "norm",
-        }:
-            return partial(linalg_function_hook, op=short)
-        if fullname.startswith("numpy.") and short in {
-            "argmax",
-            "argmin",
-            "nanargmax",
-            "nanargmin",
-            "argsort",
-            "sort",
-            "partition",
-            "argpartition",
-        }:
-            return partial(arg_function_hook, op=short)
+        # Exact canonical names only (see _numpy_function_hooks): a name
+        # tail would also catch np.ma / np.emath / numpy.matlib twins.
+        hook = _NUMPY_FUNCTION_HOOKS.get(fullname)
+        if hook is not None:
+            return hook
+        short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.random._generator.Generator.") and short in {
             "normal",
             "integers",
@@ -3976,13 +3793,6 @@ def broadcast_method_hook(ctx: MethodContext) -> Type:
     if args is None:
         return ctx.default_return_type
     return _solve_broadcast(ctx, ctx.type, args[0])
-
-
-def broadcast_function_hook(ctx: FunctionContext) -> Type:
-    args = _positional_actuals(ctx, 2)
-    if args is None:
-        return ctx.default_return_type
-    return _solve_broadcast(ctx, args[0], args[1])
 
 
 STR_FULLNAME = "builtins.str"
@@ -8070,13 +7880,6 @@ def _truediv_types(
     return _ndarray_type(ctx, dims, dtype)
 
 
-def truediv_function_hook(ctx: FunctionContext) -> Type:
-    args = _positional_actuals(ctx, 2)
-    if args is None:
-        return ctx.default_return_type
-    return _solve_truediv_pair(ctx, args[0], args[1])
-
-
 def truediv_method_hook(ctx: MethodContext) -> Type:
     args = _positional_actuals(ctx, 1)
     if args is None:
@@ -8467,3 +8270,173 @@ def _ufunc_bool_types(
         return ctx.default_return_type
     return _ndarray_type(ctx, dims, bool_dtype)
 
+
+def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
+    """Exact fullname -> hook for the numpy functions numty solves.
+
+    mypy reports a re-exported function under its defining module
+    (np.sum is numpy._core.fromnumeric.sum), so the keys are those
+    canonical names. Matching on the name tail instead would also catch
+    same-named twins with different semantics: numpy.ma (MaskedArray
+    results), numpy.emath / numpy.lib.scimath (complex results),
+    numpy.matlib (matrix results), numpy.char / numpy.strings,
+    numpy.rec and numpy.linalg.outer (1-D only). Those keep their stub
+    return types.
+    """
+    by_module: dict[str, dict[str, Callable[[FunctionContext], Type]]] = {
+        "numpy._core.einsumfunc": {"einsum": einsum_function_hook},
+        "numpy._core.fromnumeric": {
+            "all": allany_function_hook,
+            "any": allany_function_hook,
+            "clip": clip_function_hook,
+            "cumprod": cumsum_function_hook,
+            "cumsum": cumsum_function_hook,
+            "max": reduction_function_hook,
+            "mean": reduction_function_hook,
+            "min": reduction_function_hook,
+            "nonzero": nonzero_function_hook,
+            "prod": reduction_function_hook,
+            "repeat": repeat_function_hook,
+            "reshape": reshape_function_hook,
+            "searchsorted": searchsorted_function_hook,
+            "squeeze": squeeze_function_hook,
+            "std": reduction_function_hook,
+            "sum": reduction_function_hook,
+            "take": take_function_hook,
+            "transpose": transpose_function_hook,
+            "var": reduction_function_hook,
+            **{
+                op: partial(arg_function_hook, op=op)
+                for op in (
+                    "argmax",
+                    "argmin",
+                    "argpartition",
+                    "argsort",
+                    "partition",
+                    "sort",
+                )
+            },
+        },
+        "numpy._core.multiarray": {
+            "arange": arange_function_hook,
+            "array": asarray_function_hook,
+            "asanyarray": asarray_function_hook,
+            "asarray": asarray_function_hook,
+            "concatenate": concatenate_function_hook,
+            "dot": dot_function_hook,
+            "empty": zeros_like_hook,
+            "empty_like": like_function_hook,
+            "inner": inner_function_hook,
+            "vdot": vdot_function_hook,
+            "where": where_function_hook,
+            "zeros": zeros_like_hook,
+        },
+        "numpy._core.numeric": {
+            "argwhere": argwhere_function_hook,
+            "convolve": convolve_function_hook,
+            "correlate": correlate_function_hook,
+            "flatnonzero": flatnonzero_function_hook,
+            "full": full_function_hook,
+            "full_like": like_function_hook,
+            "ones": zeros_like_hook,
+            "ones_like": like_function_hook,
+            "outer": outer_function_hook,
+            "roll": roll_function_hook,
+            "tensordot": tensordot_function_hook,
+            "zeros_like": like_function_hook,
+        },
+        "numpy._core.shape_base": {
+            "atleast_1d": partial(atleast_function_hook, rank=1),
+            "atleast_2d": partial(atleast_function_hook, rank=2),
+            "atleast_3d": partial(atleast_function_hook, rank=3),
+            "hstack": hstack_function_hook,
+            "stack": stack_function_hook,
+            "vstack": vstack_function_hook,
+        },
+        "numpy.fft._pocketfft": {
+            "fft": fft_function_hook,
+            "fftn": fftn_function_hook,
+            "ifft": fft_function_hook,
+            "rfft": rfft_function_hook,
+            "rfftn": rfftn_function_hook,
+        },
+        "numpy.lib._arraypad_impl": {"pad": pad_function_hook},
+        "numpy.lib._arraysetops_impl": {
+            "isin": isin_function_hook,
+            "unique": unique_function_hook,
+        },
+        "numpy.lib._function_base_impl": {
+            "average": average_function_hook,
+            "diff": diff_function_hook,
+            "flip": flip_function_hook,
+            "gradient": gradient_function_hook,
+            "median": reduction_function_hook,
+            "rot90": rot90_function_hook,
+            "sinc": partial(ufunc_function_hook, group="float"),
+        },
+        "numpy.lib._nanfunctions_impl": {
+            "nanargmax": partial(arg_function_hook, op="nanargmax"),
+            "nanargmin": partial(arg_function_hook, op="nanargmin"),
+            "nancumprod": cumsum_function_hook,
+            "nancumsum": cumsum_function_hook,
+            "nanmax": reduction_function_hook,
+            "nanmean": reduction_function_hook,
+            "nanmedian": reduction_function_hook,
+            "nanmin": reduction_function_hook,
+            "nanprod": reduction_function_hook,
+            "nanstd": reduction_function_hook,
+            "nansum": reduction_function_hook,
+            "nanvar": reduction_function_hook,
+        },
+        "numpy.lib._shape_base_impl": {
+            "column_stack": column_stack_function_hook,
+            "dstack": dstack_function_hook,
+            "expand_dims": expand_dims_function_hook,
+            "split": split_function_hook,
+            "take_along_axis": take_along_axis_function_hook,
+            "tile": tile_function_hook,
+        },
+        "numpy.lib._stride_tricks_impl": {
+            "broadcast_to": broadcast_to_function_hook,
+            "sliding_window_view": sliding_window_view_function_hook,
+        },
+        "numpy.lib._twodim_base_impl": {
+            "eye": eye_function_hook,
+            "fliplr": fliplr_function_hook,
+            "flipud": flipud_function_hook,
+        },
+        "numpy.lib._type_check_impl": {
+            "imag": partial(ufunc_function_hook, group="real"),
+            "real": partial(ufunc_function_hook, group="real"),
+        },
+        "numpy.lib._ufunclike_impl": {
+            "isneginf": partial(ufunc_function_hook, group="bool"),
+            "isposinf": partial(ufunc_function_hook, group="bool"),
+        },
+        "numpy.linalg._linalg": {
+            # numpy.linalg.tensordot is np.tensordot with keyword-only
+            # axes; numpy.linalg.outer (1-D only) is deliberately absent.
+            "tensordot": tensordot_function_hook,
+            **{
+                op: partial(linalg_function_hook, op=op)
+                for op in (
+                    "cholesky",
+                    "eig",
+                    "eigh",
+                    "inv",
+                    "lstsq",
+                    "norm",
+                    "solve",
+                    "svd",
+                )
+            },
+        },
+    }
+    return {
+        f"{module}.{name}": hook
+        for module, hooks in by_module.items()
+        for name, hook in hooks.items()
+    }
+
+
+_NUMPY_FUNCTION_HOOKS = _numpy_function_hooks()
