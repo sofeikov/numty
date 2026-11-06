@@ -361,8 +361,9 @@ unrelated unknowns print differently. In
 `tests/fixtures/unknown_names_ok.py`, two masks on lines 17 and 18 give
 an outer product of `tuple[?U@17, ?U@18]`, not a square, and padding a
 mask taken on line 24 gives `?U@24+2`. A second unknown minted on the
-same line gets a letter: `r, c = np.nonzero(y)` over a 2-d `y` on
-line 6 of a file gives `?U@6` and `?U@6b`.
+same line gets a letter: `a, b = x[x > 0.0], x[x > 1.5]` on line 7
+of a file gives `?U@7` and `?U@7b` (numpy: `(4,)` and `(3,)` for
+`x = [1., 2., 2., 3.]`).
 
 The boundary is principled: unknowns flow through bodies but cannot be
 named in signatures — there is no spelling for "somebody else's count".
