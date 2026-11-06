@@ -1,8 +1,24 @@
 """Runtime behavior of the numty helpers: shapes, values, narrowing."""
+import dataclasses
+import os
+import subprocess
+import sys
+import typing
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pytest
 
-from numty import ident, matmul, narrow
+from numty import F32, F64, I32, I64, Bool, NarrowError, batch, ident, matmul, narrow
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclasses.dataclass
+class Batch:
+    x: F64["batch features"]
+    mask: Bool[4]
 
 
 def test_zeros_have_expected_shapes() -> None:
@@ -41,17 +57,102 @@ def test_end_to_end_matmul_plus_bias() -> None:
 
 
 def test_narrow_accepts_matching() -> None:
-    assert narrow(np.zeros((2, 3)), np.zeros((2, 3))).shape == (2, 3)
+    m = np.zeros((2, 3))
+    got = narrow(m, np.zeros((2, 3)))
+    assert got is m
+    assert got.shape == (2, 3)
 
 
 def test_narrow_rejects_mismatch() -> None:
-    with pytest.raises(AssertionError):
+    with pytest.raises(NarrowError, match=r"shape \(3, 2\) does not match witness \(2, 3\)"):
         narrow(np.zeros((3, 2)), np.zeros((2, 3)))
 
 
 def test_narrow_rejects_dtype_mismatch() -> None:
-    with pytest.raises(AssertionError):
+    with pytest.raises(NarrowError, match="dtype float32 does not match witness float64"):
         narrow(np.zeros((2, 3), dtype=np.float32), np.zeros((2, 3)))
+
+
+def test_narrow_error_is_value_and_assertion_error() -> None:
+    # ValueError is the documented type; AssertionError keeps callers of
+    # the old assert-based check working.
+    with pytest.raises(ValueError):
+        narrow(np.zeros((3, 2)), np.zeros((2, 3)))
+    with pytest.raises(AssertionError):
+        narrow(np.zeros((3, 2)), np.zeros((2, 3)))
+
+
+@pytest.mark.parametrize(
+    "call, message",
+    [
+        (
+            "narrow(np.zeros((3, 2)), np.zeros((2, 3)))",
+            "shape (3, 2) does not match witness (2, 3)",
+        ),
+        (
+            "narrow(np.zeros((2, 3), dtype=np.int64), np.zeros((2, 3)))",
+            "dtype int64 does not match witness float64",
+        ),
+    ],
+)
+def test_narrow_rejects_mismatch_under_O(call: str, message: str) -> None:
+    # python -O strips asserts; narrow must still refuse the array.
+    code = f"import numpy as np\nfrom numty import narrow\nassert False\n{call}\n"
+    proc = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0
+    assert "NarrowError" in proc.stderr
+    assert message in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "head, dtype",
+    [(F64, np.float64), (F32, np.float32), (I64, np.int64), (I32, np.int32), (Bool, np.bool_)],
+)
+def test_isinstance_against_head_checks_ndarray_and_dtype(head: Any, dtype: Any) -> None:
+    assert isinstance(np.zeros(3, dtype=dtype), head)
+    assert isinstance(np.zeros((2, 3, 4), dtype=dtype), head)
+    assert not isinstance(np.zeros(3, dtype=np.complex128), head)
+    assert not isinstance([0.0, 1.0], head)
+    assert not isinstance(dtype(0), head)
+
+
+def test_isinstance_picks_array_branch() -> None:
+    def describe(x: F64[3] | list[float]) -> str:
+        if isinstance(x, F64):
+            return "array"
+        return "list"
+
+    assert describe(np.zeros(3)) == "array"
+    assert describe([1.0, 2.0, 3.0]) == "list"
+
+
+def test_head_is_not_constructible() -> None:
+    with pytest.raises(TypeError, match="shape annotation"):
+        F64()
+
+
+def test_heads_still_work_as_runtime_annotations() -> None:
+    def f(x: F64["batch features"], y: F64[batch, 3], z: I64[3]) -> None: ...
+
+    hints = typing.get_type_hints(f)
+    assert hints["x"] is F64
+    assert typing.get_origin(hints["y"]) is F64
+    assert typing.get_args(hints["y"]) == (batch, 3)
+    assert typing.get_origin(hints["z"]) is I64
+    assert isinstance(np.zeros((2, 3)), typing.get_origin(hints["y"]))
+    assert not isinstance(np.zeros((2, 3)), typing.get_origin(hints["z"]))
+
+    assert [f.name for f in dataclasses.fields(Batch)] == ["x", "mask"]
+    batch_hints = typing.get_type_hints(Batch)
+    assert batch_hints["x"] is F64
+    assert typing.get_origin(batch_hints["mask"]) is Bool
+    assert typing.get_args(batch_hints["mask"]) == (4,)
 
 
 def test_ident_returns_same_object() -> None:

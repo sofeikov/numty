@@ -46,7 +46,34 @@ FlexArray = np.ndarray[S2, D2]
 TsFam = TypeVarTuple("TsFam")
 
 
-class _StringDims:
+class _HeadMeta(type):
+    """Metaclass that makes the heads honest at runtime.
+
+    Statically the plugin rewrites `F64[...]` in annotations to an
+    ndarray, so `isinstance(x, F64)` narrows `x` to an array. Back that up
+    here: a head matches exactly the ndarrays of its dtype. Rank and dims
+    are not checked, and a subscripted head (`F64[3]`) cannot be used with
+    isinstance, as for any generic. Heads are annotations, never values,
+    so calling one raises instead of building an object that is not an
+    array.
+    """
+
+    _numty_dtype: np.dtype[Any] | None = None
+
+    def __instancecheck__(cls, obj: object) -> bool:
+        dtype = cls._numty_dtype
+        if dtype is None:
+            return super().__instancecheck__(obj)
+        return isinstance(obj, np.ndarray) and obj.dtype == dtype
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError(
+            f"{cls.__name__} is a shape annotation, not a constructor; "
+            "build the array with numpy (e.g. np.zeros(..., dtype=...))"
+        )
+
+
+class _StringDims(metaclass=_HeadMeta):
     """Runtime companion for the familiar heads below.
 
     Static checking happens in mypy (see numty_plugin); at runtime a
@@ -67,21 +94,31 @@ class _StringDims:
 class F64(_StringDims, Generic[Unpack[TsFam]]):
     """float64 array with flat dims, e.g. F64[batch, features]."""
 
+    _numty_dtype = np.dtype(np.float64)
+
 
 class F32(_StringDims, Generic[Unpack[TsFam]]):
     """float32 array with flat dims, e.g. F32[batch, features]."""
+
+    _numty_dtype = np.dtype(np.float32)
 
 
 class I64(_StringDims, Generic[Unpack[TsFam]]):
     """int64 array with flat dims, e.g. I64[batch, count]."""
 
+    _numty_dtype = np.dtype(np.int64)
+
 
 class I32(_StringDims, Generic[Unpack[TsFam]]):
     """int32 array with flat dims, e.g. I32[batch, count]."""
 
+    _numty_dtype = np.dtype(np.int32)
+
 
 class Bool(_StringDims, Generic[Unpack[TsFam]]):
     """boolean array with flat dims, e.g. Bool[batch, mask]."""
+
+    _numty_dtype = np.dtype(np.bool_)
 
 
 # Ready-made dim TypeVars for the heads above: `F64[batch, features]`
@@ -108,12 +145,28 @@ def ident(m: FloatArray[S]) -> FloatArray[S]:
     return m
 
 
+class NarrowError(ValueError, AssertionError):
+    """`narrow` got an array that does not match its witness.
+
+    A ValueError, and also an AssertionError so code written against the
+    earlier assert-based check keeps catching it.
+    """
+
+
 # Narrowing for values whose shape is only known at runtime. The witness
 # carries the desired shape as its type, so no per-shape helper is needed:
-# narrow(m, np.zeros((2, 3))) -> precisely 2x3, with a runtime assert.
+# narrow(m, np.zeros((2, 3))) -> precisely 2x3, checked at runtime. The
+# checks raise explicitly rather than assert: `python -O` strips asserts,
+# and the cast would then hand back a mismatched array typed as the witness.
 def narrow(m: LooseArray, witness: FloatArray[S]) -> FloatArray[S]:
-    assert m.shape == witness.shape
-    assert m.dtype == witness.dtype
+    if m.shape != witness.shape:
+        raise NarrowError(
+            f"narrow: shape {m.shape} does not match witness {witness.shape}"
+        )
+    if m.dtype != witness.dtype:
+        raise NarrowError(
+            f"narrow: dtype {m.dtype} does not match witness {witness.dtype}"
+        )
     return cast(FloatArray[S], m)
 
 

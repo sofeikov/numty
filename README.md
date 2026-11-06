@@ -649,8 +649,22 @@ Narrowing a dynamically-shaped value uses a witness instead of a
 per-shape helper:
 
 ```python
-use_2x3(narrow(m, np.zeros((2, 3))))  # asserts at runtime, precise statically
+use_2x3(narrow(m, np.zeros((2, 3))))  # checked at runtime, precise statically
 ```
+
+`narrow` returns `m` itself when its shape and dtype equal the witness's,
+and otherwise raises `numty.NarrowError` (a `ValueError`, and also an
+`AssertionError` for older callers), e.g. `narrow: shape (3, 2) does not
+match witness (2, 3)`. The check is an explicit raise, not an `assert`,
+so it still runs under `python -O`.
+
+At runtime the heads are annotations, not array classes: calling
+`F64()` raises `TypeError`. `isinstance(x, F64)` is true exactly when
+`x` is an `ndarray` with dtype float64 (likewise `F32`, `I64`, `I32`,
+`Bool`), which backs up mypy narrowing `x` to an array in that branch.
+Rank and dims are not checked at runtime, and a subscripted head
+(`isinstance(x, F64[3])`) raises `TypeError` like any subscripted
+generic; use `narrow` or compare `x.shape` for those.
 
 ## Quickstart
 
@@ -806,7 +820,8 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   math library, 17 of 18 seeded mistakes caught), with its own scorecard in
   [bench/README.md](bench/README.md).
 - [tests/test_runtime.py](tests/test_runtime.py) —
-  shapes, values, narrowing accept/reject.
+  shapes, values, narrowing accept/reject (also under `python -O`),
+  `isinstance` against heads.
 - [tests/test_static.py](tests/test_static.py) — runs
   real mypy over [fixtures](tests/fixtures/static_ok.py):
   each bad one must fail with our message, and `reveal_type` pins must show
