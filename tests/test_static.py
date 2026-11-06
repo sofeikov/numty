@@ -1124,3 +1124,33 @@ def test_split_axis_mismatch() -> None:
         "split axis 5 is out of range for 2 dimensions",
         "(2, 3)",
     )
+
+
+def test_select_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "select_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_unique_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_unique_axis.py"),
+        "unique axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
+    )
+
+
+def test_nonzero_rank_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_nonzero_rank.py"),
+        "nonzero on 0d arrays is not allowed",
+        '"nonzero"',
+    )
+
+
+def test_where_rank_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_where_rank.py"),
+        "where on 0d arrays is not allowed",
+        '"where"',
+    )

@@ -668,6 +668,18 @@ class NumtyPlugin(Plugin):
             return pad_function_hook
         if fullname.startswith("numpy.") and short == "split":
             return split_function_hook
+        if fullname.startswith("numpy.") and short == "nonzero":
+            return nonzero_function_hook
+        if fullname.startswith("numpy.") and short == "flatnonzero":
+            return flatnonzero_function_hook
+        if fullname.startswith("numpy.") and short == "argwhere":
+            return argwhere_function_hook
+        if fullname.startswith("numpy.") and short == "unique":
+            return unique_function_hook
+        if fullname.startswith("numpy.") and short == "isin":
+            return isin_function_hook
+        if fullname.startswith("numpy.") and short == "searchsorted":
+            return searchsorted_function_hook
         if fullname.startswith("numpy.") and short == "convolve":
             return convolve_function_hook
         if fullname.startswith("numpy.") and short == "correlate":
@@ -2816,6 +2828,185 @@ def split_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     element = _ndarray_type(ctx, out, dtype)
     return ctx.api.named_generic_type("builtins.list", [element])
+
+
+def _select_index_elem(
+    ctx: FunctionContext, op: str, index: int
+) -> Type | None:
+    """A 1-d int64 ?U index array, else None to bail."""
+    dtype = _construct_dtype(ctx, "numpy.int64")
+    if dtype is None:
+        return None
+    return _ndarray_type(ctx, [_fresh_unknown(ctx, op, index)], dtype)
+
+
+def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
+    """Tuple of 1-d int ?U arrays, one per dim; 0-d fails loudly."""
+    parts = _ndarray_parts(arg)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if not dims:
+        ctx.api.fail(
+            f"{op} on 0d arrays is not allowed (use atleast_1d first)",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    elems: list[Type] = []
+    for i in range(len(dims)):
+        elem = _select_index_elem(ctx, op, i)
+        if elem is None:
+            return ctx.default_return_type
+        elems.append(elem)
+    return _linalg_tuple(ctx, elems)
+
+
+def nonzero_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _nonzero_like(ctx, "nonzero", pairs[0][0])
+
+
+def flatnonzero_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    elem = _select_index_elem(ctx, "flatnonzero", 0)
+    if elem is None:
+        return ctx.default_return_type
+    return elem
+
+
+def argwhere_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    dtype = _construct_dtype(ctx, "numpy.int64")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [_fresh_unknown(ctx, "argwhere", 0), len(dims)], dtype)
+
+
+def unique_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if not _picture_complete(ctx, "ar"):
+        return ctx.default_return_type
+    for name, index in (
+        ("return_index", 1),
+        ("return_inverse", 2),
+        ("return_counts", 3),
+    ):
+        found = _hook_pair(ctx, "ar", name, index)
+        if found == "incomplete":
+            return ctx.default_return_type
+        assert not isinstance(found, str)
+        if found is None:
+            continue
+        if _fold_flag(found) is not False:
+            return ctx.default_return_type
+    found_axis = _hook_pair(ctx, "ar", "axis", 4)
+    if found_axis == "incomplete":
+        return ctx.default_return_type
+    assert not isinstance(found_axis, str)
+    if found_axis is None:
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "unique", 0)], dtype)
+    folded = _int_or_none(found_axis)
+    if folded == "bail":
+        return ctx.default_return_type
+    if folded is None:
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "unique", 0)], dtype)
+    assert isinstance(folded, int)
+    target = _normalize_axis(folded, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"unique axis {folded} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    out[target] = _fresh_unknown(ctx, "unique", target)
+    return _ndarray_type(ctx, out, dtype)
+
+
+def isin_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    dtype = _construct_dtype(ctx, "numpy.bool")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, list(dims), dtype)
+
+
+def _search_values_dims(
+    tp: Type, expr: Expression | None
+) -> list[int | Type] | None:
+    """Shape of searchsorted values: [] scalar, dims otherwise, None to bail."""
+    if expr is not None and isinstance(expr, (TupleExpr, ListExpr)):
+        if not expr.items:
+            return [0]
+        subs: list[list[int | Type]] = []
+        for item in expr.items:
+            if isinstance(item, StarExpr):
+                return None
+            if isinstance(item, (TupleExpr, ListExpr)):
+                sub = _search_values_dims(None, item)
+            else:
+                sub = []
+            if sub is None:
+                return None
+            subs.append(sub)
+        if any(sub != subs[0] for sub in subs[1:]):
+            return None
+        return [len(expr.items), *subs[0]]
+    parts = _ndarray_parts(tp)
+    if parts is not None:
+        return list(parts[0])
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance):
+        return None
+    if proper.type.fullname in (
+        "builtins.int",
+        "builtins.float",
+        "builtins.complex",
+        "builtins.bool",
+    ):
+        return []
+    if proper.type.fullname in _DTYPE_INFO:
+        return []
+    return None
+
+
+def searchsorted_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    values_dims = _search_values_dims(pairs[1][0], pairs[1][1])
+    if values_dims is None:
+        return ctx.default_return_type
+    dtype = _construct_dtype(ctx, "numpy.int64")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, values_dims, dtype)
 
 
 def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
@@ -6616,7 +6807,10 @@ def _specs_dtype(
 def _solve_where(ctx: FunctionContext) -> Type:
     args = _positional_actuals(ctx, 3)
     if args is None:
-        # Single-argument where(cond) returns indices: the stubs own it.
+        # Single-argument where(cond) returns indices like nonzero.
+        pairs = _all_positionals(ctx)
+        if len(pairs) == 1:
+            return _nonzero_like(ctx, "where", pairs[0][0])
         return ctx.default_return_type
     dist = _distribute_solve(args, lambda c, x, y: _where_types(ctx, c, x, y))
     if dist is not None:

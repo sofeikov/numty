@@ -532,7 +532,12 @@ and non-positive sizes error. Data prep computes too: `tile` multiplies
 reps (concrete or `?U`), `repeat` scales the axis (flattening to one dim
 for `axis=None`, `?U` for array repeats), `pad` adds widths per axis, and
 `split` returns a list of equal parts (`?U` for uneven index splits);
-negative counts and uneven divisions error. Elementwise ops — operators and bare
+negative counts and uneven divisions error. Selection results track what
+they can: `unique` keeps the dtype with a `?U` length (rank kept for
+`axis=`), `nonzero`/`where` with one argument return per-dim `?U`
+tuples (`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the
+input shape with a bool dtype, and `searchsorted` follows the values
+shape; 0-d nonzero errors. Elementwise ops — operators and bare
 `np.*` ufuncs alike — broadcast shapes and promote dtypes exactly like
 NumPy (verified against `np.result_type` over the full dtype matrix,
 plus weak Python scalars). `einsum` parses the subscript string
