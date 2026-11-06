@@ -413,3 +413,24 @@ def test_fancy_index_and_take_values() -> None:
     assert a[ids].shape == (5, 3, 10, 2)
     assert a[ids[:, 0]].shape == (5, 10, 2)
     assert np.zeros((5, 6))[np.array(3)].shape == (6,)
+
+
+def test_numpy_hook_table_matches_installed_numpy() -> None:
+    # The plugin dispatches on exact stub fullnames (#59). If a numpy
+    # release moves a function, its hook would silently stop firing; fail
+    # loudly here instead, so the table is updated with the move.
+    import importlib
+
+    import numty_plugin
+
+    missing = []
+    for fullname in numty_plugin._NUMPY_FUNCTION_HOOKS:
+        module, _, name = fullname.rpartition(".")
+        try:
+            found = hasattr(importlib.import_module(module), name)
+        except ImportError:
+            found = False
+        if not found:
+            missing.append(fullname)
+    assert len(numty_plugin._NUMPY_FUNCTION_HOOKS) > 100
+    assert missing == [], f"hooked numpy names not found at runtime: {missing}"

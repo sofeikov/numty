@@ -1606,3 +1606,27 @@ def test_flexarray_portable_fixture_under_mypy() -> None:
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert [int(e.split(":")[1]) for e in errors] == bugs, result.stdout
+
+
+def test_numpy_twins_keep_stub_types() -> None:
+    # np.ma / np.emath / numpy.matlib share names with the ndarray API;
+    # exact-fullname dispatch leaves their MaskedArray, complex and
+    # matrix stub types alone (issue #59).
+    result = run_mypy(FIXTURES / "numpy_twins_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert _run_fixture("numpy_twins_ok.py") == [
+        "[False, True, False] [1.0, 0.0, 3.0] 2",
+        "MaskedArray (4, 3) False",
+        "False 6",
+        "(3, 2)",
+        "complex128 complex128",
+        "matrix (1, 3)",
+    ]
+
+
+def test_matlib_zeros_is_not_a_vector() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matlib_vector.py"),
+        "Incompatible types in assignment",
+        'expression has type "matrix[tuple[int, int], dtype[float64]]"',
+    )
