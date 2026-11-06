@@ -800,8 +800,9 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   array passed to `F64[batch, features]` is an `invalid-argument-type`
   error; [#5](https://github.com/sofeikov/numty/issues/5)).
 - **Adopting numty in a repo that gates on ty (or pyright) alone:** the
-  heads give that gate no shape checking at all. Every call into an
-  `F64[...]` signature is an error there, correct or not, so the heads
+  heads give that gate no shape checking at all. Every call that passes
+  an `ndarray` into an `F64[...]` signature is an error there, correct or
+  not, so the heads
   cost the full annotation effort and catch nothing. Shapes that must
   hold under such a gate go in layers 1–2 or `FlexArray`, which are
   plain `ndarray` types to every checker:

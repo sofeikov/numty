@@ -4,6 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+# ty is a pinned dev dependency; skip, not fail, where it is not installed.
+pytest.importorskip("ty")
+
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
 

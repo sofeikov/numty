@@ -35,6 +35,9 @@ Array2D = np.ndarray[tuple[M, N], np.dtype[np.float64]]
 # this one. mypy still checks the expanded ``ndarray`` against the stubs'
 # bound, so the two ``type: ignore[type-var]`` notes each rank-generic
 # signature needs are the only cost; bodies and call sites check fully.
+# Runtime note: as a ``typing.TypeAliasType``, ``get_origin`` of a
+# ``FlexArray[...]`` hint is ``FlexArray`` (``get_origin(FlexArray.__value__)``
+# is ``np.ndarray``), and calling ``FlexArray(...)`` raises TypeError.
 type FlexArray[S2: tuple[Any, ...], D2: np.dtype[Any]] = np.ndarray[S2, D2]
 
 
