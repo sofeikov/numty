@@ -25,17 +25,17 @@ N = TypeVar("N", bound=int)
 Array1D = np.ndarray[tuple[M], np.dtype[np.float64]]
 Array2D = np.ndarray[tuple[M, N], np.dtype[np.float64]]
 
-# Rank-polymorphic base. S2 is intentionally unbounded so a shape containing
-# ``*Ts`` (e.g. ``tuple[Unpack[Ts], Literal[2]]``) passes the bound check
-# that numpy's ``tuple[int, ...]``-bounded stubs reject. mypy's solver still
-# unifies ``*Ts`` from the actual argument, so call sites stay precise.
-# D2 carries the dtype the same way: spell both at use sites, e.g.
-# ``FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[NP_FLOAT]]``. The
-# two ``type: ignore[type-var]`` notes each rank-generic signature needs
-# are the only cost; bodies and call sites check fully.
-S2 = TypeVar("S2")
-D2 = TypeVar("D2", bound=np.dtype[Any])
-FlexArray = np.ndarray[S2, D2]
+# Rank-polymorphic base: shape and dtype, both spelled at use sites, e.g.
+# ``FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[NP_FLOAT]]``. S2 is
+# bound to ``tuple[Any, ...]``, not numpy's ``tuple[int, ...]``, so a shape
+# containing ``*Ts`` fits the alias; mypy's solver unifies ``*Ts`` from the
+# actual argument, so call sites stay precise. A PEP 695 alias rather than
+# an assignment: ty resolved ``FlexArray = np.ndarray[S2, D2]`` to an
+# Unknown shape (no rank checks at all, #36), and keeps both parameters of
+# this one. mypy still checks the expanded ``ndarray`` against the stubs'
+# bound, so the two ``type: ignore[type-var]`` notes each rank-generic
+# signature needs are the only cost; bodies and call sites check fully.
+type FlexArray[S2: tuple[Any, ...], D2: np.dtype[Any]] = np.ndarray[S2, D2]
 
 
 # Familiar-style shape heads: jaxtyping's feel, numty's solver. Spell dims
@@ -86,7 +86,9 @@ class _StringDims(metaclass=_HeadMeta):
 
     def __class_getitem__(cls, params):
         try:
-            return super().__class_getitem__(params)
+            # Generic supplies __class_getitem__ through the MRO of each
+            # head; ty and pyright cannot see that from _StringDims alone.
+            return super().__class_getitem__(params)  # ty: ignore[unresolved-attribute]  # pyright: ignore[reportAttributeAccessIssue]
         except (SyntaxError, TypeError):
             return cls
 
