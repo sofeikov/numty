@@ -205,7 +205,7 @@ np.tensordot(np.zeros((2, 3)), np.zeros((4, 5)), axes=1)
 np.tensordot(np.zeros((2, 3)), np.zeros((3, 2)), axes=([1], [0]))  # clean: (2, 2)
 ```
 
-These are not cherry-picked: [bench/](/home/sofeikov/my/numty/bench) seeds 18
+These are not cherry-picked: [bench/](bench) seeds 18
 realistic mistakes into MLP-training and math-library code, and the checker
 flags 17 of them before anything runs (the 18th is unprovable on purpose —
 see limitations). Each error names the axes and the shapes, e.g.
@@ -234,7 +234,7 @@ unifies — the same rule as above — so mis-wiring the bias is caught at
 the call site:
 
 ```text
-error: call-site shape conflict for 'hid': 8 (argument 'x') vs 2 (argument 'y')
+error: call-site shape conflict for 'hid': 8 (argument 'w') vs 2 (argument 'b')
 ```
 
 Fixed sizes spell as integers (`F64[3, 4]`), rank polymorphism as
@@ -393,7 +393,7 @@ existing files, a plugin cannot read jaxtyping's dim strings — they ride
 inside `Annotated` metadata, which no mypy type-analyze hook ever sees
 (probed every hook: only jaxtyping's internals fire, the string never
 arrives). So the bridge is a one-time source rewrite instead of a hook:
-[numty_convert.py](/home/sofeikov/my/numty/numty_convert.py) mechanically
+[numty_convert.py](numty_convert.py) mechanically
 translates the annotations, then gets out of the way:
 
 ```sh
@@ -427,7 +427,7 @@ your code already binds (a module-level `BATCH = 5` would be rebound by
 the emitted decl, so that annotation stays jaxtyping). A fully converted
 file runs unchanged — the annotations evaluate — and no longer needs
 jaxtyping installed. The round trip is pinned by
-[tests/test_convert.py](/home/sofeikov/my/numty/tests/test_convert.py):
+[tests/test_convert.py](tests/test_convert.py):
 goldens for every dim kind plus an end-to-end MLP that checks clean and a
 seeded-bug twin that must fail.
 
@@ -448,15 +448,22 @@ a[Slots.VX]       # error: index 2 is out of range for axis 0 with size 2
 ```
 
 Slicing past the end clips like NumPy (`a[1:99]` on a size-2 axis is
-size 1); boolean masks and unknown bounds bail out. A full slice on a
+size 1); a 1-D boolean mask turns its axis into a fresh unknown
+(`a[np.ones(3, dtype=bool)]` on `(3, 4)` is `(?U0, 4)`, see unknown dims
+above), and unknown bounds bail out. An n-D mask is still typed as if it
+masked only the first axis (`a[a > 0]` on `(3, 4)` is `(?U0, 4)`, numpy returns
+1-D; [#49](https://github.com/sofeikov/numty/issues/49)). A full slice on a
 symbolic axis keeps the TypeVar (`a[:, :]` on `(N, K)` stays `(N, K)`);
 a bounded slice on one (`a[:, :k]`) bails out. Indexing every axis
 with integers yields a scalar, which the plugin leaves to the stubs.
 
 Integer arrays index fancy-style: the index shape replaces the axis,
 broadcast when there are several; `take_along_axis` broadcasts the two
-shapes, with the index winning along the axis (a 1 there falls back to
-the array dim):
+shapes, with the index winning along the axis. Known bug: an index of
+size 1 along the axis keeps the array's dim instead
+(`take_along_axis(a, idx, axis=1)` with `a: (3, 4)`, `idx: (3, 1)` is
+typed `(3, 4)`, numpy returns `(3, 1)`;
+[#46](https://github.com/sofeikov/numty/issues/46)):
 
 ```python
 table[ids]                        # (5, 4): index shape + trailing dims
@@ -574,9 +581,14 @@ def f(u: F64[N], w: F64[N, K]) -> None:
 ```
 
 **Elementwise, einsum, linalg, random.** Operators and bare `np.*`
-ufuncs alike — broadcast shapes and promote dtypes exactly like NumPy
-(verified against `np.result_type` over the full dtype matrix, plus weak
-Python scalars). `einsum` parses the subscript string (explicit, implicit,
+ufuncs alike — broadcast shapes and promote dtypes. Add-style promotion
+(`+`, `-`, `*`) matches NumPy (verified against `np.result_type` over
+the full dtype matrix, plus weak Python scalars). True division mixing a
+`float16`/`float32` with a bool or 8/16-bit int, and float ufuncs on
+small ints, do not yet: they are typed `float64` where NumPy picks a smaller float
+(`float32 / uint8` and `np.sqrt` of `int8` give `float32` and `float16`
+in NumPy; [#61](https://github.com/sofeikov/numty/issues/61)).
+`einsum` parses the subscript string (explicit, implicit,
 ellipsis, diagonals) and `linalg` checks squareness and inner dims while
 tracking dtypes (`eigh` stays real, `svd` shrinks with
 `full_matrices=False`). `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
@@ -586,8 +598,8 @@ out instead of guessing.
 ## Your own sizes, in one line
 
 No pre-baked list from the library — exact sizes live in your code,
-one line each, and they work under mypy, pyright, and ty with no
-plugin at all:
+one line each, in standard typing that needs no plugin to write (what
+each checker catches without the plugin is in "How it works" below):
 
 ```python
 from typing import Literal
@@ -601,10 +613,15 @@ use_2x3(np.zeros((3, 2)))  # error: 3x2 is not 2x3
 ```
 
 Rank-only aliases (`Vector`, `Matrix`) catch transposed/flattened
-mixups even more cheaply. Named sizes work too — mark them `Final`
-and the solver folds names and arithmetic (`H * 2`, `W + 1`, `M //
-2`) just like literals, and `len()` of an `IntEnum` class folds to
-its member count (aliases share one value, so they count once). Plain
+mixups even more cheaply. Named sizes work in expressions — mark them
+`Final` and the solver folds names and arithmetic (`H * 2`, `W + 1`,
+`M // 2`) just like literals, so `np.zeros((H * 2, 3))` is `(56, 3)`
+for `H: Final = 28`, and `len()` of an `IntEnum` class folds to its
+member count (aliases share one value, so they count once). A `Final`
+name is not a dim in an annotation: `I64[H, 2]` fails with `I64 dim
+"H" must be a TypeVar, an integer, Unpack[Ts], or Literal[...]` and
+the parameter becomes `Any`. Name an annotation size with a `Literal`
+alias instead (`H = Literal[28]`, see "Named sizes" above). Plain
 variables and parameters stay unknown: their values are gone from the
 types before the plugin sees them, so they bail out instead of
 erroring. A generic `int` parameter can never be verified against a
@@ -626,10 +643,21 @@ uv pip install mypy numpy pytest
 ```
 
 ```sh
-PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
-uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: runtime + mypy-driven (89 and growing)
+PYTHONPATH=. uv run mypy demo.py      # expect 2 errors: rank, size
+uvx ty@0.0.97 check numty.py demo.py  # the same 2 in demo.py, plus 2 in numty.py itself
+uv run pytest                         # full suite: runtime + mypy-driven
 ```
+
+The two `numty.py` diagnostics are ty rejecting the `FlexArray` alias's
+shape bound (`FlexArray` annotations break under ty,
+[#36](https://github.com/sofeikov/numty/issues/36)) and the string-spec
+`__class_getitem__`. `uvx ty@0.0.97 check demo.py` alone reports just
+the 2 demo errors.
+
+mypy skips the bodies of unannotated functions by default, so a script
+or notebook cell written as `def main():` gets no shape checking at all.
+Run with `--check-untyped-defs` (or set `check_untyped_defs = True` in
+your `mypy.ini`) to have the solver check them too.
 
 ## How it works
 
@@ -639,7 +667,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul` (incl. `(*Ts, N, M)` pairs), arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape` (incl. symbolic conservation and `*Ts` block regroups), rank-changing ops (`transpose`/`.T` reversal incl. over `*Ts`), shape builders, comparisons, bool logic (`&`/`\|`), `any`/`all`, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, symbolic TypeVar dims (same name unifies, ranks check, the rest bails), call-site TypeVar conflicts, enum-driven stacks, folds constant int expressions and `len()` (`Final` arithmetic, enum member counts), solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](numty_plugin.py) hooks constructors, `matmul` (incl. `(*Ts, N, M)` pairs), arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape` (incl. symbolic conservation and `*Ts` block regroups), rank-changing ops (`transpose`/`.T` reversal incl. over `*Ts`), shape builders, comparisons, bool logic (`&`/`\|`), `any`/`all`, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, symbolic TypeVar dims (same name unifies, ranks check, the rest bails), call-site TypeVar conflicts, enum-driven stacks, folds constant int expressions and `len()` (`Final` arithmetic, enum member counts), solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `FlexArray`,
@@ -656,16 +684,28 @@ errors like `matmul batch dimensions disagree: (5,) vs (4,)` — including
 a call-site check that catches the shared-`TypeVar` conflict the join
 hides (`f(x_5, y_6)` against `(A[N], A[N])`).
 
-The plugin is registered in [mypy.ini](/home/sofeikov/my/numty/mypy.ini) and
+The plugin is registered in [mypy.ini](mypy.ini) and
 needs `PYTHONPATH=.` so mypy can import it (`MYPYPATH` does not work for
-plugins). Without the plugin, checking degrades gracefully to the first two
-layers.
+plugins). Without the plugin, only annotations spelled with the first
+two layers keep any checking, and under plain mypy less than the table
+suggests: rank aliases still catch rank mixups, but mypy widens a
+constructor's sizes to `int` once the array is assigned to a name, so
+exact-size aliases then reject correct code. `mypy demo.py` with no
+plugin configured reports 4 errors, 3 of them on correct code, and
+misses the 3x2 size bug. The `F64`/`F32`/`I64`/`I32`/`Bool` heads need
+the plugin: without it a correct call is rejected (`f(np.zeros((2, 3)))`
+against `F64[batch, features]` fails with `expected "F64[Never,
+Never]"` under plain mypy) and results become `F64[Any, Any]`
+([#5](https://github.com/sofeikov/numty/issues/5)).
 
 ## Limitations, stated plainly
 
 - The plugin is mypy-only and pinned to mypy internals that occasionally
   shift. `ty` and pyright users get layers 1–2, which still catch rank and
-  fixed-size bugs.
+  fixed-size bugs. They do not get the `F64`-style heads: ty 0.0.97
+  rejects correct calls into head-annotated functions too (a `(2, 3)`
+  array passed to `F64[batch, features]` is an `invalid-argument-type`
+  error; [#5](https://github.com/sofeikov/numty/issues/5)).
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error.
@@ -683,10 +723,22 @@ layers.
   the method hook inconsistently in testing. Raw `np.matmul` solves
   through the ufunc hook instead, as does the `numty.matmul` wrapper.
   Same for reflected ops beyond the hooked pairs.
-- Ufunc calls need mypy to follow imports (the default): under
-  `--follow-imports=skip` the ufunc generic aliases stay unresolved and
-  bare `np.sqrt`-style calls bail out. Operators, methods, and real
-  `def` stubs are unaffected.
+- numty needs mypy to follow imports (the default). Under
+  `--follow-imports=skip` mypy skips `numty` itself, so every
+  `F64[...]`-annotated parameter and return becomes `Any` and nothing
+  through them is checked, with no warning. The ufunc generic aliases
+  also stay unresolved, so bare `np.sqrt`-style calls bail out;
+  operators, methods, and real `def` stubs on plain numpy arrays are
+  unaffected. If you need `skip`, keep following `numty` with a
+  per-module override, which brings the heads back (ufunc calls still
+  bail):
+
+  ```ini
+  [mypy-numty]
+  follow_imports = normal
+  ```
+- Unannotated functions are not checked: mypy skips their bodies unless
+  `check_untyped_defs` is on (see Quickstart).
 - An inline call to an overloaded function nested directly inside an
   overloaded numpy call dissolves to `Any` (mypy keeps the
   overload-inferred type over the hook result): hoist it to a local
@@ -724,28 +776,28 @@ layers.
 
 ## Layout
 
-- [numty.py](/home/sofeikov/my/numty/numty.py) — rank aliases, generic shape
+- [numty.py](numty.py) — rank aliases, generic shape
   bases, `FlexArray` rank-polymorphic base, `narrow` witness helper,
   shape-preserving `ident`, loose `matmul` fallback, familiar-style heads
   (`F64` and friends) with ready-made dims (`batch`, `features`, …).
-- [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) — the solver.
-- [demo.py](/home/sofeikov/my/numty/demo.py) — good and bad usages, clean under
+- [numty_plugin.py](numty_plugin.py) — the solver.
+- [demo.py](demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.
-- [bench/](/home/sofeikov/my/numty/bench) — realistic benchmark (MLP training,
+- [bench/](bench) — realistic benchmark (MLP training,
   math library, 17 of 18 seeded mistakes caught), with its own scorecard in
-  [bench/README.md](/home/sofeikov/my/numty/bench/README.md).
-- [tests/test_runtime.py](/home/sofeikov/my/numty/tests/test_runtime.py) —
+  [bench/README.md](bench/README.md).
+- [tests/test_runtime.py](tests/test_runtime.py) —
   shapes, values, narrowing accept/reject.
-- [tests/test_static.py](/home/sofeikov/my/numty/tests/test_static.py) — runs
-  real mypy over [fixtures](/home/sofeikov/my/numty/tests/fixtures/static_ok.py):
+- [tests/test_static.py](tests/test_static.py) — runs
+  real mypy over [fixtures](tests/fixtures/static_ok.py):
   each bad one must fail with our message, and `reveal_type` pins must show
   precise shapes on the good paths. The `f64_ok` + `bad_f64_*` fixtures do
   the same for the familiar-style heads (clean end-to-end MLP included).
-- [numty_convert.py](/home/sofeikov/my/numty/numty_convert.py) +
-  [tests/test_convert.py](/home/sofeikov/my/numty/tests/test_convert.py) —
+- [numty_convert.py](numty_convert.py) +
+  [tests/test_convert.py](tests/test_convert.py) —
   the jaxtyping bridge: one-time annotation rewrite with goldens for every
   dim kind and an end-to-end MLP (clean + seeded-bug twins in
-  [fixtures](/home/sofeikov/my/numty/tests/fixtures/jaxtyping_mlp.py)).
+  [fixtures](tests/fixtures/jaxtyping_mlp.py)).
 
 ## Roadmap
 
