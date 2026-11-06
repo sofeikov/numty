@@ -46,23 +46,41 @@ FlexArray = np.ndarray[S2, D2]
 TsFam = TypeVarTuple("TsFam")
 
 
-class F64(Generic[Unpack[TsFam]]):
+class _StringDims:
+    """Runtime companion for the familiar heads below.
+
+    Static checking happens in mypy (see numty_plugin); at runtime a
+    multi-word spec like "batch features" is not a valid forward
+    reference, so `Generic.__class_getitem__` would raise SyntaxError at
+    import time. Fall back to the bare head (plain erasure): runtime
+    never sees shapes anyway. Specs that subscribe fine today (bare
+    names, integers, Unpack) pass through untouched.
+    """
+
+    def __class_getitem__(cls, params):
+        try:
+            return super().__class_getitem__(params)
+        except (SyntaxError, TypeError):
+            return cls
+
+
+class F64(_StringDims, Generic[Unpack[TsFam]]):
     """float64 array with flat dims, e.g. F64[batch, features]."""
 
 
-class F32(Generic[Unpack[TsFam]]):
+class F32(_StringDims, Generic[Unpack[TsFam]]):
     """float32 array with flat dims, e.g. F32[batch, features]."""
 
 
-class I64(Generic[Unpack[TsFam]]):
+class I64(_StringDims, Generic[Unpack[TsFam]]):
     """int64 array with flat dims, e.g. I64[batch, count]."""
 
 
-class I32(Generic[Unpack[TsFam]]):
+class I32(_StringDims, Generic[Unpack[TsFam]]):
     """int32 array with flat dims, e.g. I32[batch, count]."""
 
 
-class Bool(Generic[Unpack[TsFam]]):
+class Bool(_StringDims, Generic[Unpack[TsFam]]):
     """boolean array with flat dims, e.g. Bool[batch, mask]."""
 
 

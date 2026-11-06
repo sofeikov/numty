@@ -107,6 +107,38 @@ per signature — numpy's own stub bound can't see through `*Ts`, same as
 with `FlexArray`). Heads cover the workhorses: `F64`, `F32`, `I64`,
 `I32`, `Bool`.
 
+Prefer jaxtyping's string look? Write that instead — one spec per
+parameter, shared names tie the signature together, same solver
+underneath:
+
+```python
+from typing import TypeVar
+from numty import F64, matmul
+
+dim1 = TypeVar("dim1", bound=int)
+dim2 = TypeVar("dim2", bound=int)
+dim3 = TypeVar("dim3", bound=int)
+
+def matrix_multiply(x: F64["dim1 dim2"], y: F64["dim2 dim3"]) -> F64["dim1 dim3"]:
+    return matmul(x, y)
+```
+
+Seed a bug — `mm(zeros((2, 4)), zeros((5, 3)))` — and the shared `dim2`
+is caught at the call site:
+
+```text
+error: call-site shape conflict for 'dim2': 4 (argument 'x') vs 5 (argument 'y')
+```
+
+String words resolve exactly like bare dims, so the styles mix freely:
+`F64["batch features"]` and `F64[batch, features]` (or even one of each
+in a single signature) mean the same thing. Only space-separated names
+in v1 — a stray `"batch 3"` fails loudly with a redirect, same as
+every other misuse. At runtime a multi-word spec erases to the bare
+head (`F64["batch features"] is F64`), so importing the module never
+crashes on the annotation; specs that already subscribe fine
+(`F64["hid"]`, `F64[3, 4]`) behave exactly as before.
+
 Two rules, both honest. First, every name must resolve: mypy binds
 function type variables by looking names up *before* any plugin runs,
 so an undeclared dim is an error, not a silent hole — `"batch"` and

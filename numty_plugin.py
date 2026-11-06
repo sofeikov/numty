@@ -54,8 +54,10 @@ What it does:
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import keyword
+from collections.abc import Callable, Iterator
 from functools import partial
+from typing import cast
 
 from mypy.nodes import (
     ARG_NAMED,
@@ -80,6 +82,7 @@ from mypy.nodes import (
     TupleExpr,
     TypeAlias,
     TypeInfo,
+    TypeVarLikeExpr,
     UnaryExpr,
     Var,
 )
@@ -91,6 +94,7 @@ from mypy.plugin import (
     MethodContext,
     Plugin,
 )
+from mypy.typeanal import TypeAnalyser
 from mypy.types import (
     AnyType,
     CallableType,
@@ -103,6 +107,7 @@ from mypy.types import (
     TupleType,
     Type,
     TypeOfAny,
+    TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
     UnboundType,
@@ -149,6 +154,11 @@ class NumtyPlugin(Plugin):
     def __init__(self, options) -> None:
         super().__init__(options)
         self._seen_conflicts: set[tuple[str, int, str]] = set()
+        # Fullnames of TypeVars first bound from inside a string dim spec
+        # (see _fam_bind_words). The pre-pass never saw them, so they are
+        # missing from the analyzed function's variables; the call-site
+        # hook adds them back so concrete calls still check and infer.
+        self._fam_late_bound: set[str] = set()
 
     def get_function_signature_hook(
         self, fullname: str
@@ -215,6 +225,26 @@ class NumtyPlugin(Plugin):
                         self._seen_conflicts.add(key)
                         ctx.api.fail(message, ctx.context)
                     break
+        # String-spec words bound late (see _fam_bind_words) are missing
+        # from the function's variables, so core checking would reject
+        # concrete actuals against the free typevars. Add exactly those
+        # back: the call then checks and infers like a written generic.
+        # Names already generic (mixed bare + string) are left alone, so
+        # no fullname ever appears twice.
+        have = {v.fullname for v in sig.variables}
+        missing: list[TypeVarLikeType] = []
+        for formal in list(sig.arg_types) + [sig.ret_type]:
+            for tvar in _iter_tvarlikes(formal):
+                if (
+                    tvar.fullname in self._fam_late_bound
+                    and tvar.fullname not in have
+                ):
+                    have.add(tvar.fullname)
+                    missing.append(tvar)
+        if missing:
+            sig = sig.copy_modified(
+                variables=tuple(sig.variables) + tuple(missing)
+            )
         return sig
 
     # Familiar-style heads (F64, F32, I64, I32, Bool in numty.py): the
@@ -238,16 +268,23 @@ class NumtyPlugin(Plugin):
 
         Every dim must resolve: a TypeVar (reused, so mypy binds it to
         the function and inference keeps working), a TypeVarTuple via
-        Unpack[Ts], a Final integer, a bare integer, or Literal[...].
-        Anything else fails loudly; anything already errored bails
-        silently to Any.
+        Unpack[Ts], a Final integer, a bare integer, Literal[...], or a
+        jaxtyping-style string spec (`"batch features"`, one dim per
+        word). Anything else fails loudly; anything already errored
+        bails silently to Any.
         """
         head = ctx.type.name
         raw_args = list(ctx.type.args)
         try:
             if not raw_args:
                 raise _FamFail(f"{head} takes at least one dim")
-            dims = [self._fam_arg(ctx, head, a) for a in raw_args]
+            dims: list[int | Type] = []
+            for a in raw_args:
+                parsed = self._fam_arg(ctx, head, a)
+                if isinstance(parsed, list):
+                    dims.extend(parsed)
+                else:
+                    dims.append(parsed)
         except _FamFail as bad:
             ctx.api.fail(bad.msg, ctx.context)
             return AnyType(TypeOfAny.from_error)
@@ -288,8 +325,8 @@ class NumtyPlugin(Plugin):
 
     def _fam_arg(
         self, ctx: AnalyzeTypeContext, head: str, arg: Type
-    ) -> int | Type:
-        """One flat dim: a TypeVar, integer, Unpack[Ts], or Literal[...]."""
+    ) -> int | Type | list[int | Type]:
+        """One flat dim, or a string spec expanding to several dims."""
         if isinstance(arg, EllipsisType):
             raise _FamFail(
                 f"{head} '...' cannot be named for shape solving;"
@@ -297,13 +334,16 @@ class NumtyPlugin(Plugin):
             )
         if isinstance(arg, RawExpressionType):
             value = arg.literal_value
+            if isinstance(value, str):
+                return self._fam_string(ctx, head, arg, value)
             if (
                 isinstance(value, bool)
                 or not isinstance(value, int)
                 or value < 0
             ):
                 raise _FamFail(
-                    f"{head} dims must be TypeVars or non-negative integers"
+                    f"{head} dims must be TypeVars, non-negative integers,"
+                    ' or a string spec like "batch features"'
                 )
             return value
         if isinstance(arg, UnboundType):
@@ -332,9 +372,76 @@ class NumtyPlugin(Plugin):
         if isinstance(arg, AnyType):
             return arg
         raise _FamFail(
-            f"{head} dims must be TypeVars, integers,"
-            " Unpack[Ts], or Literal[...]"
+            f"{head} dims must be TypeVars, integers, Unpack[Ts],"
+            ' Literal[...], or a string spec like "batch features"'
         )
+
+    def _fam_string(
+        self, ctx: AnalyzeTypeContext, head: str, arg: RawExpressionType, text: str
+    ) -> list[int | Type]:
+        """A jaxtyping-style spec: space-separated dim names, one per dim.
+
+        Each word resolves exactly like a bare name (same declared-TypeVar
+        lookup, same case rule), so `"dim2"` in two parameters shares the
+        dim with a bare `dim2` elsewhere in the signature. Words that only
+        appear inside strings are bound into scope first (see
+        `_fam_bind_words`); the rest of the lookup path is `_fam_bare`.
+        """
+        words = text.split()
+        if not words:
+            raise _FamFail(
+                f'{head} string dims must name at least one dim, e.g. "batch features"'
+            )
+        for word in words:
+            if not word.isidentifier() or keyword.iskeyword(word):
+                raise _FamFail(
+                    f'{head} string dim "{word}" is not a name;'
+                    ' write space-separated names like "batch features"'
+                )
+        self._fam_bind_words(ctx, words, arg)
+        dims: list[int | Type] = []
+        for word in words:
+            dims.append(
+                self._fam_bare(
+                    ctx,
+                    head,
+                    UnboundType(word, [], line=arg.line, column=arg.column),
+                )
+            )
+        return dims
+
+    def _fam_bind_words(
+        self, ctx: AnalyzeTypeContext, words: list[str], node: RawExpressionType
+    ) -> None:
+        """Bind string-only dim names the way mypy's pre-pass would have.
+
+        mypy binds a function's type variables by scanning the *written*
+        signature (FindTypeVarVisitor) before analyzing it, so a name that
+        only appears inside a string spec is still unbound when this hook
+        runs and `analyze_type` would reject it as unbound. Bind each such
+        word here, replicating the pre-pass rule: a TypeVar-like name with
+        no binding yet (and no scoping prohibition) gets `bind_new` in the
+        live scope; everything else (Final ints, undeclared names, names
+        bound already or further out) is left for the normal path, which
+        reports them exactly as it would a bare name.
+
+        This reaches through `ctx.api` to the running TypeAnalyser
+        (that is what mypy passes as the hook api). Pinned to
+        mypy==2.4.1; the `f64_str_*` tests pin the behavior.
+        """
+        analyzer = cast(TypeAnalyser, ctx.api)
+        scope = analyzer.tvar_scope
+        for word in words:
+            sym = analyzer.lookup_qualified(word, node)
+            if sym is None or not isinstance(sym.node, TypeVarLikeExpr):
+                continue
+            if scope.get_binding(sym) is not None:
+                continue
+            if sym.fullname and not scope.allow_binding(sym.fullname):
+                continue
+            scope.bind_new(word, sym.node, analyzer.fail_func, node)
+            if sym.fullname:
+                self._fam_late_bound.add(sym.fullname)
 
     def _fam_bare(
         self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType
@@ -982,6 +1089,24 @@ def _split_flat(
     item = dims[found[0]]
     assert isinstance(item, UnpackType)
     return dims[: found[0]], item, dims[found[0] + 1 :]
+
+
+def _iter_tvarlikes(tp: Type) -> Iterator[TypeVarLikeType]:
+    """Every TypeVar-like nested in an analyzed type (any container)."""
+    tp = get_proper_type(tp)
+    if isinstance(tp, TypeVarLikeType):
+        yield tp
+    elif isinstance(tp, Instance):
+        for a in tp.args:
+            yield from _iter_tvarlikes(a)
+    elif isinstance(tp, TupleType):
+        for item in tp.items:
+            yield from _iter_tvarlikes(item)
+    elif isinstance(tp, UnionType):
+        for item in tp.relevant_items():
+            yield from _iter_tvarlikes(item)
+    elif isinstance(tp, UnpackType):
+        yield from _iter_tvarlikes(tp.type)
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:

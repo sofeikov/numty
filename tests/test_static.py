@@ -638,3 +638,47 @@ def test_f64_star_redirect() -> None:
         "F64 *Ts needs a name for the solver",
         "write Unpack[Ts] instead",
     )
+
+
+def test_f64_str_ok_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "f64_str_ok.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "f64_str_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(5, 3)", "(5, 6)"]
+
+
+def test_f64_str_callsite_conflict() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_str_conflict.py"),
+        "call-site shape conflict for 'hid'",
+        "8 (argument 'x') vs 2 (argument 'y')",
+    )
+
+
+def test_f64_str_matmul_dim_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_str_matmul.py"),
+        "call-site shape conflict for 'dim2'",
+        "4 (argument 'x') vs 5 (argument 'y')",
+    )
+
+
+def test_f64_str_undeclared_name() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_str_undeclared.py"),
+        'Name "batsh" is not defined',
+    )
+
+
+def test_f64_str_bad_token_rejected() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_str_token.py"),
+        'F64 string dim "3" is not a name',
+        'space-separated names like "batch features"',
+    )
