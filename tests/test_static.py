@@ -1592,3 +1592,17 @@ def test_every_plugin_fail_site_passes_an_error_code() -> None:
     assert len(sites) > 100, len(sites)
     missing = [n.lineno for n in sites if not any(k.arg == "code" for k in n.keywords)]
     assert not missing, f"ctx.api.fail without code= at numty_plugin.py lines {missing}"
+
+
+def test_flexarray_portable_fixture_under_mypy() -> None:
+    # Same fixture test_ty.py runs under ty: both checkers flag exactly
+    # the `# BUG` lines, so the FlexArray spelling is safe in a dual gate.
+    fixture = FIXTURES / "flex_portable.py"
+    bugs = [
+        i for i, line in enumerate(fixture.read_text().splitlines(), 1)
+        if "# BUG" in line
+    ]
+    result = run_mypy(fixture, flags=("--warn-unused-ignores",))
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert [int(e.split(":")[1]) for e in errors] == bugs, result.stdout
