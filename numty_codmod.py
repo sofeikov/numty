@@ -18,11 +18,18 @@ matched shape; the exact safety condition lives on each transform.
     display distributes per-name where the lazy forms join. Anything
     else (non-identity elements, filters, non-display iterables, `map`)
     is left alone.
+
+Rewrites are spliced into the original text: only the rewritten
+expressions change, so comments (including the `# type: ignore` notes
+numty needs), blank lines and formatting stay byte-identical, and with
+no flags the file comes back unchanged.
 """
 
+import argparse
 import ast
 import sys
-from pathlib import Path
+
+from numty_convert import Edit, Source, run_cli, splice
 
 _SELF_OP_UFUNCS = {
     ast.Add: "add",
@@ -43,35 +50,25 @@ def _numpy_alias(tree: ast.Module) -> str | None:
     return None
 
 
-class _SelfOps(ast.NodeTransformer):
+def _self_op_edits(tree: ast.Module, source: Source, np_alias: str) -> list[Edit]:
     """`x + x` -> `np.add(x, x)` for same-Name arithmetic dunders."""
-
-    def __init__(self, np_alias: str) -> None:
-        self.np_alias = np_alias
-
-    def visit_BinOp(self, node: ast.BinOp) -> ast.expr:
-        self.generic_visit(node)
+    edits: list[Edit] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp):
+            continue
         ufunc = _SELF_OP_UFUNCS.get(type(node.op))
         if ufunc is None:
-            return node
+            continue
         if not (
             isinstance(node.left, ast.Name) and isinstance(node.right, ast.Name)
         ):
-            return node
+            continue
         if node.left.id != node.right.id:
-            return node
-        return ast.copy_location(
-            ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id=self.np_alias, ctx=ast.Load()),
-                    attr=ufunc,
-                    ctx=ast.Load(),
-                ),
-                args=[node.left, node.right],
-                keywords=[],
-            ),
-            node,
-        )
+            continue
+        name = node.left.id
+        start, end = source.span(node)
+        edits.append((start, end, f"{np_alias}.{ufunc}({name}, {name})"))
+    return edits
 
 
 def _as_display(node: ast.expr) -> ast.expr | None:
@@ -81,12 +78,13 @@ def _as_display(node: ast.expr) -> ast.expr | None:
     return None
 
 
-def _identity_display(node: ast.expr) -> ast.expr | None:
+def _identity_display(node: ast.expr) -> tuple[ast.expr, bool] | None:
     """Unpack source normalizable to a literal display, else None.
 
     Identity comprehensions/generators over a display, `tuple()` over a
     display or identity genexp, and starred displays all denote exactly
-    the display's items in order -- what unpacking consumes.
+    the display's items in order -- what unpacking consumes. The flag
+    says the display must be spelled as a tuple.
     """
     if isinstance(node, (ast.GeneratorExp, ast.ListComp)):
         if len(node.generators) != 1:
@@ -101,7 +99,7 @@ def _identity_display(node: ast.expr) -> ast.expr | None:
         disp = _as_display(gen.iter)
         if disp is None:
             return None
-        return disp
+        return disp, False
     if isinstance(node, ast.Call):
         if not (isinstance(node.func, ast.Name) and node.func.id == "tuple"):
             return None
@@ -109,96 +107,109 @@ def _identity_display(node: ast.expr) -> ast.expr | None:
             return None
         inner = node.args[0]
         if isinstance(inner, (ast.Tuple, ast.List)):
-            disp: ast.expr | None = inner
-        else:
-            disp = _identity_display(inner)
-        if disp is None:
+            return inner, True
+        found = _identity_display(inner)
+        if found is None:
             return None
-        if isinstance(disp, ast.List):
-            return ast.copy_location(
-                ast.Tuple(elts=disp.elts, ctx=ast.Load()), disp
-            )
-        return disp
+        return found[0], True
     if isinstance(node, ast.Tuple) and len(node.elts) == 1:
         starred = node.elts[0]
         if isinstance(starred, ast.Starred):
             disp = _as_display(starred.value)
             if disp is None:
                 return None
-            if isinstance(disp, ast.List):
-                return ast.copy_location(
-                    ast.Tuple(elts=disp.elts, ctx=ast.Load()), disp
-                )
-            return disp
+            return disp, True
     return None
 
 
-class _UnpackDisplays(ast.NodeTransformer):
-    """Normalize unpack sources to literal displays (see _identity_display)."""
+def _display_text(source: Source, disp: ast.expr, as_tuple: bool) -> str:
+    """Source of the display, brackets swapped for parens if needed."""
+    text = source.segment(disp)
+    if not (as_tuple and isinstance(disp, ast.List)):
+        return text
+    start, _ = source.span(disp)
+    inner = text[1:-1]
+    if len(disp.elts) == 1:
+        # `[a]` -> `(a,)`: the comma goes right after the element so a
+        # trailing comment inside the brackets cannot swallow it.
+        _, elt_end = source.span(disp.elts[0])
+        cut = elt_end - start - 1
+        if not inner[cut:].lstrip().startswith(","):
+            inner = inner[:cut] + "," + inner[cut:]
+    return f"({inner})"
 
-    def visit_Assign(self, node: ast.Assign) -> ast.stmt:
-        self.generic_visit(node)
+
+def _unpack_display_edits(tree: ast.Module, source: Source) -> list[Edit]:
+    """Normalize unpack sources to literal displays (see _identity_display)."""
+    edits: list[Edit] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
         if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Tuple):
-            return node
-        disp = _identity_display(node.value)
-        if disp is None:
-            return node
-        node.value = ast.copy_location(disp, node.value)
-        return node
+            continue
+        found = _identity_display(node.value)
+        if found is None:
+            continue
+        start, end = source.span(node.value)
+        edits.append((start, end, _display_text(source, *found)))
+    return edits
 
 
 def codemod_source(
     src: str, *, self_ops: bool = False, unpack_displays: bool = False
 ) -> tuple[str, list[str]]:
-    """Apply the enabled rewrites; return (out, warnings)."""
-    tree = ast.parse(src)
+    """Apply the enabled rewrites; return (out, warnings).
+
+    Each pass re-parses the previous pass's output, so their edits never
+    overlap. With nothing enabled (or nothing matched) out == src.
+    """
+    ast.parse(src)  # syntax errors surface even with no flags
     warnings: list[str] = []
+    out = src
     if self_ops:
+        tree = ast.parse(out)
         alias = _numpy_alias(tree)
         if alias is None:
             warnings.append(
                 "self-ops skipped: no `import numpy [as ...]` found"
             )
         else:
-            tree = _SelfOps(alias).visit(tree)
+            out = splice(out, _self_op_edits(tree, Source(out), alias))
     if unpack_displays:
-        tree = _UnpackDisplays().visit(tree)
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree), warnings
+        tree = ast.parse(out)
+        out = splice(out, _unpack_display_edits(tree, Source(out)))
+    return out, warnings
 
 
 def main(argv: list[str]) -> int:
-    flags = [a for a in argv[1:] if a.startswith("--")]
-    files = [a for a in argv[1:] if not a.startswith("--")]
-    if not files or any(
-        f not in ("--self-ops", "--unpack-displays", "--help", "-h")
-        for f in flags
-    ):
-        print(
-            "usage: numty_codmod.py [--self-ops] [--unpack-displays]"
-            " src.py [dst.py]",
-            file=sys.stderr,
-        )
-        return 2
-    if len(files) not in (1, 2):
-        print(
-            "usage: numty_codmod.py [--self-ops] [--unpack-displays]"
-            " src.py [dst.py]",
-            file=sys.stderr,
-        )
-        return 2
-    out, warnings = codemod_source(
-        Path(files[0]).read_text(),
-        self_ops="--self-ops" in flags,
-        unpack_displays="--unpack-displays" in flags,
+    parser = argparse.ArgumentParser(
+        prog="numty_codmod.py",
+        description="Opt-in pre-pass rewrites the numty solver understands"
+        " better. Only rewritten expressions change; with no flags the"
+        " file is printed unchanged.",
     )
-    for warning in warnings:
-        print(f"{files[0]}: {warning}", file=sys.stderr)
-    if len(files) == 2:
-        Path(files[1]).write_text(out + "\n")
-    else:
-        print(out)
-    return 0
+    parser.add_argument(
+        "--self-ops",
+        action="store_true",
+        help="rewrite `x + x` (and -, *, /, **) to `np.<ufunc>(x, x)`",
+    )
+    parser.add_argument(
+        "--unpack-displays",
+        action="store_true",
+        help="normalize `a, b = (x for x in (p, q))` and friends to the display",
+    )
+    parser.add_argument("src", help="Python file to rewrite")
+    parser.add_argument(
+        "dst", nargs="?", help="where to write the result (default: stdout)"
+    )
+    args = parser.parse_args(argv[1:])
+    return run_cli(
+        parser,
+        args,
+        lambda src: codemod_source(
+            src, self_ops=args.self_ops, unpack_displays=args.unpack_displays
+        ),
+    )
 
 
 if __name__ == "__main__":

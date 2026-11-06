@@ -1,12 +1,15 @@
 """Tests for numty_codmod: opt-in pre-pass rewrites.
 
-Unit tests pin exact rewritten source; end-to-end tests prove the
-precision gain by running mypy on the rewritten output.
+Unit tests pin exact rewritten source (rewrites are spliced into the
+original text, so everything else comes back byte for byte); end-to-end
+tests prove the precision gain by running mypy on the rewritten output.
 """
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from numty_codmod import codemod_source
 
@@ -16,8 +19,7 @@ CACHE = ROOT / ".mypy-codmod-cache"
 
 def codemod(src: str, **flags: bool) -> tuple[str, list[str]]:
     out, warnings = codemod_source(src, **flags)
-    lines = [line for line in out.splitlines() if line.strip()]
-    return "\n".join(lines), warnings
+    return out.rstrip("\n"), warnings
 
 
 def test_self_op_add() -> None:
@@ -197,3 +199,122 @@ def test_unpack_end_to_end_distributes(tmp_path: Path) -> None:
     assert len(notes) == 2, result.stdout
     assert "tuple[Literal[2], Literal[3]]" in notes[0], result.stdout
     assert "tuple[Literal[2], Literal[2]]" in notes[1], result.stdout
+
+
+README_NORM = '''# SPDX-License-Identifier: MIT
+from typing import Literal
+from typing_extensions import TypeVarTuple, Unpack
+import numpy as np
+from numty import FlexArray
+
+Ts = TypeVarTuple("Ts")
+
+
+def squared_norm(  # README "One signature, every rank", verbatim
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return v[..., 0] ** 2 + v[..., 1] ** 2
+
+
+print(squared_norm(np.zeros((5, 7, 2))).shape)
+'''
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        README_NORM,
+        README_NORM.replace("\n", "\r\n"),
+        README_NORM.rstrip("\n"),
+    ],
+    ids=["readme", "crlf", "no-final-newline"],
+)
+@pytest.mark.parametrize(
+    "flags",
+    [{}, {"self_ops": True, "unpack_displays": True}],
+    ids=["no-flags", "all-flags"],
+)
+def test_nothing_to_rewrite_is_identity(src: str, flags: dict[str, bool]) -> None:
+    out, warnings = codemod_source(src, **flags)
+    assert warnings == []
+    assert out == src
+
+
+def test_rewrites_keep_surrounding_text() -> None:
+    src = (
+        "# license header\n"
+        "import numpy as np\n"
+        "\n"
+        "\n"
+        "x = np.zeros(3)\n"
+        "y = x + x  # keep me\n"
+        "a, b = (  # pair\n"
+        "    v for v in (x, y)\n"
+        ")  # type: ignore[misc]\n"
+        "c, = tuple([x  # only\n"
+        "])\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True, unpack_displays=True)
+    assert warnings == []
+    assert out == (
+        "# license header\n"
+        "import numpy as np\n"
+        "\n"
+        "\n"
+        "x = np.zeros(3)\n"
+        "y = np.add(x, x)  # keep me\n"
+        "a, b = (x, y)  # type: ignore[misc]\n"
+        "c, = (x,  # only\n"
+        ")\n"
+    )
+
+
+def test_readme_norm_still_checks_after_codmod(tmp_path: Path) -> None:
+    out, _ = codemod_source(README_NORM, self_ops=True, unpack_displays=True)
+    probe = tmp_path / "probe_norm.py"
+    probe.write_text(out)
+    result = _run_mypy(probe)
+    assert result.returncode == 0, result.stdout
+
+
+def _cli(*args: str, cwd: Path) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(
+        [sys.executable, str(ROOT / "numty_codmod.py"), *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@pytest.mark.parametrize("args", [["-h"], ["--help"], ["--help", "ok.py"]])
+def test_cli_help(args: list[str], tmp_path: Path) -> None:
+    (tmp_path / "ok.py").write_text("y = 1  # keep me\n")
+    result = _cli(*args, cwd=tmp_path)
+    assert result.returncode == 0
+    assert result.stdout.startswith("usage: numty_codmod.py")
+
+
+def test_cli_errors_are_one_line(tmp_path: Path) -> None:
+    (tmp_path / "broken.py").write_text("def f(:\n    pass\n")
+    missing = _cli("--self-ops", "missing.py", cwd=tmp_path)
+    assert missing.returncode == 2
+    assert missing.stderr == (
+        "numty_codmod.py: error: missing.py: No such file or directory\n"
+    )
+    broken = _cli("broken.py", cwd=tmp_path)
+    assert broken.returncode == 2
+    assert broken.stderr == (
+        "numty_codmod.py: error: broken.py:1: syntax error: invalid syntax\n"
+    )
+    bogus = _cli("--bogus", "broken.py", cwd=tmp_path)
+    assert bogus.returncode == 2
+    assert "unrecognized arguments: --bogus" in bogus.stderr
+
+
+def test_cli_no_flags_writes_bytes_unchanged(tmp_path: Path) -> None:
+    src = README_NORM.replace("\n", "\r\n").encode()
+    (tmp_path / "norm.py").write_bytes(src)
+    result = _cli("norm.py", "out.py", cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "out.py").read_bytes() == src

@@ -419,11 +419,16 @@ INP = TypeVar('INP', bound=int)
 def forward(x: FlexArray[tuple[BATCH, INP], np.dtype[Any]], ...) -> FlexArray[tuple[BATCH, OUT], np.dtype[Any]]: ...
 ```
 
-Names become shared TypeVars — the same same-name-unifies rule as above —
-fixed sizes become `Literal`s, `...` and `_` become fresh variables,
-`*name` becomes a named `*Ts`, exact dtypes (`Float64`, `Int32`, …) keep
-their precision, and family heads (`Float`, `Int`, …) keep the shape while
-the dtype stays `Any`. It catches real mistakes: mis-annotate the output
+Names become shared TypeVars — the same same-name-unifies rule as above,
+case-sensitive like jaxtyping (`B` and `b` stay two variables) —
+fixed sizes become `Literal`s, `...`, `_` and unchecked `_name` become
+fresh variables, `*name` becomes a named `*Ts` (with the
+`# type: ignore[type-var]` such signatures need), exact dtypes (`Float64`,
+`Int32`, …) keep their precision, and family heads (`Float`, `Int`, …)
+keep the shape while the dtype stays `Any`. Only `def` parameter and
+return annotations convert. The rest of the file is left byte for byte:
+comments, pragmas and blank lines survive, and a file with nothing to
+convert comes back unchanged. It catches real mistakes: mis-annotate the output
 bias as `"hid"` instead of `"out"` and the converted file fails with
 
 ```text
@@ -431,9 +436,12 @@ error: call-site shape conflict for 'HID': 8 (argument 'w1', axis 1) vs 2 (argum
 ```
 
 Anything the static solver cannot express is left verbatim with a
-warning, never silently changed: symbolic dims (`"n+1"`), stacked
-subscriptions, non-numpy bases, aliased heads (`Float as F`), and names
-your code already binds (a module-level `BATCH = 5` would be rebound by
+warning, never silently changed: symbolic dims (`"n+1"`), broadcastable
+`#name` dims (size 1 *or* the name — no static spelling), two variadics,
+stacked subscriptions, non-numpy bases, aliased heads (`Float as F`),
+string annotations, jaxtyping subscripts outside a signature (module
+variables, `isinstance`), and names your code already binds (a
+module-level `BATCH = 5` or `from config import BATCH` would be rebound by
 the emitted decl, so that annotation stays jaxtyping). A fully converted
 file runs unchanged — the annotations evaluate — and no longer needs
 jaxtyping installed. The round trip is pinned by
