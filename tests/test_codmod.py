@@ -39,6 +39,7 @@ def test_self_op_add() -> None:
 def test_self_op_family() -> None:
     out, warnings = codemod(
         "import numpy as np\n"
+        "x = np.ones(3)\n"
         "a = x - x\n"
         "b = x * x\n"
         "c = x / x\n"
@@ -49,6 +50,7 @@ def test_self_op_family() -> None:
     assert out == "\n".join(
         [
             "import numpy as np",
+            "x = np.ones(3)",
             "a = np.subtract(x, x)",
             "b = np.multiply(x, x)",
             "c = np.divide(x, x)",
@@ -90,6 +92,176 @@ def test_self_op_without_numpy_warns() -> None:
     out, warnings = codemod("y = x + x\n", self_ops=True)
     assert warnings == ["self-ops skipped: no `import numpy [as ...]` found"]
     assert out == "y = x + x"
+
+
+# Every operand here is a plain Python object: the operator means
+# concatenation, unbounded ints, bool -> int, or ZeroDivisionError, none
+# of which the ufunc reproduces.
+NON_ARRAYS = """import numpy as np
+
+
+def cells(n: int) -> int:
+    return n * n  # grid size, plain Python int
+
+
+lst = [1, 2]
+doubled = lst + lst  # list concatenation
+t = (1, 2)
+words = ["a", "b"]
+s = "ab"
+flag = True
+z = 0
+k = -2
+m = 20
+p = 3
+print("lst + lst:", doubled)
+print("t + t:", t + t, "words:", words + words, "s + s:", repr(s + s))
+print("flag + flag:", repr(flag + flag))
+print("cells(4_000_000_000):", cells(4_000_000_000))
+print("k ** k:", k ** k, "m ** m:", m ** m, "p ** p:", repr(p ** p))
+print("lambda:", (lambda: lst + lst)())
+for op in ("lst * lst", "lst - lst", "z / z"):
+    try:
+        print(op, "->", eval(op))
+    except (TypeError, ZeroDivisionError) as e:
+        print(op, "->", type(e).__name__)
+try:
+    print("z / z:", z / z)
+except ZeroDivisionError as e:
+    print("z / z: ZeroDivisionError:", e)
+"""
+
+
+def _run_python(src: str, tmp_path: Path, name: str) -> str:
+    path = tmp_path / name
+    path.write_text(src)
+    result = subprocess.run(
+        [sys.executable, str(path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_self_op_skips_non_arrays(tmp_path: Path) -> None:
+    out, warnings = codemod_source(NON_ARRAYS, self_ops=True)
+    assert out == NON_ARRAYS
+    skipped = [w.split(": ", 1)[1] for w in warnings]
+    assert skipped == [
+        f"self-ops skipped: {name} is not known to be an array"
+        for name in ["n", "lst", "t", "words", "s", "flag", "k", "m", "p", "lst", "z"]
+    ]
+    assert _run_python(out, tmp_path, "after.py") == _run_python(
+        NON_ARRAYS, tmp_path, "before.py"
+    )
+
+
+def test_self_op_array_bindings_still_rewrite(tmp_path: Path) -> None:
+    src = (
+        "from typing import Literal, TypeAlias\n"
+        "import numpy as np\n"
+        "import numpy.typing as npt\n"
+        "from numty import F64, FlexArray\n"
+        "\n"
+        "Vec = np.ndarray[tuple[Literal[3]], np.dtype[np.float64]]\n"
+        "Alias: TypeAlias = Vec\n"
+        "a = np.zeros(3)\n"
+        "b = np.array([1, 2], dtype=np.int64)\n"
+        "b += 1\n"
+        "\n"
+        "def f(x: F64[3]) -> F64[3]:\n"
+        "    return x + x\n"
+        "\n"
+        "def g(x: npt.NDArray[np.float64], y: 'np.ndarray', z: Alias | Vec):\n"
+        "    return x * x, y / y, z ** z, [a - a for _ in range(1)]\n"
+        "\n"
+        "def h(v: FlexArray[tuple[int], np.dtype[np.float64]]):\n"
+        "    w: np.ndarray = v\n"
+        "    return v + v, w + w, b + b\n"
+        "\n"
+        "print(f(a), g(a, a, a), h(a))\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True)
+    assert warnings == []
+    for rewritten in [
+        "return np.add(x, x)",
+        "return np.multiply(x, x), np.divide(y, y), np.power(z, z),"
+        " [np.subtract(a, a) for _ in range(1)]",
+        "return np.add(v, v), np.add(w, w), np.add(b, b)",
+    ]:
+        assert rewritten in out
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    runs = []
+    for name, text in (("before.py", src), ("after.py", out)):
+        (tmp_path / name).write_text(text)
+        runs.append(
+            subprocess.run(
+                [sys.executable, str(tmp_path / name)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        )
+    assert runs[0].returncode == 0, runs[0].stderr
+    assert runs[1].stdout == runs[0].stdout
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        # Rebound to a non-array in the same scope (flow-insensitive).
+        "x = np.zeros(3)\nx = [1, 2]\ny = x + x\n",
+        # Local parameter shadows the module array.
+        "x = np.zeros(3)\ndef f(x):\n    return x + x\n",
+        "x = np.zeros(3)\ndef f(x: int):\n    return x + x\n",
+        # A `global` rebinding elsewhere counts against the module name.
+        "x = np.zeros(3)\ndef f():\n    global x\n    x = 4\n"
+        "def g():\n    return x + x\n",
+        # `nonlocal` rebinding from a nested function.
+        "def f():\n    x = np.zeros(3)\n    def g():\n        nonlocal x\n"
+        "        x = 4\n    g()\n    return x + x\n",
+        # Comprehension / lambda / loop / unpacking / with targets.
+        "xs = [np.zeros(3)]\ny = [x + x for x in xs]\n",
+        "f = lambda x: x + x\n",
+        "for x in [np.zeros(3)]:\n    y = x + x\n",
+        "x, y = np.zeros(3), np.zeros(3)\nz = x + x\n",
+        "x = np.zeros(3)\nwith open('f') as x:\n    pass\ny = x + x\n",
+        # Class-body names are invisible to methods.
+        "class C:\n    x = np.zeros(3)\n    def m(self):\n        return x + x\n",
+        # Constructors that can return a subclass or a tuple.
+        "m = np.matrix([[1]])\nx = np.zeros_like(m)\ny = x * x\n",
+        "x = np.linspace(0, 1, 5, retstep=True)\ny = x + x\n",
+        "x = np.asarray([1], like=None)\ny = x + x\n",
+        # Builtins, unbound names, imports, plain calls.
+        "y = x + x\n",
+        "from mod import x\ny = x + x\n",
+        "x = make()\ny = x + x\n",
+        "x = np.sum(np.zeros(3))\ny = x + x\n",
+        # Annotations that admit non-arrays.
+        "def f(x: np.ndarray | int):\n    return x + x\n",
+        "def f(*x: np.ndarray):\n    return x + x\n",
+    ],
+)
+def test_self_op_unsure_sites_left_alone(src: str) -> None:
+    src = "import numpy as np\n" + src
+    out, warnings = codemod_source(src, self_ops=True)
+    assert out == src
+    assert len(warnings) == 1
+    assert warnings[0].endswith("is not known to be an array")
+
+
+def test_self_op_numpy_alias_shadowed() -> None:
+    src = (
+        "import numpy as np\n"
+        "def f(x: np.ndarray, np: object):\n"
+        "    return x + x\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True)
+    assert out == src
+    assert warnings == ["line 3: self-ops skipped: np does not mean numpy here"]
 
 
 def test_unpack_genexp_to_display() -> None:
