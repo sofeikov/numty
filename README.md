@@ -451,7 +451,7 @@ Slicing past the end clips like NumPy (`a[1:99]` on a size-2 axis is
 size 1); a 1-D boolean mask turns its axis into a fresh unknown
 (`a[np.ones(3, dtype=bool)]` on `(3, 4)` is `(?U0, 4)`, see unknown dims
 above), and unknown bounds bail out. An n-D mask is still typed as if it
-removed one axis (`a[a > 0]` on `(3, 4)` is `(?U0, 4)`, numpy returns
+masked only the first axis (`a[a > 0]` on `(3, 4)` is `(?U0, 4)`, numpy returns
 1-D; [#49](https://github.com/sofeikov/numty/issues/49)). A full slice on a
 symbolic axis keeps the TypeVar (`a[:, :]` on `(N, K)` stays `(N, K)`);
 a bounded slice on one (`a[:, :k]`) bails out. Indexing every axis
@@ -583,9 +583,9 @@ def f(u: F64[N], w: F64[N, K]) -> None:
 **Elementwise, einsum, linalg, random.** Operators and bare `np.*`
 ufuncs alike — broadcast shapes and promote dtypes. Add-style promotion
 (`+`, `-`, `*`) matches NumPy (verified against `np.result_type` over
-the full dtype matrix, plus weak Python scalars). True division with a
-bool, int or float16 operand, and float ufuncs on small ints, do not
-yet: they are typed `float64` where NumPy picks a smaller float
+the full dtype matrix, plus weak Python scalars). True division mixing a
+`float16`/`float32` with a bool or 8/16-bit int, and float ufuncs on
+small ints, do not yet: they are typed `float64` where NumPy picks a smaller float
 (`float32 / uint8` and `np.sqrt` of `int8` give `float32` and `float16`
 in NumPy; [#61](https://github.com/sofeikov/numty/issues/61)).
 `einsum` parses the subscript string (explicit, implicit,
