@@ -41,5 +41,5 @@ def constructor_precision() -> None:
 
 
 def narrowed(m: Matrix) -> None:
-    use_2x3(narrow(m, np.zeros((2, 3))))  # runtime assert + witness: passes
+    use_2x3(narrow(m, np.zeros((2, 3))))  # runtime check + witness: passes
     use_2x3(ident(np.zeros((2, 3))))  # shape-preserving generic: passes
