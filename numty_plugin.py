@@ -661,6 +661,12 @@ class NumtyPlugin(Plugin):
         if fullname.startswith("numpy.") and short == "take":
             return take_function_hook
         if fullname.startswith("numpy.") and short in {
+            "atleast_1d",
+            "atleast_2d",
+            "atleast_3d",
+        }:
+            return partial(atleast_function_hook, rank=int(short[-2]))
+        if fullname.startswith("numpy.") and short in {
             "cumsum",
             "cumprod",
             "nancumsum",
@@ -1849,6 +1855,31 @@ def take_method_hook(ctx: MethodContext) -> Type:
     if not pairs:
         return ctx.default_return_type
     return _take_solve(ctx, ctx.type, pairs[0])
+
+
+def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        # Multi-arg form returns a tuple the stubs own.
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if len(dims) >= rank:
+        return _ndarray_type(ctx, list(dims), dtype)
+    out: list[int | Type]
+    if rank == 1:
+        out = [1]
+    elif rank == 2:
+        out = [1, 1] if not dims else [1, *dims]
+    elif not dims:
+        out = [1, 1, 1]
+    elif len(dims) == 1:
+        out = [1, dims[0], 1]
+    else:
+        out = [1, *dims]
+    return _ndarray_type(ctx, out, dtype)
 
 
 def _dims_str(dims: list[int | Type]) -> str:

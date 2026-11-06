@@ -953,3 +953,9 @@ def test_nan_axis_mismatch() -> None:
         "axis 2 is out of range for 2 dimensions",
         "incompatible type",
     )
+
+
+def test_atleast_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "atleast_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout

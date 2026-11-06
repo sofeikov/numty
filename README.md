@@ -500,6 +500,7 @@ only the per-member checking matters, the generator form is fine.
 
 Constructors compute result shapes (`zeros_like` keeps shape and dtype,
 `full((2, 3), 5.0)` is a known 2x3 float64, `eye(3)`, `arange(6)`,
+`atleast_2d` promotes `(N,)` to `(1, N)`,
 `concatenate` adds dims on the axis, `stack` adds the stacked axis —
 including enum-driven stacks; mismatches error). Reshape conserves the
 total with symbolic sizes and infers `-1` (`(N, 10, 2)` to `(N, 20)` is
