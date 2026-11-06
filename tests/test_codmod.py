@@ -17,6 +17,11 @@ ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / ".mypy-codmod-cache"
 
 
+
+def _non_reports(warnings: list[str]) -> list[str]:
+    """Warnings other than the per-site 'self-ops rewrote' reports."""
+    return [w for w in warnings if "self-ops rewrote" not in w]
+
 def codemod(src: str, **flags: bool) -> tuple[str, list[str]]:
     out, warnings = codemod_source(src, **flags)
     return out.rstrip("\n"), warnings
@@ -26,7 +31,7 @@ def test_self_op_add() -> None:
     out, warnings = codemod(
         "import numpy as np\nx = np.zeros(3)\ny = x + x\n", self_ops=True
     )
-    assert warnings == []
+    assert _non_reports(warnings) == []
     assert out == "\n".join(
         [
             "import numpy as np",
@@ -46,7 +51,7 @@ def test_self_op_family() -> None:
         "d = x ** x\n",
         self_ops=True,
     )
-    assert warnings == []
+    assert _non_reports(warnings) == []
     assert out == "\n".join(
         [
             "import numpy as np",
@@ -63,7 +68,7 @@ def test_self_op_respects_numpy_alias() -> None:
     out, warnings = codemod(
         "import numpy as npy\nx = npy.zeros(3)\ny = x + x\n", self_ops=True
     )
-    assert warnings == []
+    assert _non_reports(warnings) == []
     assert "y = npy.add(x, x)" in out.splitlines()
 
 
@@ -184,7 +189,7 @@ def test_self_op_array_bindings_still_rewrite(tmp_path: Path) -> None:
         "print(f(a), g(a, a, a), h(a))\n"
     )
     out, warnings = codemod_source(src, self_ops=True)
-    assert warnings == []
+    assert _non_reports(warnings) == []
     for rewritten in [
         "return np.add(x, x)",
         "return np.multiply(x, x), np.divide(y, y), np.power(z, z),"
@@ -243,6 +248,12 @@ def test_self_op_array_bindings_still_rewrite(tmp_path: Path) -> None:
         # Annotations that admit non-arrays.
         "def f(x: np.ndarray | int):\n    return x + x\n",
         "def f(*x: np.ndarray):\n    return x + x\n",
+        # linspace's 5th positional is retstep: a tuple comes back.
+        "j = np.linspace(0, 1, 3, True, True)\nprint(j + j)\n",
+        # Splatted positionals may carry retstep too.
+        "args = (0, 1, 3, True, True)\nm = np.linspace(*args)\nprint(m + m)\n",
+        # A star import may rebind an earlier array name.
+        "a = np.zeros(2)\nfrom starmod import *\nprint(a + a)\n",
     ],
 )
 def test_self_op_unsure_sites_left_alone(src: str) -> None:
@@ -427,7 +438,7 @@ def test_rewrites_keep_surrounding_text() -> None:
         "])\n"
     )
     out, warnings = codemod_source(src, self_ops=True, unpack_displays=True)
-    assert warnings == []
+    assert _non_reports(warnings) == []
     assert out == (
         "# license header\n"
         "import numpy as np\n"
@@ -490,3 +501,29 @@ def test_cli_no_flags_writes_bytes_unchanged(tmp_path: Path) -> None:
     result = _cli("norm.py", "out.py", cwd=tmp_path)
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "out.py").read_bytes() == src
+
+
+def test_self_op_skips_fstrings() -> None:
+    # f"{x * x=}" prints its own source text, so it must stay as written.
+    src = 'import numpy as np\nx = np.zeros(2)\nprint(f"{x * x=}")\n'
+    out, warnings = codemod_source(src, self_ops=True)
+    assert out == src
+    assert warnings == []
+
+
+def test_self_op_reports_rewritten_sites() -> None:
+    src = "import numpy as np\nx = np.zeros(2)\ny = x * x\n"
+    out, warnings = codemod_source(src, self_ops=True)
+    assert out == "import numpy as np\nx = np.zeros(2)\ny = np.multiply(x, x)\n"
+    assert warnings == ["line 3: self-ops rewrote to np.multiply(x, x)"]
+
+
+def test_self_op_star_import_blocks_numpy_alias() -> None:
+    src = (
+        "import numpy as np\n"
+        "from config import *\n"
+        "def f(x: np.ndarray):\n"
+        "    return x + x\n"
+    )
+    out, _ = codemod_source(src, self_ops=True)
+    assert out == src

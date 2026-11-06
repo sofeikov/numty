@@ -16,7 +16,14 @@ matched shape; the exact safety condition lives on each transform.
     (`np.zeros`, `np.array`, ...). On lists, tuples, str, int and bool
     the operator means something else (concatenation, unbounded ints,
     `True + True == 2`, ZeroDivisionError), so every site that is not
-    provably an array is left alone and reported as a warning.
+    known to be an array is left alone and reported as a warning; each
+    rewritten site is reported too. Annotations are trusted, not
+    checked: an `np.matrix` (where `*` is matmul) or a list passed into
+    a parameter annotated `np.ndarray` is still rewritten, so run the
+    test suite after rewriting. A module-level star import, splatted
+    positionals or `linspace`'s positional `retstep` count as unknown,
+    and nothing inside an f-string is rewritten (`f"{x * x=}"` prints
+    its own source).
 --unpack-displays: in `a, b = RHS` unpacking, identity comprehensions
     and wrappers over a literal display become the display itself:
     `(x for x in D)`, `[x for x in D]`, `tuple(x for x in D)`,
@@ -106,6 +113,8 @@ class _Scope:
         # ("numpy", "numpy.typing", "numty", "type") or "other".
         self.bindings: dict[str, list[tuple[str, ast.expr | None, _Scope]]] = {}
         self.globals: set[str] = set()
+        # `from m import *` (module level only) may rebind any name.
+        self.star = False
 
 
 class _ArrayNames:
@@ -125,6 +134,7 @@ class _ArrayNames:
         self.sites: list[tuple[ast.BinOp, _Scope]] = []
         self._nonlocal: set[str] = set()
         self._alias_stack: set[str] = set()
+        self._fstring_depth = 0
         for stmt in tree.body:
             self._visit(stmt, self.module)
         self.sites.sort(key=lambda s: (s[0].lineno, s[0].col_offset))
@@ -242,8 +252,16 @@ class _ArrayNames:
                 self._bind(node.id, scope, "other")
             elif isinstance(node.ctx, ast.Del):
                 self._bind(node.id, scope, "aug")
+        elif isinstance(node, ast.JoinedStr):
+            # f"{x * x=}" prints its own source text, so a rewrite inside
+            # an f-string can change output: never rewrite there.
+            self._fstring_depth += 1
+            try:
+                self._visit_all(list(ast.iter_child_nodes(node)), scope)
+            finally:
+                self._fstring_depth -= 1
         else:
-            if isinstance(node, ast.BinOp):
+            if isinstance(node, ast.BinOp) and not self._fstring_depth:
                 self._site(node, scope)
             name = None
             if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
@@ -276,6 +294,7 @@ class _ArrayNames:
                 self._bind(local, scope, kind)
                 continue
             if a.name == "*":
+                scope.star = True
                 continue
             full = (node.module if node.level == 0 else None, a.name)
             if full in (("numpy", "ndarray"), ("numpy.typing", "NDArray")) or (
@@ -317,6 +336,8 @@ class _ArrayNames:
 
     def _module_is(self, name: str, kind: str) -> bool:
         """Every module-level binding of name is of this kind."""
+        if self.module.star:
+            return False  # a star import may rebind it
         records = self.module.bindings.get(name, [])
         return bool(records) and all(k == kind for k, _, _ in records)
 
@@ -330,6 +351,8 @@ class _ArrayNames:
         owner = self._resolve(name, scope)
         if owner is None or (owner.kind == "function" and name in self._nonlocal):
             return False
+        if owner is self.module and self.module.star:
+            return False  # a star import may rebind it
         found = False
         for kind, node, where in owner.bindings[name]:
             if kind == "aug":
@@ -354,6 +377,10 @@ class _ArrayNames:
             and self.numpy_ok(node.func.value.id, scope)
         ):
             return False
+        if any(isinstance(arg, ast.Starred) for arg in node.args):
+            return False  # unknown positionals (e.g. linspace's retstep)
+        if node.func.attr == "linspace" and len(node.args) >= 5:
+            return False  # 5th positional is retstep: returns a tuple
         return all(
             kw.arg is not None and kw.arg not in _NP_RISKY_KEYWORDS
             for kw in node.keywords
@@ -397,6 +424,8 @@ class _ArrayNames:
         """A module-level alias: `A = np.ndarray[...]`, `type A = ...`."""
         if name in self._alias_stack:
             return False  # a cycle proves nothing
+        if self.module.star:
+            return False  # a star import may rebind it
         records = self.module.bindings.get(name, [])
         self._alias_stack.add(name)
         try:
@@ -444,7 +473,9 @@ def _self_op_edits(
             continue
         ufunc = _SELF_OP_UFUNCS[type(node.op)]
         start, end = source.span(node)
-        edits.append((start, end, f"{np_alias}.{ufunc}({name}, {name})"))
+        new = f"{np_alias}.{ufunc}({name}, {name})"
+        edits.append((start, end, new))
+        warnings.append(f"line {node.lineno}: self-ops rewrote to {new}")
     return edits, warnings
 
 
