@@ -498,57 +498,88 @@ only the per-member checking matters, the generator form is fine.
 
 ## The rest of the catalog
 
-Constructors compute result shapes (`zeros_like` keeps shape and dtype,
-`full((2, 3), 5.0)` is a known 2x3 float64, `eye(3)`, `arange(6)`,
-`atleast_2d` promotes `(N,)` to `(1, N)`,
-`concatenate` adds dims on the axis, `stack` adds the stacked axis,
-`vstack`/`hstack`/`dstack`/`column_stack` promote then concatenate —
-including enum-driven stacks; mismatches error). Reshape conserves the
-total with symbolic sizes and infers `-1` (`(N, 10, 2)` to `(N, 20)` is
-fine, `(N, 10, 2)` to `(N, 21)` errors, `(N, 10)` to `(M, 10)` bails),
-and regroups block-preserving runs over `*Ts` (`(*Ts, 2, 3)` to
-`(*Ts, 6)` is fine; a `-1` that would absorb `*Ts`, or a total no
-`*Ts` can absorb, bails or errors respectively). Rank-changing ops
-track the new shape (`transpose`/`.T` — reversal included over `*Ts`
-— `squeeze`, `expand_dims`, `sum(axis=1)` (plus `median` and every
-`nan*` twin: `nansum`, `nanmean`, `nanargmin`, …), `average` (1-D weights must
-match the averaged axis), `diff` (concrete lengths subtract, bad axes
-and negative orders error), `cumsum`/`cumprod` (shape-preserving);
-bad permutations and non-1 squeeze axes error). `matmul` solves inner
-dims and batch broadcasts
+**Construction.** `zeros_like` keeps shape and dtype, `full((2, 3), 5.0)`
+is a known 2x3 float64, plus `eye(3)`, `arange(6)`, and `atleast_2d`
+promoting `(N,)` to `(1, N)`.
+
+**Joining.** `concatenate` adds dims on the axis, `stack` adds the
+stacked axis, `vstack`/`hstack`/`dstack`/`column_stack` promote then
+concatenate — including enum-driven stacks; mismatches error.
+
+**Reshape.** Conserves the total with symbolic sizes and infers `-1`
+(`(N, 10, 2)` to `(N, 20)` is fine, `(N, 10, 2)` to `(N, 21)` errors,
+`(N, 10)` to `(M, 10)` bails). Regroups block-preserving runs over
+`*Ts` (`(*Ts, 2, 3)` to `(*Ts, 6)` is fine; a `-1` that would absorb
+`*Ts`, or a total no `*Ts` can absorb, bails or errors respectively).
+
+**Rank changes.** `transpose`/`.T` (reversal included over `*Ts`),
+`squeeze`, `expand_dims`; bad permutations and non-1 squeeze axes error.
+
+**Reductions.** `sum(axis=1)` (plus `median` and every `nan*` twin:
+`nansum`, `nanmean`, `nanargmin`, …), `average` (1-D weights must match
+the averaged axis), `diff` (concrete lengths subtract, bad axes and
+negative orders error), `cumsum`/`cumprod` (shape-preserving).
+
+**Matmul family.** `matmul` solves inner dims and batch-broadcasts
 through shared `*Ts` (a lone concrete 1-D/2-D operand contributes an
-empty batch). The rest of the family solves through the same inner-dim
-machinery: `dot` (no batch broadcast past rank 2), `tensordot` (int or
-pair-of-lists axes), `inner`/`outer`/`vdot` (scalars included), and
-`take` (the axis is swapped for the index shape). Indexing consumes leading dims without an ellipsis
-(`v[0]`, `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax` drops the
-axis, `sort` keeps the shape. Shape math keeps its promises too:
-`flip`/`fliplr`/`flipud`/`roll` preserve (with rank floors and axis
-checks), `rot90` swaps dims on odd turns, `gradient` keeps the shape for
-one resolved axis, `convolve`/`correlate` compute full/valid/same lengths,
-and the fft family tracks complex dtypes — `rfft` halves (`N→N//2+1`),
-`fftn`/`rfftn` apply `s` over `axes` with trailing alignment; bad axes
-and non-positive sizes error. Data prep computes too: `tile` multiplies
-reps (concrete or `?U`), `repeat` scales the axis (flattening to one dim
-for `axis=None`, `?U` for array repeats), `pad` adds widths per axis, and
-`split` returns a list of equal parts (`?U` for uneven index splits);
-negative counts and uneven divisions error. Selection results track what
-they can: `unique` keeps the dtype with a `?U` length (rank kept for
-`axis=`), `nonzero`/`where` with one argument return per-dim `?U`
-tuples (`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the
-input shape with a bool dtype, and `searchsorted` follows the values
-shape; 0-d nonzero errors. Symbolic dims stay exact through arithmetic:
+empty batch). The rest solves through the same inner-dim machinery:
+`dot` (no batch broadcast past rank 2), `tensordot` (int or pair-of-lists
+axes), `inner`/`outer`/`vdot` (scalars included), and `take` (the axis is
+swapped for the index shape).
+
+**Indexing.** Consumes leading dims without an ellipsis (`v[0]`,
+`v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax`
+drops the axis, `sort` keeps the shape.
+
+**Shape math.** `flip`/`fliplr`/`flipud`/`roll` preserve (with rank floors
+and axis checks), `rot90` swaps dims on odd turns, `gradient` keeps the
+shape for one resolved axis, `convolve`/`correlate` compute full/valid/same
+lengths. The fft family tracks complex dtypes — `rfft` halves (`N//2+1`),
+`fftn`/`rfftn` apply `s` over `axes` with trailing alignment; bad axes and
+non-positive sizes error.
+
+**Data prep.** `tile` multiplies reps, `repeat` scales the axis
+(flattening to one dim for `axis=None`, `?U` for array repeats), `pad`
+adds widths per axis, `split` returns a list of equal parts (`?U` for
+uneven index splits); negative counts and uneven divisions error.
+
+**Selection.** `unique` keeps the dtype with a `?U` length (rank kept for
+`axis=`), `nonzero`/`where` with one argument return per-dim `?U` tuples
+(`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the input shape
+with a bool dtype, `searchsorted` follows the values shape; 0-d nonzero
+errors.
+
+**Symbolic arithmetic.** Dims stay exact through arithmetic:
 `repeat`/`tile` multiply (`N*2`), `pad` adds (`N+2`), `convolve` adds
 lengths (`N+M-1`), `rfft` halves (`N//2+1`), `split` divides (`N//2`),
 and reshape proves `N*2` vs `2*N` (dividing `-1` exactly); mismatches
-error with readable formulas. Elementwise ops — operators and bare
-`np.*` ufuncs alike — broadcast shapes and promote dtypes exactly like
-NumPy (verified against `np.result_type` over the full dtype matrix,
-plus weak Python scalars). `einsum` parses the subscript string
-(explicit, implicit, ellipsis, diagonals) and `linalg` checks squareness
-and inner dims while tracking dtypes (`eigh` stays real, `svd` shrinks
-with `full_matrices=False`). `Generator` random methods solve from
-`size=`. Tuple and list displays keep per-item precision. An explicit
+error with readable formulas. `sliding_window_view` appends the window
+after the shrunken dims (`N-w+1`, symbolic included — the conv-output
+formula falls out).
+
+What that unlocks — code that failed before, exact now:
+
+```python
+def f(u: F64[N], w: F64[N, K]) -> None:
+    n: N = u.shape[0]
+    # Was: "reshape changes total size: 1 -> 2". Now: exact F64[2, N].
+    r: F64[2, N] = np.reshape(np.repeat(u, 2), (2, n))
+    # -1 divides the canonical product (N*2 / 2 = N); the quotient
+    # contracts exactly downstream. Was: bailed to Any.
+    t = np.reshape(np.repeat(u, 2), (2, -1))
+    m: F64[2, K] = np.dot(t, w)
+    # rfft on symbolic input claimed (N,) — silently wrong.
+    # Now: (N//2+1), and it participates in checks.
+    s = np.fft.rfft(u)
+```
+
+**Elementwise, einsum, linalg, random.** Operators and bare `np.*`
+ufuncs alike — broadcast shapes and promote dtypes exactly like NumPy
+(verified against `np.result_type` over the full dtype matrix, plus weak
+Python scalars). `einsum` parses the subscript string (explicit, implicit,
+ellipsis, diagonals) and `linalg` checks squareness and inner dims while
+tracking dtypes (`eigh` stays real, `svd` shrinks with
+`full_matrices=False`). `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
 `dtype=` you name is used as-is when it resolves; anything exotic bails
 out instead of guessing.
 

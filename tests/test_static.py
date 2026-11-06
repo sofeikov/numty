@@ -1169,3 +1169,48 @@ def test_symexpr_product_mismatch() -> None:
         "(2*N,)",
         "(3, N)",
     )
+
+
+def test_sliding_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "sliding_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_swv_shape_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_swv_shape.py"),
+        "must provide window_shape for all 2 dimensions",
+        "(10, 8)",
+    )
+
+
+def test_swv_size_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_swv_size.py"),
+        "window shape cannot be larger than input array shape",
+        "window 20 over dim 10",
+    )
+
+
+def test_swv_neg_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_swv_neg.py"),
+        "`window_shape` cannot contain negative values (got -1)",
+    )
+
+
+def test_swv_len_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_swv_len.py"),
+        "must provide matching length window_shape and axis",
+        "2 window entries for 1 axes",
+    )
+
+
+def test_swv_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_swv_axis.py"),
+        "sliding_window_view axis 5 is out of range for 2 dimensions",
+        "(10, 8)",
+    )

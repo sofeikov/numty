@@ -668,6 +668,8 @@ class NumtyPlugin(Plugin):
             return pad_function_hook
         if fullname.startswith("numpy.") and short == "split":
             return split_function_hook
+        if fullname.startswith("numpy.") and short == "sliding_window_view":
+            return sliding_window_view_function_hook
         if fullname.startswith("numpy.") and short == "nonzero":
             return nonzero_function_hook
         if fullname.startswith("numpy.") and short == "flatnonzero":
@@ -1015,13 +1017,15 @@ class _DivForm(NamedTuple):
 
 _expr_forms: dict[str, _LinForm | _DivForm] = {}
 _expr_ids: dict[str, TypeVarId] = {}
+_seen_vars: dict[str, TypeVarType] = {}
 
 
 def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | None:
     """Canonical form of a dim: ints and TypeVars (expressions included).
 
     Plain TypeVars read as single-term linears, so N and N*1 compare
-    equal; anything else is unresolvable.
+    equal; anything else is unresolvable. Seen variables are remembered
+    by fullname so materialization can return the real object.
     """
     if isinstance(d, int):
         return _LinForm((), d)
@@ -1029,6 +1033,7 @@ def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | None:
         form = _expr_forms.get(d.fullname)
         if form is not None:
             return form
+        _seen_vars.setdefault(d.fullname, d)
         return _LinForm(((d.fullname, 1),), 0)
     return None
 
@@ -1078,7 +1083,7 @@ def _expr_var(
     _expr_forms[fullname] = form
     upper = ctx.api.named_generic_type("builtins.int", [])
     return TypeVarType(
-        name=f"?E{index}",
+        name=_expr_str(form),
         fullname=fullname,
         id=vid,
         values=[],
@@ -1121,11 +1126,25 @@ def _materialize_dim(
     form: _LinForm | _DivForm,
     prefer: int | Type | None = None,
 ) -> int | Type:
-    """A dim for a canonical form: int, the preferred original, or a fresh var."""
+    """A dim for a canonical form: int, the real variable, or a fresh var.
+
+    A form that is just one known variable returns that variable's own
+    object (so N*2/2 checks as F64[N], not as a lookalike); anything else
+    mints a formula-named variable.
+    """
     if isinstance(form, _LinForm) and not form.coeffs:
         return form.const
     if prefer is not None and _resolve_dim(prefer) == form:
         return prefer
+    if (
+        isinstance(form, _LinForm)
+        and len(form.coeffs) == 1
+        and form.coeffs[0][1] == 1
+        and form.const == 0
+    ):
+        seen = _seen_vars.get(form.coeffs[0][0])
+        if seen is not None:
+            return seen
     return _expr_var(ctx, op, index, form)
 
 
@@ -3253,6 +3272,114 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, values_dims, dtype)
+
+
+def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    ndim = len(dims)
+    found_w = _hook_pair(ctx, "x", "window_shape", 1)
+    found_ax = _hook_pair(ctx, "x", "axis", 2)
+    if found_w == "incomplete" or found_ax == "incomplete":
+        return ctx.default_return_type
+    assert not isinstance(found_w, str) and not isinstance(found_ax, str)
+    if found_w is None:
+        return ctx.default_return_type
+    window = _int_or_none(found_w)
+    widths: list[int] | None = None
+    if isinstance(window, int):
+        widths = [window]
+        scalar_window = True
+    elif window == "bail":
+        seq = _fft_seq_arg(found_w)
+        if not isinstance(seq, list):
+            return ctx.default_return_type
+        items: list[int] = []
+        for entry in seq:
+            if not isinstance(entry, int):
+                return ctx.default_return_type
+            items.append(entry)
+        widths = items
+        scalar_window = False
+    else:
+        return ctx.default_return_type
+    axes: list[int] | None = None
+    if found_ax is not None and not _is_none_type(found_ax[0]):
+        axis_val = _int_or_none(found_ax)
+        if isinstance(axis_val, int):
+            axes = [axis_val]
+        elif axis_val == "bail":
+            seq = _fft_seq_arg(found_ax)
+            if not isinstance(seq, list):
+                return ctx.default_return_type
+            items = []
+            for entry in seq:
+                if not isinstance(entry, int):
+                    return ctx.default_return_type
+                items.append(entry)
+            axes = items
+        else:
+            axes = None
+    if axes is None:
+        # A scalar window reads as one entry, which only fits 1-d input;
+        # anything else must spell every dimension.
+        if len(widths) != ndim:
+            ctx.api.fail(
+                "sliding_window_view with axis=None must provide window_shape "
+                f"for all {ndim} dimensions (shape {_dims_str(dims)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        eff = list(range(ndim))
+    else:
+        eff = []
+        for ax in axes:
+            target = _normalize_axis(ax, ndim)
+            if target is None:
+                ctx.api.fail(
+                    f"sliding_window_view axis {ax} is out of range for "
+                    f"{ndim} dimensions (shape {_dims_str(dims)})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            eff.append(target)
+        if len(set(eff)) != len(eff):
+            return ctx.default_return_type
+        if scalar_window:
+            widths = widths * len(eff)
+        elif len(widths) != len(eff):
+            ctx.api.fail(
+                "sliding_window_view must provide matching length window_shape "
+                f"and axis (got {len(widths)} window entries for {len(eff)} axes)",
+                ctx.context,
+            )
+            return ctx.default_return_type
+    out = list(dims)
+    for ax, wval in zip(eff, widths):
+        if wval < 0:
+            ctx.api.fail(
+                "sliding_window_view `window_shape` cannot contain "
+                f"negative values (got {wval})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        d = out[ax]
+        if isinstance(d, int) and wval > d:
+            ctx.api.fail(
+                "sliding_window_view window shape cannot be larger than "
+                f"input array shape (window {wval} over dim {d} of shape "
+                f"{_dims_str(dims)})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        out[ax] = _dim_add_const(ctx, "sliding_window_view", ax, d, 1 - wval)
+    out.extend(widths)
+    return _ndarray_type(ctx, out, dtype)
 
 
 def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
