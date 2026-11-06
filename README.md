@@ -676,6 +676,43 @@ or notebook cell written as `def main():` gets no shape checking at all.
 Run with `--check-untyped-defs` (or set `check_untyped_defs = True` in
 your `mypy.ini`) to have the solver check them too.
 
+## Error codes
+
+Every numty diagnostic carries one of six mypy error codes, so each kind
+can be silenced or selected on its own:
+
+| Code | Covers | Example message |
+|---|---|---|
+| `numty-shape` | dims, ranks or size arguments that do not fit the operation (matmul, reshape, concatenate, linalg, einsum, …) | `matmul inner dimensions disagree: 3 vs 2` |
+| `numty-broadcast` | elementwise operands (arithmetic, comparisons, ufuncs, `where`, `broadcast_*`, index arrays) that do not broadcast | `broadcast shapes disagree at trailing axis 0: 3 vs 4` |
+| `numty-callsite` | one shape variable bound to two sizes by the arguments of a call | `call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)` |
+| `numty-axis` | axis or index arguments out of range, duplicated or mismatched | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
+| `numty-bail` | correct code numty cannot check and says so loudly (stacks built dynamically) | `stack needs a sequence of known length (built dynamically; preallocate or ignore)` |
+| `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
+
+```text
+codes.py:9: error: F64 takes at least one dim  [numty-annotation]
+codes.py:13: error: matmul inner dimensions disagree: 3 vs 2  [numty-shape]
+codes.py:14: error: call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)  [numty-callsite]
+codes.py:15: error: where shapes disagree: broadcast shapes disagree at trailing axis 0: 3 vs 4 (shapes (4, 3) vs (4,))  [numty-broadcast]
+codes.py:16: error: axis 2 is out of range for 2 dimensions (shape (4, 3))  [numty-axis]
+codes.py:17: error: stack needs a sequence of known length (built dynamically; preallocate or ignore)  [numty-bail]
+```
+
+Code that stacks or concatenates lists built at runtime can turn the
+bails off and keep every real shape error:
+
+```ini
+[mypy]
+plugins = numty_plugin
+disable_error_code = numty-bail
+```
+
+or per line, `np.stack(blocks)  # type: ignore[numty-bail]`, which still
+reports a shape error on that line. All six are sub-codes of `misc`, so
+an existing `# type: ignore[misc]` or `disable_error_code = misc` keeps
+covering them.
+
 ## How it works
 
 Three layers, each building on the previous one:

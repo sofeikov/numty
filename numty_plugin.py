@@ -61,6 +61,7 @@ from collections.abc import Callable, Iterator
 from functools import partial
 from typing import NamedTuple, cast
 
+from mypy.errorcodes import MISC, ErrorCode
 from mypy.nodes import (
     ARG_NAMED,
     ARG_OPT,
@@ -120,6 +121,36 @@ from mypy.types import (
     UnionType,
     UnpackType,
     get_proper_type,
+)
+
+
+# Error codes, one per kind of diagnostic a user may want to silence or
+# select on its own (`# type: ignore[numty-bail]`,
+# `disable_error_code = numty-bail`). All are sub-codes of misc, so an
+# existing `ignore[misc]` or `disable_error_code = misc` still covers them.
+NUMTY_SHAPE = ErrorCode(
+    "numty-shape",
+    "Array dimensions, ranks or size arguments do not fit the operation",
+    "numty",
+    sub_code_of=MISC,
+)
+NUMTY_BROADCAST = ErrorCode(
+    "numty-broadcast", "Array shapes do not broadcast together", "numty", sub_code_of=MISC
+)
+NUMTY_CALLSITE = ErrorCode(
+    "numty-callsite",
+    "Shape variable bound to conflicting sizes at a call",
+    "numty",
+    sub_code_of=MISC,
+)
+NUMTY_AXIS = ErrorCode(
+    "numty-axis", "Axis or index argument out of range or invalid", "numty", sub_code_of=MISC
+)
+NUMTY_BAIL = ErrorCode(
+    "numty-bail", "numty cannot check this expression", "numty", sub_code_of=MISC
+)
+NUMTY_ANNOTATION = ErrorCode(
+    "numty-annotation", "Invalid numty shape annotation", "numty", sub_code_of=MISC
 )
 
 
@@ -229,7 +260,7 @@ class NumtyPlugin(Plugin):
                     key = (ctx.api.path, ctx.context.line, message)
                     if key not in self._seen_conflicts:
                         self._seen_conflicts.add(key)
-                        ctx.api.fail(message, ctx.context)
+                        ctx.api.fail(message, ctx.context, code=NUMTY_CALLSITE)
                     break
         # String-spec words bound late (see _fam_bind_words) are missing
         # from the function's variables, so core checking would reject
@@ -292,7 +323,7 @@ class NumtyPlugin(Plugin):
                 else:
                     dims.append(parsed)
         except _FamFail as bad:
-            ctx.api.fail(bad.msg, ctx.context)
+            ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
             return AnyType(TypeOfAny.from_error)
         except _FamBail:
             return AnyType(TypeOfAny.from_error)
@@ -1293,7 +1324,7 @@ def _check_dim_eq(
     if _dim_eq(x, y):
         return True
     if isinstance(x, int) and isinstance(y, int):
-        ctx.api.fail(message, ctx.context)
+        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
     return False
 
 
@@ -1666,6 +1697,7 @@ def _dims_fit_intp(ctx: FunctionContext | MethodContext, dims: list[int]) -> boo
                 f"dimension {d} exceeds the maximum allowed dimension "
                 f"{INTP_MAX} (shape {_dims_str(list(dims))})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return False
     return True
@@ -1839,14 +1871,14 @@ def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type)
         (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
         dims, message = _matmul_result(dims_a, dims_b)
         if message is not None:
-            ctx.api.fail(message, ctx.context)
+            ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
         if dims is None:
             return ctx.default_return_type
         return _matmul_promoted(ctx, dims, dtype_a, dtype_b)
     dims, message, dtype_a, dtype_b = _matmul_unpack_dims(left, right)
     if message is not None:
-        ctx.api.fail(message, ctx.context)
+        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     if dims is None or dtype_a is None or dtype_b is None:
         return ctx.default_return_type
@@ -1882,6 +1914,7 @@ def _matmul_has_dims(ctx: FunctionContext | MethodContext, operands: list[Type])
             f"matmul operand {i} has no dimensions ({what}); "
             "matmul needs arrays with at least 1 dimension",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return False
     return True
@@ -1959,7 +1992,7 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
         # Vector inner product is a scalar (the stubs agree).
         matched, message = _contract_pair("dot", dims_a[0], dims_b[0])
         if message is not None:
-            ctx.api.fail(message, ctx.context)
+            ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
         if not matched:
             return ctx.default_return_type
@@ -1974,7 +2007,7 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
         out = dims_a[:-1] + dims_b[:-2] + dims_b[-1:]
     matched, message = _contract_pair("dot", *contracted)
     if message is not None:
-        ctx.api.fail(message, ctx.context)
+        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     if not matched:
         return ctx.default_return_type
@@ -1992,7 +2025,7 @@ def inner_function_hook(ctx: FunctionContext) -> Type:
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
     matched, message = _contract_pair("inner", dims_a[-1], dims_b[-1])
     if message is not None:
-        ctx.api.fail(message, ctx.context)
+        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     if not matched:
         return ctx.default_return_type
@@ -2043,6 +2076,7 @@ def vdot_function_hook(ctx: FunctionContext) -> Type:
         ctx.api.fail(
             f"vdot operands have different sizes: {total_a} vs {total_b}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     return _promoted_scalar(ctx, parts_a[1], parts_b[1])
@@ -2109,6 +2143,7 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
                 f"tensordot axes {form} contracts more axes than the operands "
                 f"have (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         contract = list(zip(range(len(dims_a) - form, len(dims_a)), range(form)))
@@ -2119,6 +2154,7 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
                 f"tensordot axes have different lengths: {len(axes_a)} vs "
                 f"{len(axes_b)}",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         contract = []
@@ -2132,6 +2168,7 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
                     f"tensordot axis {ia} is out of range for {len(dims_a)} "
                     f"dimensions (shape {_dims_str(dims_a)})",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
             if not 0 <= nb < len(dims_b):
@@ -2139,12 +2176,15 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
                     f"tensordot axis {ib} is out of range for {len(dims_b)} "
                     f"dimensions (shape {_dims_str(dims_b)})",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
             if na in seen_a or nb in seen_b:
                 bad = ia if na in seen_a else ib
                 ctx.api.fail(
-                    f"duplicate axis {bad} in tensordot axes", ctx.context
+                    f"duplicate axis {bad} in tensordot axes",
+                    ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
             seen_a.add(na)
@@ -2155,7 +2195,7 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
     for i, j in contract:
         matched, message = _contract_pair("tensordot", dims_a[i], dims_b[j])
         if message is not None:
-            ctx.api.fail(message, ctx.context)
+            ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
         if not matched:
             return ctx.default_return_type
@@ -2232,6 +2272,7 @@ def _take_in_bounds(
                 f"take index {value} is out of bounds for {where} "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return False
     return True
@@ -2267,7 +2308,7 @@ def _take_solve(
             return scalar if scalar is not None else ctx.default_return_type
         return _ndarray_type(ctx, idx_dims, dtype)
     if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
-        ctx.api.fail("np.take axis must be an integer or None", ctx.context)
+        ctx.api.fail("np.take axis must be an integer or None", ctx.context, code=NUMTY_AXIS)
         return ctx.default_return_type
     norm = _normalize_axis(axis[0], len(dims))
     if norm is None:
@@ -2275,6 +2316,7 @@ def _take_solve(
             f"axis {axis[0]} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     # numpy skips the index check when a dim before the axis is 0:
@@ -2359,6 +2401,7 @@ def _check_each_axis(
                 f"{op} axis {ax} is out of range for {len(dims)} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return False
     return True
@@ -2378,6 +2421,7 @@ def _check_unique_axes(
                 f"{op} has duplicate axis {ax} in {tuple(axes)} "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return False
         seen.append(norm)
@@ -2405,6 +2449,7 @@ def _roll_shift_matches(
         f"roll shift has {len(shift)} entries for {len(axis)} axes "
         f"(shift {tuple(shift)}, axis {tuple(axis)}, shape {_dims_str(dims)})",
         ctx.context,
+        code=NUMTY_AXIS,
     )
     return False
 
@@ -2436,6 +2481,7 @@ def _same_shape_hook(
             f"{op} requires at least {rank_min} dimensions, got {len(dims)} "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if not _picture_complete(ctx, first):
@@ -2558,6 +2604,7 @@ def rot90_function_hook(ctx: FunctionContext) -> Type:
                 f"rot90 axis {ax} is out of range for {len(dims)} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
     na = ia + len(dims) if ia < 0 else ia
@@ -2568,6 +2615,7 @@ def rot90_function_hook(ctx: FunctionContext) -> Type:
             f"rot90 axes must be different (got ({ia}, {ib}) on shape "
             f"{_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims)
@@ -2597,6 +2645,7 @@ def _convolve_solve(
             f"{op} only supports 1-dimensional arrays "
             f"(shapes {_dims_str(dims_a)} and {_dims_str(dims_b)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     for which, dim in (("first", dims_a[0]), ("second", dims_b[0])):
@@ -2605,6 +2654,7 @@ def _convolve_solve(
                 f"{op} {which} array argument cannot be empty "
                 f"(shapes {_dims_str(dims_a)} and {_dims_str(dims_b)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
     if mode not in ("full", "valid", "same"):
@@ -2668,6 +2718,7 @@ def fft_function_hook(ctx: FunctionContext) -> Type:
             f"fft axis {axis} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims)
@@ -2695,6 +2746,7 @@ def _rfft_solve(
             f"{op} axis {axis} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims)
@@ -2730,6 +2782,7 @@ def _fft_axis_n(ctx: FunctionContext) -> tuple[int | None, int] | None:
         ctx.api.fail(
             f"fft n must be a positive number of data points, got {n}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return None
     return (n, -1 if axis is None else axis)
@@ -2828,6 +2881,7 @@ def _fftn_solve(
                 f"{op} s has {len(s)} entries for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         eff = list(range(ndim - len(s), ndim))
@@ -2845,6 +2899,7 @@ def _fftn_solve(
                     f"{op} axis {ax} is out of range for {ndim} dimensions "
                     f"(shape {_dims_str(dims)})",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
             eff.append(target)
@@ -2855,6 +2910,7 @@ def _fftn_solve(
                 f"{op} Shape and axes have different lengths "
                 f"({len(s)} vs {len(eff)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         sizes = list(s) if s is not None else [None] * len(eff)
@@ -2866,6 +2922,7 @@ def _fftn_solve(
             ctx.api.fail(
                 f"{op} s entries must be positive, got {size}",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         out[ax] = size
@@ -2975,7 +3032,7 @@ def tile_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     shown = "[" + ", ".join("?" if r is None else str(r) for r in reps) + "]"
     if any(isinstance(r, int) and r < 0 for r in reps):
-        ctx.api.fail(f"tile reps must be non-negative, got {shown}", ctx.context)
+        ctx.api.fail(f"tile reps must be non-negative, got {shown}", ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     if len(reps) > len(dims):
         eff = [1] * (len(reps) - len(dims)) + list(dims)
@@ -3051,6 +3108,7 @@ def _repeat_display_size(
             f"repeat repeats has {len(entries)} entries for {where} "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return None
     counts = [e for e in entries if e is not None and e >= 0]
@@ -3086,7 +3144,9 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if isinstance(count, int) and count < 0:
         ctx.api.fail(
-            f"repeat repeats must be non-negative, got {count}", ctx.context
+            f"repeat repeats must be non-negative, got {count}",
+            ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     # A multi-entry display fixes the new size outright (or proves the
@@ -3112,6 +3172,7 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
             f"repeat axis {axis} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims)
@@ -3273,6 +3334,7 @@ def pad_function_hook(ctx: FunctionContext) -> Type:
             f"pad pad_width entries do not match {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     assert isinstance(widths, list)
@@ -3283,6 +3345,7 @@ def pad_function_hook(ctx: FunctionContext) -> Type:
                 "pad pad_width entries must be non-negative, "
                 f"got ({before}, {after})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         if isinstance(before, int) and isinstance(after, int):
@@ -3318,6 +3381,7 @@ def split_function_hook(ctx: FunctionContext) -> Type:
             f"split axis {axis} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims)
@@ -3327,7 +3391,9 @@ def split_function_hook(ctx: FunctionContext) -> Type:
     if isinstance(sections, int):
         if sections < 1:
             ctx.api.fail(
-                f"split sections must be positive, got {sections}", ctx.context
+                f"split sections must be positive, got {sections}",
+                ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         dim = out[target]
@@ -3337,6 +3403,7 @@ def split_function_hook(ctx: FunctionContext) -> Type:
                     f"split cannot divide axis {target} of size {dim} into "
                     f"{sections} equal sections (shape {_dims_str(dims)})",
                     ctx.context,
+                    code=NUMTY_SHAPE,
                 )
                 return ctx.default_return_type
             out[target] = dim // sections
@@ -3381,6 +3448,7 @@ def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
         ctx.api.fail(
             f"{op} on 0d arrays is not allowed (use atleast_1d first)",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     elems: list[Type] = []
@@ -3467,6 +3535,7 @@ def unique_function_hook(ctx: FunctionContext) -> Type:
             f"unique axis {folded} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims)
@@ -3599,6 +3668,7 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
                 "sliding_window_view with axis=None must provide window_shape "
                 f"for all {ndim} dimensions (shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         eff = list(range(ndim))
@@ -3611,6 +3681,7 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
                     f"sliding_window_view axis {ax} is out of range for "
                     f"{ndim} dimensions (shape {_dims_str(dims)})",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
             eff.append(target)
@@ -3623,6 +3694,7 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
                 "sliding_window_view must provide matching length window_shape "
                 f"and axis (got {len(widths)} window entries for {len(eff)} axes)",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
     out = list(dims)
@@ -3632,6 +3704,7 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
                 "sliding_window_view `window_shape` cannot contain "
                 f"negative values (got {wval})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         d = out[ax]
@@ -3641,6 +3714,7 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
                 f"input array shape (window {wval} over dim {d} of shape "
                 f"{_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         out[ax] = _dim_add_const(ctx, "sliding_window_view", ax, d, 1 - wval)
@@ -3827,7 +3901,7 @@ def _solve_broadcast_unpack(
         (p2, u2, s2), dtype_b = sb
         dims, message = _merge_unpack_dims(p1, u1, s1, p2, u2, s2)
         if message is not None:
-            ctx.api.fail(message, ctx.context)
+            ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
             return ctx.default_return_type
         if dims is None:
             return ctx.default_return_type
@@ -3883,7 +3957,7 @@ def _broadcast_types(ctx: FunctionContext | MethodContext, left: Type, right: Ty
         return ctx.default_return_type
     dims, message = _broadcast_result(dims_a, dims_b)
     if message is not None:
-        ctx.api.fail(message, ctx.context)
+        ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
         return ctx.default_return_type
     if dims is None:
         return ctx.default_return_type
@@ -4101,6 +4175,7 @@ def _solve_reshape_unpack(
             f"reshape changes total size: {total} is not a multiple of "
             f"known size {known} (shapes {_dims_str(old)} vs {tuple(raw)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if known == 0 and total != 0:
@@ -4108,6 +4183,7 @@ def _solve_reshape_unpack(
             f"reshape changes total size: 0 -> {total} "
             f"(shapes {_dims_str(old)} vs {tuple(raw)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     return ctx.default_return_type
@@ -4130,12 +4206,14 @@ def _solve_reshape(
                 f"reshape has invalid dimension {min(raw_ints)}; only -1 may be negative "
                 f"(shape {_dims_str(raw)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         if raw_ints.count(-1) > 1:
             ctx.api.fail(
                 f"reshape accepts only one -1 dimension (shape {_dims_str(raw)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         (prefix, unpack, suffix), dtype = split
@@ -4150,12 +4228,14 @@ def _solve_reshape(
             f"reshape has invalid dimension {min(raw_ints)}; only -1 may be negative "
             f"(shape {_dims_str(raw)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if raw_ints.count(-1) > 1:
         ctx.api.fail(
             f"reshape accepts only one -1 dimension (shape {_dims_str(raw)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     # Conservation with symbolic sizes: int products must match and the
@@ -4217,6 +4297,7 @@ def _solve_reshape(
                 f"reshape cannot infer -1: total size {size_old} is not divisible "
                 f"by {known} {detail}",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         inferred = size_old // known
@@ -4241,12 +4322,14 @@ def _solve_reshape(
                     f"{_expr_str(new_form)} "
                     f"(shapes {_dims_str(dims_old)} vs {raw_str})",
                     ctx.context,
+                    code=NUMTY_SHAPE,
                 )
             else:
                 ctx.api.fail(
                     f"reshape changes total size: {size_old} -> {size_new} "
                     f"(shapes {_dims_str(dims_old)} vs {raw_str})",
                     ctx.context,
+                    code=NUMTY_SHAPE,
                 )
             return ctx.default_return_type
         if old_vars != new_vars:
@@ -4452,6 +4535,7 @@ def _apply_permutation(
                 f"transpose axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         normalized.append(norm)
@@ -4460,6 +4544,7 @@ def _apply_permutation(
             f"transpose axes {tuple(axes)} are not a permutation of {ndim} "
             f"dimensions (shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     return _ndarray_type(ctx, [dims[ax] for ax in normalized], dtype)
@@ -4669,6 +4754,7 @@ def _solve_squeeze(
                 f"squeeze axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         if not isinstance(dims[norm], int):
@@ -4678,6 +4764,7 @@ def _solve_squeeze(
                 f"squeeze axis {ax} has size {dims[norm]}, not 1 "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         chosen.append(norm)
@@ -4699,10 +4786,11 @@ def _solve_expand_dims(
                 f"expand_dims axis {ax} is out of range for {ndim} dimensions "
                 f"with {len(axis)} new axes",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         if norm in normalized:
-            ctx.api.fail(f"expand_dims has duplicate axis {ax}", ctx.context)
+            ctx.api.fail(f"expand_dims has duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
             return ctx.default_return_type
         normalized.append(norm)
     out = list(dims)
@@ -4734,10 +4822,11 @@ def _solve_reduction(
                 f"axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         if norm in normalized:
-            ctx.api.fail(f"duplicate axis {ax}", ctx.context)
+            ctx.api.fail(f"duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
             return ctx.default_return_type
         normalized.append(norm)
     chosen = set(normalized)
@@ -5109,6 +5198,7 @@ def eye_function_hook(ctx: FunctionContext) -> Type:
         ctx.api.fail(
             f"eye dimensions must be non-negative, got ({n}, {m})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -5164,7 +5254,7 @@ def arange_function_hook(ctx: FunctionContext) -> Type:
         try:
             dims = [len(range(start, stop, step))]
         except ValueError:
-            ctx.api.fail("arange step is zero", ctx.context)
+            ctx.api.fail("arange step is zero", ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
     else:
         dims = _arange_symbolic(pairs)
@@ -5322,6 +5412,7 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
                 "concatenate needs a sequence of known length "
                 "(built dynamically; preallocate or ignore)",
                 ctx.context,
+                code=NUMTY_BAIL,
             )
             return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
@@ -5353,6 +5444,7 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
             "concatenate ranks differ: "
             + ", ".join(_dims_str(dims) for dims, _ in items),
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     ndim = len(items[0][0])
@@ -5361,6 +5453,7 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
         ctx.api.fail(
             f"concatenate axis {axis} is out of range for {ndim} dimensions",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     return _concat_merge(ctx, "concatenate", items, dtype, norm)
@@ -5402,6 +5495,7 @@ def _concat_merge(
                         f"{op} dimension {i} differs: {out[i]} vs {d} "
                         f"(shapes {_dims_str(out)} vs {_dims_str(dims)})",
                         ctx.context,
+                        code=NUMTY_SHAPE,
                     )
                     return ctx.default_return_type
                 return ctx.default_return_type
@@ -5429,6 +5523,7 @@ def _stack_solve(
                     f"{kind} needs a sequence of known length "
                     "(built dynamically; preallocate or ignore)",
                     ctx.context,
+                    code=NUMTY_BAIL,
                 )
                 return AnyType(TypeOfAny.from_error)
             dims_e, dtype_e = elem
@@ -5460,6 +5555,7 @@ def _stack_solve(
             f"{kind} ranks differ: "
             + ", ".join(_dims_str(dims) for dims in promoted),
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     norm = axis
@@ -5533,6 +5629,7 @@ def _concat_dynamic(
         ctx.api.fail(
             f"concatenate axis {axis} is out of range for {len(dims_e)} dimensions",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims_e)
@@ -5560,6 +5657,7 @@ def _stack_dynamic(
         ctx.api.fail(
             f"stack axis {axis} is out of range for {ndim} dimensions",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(dims_e)
@@ -5581,6 +5679,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                 "stack needs a sequence of known length "
                 "(built dynamically; preallocate or ignore)",
                 ctx.context,
+                code=NUMTY_BAIL,
             )
             return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
@@ -5605,6 +5704,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                     "stack shapes differ: "
                     + ", ".join(_dims_str(dims) for dims, _ in items),
                     ctx.context,
+                    code=NUMTY_SHAPE,
                 )
                 return ctx.default_return_type
             return ctx.default_return_type
@@ -5614,6 +5714,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
         ctx.api.fail(
             f"stack axis {axis} is out of range for {ndim} dimensions",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     out = list(first)
@@ -5741,7 +5842,7 @@ def _solve_reduction_unpack(
                 return ctx.default_return_type
             pos = ax
         if pos in chosen:
-            ctx.api.fail(f"duplicate axis {ax}", ctx.context)
+            ctx.api.fail(f"duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
             return ctx.default_return_type
         chosen.add(pos)
     if keepdims:
@@ -6017,6 +6118,7 @@ def _consume_one(
                     f"index {item[1]} is out of range for axis {axis} "
                     f"with size {size} (shape {shape_repr})",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
         return []
     if kind == "fancy0d":
@@ -6028,6 +6130,7 @@ def _consume_one(
         ctx.api.fail(
             "arrays used as indices must be of integer (or boolean) type",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return None
     _, begin, end, stride = item
@@ -6039,7 +6142,7 @@ def _consume_one(
     try:
         return [len(range(*slice(*bounds).indices(size)))]
     except ValueError:
-        ctx.api.fail("slice step is zero", ctx.context)
+        ctx.api.fail("slice step is zero", ctx.context, code=NUMTY_AXIS)
         return None
 
 
@@ -6121,7 +6224,11 @@ def _solve_getitem_unpack(
     if items is None:
         return ctx.default_return_type
     if sum(1 for item in items if item[0] == "ellipsis") > 1:
-        ctx.api.fail("only one Ellipsis (...) is allowed in an index", ctx.context)
+        ctx.api.fail(
+            "only one Ellipsis (...) is allowed in an index",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
         return ctx.default_return_type
     positions = [n for n, item in enumerate(items) if item[0] == "ellipsis"]
     if not positions:
@@ -6153,7 +6260,11 @@ def _solve_getitem(
     if items is None:
         return ctx.default_return_type
     if sum(1 for item in items if item[0] == "ellipsis") > 1:
-        ctx.api.fail("only one Ellipsis (...) is allowed in an index", ctx.context)
+        ctx.api.fail(
+            "only one Ellipsis (...) is allowed in an index",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
         return ctx.default_return_type
     ndim = len(dims)
     consuming = sum(
@@ -6164,6 +6275,7 @@ def _solve_getitem(
             f"too many indices for {ndim} dimensions "
             f"(got {consuming}, shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     fancy_positions = [n for n, item in enumerate(items) if item[0] == "fancy"]
@@ -6185,6 +6297,7 @@ def _solve_getitem(
             ctx.api.fail(
                 f"indexing arrays could not be broadcast together: {cause}",
                 ctx.context,
+                code=NUMTY_BROADCAST,
             )
             return ctx.default_return_type
         assert merged is not None
@@ -6209,6 +6322,7 @@ def _solve_getitem(
                         f"index {item[1]} is out of range for axis {dim} "
                         f"with size {size} (shape {_dims_str(dims)})",
                         ctx.context,
+                        code=NUMTY_AXIS,
                     )
                     return ctx.default_return_type
             dim += 1
@@ -6237,6 +6351,7 @@ def _solve_getitem(
             ctx.api.fail(
                 "arrays used as indices must be of integer (or boolean) type",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         else:
@@ -6253,7 +6368,7 @@ def _solve_getitem(
             try:
                 out.append(len(range(*slice(*bounds).indices(size))))
             except ValueError:
-                ctx.api.fail("slice step is zero", ctx.context)
+                ctx.api.fail("slice step is zero", ctx.context, code=NUMTY_AXIS)
                 return ctx.default_return_type
             dim += 1
     out.extend(dims[dim:])
@@ -6322,7 +6437,7 @@ def _broadcast_dims_unpack(
         (p2, u2, s2), _ = sb
         dims, message = _merge_unpack_dims(p1, u1, s1, p2, u2, s2)
         if message is not None:
-            ctx.api.fail(message, ctx.context)
+            ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
             return None
         return dims
     sel, other = (sa, right) if sa is not None else (sb, left)
@@ -6348,7 +6463,7 @@ def _broadcast_dims(
     dims_b, _ = b
     dims, message = _broadcast_result(dims_a, dims_b)
     if message is not None:
-        ctx.api.fail(message, ctx.context)
+        ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
         return None
     return dims
 
@@ -6422,10 +6537,11 @@ def _solve_argdrop(
                 f"axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         if norm in normalized:
-            ctx.api.fail(f"duplicate axis {ax}", ctx.context)
+            ctx.api.fail(f"duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
             return ctx.default_return_type
         normalized.append(norm)
     chosen = set(normalized)
@@ -6457,6 +6573,7 @@ def _solve_same_or_flat(
                 f"axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
     return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
@@ -6518,6 +6635,7 @@ def _kth_in_bounds(
                 f"{op} kth {k} is out of bounds for {where} "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return False
     return True
@@ -6679,7 +6797,7 @@ def average_function_hook(ctx: FunctionContext) -> Type:
     if weights is not None and not _is_none_type(weights[0]):
         message = _check_average_weights(ctx, pairs[0][0], weights[0])
         if message is not None:
-            ctx.api.fail(message, ctx.context)
+            ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
     return _reduction_inputs(ctx, pairs[0][0])
 
@@ -6706,6 +6824,7 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
             f"axis {axis[0]} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     dtype_pair = _formal_pair(ctx, "dtype")
@@ -6764,6 +6883,7 @@ def diff_function_hook(ctx: FunctionContext) -> Type:
                 f"axis {axis[0]} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         ax = norm
@@ -6774,7 +6894,7 @@ def diff_function_hook(ctx: FunctionContext) -> Type:
     if n is None:
         return ctx.default_return_type
     if n < 0:
-        ctx.api.fail(f"np.diff order n={n} must be non-negative", ctx.context)
+        ctx.api.fail(f"np.diff order n={n} must be non-negative", ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     for name in ("prepend", "append"):
         pair = _formal_pair(ctx, name)
@@ -6867,6 +6987,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
             f"einsum subscripts describe {len(terms)} operand(s) but "
             f"{len(parts)} array(s) given",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     label_size: dict[str, int | Type] = {}
@@ -6884,6 +7005,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                     f"{len(pre) + len(post)} dimensions but operand has "
                     f"shape {_dims_str(dims)}",
                     ctx.context,
+                    code=NUMTY_SHAPE,
                 )
                 return ctx.default_return_type
             head = dims[: len(pre)]
@@ -6896,6 +7018,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                     f"einsum subscript '{term}' has {len(pre)} labels but "
                     f"operand has rank {len(dims)} (shape {_dims_str(dims)})",
                     ctx.context,
+                    code=NUMTY_SHAPE,
                 )
                 return ctx.default_return_type
             bound = list(zip(pre, dims))
@@ -6910,6 +7033,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                         f"einsum label '{label}' has conflicting sizes: "
                         f"{known} vs {size} (shape {_dims_str(dims)})",
                         ctx.context,
+                        code=NUMTY_SHAPE,
                     )
                     return ctx.default_return_type
                 # Symbolic vs anything unprovable: bail out.
@@ -6924,6 +7048,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
             ctx.api.fail(
                 f"einsum ellipsis dimensions cannot broadcast: {cause}",
                 ctx.context,
+                code=NUMTY_BROADCAST,
             )
             return ctx.default_return_type
         assert out is not None
@@ -6940,6 +7065,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                 "einsum output omits the ellipsis dimensions present "
                 "in the inputs",
                 ctx.context,
+                code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         seen: set[str] = set()
@@ -6948,6 +7074,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                 ctx.api.fail(
                     f"einsum output subscript '{label}' appears more than once",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
             seen.add(label)
@@ -6956,6 +7083,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                     f"einsum output subscript '{label}' never appeared "
                     "in an input",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
         out_dims = (
@@ -7040,6 +7168,7 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
             "linalg.solve requires a square (..., N, N) array, got shape "
             f"{_dims_str(dims_a)}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if not _check_dim_eq(
@@ -7079,6 +7208,7 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
             f"linalg.solve batch dimensions disagree: {_dims_str(dims_a[:-2])} vs "
             f"{_dims_str(batch_b)} ({cause})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     assert batch is not None
@@ -7102,6 +7232,7 @@ def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
             f"linalg.{op} requires a square (..., N, N) array, got shape "
             f"{_dims_str(dims)}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if not _check_dim_eq(
@@ -7140,6 +7271,7 @@ def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
             f"linalg.{op} requires a square (..., M, M) array, got shape "
             f"{_dims_str(dims)}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if not _check_dim_eq(
@@ -7191,6 +7323,7 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
         ctx.api.fail(
             f"linalg.svd requires at least 2 dimensions, got shape {_dims_str(dims)}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     if any(not isinstance(d, int) for d in dims[-2:]):
@@ -7253,6 +7386,7 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
             f"linalg.lstsq requires a with at least 2 dimensions, got shape "
             f"{_dims_str(dims_a)}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     rows, cols = dims_a[-2], dims_a[-1]
@@ -7284,6 +7418,7 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
             f"linalg.lstsq batch dimensions disagree: {_dims_str(dims_a[:-2])} vs "
             f"{_dims_str(batch_b)} ({cause})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     assert batch is not None
@@ -7322,6 +7457,7 @@ def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -
             f"linalg.norm with {shown} reduces {reduced} dimensions; only "
             f"vector (1) or matrix (2) norms exist (shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return False
     if order is not None and reduced == 1:
@@ -7329,6 +7465,7 @@ def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -
             f"linalg.norm ord={order!r} is a matrix norm and needs 2 axes, "
             f"got 1 (shape {_dims_str(dims)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return False
     return True
@@ -7360,6 +7497,7 @@ def _linalg_norm(ctx: FunctionContext) -> Type:
                     f"linalg.norm axis {ax} is out of range for {len(dims)} "
                     f"dimensions (shape {_dims_str(dims)})",
                     ctx.context,
+                    code=NUMTY_AXIS,
                 )
                 return ctx.default_return_type
             axes.append(norm)
@@ -7536,7 +7674,7 @@ def _broadcast_shapes(
         if not _has_unpack(dims) and not _has_unpack(other):
             out, cause = _broadcast_result(dims, other)
             if cause is not None:
-                ctx.api.fail(f"{op} shapes disagree: {cause}", ctx.context)
+                ctx.api.fail(f"{op} shapes disagree: {cause}", ctx.context, code=NUMTY_BROADCAST)
                 return None
             if out is None:
                 return None
@@ -7544,7 +7682,7 @@ def _broadcast_shapes(
             continue
         merged, message = _merge_shape_lists(dims, other)
         if message is not None:
-            ctx.api.fail(f"{op} shapes disagree: {message}", ctx.context)
+            ctx.api.fail(f"{op} shapes disagree: {message}", ctx.context, code=NUMTY_BROADCAST)
             return None
         if merged is None:
             return None
@@ -7707,6 +7845,7 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
         ctx.api.fail(
             f"broadcast_to dimensions must be non-negative, got {_dims_str(dims)}",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     dist = _distribute_solve([pairs[0][0]], lambda t: _broadcast_to_types(ctx, t, dims))
@@ -8068,7 +8207,7 @@ def len_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     dims, _ = parts
     if not dims:
-        ctx.api.fail("len() of unsized object", ctx.context)
+        ctx.api.fail("len() of unsized object", ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     first = dims[0]
     if isinstance(first, TypeVarType):
@@ -8092,6 +8231,7 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
         ctx.api.fail(
             "take_along_axis `indices` must be an integer array",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
@@ -8104,6 +8244,7 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
                 "take_along_axis with axis=None needs 1-d `indices`, got "
                 f"shape {_dims_str(dims_i)}",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         return _ndarray_type(ctx, dims_i, dtype_a)
@@ -8115,6 +8256,7 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
             f"take_along_axis axis {axis[0]} is out of range for "
             f"{len(dims_a)} dimensions (shape {_dims_str(dims_a)})",
             ctx.context,
+            code=NUMTY_AXIS,
         )
         return ctx.default_return_type
     if len(dims_a) != len(dims_i):
@@ -8122,6 +8264,7 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
             f"take_along_axis `indices` and `arr` must have the same number "
             f"of dimensions (shapes {_dims_str(dims_a)} vs {_dims_str(dims_i)})",
             ctx.context,
+            code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
     out: list[int | Type] = []
@@ -8144,6 +8287,7 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
                 f"take_along_axis shapes mismatch at axis {d}: {x} vs {y} "
                 f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_i)})",
                 ctx.context,
+                code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
         else:
