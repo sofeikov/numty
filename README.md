@@ -520,7 +520,8 @@ concatenate — including enum-driven stacks; mismatches error.
 `*Ts`, or a total no `*Ts` can absorb, bails or errors respectively).
 
 **Rank changes.** `transpose`/`.T` (reversal included over `*Ts`),
-`squeeze`, `expand_dims`; bad permutations and non-1 squeeze axes error.
+`squeeze`, `expand_dims`; bad permutations, repeated axes and non-1
+squeeze axes error.
 
 **Reductions.** `sum(axis=1)` (plus `median` and every `nan*` twin:
 `nansum`, `nanmean`, `nanargmin`, …), `average` (1-D weights must match
@@ -532,21 +533,27 @@ through shared `*Ts` (a lone concrete 1-D/2-D operand contributes an
 empty batch). The rest solves through the same inner-dim machinery:
 `dot` (no batch broadcast past rank 2), `tensordot` (int or pair-of-lists
 axes), `inner`/`outer`/`vdot` (scalars included), and `take` (the axis is
-swapped for the index shape).
+swapped for the index shape; literal indices past the axis error unless
+`mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, and
+`linalg.norm` with an explicit `ord` needs one or two reduced axes.
 
 **Indexing.** Consumes leading dims without an ellipsis (`v[0]`,
 `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax`
-drops the axis, `sort` keeps the shape.
+drops the axis, `sort` keeps the shape, and a literal `partition` kth
+past the axis errors.
 
 **Shape math.** `flip`/`fliplr`/`flipud`/`roll` preserve (with rank floors
-and axis checks), `rot90` swaps dims on odd turns, `gradient` keeps the
-shape for one resolved axis, `convolve`/`correlate` compute full/valid/same
-lengths. The fft family tracks complex dtypes — `rfft` halves (`N//2+1`),
+and axis checks; `flip` rejects a repeated axis, `roll` a shift that does
+not match its axes), `rot90` swaps dims on odd turns (equal axes error),
+`gradient` keeps the shape for one resolved axis, `convolve`/`correlate`
+compute full/valid/same lengths (empty operands error). The fft family tracks complex dtypes — `rfft` halves (`N//2+1`),
 `fftn`/`rfftn` apply `s` over `axes` with trailing alignment; bad axes and
 non-positive sizes error.
 
 **Data prep.** `tile` multiplies reps, `repeat` scales the axis
-(flattening to one dim for `axis=None`, `?U` for array repeats), `pad`
+(flattening to one dim for `axis=None`; a count list of several entries
+must have one per element and literal counts sum to the new size, other
+array repeats give `?U`), `pad`
 adds widths per axis, `split` returns a list of equal parts (`?U` for
 uneven index splits); negative counts and uneven divisions error.
 

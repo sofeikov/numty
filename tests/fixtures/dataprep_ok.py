@@ -25,7 +25,7 @@ def f(a: F64[2, 3], v: F64[4], u: F64[N], k: int) -> None:
     s2: list[F64[1, 3]] = np.split(a, 2, axis=0)
     # Data-dependent cases dissolve to ?U instead of erroring.
     np.tile(a, (2, k))
-    np.repeat(a, [1, 2], axis=0)
+    np.repeat(a, [1, k], axis=0)
     np.repeat(a, k, axis=1)
     np.split(v, [1, 3])
     np.split(u, 2)
