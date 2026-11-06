@@ -1059,3 +1059,68 @@ def test_fftn_long_mismatch() -> None:
         "fftn s has 3 entries for 2 dimensions",
         '"fftn"',
     )
+
+
+def test_dataprep_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "dataprep_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_tile_reps_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_tile_reps.py"),
+        "tile reps must be non-negative, got [-1]",
+    )
+
+
+def test_repeat_neg_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_repeat_neg.py"),
+        "repeat repeats must be non-negative, got -2",
+    )
+
+
+def test_repeat_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_repeat_axis.py"),
+        "repeat axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
+    )
+
+
+def test_pad_neg_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_pad_neg.py"),
+        "pad pad_width entries must be non-negative, got (-1, -1)",
+    )
+
+
+def test_pad_len_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_pad_len.py"),
+        "pad pad_width entries do not match 2 dimensions",
+        "(2, 3)",
+    )
+
+
+def test_split_equal_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_split_equal.py"),
+        "split array split does not result in an equal division (size 4 into 3)",
+    )
+
+
+def test_split_sections_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_split_sections.py"),
+        "split sections must be positive, got 0",
+    )
+
+
+def test_split_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_split_axis.py"),
+        "split axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
+    )

@@ -660,6 +660,14 @@ class NumtyPlugin(Plugin):
             return vdot_function_hook
         if fullname.startswith("numpy.") and short == "take":
             return take_function_hook
+        if fullname.startswith("numpy.") and short == "tile":
+            return tile_function_hook
+        if fullname.startswith("numpy.") and short == "repeat":
+            return repeat_function_hook
+        if fullname.startswith("numpy.") and short == "pad":
+            return pad_function_hook
+        if fullname.startswith("numpy.") and short == "split":
+            return split_function_hook
         if fullname.startswith("numpy.") and short == "convolve":
             return convolve_function_hook
         if fullname.startswith("numpy.") and short == "correlate":
@@ -2410,6 +2418,404 @@ def rfftn_function_hook(ctx: FunctionContext) -> Type:
         # call-overload error already fires; bail silently here.
         return ctx.default_return_type
     return _fftn_solve(ctx, "rfftn", pairs[0][0], axes, s, True)
+
+
+def _hook_pair(
+    ctx: FunctionContext, first: str, name: str, index: int
+) -> tuple[Type, Expression | None] | None | str:
+    """An optional actual: formal, else the positional slot when complete.
+
+    Returns "incomplete" when keywords may hide behind erased formals.
+    """
+    if not _picture_complete(ctx, first):
+        return "incomplete"
+    pair = _formal_pair(ctx, name)
+    if pair is None and _positionals_only(ctx):
+        pos = _all_positionals(ctx)
+        pair = pos[index] if index < len(pos) else None
+    return pair
+
+
+def _tile_reps(pair: tuple[Type, Expression | None]) -> list[int | None] | None:
+    """reps entries (None = unknown); None whole when absent or garbage."""
+    tp, expr = pair
+    if _is_none_type(tp):
+        return None
+    if expr is not None and isinstance(expr, (TupleExpr, ListExpr)):
+        proper = get_proper_type(tp)
+        types: list[Type | None]
+        if isinstance(proper, TupleType) and len(proper.items) == len(expr.items):
+            types = list(proper.items)
+        else:
+            types = [None] * len(expr.items)
+        out: list[int | None] = []
+        for e, t in zip(expr.items, types):
+            value = _fold_int(e)
+            if value is None and t is not None and not _is_none_type(t):
+                dim = _dim_value(t)
+                value = dim if isinstance(dim, int) and not isinstance(dim, bool) else None
+            out.append(value)
+        return out
+    proper = get_proper_type(tp)
+    if isinstance(proper, TupleType):
+        out2: list[int | None] = []
+        for item in proper.items:
+            if _is_none_type(item):
+                return None
+            dim = _dim_value(item)
+            out2.append(dim if isinstance(dim, int) and not isinstance(dim, bool) else None)
+        return out2
+    value = _int_value(tp)
+    if value is None and expr is not None:
+        value = _fold_int(expr)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [value]
+    return [None]
+
+
+def tile_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    found = _hook_pair(ctx, "A", "reps", 1)
+    if found == "incomplete" or found is None:
+        return ctx.default_return_type
+    assert not isinstance(found, str)
+    reps = _tile_reps(found)
+    if reps is None:
+        return ctx.default_return_type
+    shown = "[" + ", ".join("?" if r is None else str(r) for r in reps) + "]"
+    if any(isinstance(r, int) and r < 0 for r in reps):
+        ctx.api.fail(f"tile reps must be non-negative, got {shown}", ctx.context)
+        return ctx.default_return_type
+    if len(reps) > len(dims):
+        eff = [1] * (len(reps) - len(dims)) + list(dims)
+    else:
+        eff = list(dims)
+        reps = [1] * (len(eff) - len(reps)) + reps
+    out: list[int | Type] = []
+    for i, (d, r) in enumerate(zip(eff, reps)):
+        if isinstance(d, int) and isinstance(r, int):
+            out.append(d * r)
+        else:
+            out.append(_fresh_unknown(ctx, "tile", i))
+    return _ndarray_type(ctx, out, dtype)
+
+
+def _repeat_count(pair: tuple[Type, Expression | None] | None) -> int | str | None:
+    """Scalar repeats, 'bail' for array-form/unprovable, None when absent."""
+    if pair is None:
+        return None
+    tp, expr = pair
+    if _is_none_type(tp):
+        return None
+    value = _int_value(tp)
+    if value is None and expr is not None:
+        value = _fold_int(expr)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return "bail"
+
+
+def repeat_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    found_repeats = _hook_pair(ctx, "a", "repeats", 1)
+    found_axis = _hook_pair(ctx, "a", "axis", 2)
+    if found_repeats == "incomplete" or found_axis == "incomplete":
+        return ctx.default_return_type
+    assert not isinstance(found_repeats, str) and not isinstance(found_axis, str)
+    axis: int | None = None
+    if found_axis is not None:
+        parsed = _parse_axis_arg(found_axis)
+        if parsed is None:
+            return ctx.default_return_type
+        if isinstance(parsed, str):
+            axis = None
+        elif len(parsed) == 1:
+            axis = parsed[0]
+        else:
+            return ctx.default_return_type
+    count = _repeat_count(found_repeats)
+    if count is None:
+        return ctx.default_return_type
+    if isinstance(count, int) and count < 0:
+        ctx.api.fail(
+            f"repeat repeats must be non-negative, got {count}", ctx.context
+        )
+        return ctx.default_return_type
+    if axis is None:
+        if isinstance(count, int) and all(isinstance(d, int) for d in dims):
+            total = 1
+            for d in dims:
+                assert isinstance(d, int)
+                total *= d
+            return _ndarray_type(ctx, [total * count], dtype)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
+    target = _normalize_axis(axis, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"repeat axis {axis} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    if isinstance(count, int) and isinstance(out[target], int):
+        out[target] = out[target] * count
+    else:
+        out[target] = _fresh_unknown(ctx, "repeat", target)
+    return _ndarray_type(ctx, out, dtype)
+
+
+def _pad_side(expr: Expression, tp: Type | None) -> int | None | str:
+    """A pad width side: int, None when unknown, 'bad' when garbage."""
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+    if tp is not None:
+        if _is_none_type(tp):
+            return "bad"
+        dim = _dim_value(tp)
+        if dim is None:
+            proper = get_proper_type(tp)
+            if (
+                isinstance(proper, Instance)
+                and proper.type.fullname == "builtins.int"
+            ) or isinstance(proper, TypeVarType):
+                return None
+    return "bad"
+
+
+def _pad_widths(
+    pair: tuple[Type, Expression | None] | None, ndim: int
+) -> list[tuple[int | None, int | None]] | str | None:
+    """Per-axis (before, after) pad widths (None = unknown side).
+
+    Returns "mismatch" when the entry count fits neither one axis nor all
+    of them, None to bail.
+    """
+    if pair is None:
+        return None
+    tp, expr = pair
+    if _is_none_type(tp):
+        return None
+
+    def entry(e: Expression, t: Type | None) -> tuple[int | None, int | None] | str:
+        if isinstance(e, (TupleExpr, ListExpr)) and len(e.items) == 2:
+            proper = get_proper_type(t) if t is not None else None
+            subs: list[Type | None]
+            if isinstance(proper, TupleType) and len(proper.items) == 2:
+                subs = list(proper.items)
+            else:
+                subs = [None, None]
+            before = _pad_side(e.items[0], subs[0])
+            after = _pad_side(e.items[1], subs[1])
+            if before == "bad" or after == "bad":
+                return "bad"
+            assert before != "bad" and after != "bad"
+            return (before, after)
+        single = _pad_side(e, t)
+        if single == "bad":
+            return "bad"
+        assert single != "bad"
+        return (single, single)
+
+    def collect(
+        raw: list[tuple[int | None, int | None] | str],
+    ) -> list[tuple[int | None, int | None]] | str | None:
+        good: list[tuple[int | None, int | None]] = []
+        for item in raw:
+            if item == "bad":
+                return None
+            assert not isinstance(item, str)
+            good.append(item)
+        if len(good) == 1:
+            return good * ndim
+        if len(good) != ndim:
+            return "mismatch"
+        return good
+
+    if expr is not None and isinstance(expr, (TupleExpr, ListExpr)):
+        proper = get_proper_type(tp)
+        types: list[Type | None]
+        if isinstance(proper, TupleType) and len(proper.items) == len(expr.items):
+            types = list(proper.items)
+        else:
+            types = [None] * len(expr.items)
+        if len(expr.items) == 2 and not any(
+            isinstance(e, (TupleExpr, ListExpr)) for e in expr.items
+        ):
+            return collect([entry(expr, None)])
+        return collect([entry(e, t) for e, t in zip(expr.items, types)])
+    proper = get_proper_type(tp)
+    if isinstance(proper, TupleType):
+        nested = [
+            isinstance(get_proper_type(item), TupleType) for item in proper.items
+        ]
+        if len(proper.items) == 2 and not any(nested):
+            return collect([_pad_side_fallback(proper)])
+        return collect([_pad_side_fallback(item) for item in proper.items])
+    value = _int_value(tp)
+    if value is None and expr is not None:
+        value = _fold_int(expr)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [(value, value)] * ndim
+    return None
+
+
+def _pad_side_fallback(tp: Type) -> tuple[int | None, int | None] | str:
+    """A pad width entry from its type only."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, TupleType) and len(proper.items) == 2:
+        before = _pad_side_fallback_single(proper.items[0])
+        after = _pad_side_fallback_single(proper.items[1])
+        if before == "bad" or after == "bad":
+            return "bad"
+        assert before != "bad" and after != "bad"
+        return (before, after)
+    single = _pad_side_fallback_single(tp)
+    if single == "bad":
+        return "bad"
+    assert single != "bad"
+    return (single, single)
+
+
+def _pad_side_fallback_single(tp: Type) -> int | None | str:
+    if _is_none_type(tp):
+        return "bad"
+    dim = _dim_value(tp)
+    if isinstance(dim, int) and not isinstance(dim, bool):
+        return dim
+    if dim is not None:
+        return None
+    proper = get_proper_type(tp)
+    if (
+        isinstance(proper, Instance) and proper.type.fullname == "builtins.int"
+    ) or isinstance(proper, TypeVarType):
+        return None
+    return "bad"
+
+
+def pad_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    found = _hook_pair(ctx, "array", "pad_width", 1)
+    if found == "incomplete" or found is None:
+        return ctx.default_return_type
+    assert not isinstance(found, str)
+    widths = _pad_widths(found, len(dims))
+    if widths is None:
+        return ctx.default_return_type
+    if widths == "mismatch":
+        ctx.api.fail(
+            f"pad pad_width entries do not match {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    assert isinstance(widths, list)
+    out: list[int | Type] = []
+    for i, (d, (before, after)) in enumerate(zip(dims, widths)):
+        if before is not None and before < 0 or after is not None and after < 0:
+            ctx.api.fail(
+                "pad pad_width entries must be non-negative, "
+                f"got ({before}, {after})",
+                ctx.context,
+            )
+            return ctx.default_return_type
+        if (
+            isinstance(d, int)
+            and isinstance(before, int)
+            and isinstance(after, int)
+        ):
+            out.append(d + before + after)
+        else:
+            out.append(_fresh_unknown(ctx, "pad", i))
+    return _ndarray_type(ctx, out, dtype)
+
+
+def split_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    found_axis = _hook_pair(ctx, "ary", "axis", 2)
+    found_sections = _hook_pair(ctx, "ary", "indices_or_sections", 1)
+    if found_axis == "incomplete" or found_sections == "incomplete":
+        return ctx.default_return_type
+    assert not isinstance(found_axis, str) and not isinstance(found_sections, str)
+    axis = 0
+    if found_axis is not None:
+        folded = _int_or_none(found_axis)
+        if folded == "bail" or folded is None:
+            return ctx.default_return_type
+        assert isinstance(folded, int)
+        axis = folded
+    target = _normalize_axis(axis, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"split axis {axis} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    if found_sections is None:
+        return ctx.default_return_type
+    sections = _int_or_none(found_sections)
+    if isinstance(sections, int):
+        if sections < 1:
+            ctx.api.fail(
+                f"split sections must be positive, got {sections}", ctx.context
+            )
+            return ctx.default_return_type
+        dim = out[target]
+        if isinstance(dim, int):
+            if dim % sections != 0:
+                ctx.api.fail(
+                    "split array split does not result in an equal division "
+                    f"(size {dim} into {sections})",
+                    ctx.context,
+                )
+                return ctx.default_return_type
+            out[target] = dim // sections
+        else:
+            out[target] = _fresh_unknown(ctx, "split", target)
+    elif sections == "bail":
+        seq = _fft_seq_arg(found_sections)
+        if seq == "bail" or isinstance(seq, str):
+            proper = get_proper_type(found_sections[0])
+            if (
+                isinstance(proper, Instance)
+                and proper.type.fullname == "builtins.int"
+            ) or isinstance(proper, TypeVarType):
+                out[target] = _fresh_unknown(ctx, "split", target)
+            else:
+                return ctx.default_return_type
+        else:
+            out[target] = _fresh_unknown(ctx, "split", target)
+    else:
+        return ctx.default_return_type
+    element = _ndarray_type(ctx, out, dtype)
+    return ctx.api.named_generic_type("builtins.list", [element])
 
 
 def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
