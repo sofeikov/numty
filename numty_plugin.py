@@ -635,6 +635,15 @@ class NumtyPlugin(Plugin):
             "max",
             "std",
             "var",
+            "median",
+            "nansum",
+            "nanprod",
+            "nanmean",
+            "nanmin",
+            "nanmax",
+            "nanstd",
+            "nanvar",
+            "nanmedian",
         }:
             return reduction_function_hook
         if fullname.startswith("numpy.") and short == "average":
@@ -651,7 +660,12 @@ class NumtyPlugin(Plugin):
             return vdot_function_hook
         if fullname.startswith("numpy.") and short == "take":
             return take_function_hook
-        if fullname.startswith("numpy.") and short in {"cumsum", "cumprod"}:
+        if fullname.startswith("numpy.") and short in {
+            "cumsum",
+            "cumprod",
+            "nancumsum",
+            "nancumprod",
+        }:
             return cumsum_function_hook
         if fullname.startswith("numpy.") and short == "diff":
             return diff_function_hook
@@ -719,6 +733,8 @@ class NumtyPlugin(Plugin):
         if fullname.startswith("numpy.") and short in {
             "argmax",
             "argmin",
+            "nanargmax",
+            "nanargmin",
             "argsort",
             "sort",
             "partition",
@@ -4438,7 +4454,7 @@ def _solve_same_or_flat(
     return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
 
 
-ARG_DROP = frozenset({"argmax", "argmin", "argpartition"})
+ARG_DROP = frozenset({"argmax", "argmin", "nanargmax", "nanargmin", "argpartition"})
 ARG_SAME_INT = frozenset({"argsort"})
 ARG_SAME = frozenset({"sort", "partition"})
 

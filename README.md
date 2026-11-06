@@ -508,7 +508,8 @@ and regroups block-preserving runs over `*Ts` (`(*Ts, 2, 3)` to
 `(*Ts, 6)` is fine; a `-1` that would absorb `*Ts`, or a total no
 `*Ts` can absorb, bails or errors respectively). Rank-changing ops
 track the new shape (`transpose`/`.T` — reversal included over `*Ts`
-— `squeeze`, `expand_dims`, `sum(axis=1)`, `average` (1-D weights must
+— `squeeze`, `expand_dims`, `sum(axis=1)` (plus `median` and every
+`nan*` twin: `nansum`, `nanmean`, `nanargmin`, …), `average` (1-D weights must
 match the averaged axis), `diff` (concrete lengths subtract, bad axes
 and negative orders error), `cumsum`/`cumprod` (shape-preserving);
 bad permutations and non-1 squeeze axes error). `matmul` solves inner

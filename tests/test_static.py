@@ -939,3 +939,17 @@ def test_take_oob_mismatch() -> None:
         "axis 5 is out of range for 2 dimensions",
         "(2, 2)",
     )
+
+
+def test_nan_ok_clean() -> None:
+    result = run_mypy(FIXTURES / "nan_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_nan_axis_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_nan_axis.py"),
+        "axis 2 is out of range for 2 dimensions",
+        "incompatible type",
+    )
