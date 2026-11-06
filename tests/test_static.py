@@ -24,11 +24,11 @@ def _fresh_mypy_cache() -> None:
     shutil.rmtree(CACHE, ignore_errors=True)
 
 
-def run_mypy(path: Path) -> "subprocess.CompletedProcess[str]":
+def run_mypy(*paths: Path, flags: tuple[str, ...] = ()) -> "subprocess.CompletedProcess[str]":
     # PYTHONPATH (not MYPYPATH) is what lets mypy import the local plugin.
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     return subprocess.run(
-        [sys.executable, "-m", "mypy", "--cache-dir", str(CACHE), str(path)],
+        [sys.executable, "-m", "mypy", "--cache-dir", str(CACHE), *flags, *map(str, paths)],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -1498,3 +1498,97 @@ def test_sum_duplicate_axis() -> None:
         run_mypy(FIXTURES / "bad_sum_dup_axis.py"),
         "duplicate axis -2",
     )
+
+
+# Error codes (#66): each kind of numty diagnostic carries its own code, a
+# sub-code of misc, so it can be silenced or selected on its own while old
+# `ignore[misc]` / `disable_error_code = misc` setups keep working.
+@pytest.mark.parametrize(
+    ("fixture", "code"),
+    [
+        ("bad_matmul_inner.py", "numty-shape"),
+        ("bad_concat_dim.py", "numty-shape"),
+        ("bad_where_broadcast.py", "numty-broadcast"),
+        ("bad_f64_conflict.py", "numty-callsite"),
+        ("bad_min_axis.py", "numty-axis"),
+        ("bad_index_range.py", "numty-axis"),
+        ("bad_bail_code.py", "numty-bail"),
+        ("bad_f64_empty.py", "numty-annotation"),
+    ],
+)
+def test_error_code_tagged(fixture: str, code: str) -> None:
+    assert_single_error(run_mypy(FIXTURES / fixture), f"  [{code}]")
+
+
+def test_broadcast_operator_error_code() -> None:
+    # The operator form adds mypy's own [operator] error; ours is tagged.
+    assert_operator_mismatch(
+        run_mypy(FIXTURES / "bad_broadcast.py"),
+        "broadcast shapes disagree",
+        "  [numty-broadcast]",
+    )
+
+
+def test_no_numty_error_falls_back_to_misc() -> None:
+    # One run over every bad fixture: no diagnostic is left on the default
+    # misc code (none of the fixtures trips a mypy-core misc error).
+    result = run_mypy(*sorted(FIXTURES.glob("bad_*.py")))
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert errors, result.stdout
+    assert not [line for line in errors if line.endswith("[misc]")], result.stdout
+
+
+def test_bail_fixture_runs_cleanly() -> None:
+    # Runtime oracle: the bail is on correct code.
+    assert _run_fixture("bad_bail_code.py") == ["(2, 3)"]
+
+
+def test_disable_bail_keeps_real_errors() -> None:
+    flags = ("--disable-error-code", "numty-bail")
+    result = run_mypy(FIXTURES / "bad_bail_code.py", flags=flags)
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout, result.stdout
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matmul_inner.py", flags=flags),
+        "matmul inner dimensions disagree",
+        "  [numty-shape]",
+    )
+
+
+def test_disable_misc_still_covers_numty_codes() -> None:
+    # Backward compatibility: misc is the parent code of every numty code.
+    for fixture in ("bad_bail_code.py", "bad_matmul_inner.py"):
+        result = run_mypy(FIXTURES / fixture, flags=("--disable-error-code", "misc"))
+        assert result.returncode == 0, result.stdout
+        assert "error:" not in result.stdout, result.stdout
+
+
+def test_targeted_ignores() -> None:
+    # ignore[numty-bail] and ignore[misc] silence the bails, ignore[misc]
+    # silences the shape error, ignore[numty-bail] does not.
+    result = run_mypy(FIXTURES / "bad_ignore_codes.py")
+    assert_single_error(result, ":14: error: matmul inner dimensions disagree", "[numty-shape]")
+    assert 'Error code "numty-shape" not covered by "type: ignore[numty-bail]"' in (
+        result.stdout
+    ), result.stdout
+
+
+def test_every_plugin_fail_site_passes_an_error_code() -> None:
+    # Static guard: fixtures only reach some fail sites, so check them all
+    # in the source. A new ctx.api.fail without code= would print [misc].
+    import ast
+
+    tree = ast.parse((ROOT / "numty_plugin.py").read_text())
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fail"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "api"
+    ]
+    assert len(sites) > 100, len(sites)
+    missing = [n.lineno for n in sites if not any(k.arg == "code" for k in n.keywords)]
+    assert not missing, f"ctx.api.fail without code= at numty_plugin.py lines {missing}"

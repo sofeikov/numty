@@ -693,6 +693,65 @@ or notebook cell written as `def main():` gets no shape checking at all.
 Run with `--check-untyped-defs` (or set `check_untyped_defs = True` in
 your `mypy.ini`) to have the solver check them too.
 
+## Error codes
+
+Every numty diagnostic carries one of six mypy error codes, so each kind
+can be silenced or selected on its own:
+
+| Code | Covers | Example message |
+|---|---|---|
+| `numty-shape` | dims, ranks or size arguments that do not fit the operation (matmul, reshape, concatenate, linalg, einsum, …) | `matmul inner dimensions disagree: 3 vs 2` |
+| `numty-broadcast` | elementwise operands (arithmetic, comparisons, ufuncs, `where`, `broadcast_*`, index arrays) that do not broadcast | `broadcast shapes disagree at trailing axis 0: 3 vs 4` |
+| `numty-callsite` | one shape variable bound to two sizes by the arguments of a call | `call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)` |
+| `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
+| `numty-bail` | correct code numty cannot check and says so loudly (stacks built dynamically) | `stack needs a sequence of known length (built dynamically; preallocate or ignore)` |
+| `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
+
+For example, `codes.py`:
+
+```python
+import numpy as np
+from numty import F64, batch
+
+
+def pair(x: F64[batch], y: F64[batch]) -> None: ...
+
+
+def demo(blocks: list[F64[3]], bad: F64[()]) -> None:
+    a, b = np.zeros((4, 3)), np.zeros((2, 5))
+    np.matmul(a, b)                     # numty-shape
+    pair(np.zeros(4), np.zeros(5))      # numty-callsite
+    np.where(a > 0, a, np.zeros(4))     # numty-broadcast
+    a.sum(axis=2)                       # numty-axis
+    np.stack([b for b in blocks])       # numty-bail
+```
+
+```text
+codes.py:8: error: F64 takes at least one dim  [numty-annotation]
+codes.py:10: error: matmul inner dimensions disagree: 3 vs 2  [numty-shape]
+codes.py:11: error: call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)  [numty-callsite]
+codes.py:12: error: where shapes disagree: broadcast shapes disagree at trailing axis 0: 3 vs 4 (shapes (4, 3) vs (4,))  [numty-broadcast]
+codes.py:13: error: axis 2 is out of range for 2 dimensions (shape (4, 3))  [numty-axis]
+codes.py:14: error: stack needs a sequence of known length (built dynamically; preallocate or ignore)  [numty-bail]
+```
+
+Code that stacks or concatenates lists built at runtime can turn the
+bails off and keep every real shape error:
+
+```ini
+[mypy]
+plugins = numty_plugin
+disable_error_code = numty-bail
+```
+
+or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
+reports a shape error on that line. All six are sub-codes of `misc`, so
+an existing `# type: ignore[misc]` or `disable_error_code = misc` keeps
+covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
+then asks for the narrower code (`Unused "type: ignore" comment, use
+narrower [numty-shape] instead of [misc] code`), so switch those
+comments to the `numty-*` code when upgrading.
+
 ## How it works
 
 Three layers, each building on the previous one:
