@@ -3,13 +3,13 @@
 Written blind to what the checker supports — a fixed target to advance
 against, not a demo of what works.
 
-- [ml.py](/home/sofeikov/my/numty/bench/ml.py) — MLP with manual backprop,
+- [ml.py](ml.py) — MLP with manual backprop,
   conv-1d head, layer norm, dropout, embeddings, top-k, train/eval loop.
   Runs (`uv run python bench/ml.py`), asserts its own shapes.
-- [mathlib.py](/home/sofeikov/my/numty/bench/mathlib.py) — PCA, least squares,
+- [mathlib.py](mathlib.py) — PCA, least squares,
   FFT denoising, Lorenz integration, k-means, geometry, stats, rankings.
   Runs (`uv run python bench/mathlib.py`), asserts its own shapes.
-- [bugs.py](/home/sofeikov/my/numty/bench/bugs.py) — 18 seeded realistic
+- [bugs.py](bugs.py) — 18 seeded realistic
   mistakes, each annotated with the expected static error. `main()` runs
   every bug and records whether it raised at runtime or ran silent.
 
@@ -21,8 +21,12 @@ PYTHONPATH=. uv run mypy bench/ml.py bench/mathlib.py bench/bugs.py
 
 Scorecard:
 
-- Clean files: **zero diagnostics** on both — correct code stays silent,
-  because unknown shapes bail instead of erroring.
+- Clean files: **one diagnostic each**, both false positives on code that
+  runs: the loud `stack needs a sequence of known length` bail on an
+  `np.stack` over a list comprehension (`ml.py:115`, `mathlib.py:147`),
+  tracked in [#30](https://github.com/sofeikov/numty/issues/30).
+  Everything else stays silent, because unknown shapes bail instead of
+  erroring.
 - Seeded bugs: **17 of 18 caught** statically, all before running. Every
   caught bug also raises at runtime, so these are true saves.
 - Miss (1): one passes an unannotated `ndarray` parameter, so there is no
