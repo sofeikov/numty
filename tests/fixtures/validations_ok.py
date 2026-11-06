@@ -83,6 +83,13 @@ def main() -> None:
     m.take(9, axis=1, mode="wrap")
     np.matmul(m, np.zeros(4))
     np.sum(m, axis=(0, -1))
+    # Zero-size arrays: numpy skips the kth and take index checks.
+    z = np.zeros((0, 4))
+    np.partition(z, 5, axis=1)
+    np.partition(np.zeros((3, 0)), 0)
+    np.argpartition(z, -9, axis=1)
+    np.take(z, 7, axis=1)
+    z.take([0, 9], axis=1)
 
 
 if __name__ == "__main__":

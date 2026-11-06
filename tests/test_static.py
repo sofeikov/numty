@@ -1393,7 +1393,7 @@ def test_take_flat_index_out_of_bounds() -> None:
 def test_matmul_scalar_operand() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_matmul_scalar.py"),
-        "matmul operand 1 has no dimensions (a scalar builtins.float)",
+        "matmul operand 1 has no dimensions (a scalar float)",
     )
 
 

@@ -1850,7 +1850,7 @@ def _matmul_has_dims(ctx: FunctionContext | MethodContext, operands: list[Type])
         if parts is not None and not parts[0]:
             what = "a 0-d array"
         elif key is not None:
-            what = f"a scalar {key[1]}"
+            what = f"a scalar {key[1].rsplit('.', 1)[-1]}"
         else:
             continue
         ctx.api.fail(
@@ -2252,7 +2252,10 @@ def _take_solve(
             ctx.context,
         )
         return ctx.default_return_type
-    if not _take_in_bounds(
+    # numpy skips the index check when a dim before the axis is 0:
+    # there is no row to take from.
+    empty_outer = any(isinstance(d, int) and d == 0 for d in dims[:norm])
+    if not empty_outer and not _take_in_bounds(
         ctx, pair, dims[norm], f"axis {axis[0]} of size {dims[norm]}", dims
     ):
         return ctx.default_return_type
@@ -6425,6 +6428,9 @@ def _kth_in_bounds(
         pos = _all_positionals(ctx)
         pair = pos[0] if pos else None
     if pair is None or not dims:
+        return True
+    if any(isinstance(d, int) and d == 0 for d in dims):
+        # numpy accepts any kth when there is nothing to partition.
         return True
     kths = _shape_from_arg(*pair)
     if not kths:
