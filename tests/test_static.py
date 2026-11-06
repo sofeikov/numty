@@ -650,7 +650,13 @@ def test_f64_str_ok_clean_and_runs() -> None:
         timeout=120,
     )
     assert run.returncode == 0, run.stderr
-    assert run.stdout.strip().splitlines() == ["(5, 3)", "(5, 6)"]
+    assert run.stdout.strip().splitlines() == [
+        "(5, 3)",
+        "(5, 6)",
+        "(3,)",
+        "(5,)",
+        "(7,)",
+    ]
 
 
 def test_f64_str_callsite_conflict() -> None:
@@ -669,10 +675,20 @@ def test_f64_str_matmul_dim_mismatch() -> None:
     )
 
 
-def test_f64_str_undeclared_name() -> None:
+def test_f64_str_undeclared_single_word() -> None:
+    # Single-word specs are forward references: mypy resolves them before
+    # any hook runs, so an undeclared one is mypy's own error, not a
+    # minted dim. Multi-word specs never parse as types and mint freely.
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_str_undeclared.py"),
         'Name "batsh" is not defined',
+    )
+
+
+def test_f64_str_empty_rejected() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_f64_str_empty.py"),
+        "F64 string dims must name at least one dim",
     )
 
 

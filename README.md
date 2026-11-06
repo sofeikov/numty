@@ -112,16 +112,16 @@ parameter, shared names tie the signature together, same solver
 underneath:
 
 ```python
-from typing import TypeVar
 from numty import F64, matmul
-
-dim1 = TypeVar("dim1", bound=int)
-dim2 = TypeVar("dim2", bound=int)
-dim3 = TypeVar("dim3", bound=int)
 
 def matrix_multiply(x: F64["dim1 dim2"], y: F64["dim2 dim3"]) -> F64["dim1 dim3"]:
     return matmul(x, y)
 ```
+
+No imports beyond the heads, no `TypeVar` boilerplate — `dim1`,
+`dim2`, `dim3` are minted implicitly from the strings. (The function
+above is `tests/fixtures/f64_str_ok.py` verbatim: it type-checks clean
+and runs, printing `(5, 3)` first.)
 
 Seed a bug — `mm(zeros((2, 4)), zeros((5, 3)))` — and the shared `dim2`
 is caught at the call site:
@@ -139,10 +139,21 @@ head (`F64["batch features"] is F64`), so importing the module never
 crashes on the annotation; specs that already subscribe fine
 (`F64["hid"]`, `F64[3, 4]`) behave exactly as before.
 
-Two rules, both honest. First, every name must resolve: mypy binds
+One honest boundary: multi-word specs need no declarations at all —
+`dim1`, `dim2`, `dim3` above are minted implicitly. A lone single-word
+spec (`F64["hid"]`) is a forward reference, which mypy resolves before
+any plugin runs, so it still needs a resolvable name: one of the
+thirteen prelude dims or a one-line `hid = TypeVar("hid", bound=int)`.
+Proven with a lobotomized-hook experiment (hook returning `Any` without
+touching args still yields the `Name "hid" is not defined` error), so no
+plugin-side fix exists on this mypy version.
+
+Two rules, both honest. First, every bare name must resolve: mypy binds
 function type variables by looking names up *before* any plugin runs,
-so an undeclared dim is an error, not a silent hole — `"batch"` and
-`batch` mean the same thing, and `batsh` fails the way any typo fails.
+so an undeclared bare dim is an error, not a silent hole — `"hid"` and
+`hid` mean the same thing, and `batsh` fails the way any typo fails.
+(Quoted multi-word specs are the exception: their words mint implicit
+dims, per the boundary note above.)
 Second, misuse fails loudly with a redirect, never a silent `Any`:
 `F64[tuple[N, M]]` tells you to write `F64[N, M]`, `F64[()]` and `_`
 tell you what's wrong. Quoted or bare is a style choice, not a semantic

@@ -82,6 +82,7 @@ from mypy.nodes import (
     TupleExpr,
     TypeAlias,
     TypeInfo,
+    TypeVarExpr,
     TypeVarLikeExpr,
     UnaryExpr,
     Var,
@@ -95,6 +96,7 @@ from mypy.plugin import (
     Plugin,
 )
 from mypy.typeanal import TypeAnalyser
+from mypy.tvar_scope import TypeVarLikeScope
 from mypy.types import (
     AnyType,
     CallableType,
@@ -335,7 +337,7 @@ class NumtyPlugin(Plugin):
         if isinstance(arg, RawExpressionType):
             value = arg.literal_value
             if isinstance(value, str):
-                return self._fam_string(ctx, head, arg, value)
+                return self._fam_string(ctx, head, value, arg)
             if (
                 isinstance(value, bool)
                 or not isinstance(value, int)
@@ -349,6 +351,11 @@ class NumtyPlugin(Plugin):
         if isinstance(arg, UnboundType):
             if arg.args:
                 return self._fam_applied(ctx, head, arg)
+            if arg.original_str_expr is not None:
+                # A quoted single-word spec ("hid"): same path as a
+                # multi-word string, so undeclared words mint implicit
+                # dims exactly like "hid rest" would.
+                return self._fam_string(ctx, head, arg.name, arg)
             return self._fam_bare(ctx, head, arg)
         # Defensive: hooks see raw args, but accept analyzed nodes too.
         if isinstance(arg, TypeVarType):
@@ -377,7 +384,11 @@ class NumtyPlugin(Plugin):
         )
 
     def _fam_string(
-        self, ctx: AnalyzeTypeContext, head: str, arg: RawExpressionType, text: str
+        self,
+        ctx: AnalyzeTypeContext,
+        head: str,
+        text: str,
+        node: RawExpressionType | UnboundType,
     ) -> list[int | Type]:
         """A jaxtyping-style spec: space-separated dim names, one per dim.
 
@@ -385,7 +396,11 @@ class NumtyPlugin(Plugin):
         lookup, same case rule), so `"dim2"` in two parameters shares the
         dim with a bare `dim2` elsewhere in the signature. Words that only
         appear inside strings are bound into scope first (see
-        `_fam_bind_words`); the rest of the lookup path is `_fam_bare`.
+        `_fam_bind_words`); undeclared words in a multi-word spec mint
+        implicit dims instead of erroring, so those need no declarations.
+        A lone single-word spec is a forward reference, which mypy resolves
+        before any hook runs, so it still needs a declared name. The rest
+        of the lookup path is `_fam_bare`.
         """
         words = text.split()
         if not words:
@@ -398,22 +413,28 @@ class NumtyPlugin(Plugin):
                     f'{head} string dim "{word}" is not a name;'
                     ' write space-separated names like "batch features"'
                 )
-        self._fam_bind_words(ctx, words, arg)
+        minted = self._fam_bind_words(ctx, words, node)
         dims: list[int | Type] = []
         for word in words:
-            dims.append(
-                self._fam_bare(
-                    ctx,
-                    head,
-                    UnboundType(word, [], line=arg.line, column=arg.column),
+            if word in minted:
+                dims.append(minted[word])
+            else:
+                dims.append(
+                    self._fam_bare(
+                        ctx,
+                        head,
+                        UnboundType(word, [], line=node.line, column=node.column),
+                    )
                 )
-            )
         return dims
 
     def _fam_bind_words(
-        self, ctx: AnalyzeTypeContext, words: list[str], node: RawExpressionType
-    ) -> None:
-        """Bind string-only dim names the way mypy's pre-pass would have.
+        self,
+        ctx: AnalyzeTypeContext,
+        words: list[str],
+        node: RawExpressionType | UnboundType,
+    ) -> dict[str, TypeVarLikeType]:
+        """Bind string-spec words the way mypy's pre-pass would have.
 
         mypy binds a function's type variables by scanning the *written*
         signature (FindTypeVarVisitor) before analyzing it, so a name that
@@ -421,9 +442,16 @@ class NumtyPlugin(Plugin):
         runs and `analyze_type` would reject it as unbound. Bind each such
         word here, replicating the pre-pass rule: a TypeVar-like name with
         no binding yet (and no scoping prohibition) gets `bind_new` in the
-        live scope; everything else (Final ints, undeclared names, names
-        bound already or further out) is left for the normal path, which
-        reports them exactly as it would a bare name.
+        live scope. A word with no declaration at all mints an implicit
+        dim (see `_fam_ensure_implicit`) instead of erroring; everything
+        else (Final ints, non-tvar names, names bound already or further
+        out) is left for the normal path, which reports them exactly as it
+        would a bare name.
+
+        Returns the implicit dims minted here, keyed by word:
+        `analyze_type` can never find them (no symbol exists to look up),
+        so callers must use the returned objects directly. Declared words
+        resolve through `_fam_bare` as before.
 
         This reaches through `ctx.api` to the running TypeAnalyser
         (that is what mypy passes as the hook api). Pinned to
@@ -431,17 +459,64 @@ class NumtyPlugin(Plugin):
         """
         analyzer = cast(TypeAnalyser, ctx.api)
         scope = analyzer.tvar_scope
+        minted: dict[str, TypeVarLikeType] = {}
         for word in words:
-            sym = analyzer.lookup_qualified(word, node)
-            if sym is None or not isinstance(sym.node, TypeVarLikeExpr):
+            # Probe, don't resolve: a miss means "undeclared, maybe
+            # mint" (or "Final etc., normal path"), never an error here.
+            sym = analyzer.lookup_qualified(word, node, suppress_errors=True)
+            if sym is not None and isinstance(sym.node, TypeVarLikeExpr):
+                if scope.get_binding(sym) is not None:
+                    continue
+                if sym.fullname and not scope.allow_binding(sym.fullname):
+                    continue
+                scope.bind_new(word, sym.node, analyzer.fail_func, node)
+                if sym.fullname:
+                    self._fam_late_bound.add(sym.fullname)
                 continue
-            if scope.get_binding(sym) is not None:
+            if sym is not None:
                 continue
-            if sym.fullname and not scope.allow_binding(sym.fullname):
-                continue
-            scope.bind_new(word, sym.node, analyzer.fail_func, node)
-            if sym.fullname:
-                self._fam_late_bound.add(sym.fullname)
+            minted[word] = self._fam_ensure_implicit(
+                ctx, analyzer, scope, word, node
+            )
+        return minted
+
+    def _fam_ensure_implicit(
+        self,
+        ctx: AnalyzeTypeContext,
+        analyzer: TypeAnalyser,
+        scope: TypeVarLikeScope,
+        word: str,
+        node: RawExpressionType | UnboundType,
+    ) -> TypeVarLikeType:
+        """Mint (or reuse) an implicit dim for an undeclared string word.
+
+        Only reached for words inside multi-word specs: a lone
+        single-word spec is a forward reference, which mypy resolves
+        (or rejects) before any hook runs. The first occurrence mints a
+        bound-int TypeVar via the real `bind_new` (so ids, namespaces, and
+        the resulting TypeVarType match declared dims exactly); later
+        occurrences in the same scope chain reuse it, so one word is one
+        dim per signature. The synthetic fullname carries a marker that
+        can never collide with a real symbol. Recorded in
+        `_fam_late_bound` like any other late binding, so calls check and
+        infer normally.
+        """
+        fullname = f"__numty_implicit__.{word}"
+        existing = scope.get_binding(fullname)
+        if existing is not None:
+            return existing
+        upper = ctx.api.named_type("builtins.int", [], node.line, node.column)
+        expr = TypeVarExpr(
+            word,
+            fullname,
+            [],
+            upper,
+            AnyType(TypeOfAny.from_omitted_generics),
+            line=node.line,
+        )
+        bound = scope.bind_new(word, expr, analyzer.fail_func, node)
+        self._fam_late_bound.add(fullname)
+        return bound
 
     def _fam_bare(
         self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType
