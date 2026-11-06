@@ -672,3 +672,123 @@ def reshape_dynamic_bails_out_safely(n: int) -> None:
     # Unknown dims cannot be proven wrong, so the hook leaves them alone.
     w = np.zeros((n, 3)).reshape((n, 3))
     use_matrix(w)
+
+
+A2x4x6 = FloatArray[tuple[Literal[2], Literal[4], Literal[6]]]
+A5x6 = FloatArray[tuple[Literal[5], Literal[6]]]
+
+
+def use_2x4x6(m: A2x4x6) -> None: ...
+
+
+def use_5x6(m: A5x6) -> None: ...
+
+
+def ts_matmul(
+    a: FlexArray[tuple[Unpack[Ts], Literal[4], Literal[5]], np.dtype[np.float64]],  # type: ignore[type-var]
+    b: FlexArray[tuple[Unpack[Ts], Literal[5], Literal[6]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts], Literal[4], Literal[6]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return np.matmul(a, b)
+
+
+def ts_matmul_mixed(
+    a: FlexArray[tuple[Unpack[Ts], Literal[4], Literal[5]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts], Literal[4], Literal[6]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return np.matmul(a, np.zeros((5, 6)))
+
+
+def ts_matmul_calls_stay_precise() -> None:
+    reveal_type(ts_matmul(np.zeros((2, 4, 5)), np.zeros((2, 5, 6))))
+    use_2x4x6(ts_matmul(np.zeros((2, 4, 5)), np.zeros((2, 5, 6))))
+    reveal_type(ts_matmul_mixed(np.zeros((2, 4, 5))))
+    use_2x4x6(ts_matmul_mixed(np.zeros((2, 4, 5))))
+
+
+def ts_tail2_first(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Literal[2], Unpack[Ts]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return v.transpose()
+
+
+def ts_transpose_stays_precise(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    reveal_type(v.transpose())
+    reveal_type(np.transpose(v))
+    reveal_type(v.T)
+    use_2x3(ts_tail2_first(np.zeros((3, 2))))
+
+
+def ts_transpose_prefix_stays_precise(
+    v: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[4], Literal[5]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    reveal_type(v.transpose())
+    reveal_type(v.T)
+
+
+def ts_transpose_bails_stay_silent(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    # Explicit axes would pin the rank but cannot order the unknown
+    # block, so the hook leaves them alone.
+    reveal_type(v.transpose(1, 0))
+
+
+def ts_flatten_tail(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts], Literal[6]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return v.reshape(6)
+
+
+def ts_reshape_stays_precise(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
+    w: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    reveal_type(v.reshape(6))
+    reveal_type(v.reshape((2, 3)))
+    reveal_type(w.reshape((w.shape[0], 6)))
+    reveal_type(w.reshape((5, 6)))
+    use_5x6(ts_flatten_tail(np.zeros((5, 2, 3))))
+
+
+def ts_reshape_bails_stay_silent(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    # A -1 would absorb the unknown *Ts product, and a target the known
+    # run neither matches nor contradicts stays possible via *Ts, so the
+    # hook leaves both alone.
+    _ = v.reshape(-1, 6)
+    _ = v.reshape(5, 6)
+
+
+def ts_head(
+    v: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[7]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> FlexArray[tuple[Unpack[Ts], Literal[7]], np.dtype[np.float64]]:  # type: ignore[type-var]
+    return v[0]
+
+
+def ts_pairwise_stays_precise(
+    teammates: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[7]], np.dtype[np.float64]],  # type: ignore[type-var]
+    opponents: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[7]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    # Rank-generic pairwise differences spell the ellipsis; without one
+    # the middle indices would reach into *Ts, which stays silent.
+    reveal_type(teammates[:, ..., None, :] - opponents[:, ..., None, :])
+    reveal_type(teammates[0])
+    use_2x7(ts_head(np.zeros((5, 2, 7))))
+
+
+def ts_pairwise_bails_stay_silent(
+    teammates: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[7]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    _ = teammates[:, 0]
+    _ = teammates[:, :, None, :]
+
+
+def ts_prefix_pairwise_stays_precise(
+    teammates: FlexArray[tuple[Literal[5], Literal[6], Literal[7], Unpack[Ts], Literal[8]], np.dtype[np.float64]],  # type: ignore[type-var]
+    opponents: FlexArray[tuple[Literal[5], Literal[6], Literal[7], Unpack[Ts], Literal[8]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    # With the leading dims known, the non-ellipsis spelling resolves
+    # purely in the prefix — the classic pairwise-difference body.
+    reveal_type(teammates[:, :, None, :] - opponents[:, None, :, :])

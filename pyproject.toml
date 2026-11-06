@@ -1,0 +1,25 @@
+[project]
+name = "numty"
+version = "0.1.0"
+description = "Static shape checking for NumPy"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy==2.4.1",
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["numty.py", "numty_plugin.py", "numty_convert.py"]
+# PEP 561 marker: without it mypy skips installed imports as untyped.
+[tool.hatch.build.targets.wheel.force-include]
+"py.typed" = "py.typed"

@@ -35,11 +35,17 @@ all of this: inside, the solver threads `*Ts` through ellipsis indexing
 (`v[..., 0]` on `(*Ts, 2)` is `(*Ts,)`, and out-of-range indices still
 error against the known suffix), same-`*Ts` broadcasts, unary ufuncs,
 `astype`/`asarray`, `.shape`, `&`/`|` on bool pairs, `where`/`clip`,
-comparisons, and reductions along axes that resolve to a known dim
-(`.all(axis=-1)` on `(*Ts, 2)` is `(*Ts,)`). Anything that would need the
-unknown length — fancy indexing, a non-ellipsis index, reducing over `*Ts`
-itself, mixing different `Ts` declarations, `matmul`, `transpose`,
-`reshape` — bails out instead of guessing.
+comparisons, reductions along axes that resolve to a known dim
+(`.all(axis=-1)` on `(*Ts, 2)` is `(*Ts,)`), and rank arithmetic over
+the unknown middle — `matmul` on `(*Ts, N, M)` pairs (inner dims must
+align, batches broadcast through the unpack), `transpose`/`.T`
+reversal (`(*Ts, 2)` reverses to `(2, *Ts)`), block-preserving
+`reshape` (`(*Ts, 2, 3)` to `(*Ts, 6)`), and leading `None`/slice
+indexing without an ellipsis (`v[0]` on `(5, *Ts, 7)` is `(*Ts, 7)`).
+Anything that would need the unknown length or order — fancy indexing,
+an index reaching into `*Ts` itself, reducing over `*Ts` itself,
+mixing different `Ts` declarations, explicit transpose axes, a `-1`
+that would absorb `*Ts` — bails out instead of guessing.
 
 ## Bugs, caught while you type
 
@@ -254,10 +260,16 @@ Constructors compute result shapes (`zeros_like` keeps shape and dtype,
 `concatenate` adds dims on the axis, `stack` adds the stacked axis —
 including enum-driven stacks; mismatches error). Reshape conserves the
 total with symbolic sizes and infers `-1` (`(N, 10, 2)` to `(N, 20)` is
-fine, `(N, 10, 2)` to `(N, 21)` errors, `(N, 10)` to `(M, 10)` bails).
-Rank-changing ops track the new shape (`transpose`, `squeeze`,
-`expand_dims`, `sum(axis=1)`; bad permutations and non-1 squeeze axes
-error). Comparisons broadcast and return bool arrays; `argmax` drops the
+fine, `(N, 10, 2)` to `(N, 21)` errors, `(N, 10)` to `(M, 10)` bails),
+and regroups block-preserving runs over `*Ts` (`(*Ts, 2, 3)` to
+`(*Ts, 6)` is fine; a `-1` that would absorb `*Ts`, or a total no
+`*Ts` can absorb, bails or errors respectively). Rank-changing ops
+track the new shape (`transpose`/`.T` — reversal included over `*Ts`
+— `squeeze`, `expand_dims`, `sum(axis=1)`; bad permutations and non-1
+squeeze axes error). `matmul` solves inner dims and batch broadcasts
+through shared `*Ts` (a lone concrete 1-D/2-D operand contributes an
+empty batch). Indexing consumes leading dims without an ellipsis
+(`v[0]`, `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax` drops the
 axis, `sort` keeps the shape. Elementwise ops — operators and bare
 `np.*` ufuncs alike — broadcast shapes and promote dtypes exactly like
 NumPy (verified against `np.result_type` over the full dtype matrix,
@@ -314,7 +326,7 @@ uv pip install mypy numpy pytest
 ```sh
 PYTHONPATH=. uv run mypy demo.py   # expect 2 errors: rank, size
 uvx ty check numty.py demo.py      # expect the same 2 errors
-uv run pytest                      # full suite: runtime + mypy-driven
+uv run pytest                      # full suite: runtime + mypy-driven (89 and growing)
 ```
 
 ## How it works
@@ -325,7 +337,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul`, arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape` (incl. symbolic conservation), rank-changing ops, shape builders, comparisons, bool logic (`&`/`\|`), `any`/`all`, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, symbolic TypeVar dims (same name unifies, ranks check, the rest bails), call-site TypeVar conflicts, enum-driven stacks, folds constant int expressions and `len()` (`Final` arithmetic, enum member counts), solves shapes itself | mypy only |
+| Shape solver | [numty_plugin.py](/home/sofeikov/my/numty/numty_plugin.py) hooks constructors, `matmul` (incl. `(*Ts, N, M)` pairs), arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape` (incl. symbolic conservation and `*Ts` block regroups), rank-changing ops (`transpose`/`.T` reversal incl. over `*Ts`), shape builders, comparisons, bool logic (`&`/`\|`), `any`/`all`, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, symbolic TypeVar dims (same name unifies, ranks check, the rest bails), call-site TypeVar conflicts, enum-driven stacks, folds constant int expressions and `len()` (`Final` arithmetic, enum member counts), solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `FlexArray`,
@@ -390,6 +402,16 @@ layers.
   check fully. A provable `*Ts` error may draw the stubs' own echo next
   to ours (an `[index]` complaint on unpack shapes); ours names the
   axis, the size, and the `(*Ts, ...)` shape.
+- Rank arithmetic over `*Ts` keeps the unknown block ordered, never
+  reordered: `transpose`/`.T` reversal moves the known runs around a
+  stationary `*Ts` (no annotation can spell its reversal), explicit
+  transpose axes bail, and a `reshape` `-1` bails because the inferred
+  dim would absorb the `*Ts` product. A non-ellipsis index that reaches
+  past the known prefix bails — rank-generic bodies spell the ellipsis
+  (`a[:, ..., None, :]`); a `1` that aligns against `*Ts` from the
+  wrong side bails for the same reason. `matmul` needs one shared
+  `Ts` and two known trailing dims per unpack side; vectors over
+  `*Ts`, mixed unpacks, and concrete batches against `*Ts` bail.
 - Heterogeneous unpacking (`a, b = (f(p) for p in (p1, p2))` with
   different shapes) assigns the whole union to every name — genexp,
   list comprehension, `tuple(...)`, starred targets, and `map` (which
@@ -428,8 +450,6 @@ layers.
 Frontiers, ordered by value: per-name precision past lazy unpacks
 (a tuple display is the only form mypy's binder distributes — genexp,
 listcomp, `tuple(...)`, starred, and `map` all assign the union);
-`matmul`/`transpose`/`reshape`
-over `*Ts` (needs rank reasoning, not just suffix matching);
 unpack-vs-concrete merges (provably unknowable today, but narrower bails
 are possible); NEP 50's value-based edge cases (out-of-bound Python ints)
 and union dtypes; the `@` operator (mypy consults the method hook

@@ -6,15 +6,9 @@ Checkable by mypy, pyright, or ty (plugin solving is mypy-only).
 """
 from __future__ import annotations
 
-import sys
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, Generic, TypeVar, TypeVarTuple, Unpack, cast
 
 import numpy as np
-
-if sys.version_info >= (3, 11):
-    from typing import TypeVarTuple, Unpack
-else:  # pragma: no cover
-    from typing_extensions import TypeVarTuple, Unpack
 
 # Rank-only aliases. Catch transposed / flattened mixups.
 Vector = np.ndarray[tuple[int], np.dtype[np.float64]]
