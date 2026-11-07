@@ -1677,14 +1677,16 @@ def _mentions_ndarray(tp: Type, depth: int = 0) -> bool:
 
 
 def _note_rank_mismatches(ctx: FunctionSigContext | MethodSigContext, sig: Type) -> None:
-    """Emit _rank_mismatch_notes, each printed under mypy's arg-type error.
+    """Emit _rank_mismatch_notes, each printed after mypy's arg-type error.
 
     Signature hooks run before mypy checks the arguments, and messages
     at one position keep emission order, so each note goes on the
     argument's first line but past its first column (at its end when
     it fits on that line): mypy sorts it after the error, which sits at
-    the argument's start. The note shares that error's code, so
-    `ignore[arg-type]` and `--disable-error-code arg-type` silence both.
+    the argument's start (another note at that argument, such as a
+    reveal_type, can still print between them). The note shares that
+    error's code, so `ignore[arg-type]` and `--disable-error-code
+    arg-type` silence both.
     """
     try:
         if not isinstance(sig, CallableType):

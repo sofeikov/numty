@@ -787,8 +787,10 @@ rank.py:13: note: "act" declares parameter "action" with shape (A,); the argumen
 ```
 
 mypy's error line still says `Never`; the names are in the note only.
-An argument dim numty knows only as a plain `int` (say from
-`np.zeros((n, 3))`) prints as `int` there: `(int, 3)`.
+An argument dim numty knows only as a plain `int` (say a size `n: int`)
+prints as `int` in the note. The note infers an inline argument such as
+`act(np.zeros((n, 3)))` on its own, so its shape can be more precise than
+the one in mypy's error line above it.
 
 The note carries the same `arg-type` code, so `# type: ignore[arg-type]`
 or `disable_error_code = arg-type` silences both. It is added only to
