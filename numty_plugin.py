@@ -2717,6 +2717,11 @@ def gradient_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     parts = _ndarray_parts(pairs[0][0])
     if parts is None:
+        # Gradient along one axis keeps the operand's type whatever its
+        # dims are, so plain `int` dims (mixed or all-int) only need a
+        # rank for the axis checks.
+        parts = _mixed_parts(pairs[0][0], partner=True)
+    if parts is None:
         return ctx.default_return_type
     dims, _ = parts
     if not _picture_complete(ctx, "f"):
@@ -4415,9 +4420,9 @@ def _solve_reshape_dynamic(
     """The requested shape of a reshape that names a plain `int` size or
     whose input shape the exact paths cannot read (_solve_reshape).
 
-    Holds by construction whenever the call is legal at runtime, and its
-    legality is not provable with a dynamic size: nothing is reported
-    here. -1 next to only literal sizes is the input's size over theirs,
+    Holds by construction whenever the call is legal at runtime. Nothing
+    is reported here, although some illegal calls are provable (a known
+    total of 12 cannot reshape to (n, 5)): main misses those too. -1 next to only literal sizes is the input's size over theirs,
     a plain `int` like the input's dynamic dims ((n, 3) -> (-1, 3) is
     (int, 3)). Next to a plain `int` size it is a ratio the caller may
     know to be fixed ((n, 3) -> (n, -1) is (n, 3) again), so it is
@@ -4443,7 +4448,10 @@ def _solve_reshape_dynamic(
     ):
         return ctx.default_return_type
     out = [inferred if d == -1 else d for d in dims]
-    return _ndarray_type(ctx, out, proper.args[1])
+    # A plain `int` target size on an axis where a mixed input had a
+    # literal ((n, 3) -> (-1, d)) may well be that literal: unknown, as
+    # for contractions, so x = x.reshape(-1, d) keeps fitting x.
+    return _mixed_result(_ndarray_type(ctx, out, proper.args[1]), old)
 
 
 def _solve_reshape(

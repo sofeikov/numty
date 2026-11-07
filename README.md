@@ -882,7 +882,10 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   it is asked for whenever one of them is a plain `int` or the input's
   shape cannot be read (`x.reshape(-1, 3)`, `x.reshape(n, 3)` and
   `x.reshape(x.shape)` are `tuple[int, Literal[3]]`; a `-1` next to an
-  `int` size is unknown, so `x.reshape(n, -1)` is `tuple[int, Any]`);
+  `int` size is unknown, so `x.reshape(n, -1)` is `tuple[int, Any]`, and
+  so is an `int` target size on an axis where the input had a literal:
+  `x.reshape(-1, d)` is `tuple[Any, Any]`); `gradient` along one axis
+  keeps the operand's type and still checks the axis;
   `np.dot`/`np.matmul` take an `int` dim as matching and keep the outer
   dims (`(n, 3)` by `(3, 3)` is `tuple[int, Literal[3]]`, while 3 against
   4 is an error as for literal shapes; an `int` dim landing on an axis

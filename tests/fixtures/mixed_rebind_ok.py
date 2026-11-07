@@ -615,6 +615,33 @@ def n34(n: int, P: np.ndarray[tuple[Literal[4], Literal[4]], F]) -> list[Shape]:
     return out
 
 
+def int_targets(n: int, d: int) -> list[Shape]:
+    """Reshape to a runtime int size, and gradient along one axis.
+
+    A plain `int` target size on an axis where the input had its literal
+    is unknown (d is 3 below), and gradient along one axis keeps the
+    operand, whichever builder made it.
+    """
+    rng = np.random.default_rng(0)
+    b = np.zeros((n, 3))
+    b = b.reshape(-1, d)
+    e = np.zeros((3, n))
+    e = e.reshape(len(e), -1)
+    h = np.zeros((n, 3, 4))
+    h = h.reshape(n, d, 4)
+    p = np.zeros((n, 3))
+    p = np.reshape(p, (-1, d))
+    a = np.full((n, 3), 1.0)
+    a = np.gradient(a, axis=0)
+    g = rng.standard_normal((n, 3))
+    g = np.gradient(g, axis=0)
+    r = rng.random((n, 3))
+    r = np.gradient(r, axis=1)
+    z = np.zeros((n, 3))
+    z = np.gradient(z, axis=0)
+    return [b.shape, e.shape, h.shape, p.shape, a.shape, g.shape, r.shape, z.shape]
+
+
 def fits(got: Shape, want: tuple[int | None, ...]) -> bool:
     return len(got) == len(want) and all(w is None or g == w for g, w in zip(got, want))
 
@@ -622,6 +649,7 @@ def fits(got: Shape, want: tuple[int | None, ...]) -> bool:
 if __name__ == "__main__":
     n = 5
     print(blocker(n, np.eye(3), 3))
+    print(int_targets(n, 3))
     for name, shapes, want in (
         ("n3", n3(n, np.eye(3)), (None, 3)),
         ("three_n", three_n(n, np.eye(n)), (3, None)),

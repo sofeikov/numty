@@ -691,6 +691,7 @@ def test_mixed_rebinding_to_own_op_stays_accepted() -> None:
     assert notes == [mixed3] * 5 + [widened] * 2 + [unknown], result.stdout
     assert _run_fixture("mixed_rebind_ok.py") == [
         "[(5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3)]",
+        "[(5, 3), (3, 5), (5, 3, 4), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3)]",
         "n3 65",
         "three_n 59",
         "n34 56",
@@ -1203,6 +1204,16 @@ def test_gradient_axis_mismatch() -> None:
     assert_rank_mismatch(
         run_mypy(FIXTURES / "bad_gradient_axis.py"),
         "gradient axis 5 is out of range for 2 dimensions",
+        '"gradient"',
+    )
+
+
+def test_gradient_axis_mismatch_dynamic_dims() -> None:
+    # Gradient's axis checks need only the rank, so a plain int dim
+    # (here from np.zeros((n, 3))) no longer skips them.
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_gradient_axis_dynamic.py"),
+        "gradient axis 5 is out of range for 2 dimensions (shape (?, 3))",
         '"gradient"',
     )
 
