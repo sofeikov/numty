@@ -54,8 +54,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Exact dtype heads: jaxtyping name -> numpy type understood by numty.
-# Sized ints/uints below 32 bits, float16-and-narrower, and Key have no
-# numpy equivalent: they convert to a loose dtype with a warning.
+# Heads in neither table (Key, BFloat16, ...) have no numpy equivalent
+# and are left as written.
 DTYPE_EXACT = {
     "Bool": "bool_",
     "UInt8": "uint8",
