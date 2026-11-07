@@ -101,10 +101,11 @@ _NUMTY_ARRAY_TYPES = {
     "Matrix",
     "Vector",
 }
-# `np.<name>(...)` calls that always build an ndarray. Every one but
-# _NP_SPACED builds a base-class ndarray whatever it is passed (np.array
-# and np.asarray drop np.matrix / MaskedArray / user subclasses, and
-# none dispatches __array_function__ on its inputs). The `*_like` family
+# `np.<name>(...)` calls that build an ndarray unless an input dispatches
+# __array_function__. Every one but _NP_SPACED builds a base-class ndarray
+# from plain inputs (np.array and np.asarray drop np.matrix / MaskedArray /
+# user subclasses; np.full dispatches on fill_value only through copyto,
+# which still returns into a base-class ndarray). The `*_like` family
 # and np.asanyarray keep subclasses and np.copy dispatches on its input,
 # so they are not here. `retstep=` / `subok=` / `like=` change what
 # comes back.
@@ -545,7 +546,7 @@ def _self_op_edits(
     (list/tuple/str concatenation, unbounded int, bool arithmetic,
     ZeroDivisionError), so those sites stay as written and are reported.
     So do `*`, `**` and `/` on names only an annotation or an
-    np.linspace & co. call on non-literal endpoints vouches for: an
+    np.linspace & co. call on non-literal arguments vouches for: an
     ndarray subclass either may let in overrides them.
     """
     names = _ArrayNames(tree)
@@ -567,10 +568,10 @@ def _self_op_edits(
             trusted = f" (trusting the annotation of {name})"
         elif evidence != "constructor":
             vouch = (
-                f"np.{evidence}(...) on non-literal endpoints, which keeps"
+                f"np.{evidence}(...) on non-literal arguments, which keeps"
                 " their ndarray subclass"
             )
-            trusted = f" (trusting the np.{evidence} endpoints of {name})"
+            trusted = f" (trusting the np.{evidence} arguments of {name})"
         else:
             vouch = trusted = ""
         if vouch and override is not None:
@@ -718,7 +719,7 @@ def main(argv: list[str]) -> int:
         help="rewrite `x + x` (and -, *, /, **) to `np.<ufunc>(x, x)` where"
         " x is known to be an ndarray; `*`, `/` and `**` only where x is"
         " built as a base-class ndarray by an np.<constructor>(...) call,"
-        " since an annotation (or np.linspace on non-literal endpoints)"
+        " since an annotation (or np.linspace on non-literal arguments)"
         " admits subclasses such as np.matrix",
     )
     parser.add_argument(

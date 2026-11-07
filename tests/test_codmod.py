@@ -794,9 +794,9 @@ def test_self_op_spaced_keep_subclass(tmp_path: Path, expr: str) -> None:
     fn = expr.split("(")[0]
     vouch = (
         f"x is only known to be an array from {fn}(...) on non-literal"
-        " endpoints, which keeps their ndarray subclass"
+        " arguments, which keeps their ndarray subclass"
     )
-    trusted = f"(trusting the {fn} endpoints of x)"
+    trusted = f"(trusting the {fn} arguments of x)"
     assert warnings == [
         f"line 19: self-ops skipped: {vouch} ({_OVERRIDES[op]})"
         for op in ("*", "**", "/")
@@ -859,7 +859,7 @@ def test_self_op_annotated_spaced_value() -> None:
     assert warnings == [
         "line 6: self-ops rewrote to np.multiply(x, x)",
         "line 6: self-ops skipped: y is only known to be an array from"
-        " np.geomspace(...) on non-literal endpoints, which keeps their"
+        " np.geomspace(...) on non-literal arguments, which keeps their"
         f" ndarray subclass ({_OVERRIDES['*']})",
     ]
     assert "return np.multiply(x, x), y * y" in out
