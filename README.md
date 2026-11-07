@@ -875,10 +875,15 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
-  `full`, `*_like(shape=...)`, `Generator` `size=`) keeps the literal dims
-  of a tuple display next to plain `int` ones: `np.zeros((n, 3))` is
-  `tuple[int, Literal[3]]`, also once assigned. Most of the solver does
-  not read `int` dims. The exceptions: `reshape` keeps the literal sizes
+  `full`, `*_like(shape=...)`) keeps the literal dims of a tuple
+  display next to plain `int` ones: `np.zeros((n, 3))` is
+  `tuple[int, Literal[3]]`, also once assigned. A `Generator` sampler's
+  mixed `size=` keeps the stubs' `tuple[Any, ...]`: its answer is final
+  (no overload takes the shape from the assignment), so a name first
+  bound to `(n, 3, 4)` could not be rebound to `size=(n, d, 4)`. A
+  `reshape` from an input with no literal axis (`x.ravel().reshape(n,
+  d)`) makes its `int` sizes unknown for the same reason. Most of the
+  solver does not read `int` dims. The exceptions: `reshape` keeps the literal sizes
   it is asked for whenever one of them is a plain `int` or the input's
   shape cannot be read (`x.reshape(-1, 3)`, `x.reshape(n, 3)` and
   `x.reshape(x.shape)` are `tuple[int, Literal[3]]`; a `-1` next to an

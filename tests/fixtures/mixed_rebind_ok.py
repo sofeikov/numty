@@ -10,6 +10,7 @@ Ops the plugin solves keep the literal (reshape(-1, 3), dot with a
 from typing import Literal, reveal_type
 
 import numpy as np
+import numpy.typing as npt
 
 F = np.dtype[np.float64]
 R3 = np.ndarray[tuple[Literal[3], Literal[3]], F]
@@ -642,6 +643,28 @@ def int_targets(n: int, d: int) -> list[Shape]:
     return [b.shape, e.shape, h.shape, p.shape, a.shape, g.shape, r.shape, z.shape]
 
 
+def no_literal_axis(n: int, d: int, x0: npt.NDArray[np.float64]) -> list[Shape]:
+    """Reshape from an input with no literal axis, samplers, transpose.
+
+    A 1-D source has no literal axis for a plain `int` size to line up
+    with, so the size is unknown; a sampler's mixed size= keeps the
+    stubs' answer; np.transpose of an unknown shape stays unknown rather
+    than taking the assignment's shape and reversing it.
+    """
+    rng = np.random.default_rng(0)
+    x = np.zeros((n, 3))
+    x = x.ravel().reshape(n, d)
+    x = x.reshape(-1).reshape((n, d))
+    x = np.ravel(x).reshape(-1, d)
+    x = np.linspace(0, 1, n * d).reshape(n, d)
+    h = np.zeros((n, 3, 4))
+    h = h.ravel().reshape(n, d, 4)
+    g = rng.standard_normal((n, 3, 4))
+    g = rng.standard_normal((n, d, 4))
+    t: np.ndarray[tuple[int, Literal[3]], F] = np.transpose(np.transpose(x0))
+    return [x.shape, h.shape, g.shape, t.shape]
+
+
 def fits(got: Shape, want: tuple[int | None, ...]) -> bool:
     return len(got) == len(want) and all(w is None or g == w for g, w in zip(got, want))
 
@@ -650,6 +673,7 @@ if __name__ == "__main__":
     n = 5
     print(blocker(n, np.eye(3), 3))
     print(int_targets(n, 3))
+    print(no_literal_axis(n, 3, np.zeros((n, 3))))
     for name, shapes, want in (
         ("n3", n3(n, np.eye(3)), (None, 3)),
         ("three_n", three_n(n, np.eye(n)), (3, None)),

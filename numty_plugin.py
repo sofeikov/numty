@@ -4422,13 +4422,17 @@ def _solve_reshape_dynamic(
 
     Holds by construction whenever the call is legal at runtime. Nothing
     is reported here, although some illegal calls are provable (a known
-    total of 12 cannot reshape to (n, 5)): main misses those too. -1 next to only literal sizes is the input's size over theirs,
+    total of 12 cannot reshape to (n, 5)); the exact paths miss those
+    too. -1 next to only literal sizes is the input's size over theirs,
     a plain `int` like the input's dynamic dims ((n, 3) -> (-1, 3) is
     (int, 3)). Next to a plain `int` size it is a ratio the caller may
     know to be fixed ((n, 3) -> (n, -1) is (n, 3) again), so it is
-    unknown (Any), which fits where a literal was expected. With
-    neither a literal nor an unknown dim, the stubs' all-int answer is
-    as good, so it stays.
+    unknown (Any), which fits where a literal was expected. Plain `int`
+    target sizes go unknown where they may stand for a literal the name
+    was first bound with: on a mixed input's literal axes, and anywhere
+    when the input has no literal axis to line them up with. With
+    neither a literal nor a plain `int` size (reshape(-1), TypeVar
+    sizes), the stubs' answer stays.
     """
     proper = get_proper_type(old)
     if not (
@@ -4441,13 +4445,17 @@ def _solve_reshape_dynamic(
     if any(d < -1 for d in ints) or ints.count(-1) > 1:
         return ctx.default_return_type
     inferred: Type = ctx.api.named_generic_type(INT_FULLNAME, [])
-    if any(_is_plain_int(d) for d in dims):
+    plain = any(_is_plain_int(d) for d in dims)
+    if plain:
         inferred = AnyType(TypeOfAny.explicit)
-    if not any(d >= 0 for d in ints) and not (
-        -1 in ints and isinstance(inferred, AnyType)
-    ):
+    if not plain and not any(d >= 0 for d in ints):
         return ctx.default_return_type
     out = [inferred if d == -1 else d for d in dims]
+    if not _is_mixed_shape(proper):
+        # No literal axis to line the sizes up with (x.ravel().reshape(n,
+        # d), a 1-D source): any plain `int` size may be the literal the
+        # name was first bound with, so it is unknown.
+        out = [AnyType(TypeOfAny.explicit) if _is_plain_int(d) else d for d in out]
     # A plain `int` target size on an axis where a mixed input had a
     # literal ((n, 3) -> (-1, d)) may well be that literal: unknown, as
     # for contractions, so x = x.reshape(-1, d) keeps fitting x.
@@ -6018,6 +6026,25 @@ def transpose_method_hook(ctx: MethodContext) -> Type:
     return _solve_transpose_unpack(ctx, prefix, unpack, suffix, dtype, _all_positionals(ctx))
 
 
+def _has_unknown_shape(tp: Type) -> bool:
+    """An ndarray whose shape is tuple[Any, ...] or Any (NDArray, bare ndarray)."""
+    proper = get_proper_type(tp)
+    if not (
+        isinstance(proper, Instance)
+        and proper.type.fullname == NDARRAY_FULLNAME
+        and len(proper.args) == 2
+    ):
+        return False
+    shape = get_proper_type(proper.args[0])
+    if isinstance(shape, AnyType):
+        return True
+    return (
+        isinstance(shape, Instance)
+        and shape.type.fullname == "builtins.tuple"
+        and isinstance(get_proper_type(shape.args[0]), AnyType)
+    )
+
+
 def transpose_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -6026,6 +6053,13 @@ def transpose_function_hook(ctx: FunctionContext) -> Type:
     if parts is None:
         split = _unpack_shape(pairs[0][0])
         if split is None:
+            if _has_unknown_shape(pairs[0][0]):
+                # Transposing an unknown shape leaves it unknown. The
+                # stubs' answer may instead be a shape mypy took from the
+                # assignment's type context (t: A = np.transpose(
+                # np.transpose(x))), which an outer transpose would then
+                # reverse into a false error.
+                return pairs[0][0]
             return ctx.default_return_type
         (prefix, unpack, suffix), dtype = split
         return _solve_transpose_unpack(ctx, prefix, unpack, suffix, dtype, pairs[1:])
@@ -6953,7 +6987,15 @@ def _parse_size_arg(ctx: MethodContext) -> list[int | Type] | str | None:
         return "absent"
     if _is_none_type(pair[0]):
         return "none"
-    return _builder_shape(*pair, ctx.default_return_type, shaped_stub=False)
+    dims = _builder_shape(*pair, ctx.default_return_type, shaped_stub=False)
+    if dims is not None and any(_is_plain_int(d) for d in dims):
+        # A mixed size= stays with the stubs (tuple[Any, ...]). Unlike
+        # np.zeros, whose overloads take the shape from the assignment's
+        # type context, a sampler's answer is final, so x =
+        # rng.standard_normal((n, d, 4)) could not rebind a name first
+        # bound to (n, 3, 4).
+        return None
+    return dims
 
 
 def rng_method_hook(ctx: MethodContext, op: str) -> Type:

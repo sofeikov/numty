@@ -634,9 +634,10 @@ def test_mixed_builders_keep_literals() -> None:
         mixed3,  # empty
         mixed3,  # full
         '"numpy.ndarray[tuple[int, Literal[4]], numpy.dtype[numpy.float64]]"',
-        mixed3,  # rng.normal(size=)
-        '"numpy.ndarray[tuple[int, Literal[3]],'
-        ' numpy.dtype[numpy.signedinteger[_64Bit]]]"',
+        # A sampler's mixed size= stays with the stubs: its answer is
+        # final, so a literal there could not be rebound to (n, d).
+        '"numpy.ndarray[tuple[Any, ...], numpy.dtype[numpy.float64]]"',
+        '"numpy.ndarray[tuple[Any, ...], numpy.dtype[numpy.signedinteger[_64Bit]]]"',
         # A dim read from .shape stays symbolic (this crashed before).
         '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.float64]]"',
         # nothing provable: the stubs' answer
@@ -692,6 +693,7 @@ def test_mixed_rebinding_to_own_op_stays_accepted() -> None:
     assert _run_fixture("mixed_rebind_ok.py") == [
         "[(5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3)]",
         "[(5, 3), (3, 5), (5, 3, 4), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3)]",
+        "[(5, 3), (5, 3, 4), (5, 3, 4), (5, 3)]",
         "n3 65",
         "three_n 59",
         "n34 56",
