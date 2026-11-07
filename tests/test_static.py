@@ -671,6 +671,32 @@ def test_mixed_widened_results_fit_literal_types() -> None:
     ]
 
 
+def test_mixed_rebinding_to_own_op_stays_accepted() -> None:
+    # A name first bound to np.zeros((n, 3)) is tuple[int, Literal[3]];
+    # rebinding it to a fitting op on itself was accepted when builders
+    # answered tuple[int, int] and must stay so. reshape and dot/matmul
+    # now solve to the literal; the stubs' int dims where the literal
+    # was turn unknown.
+    result = run_mypy(FIXTURES / "mixed_rebind_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [
+        line.split("Revealed type is ")[1]
+        for line in result.stdout.splitlines()
+        if "Revealed type" in line
+    ]
+    mixed3 = '"numpy.ndarray[tuple[int, Literal[3]], numpy.dtype[numpy.float64]]"'
+    widened = '"numpy.ndarray[tuple[int, Any], numpy.dtype[numpy.float64]]"'
+    # (n, 3) by (3, k): k sits where o has its 3, n where w has its 3.
+    unknown = '"numpy.ndarray[tuple[Any, Any], numpy.dtype[numpy.float64]]"'
+    assert notes == [mixed3] * 5 + [widened] * 2 + [unknown], result.stdout
+    assert _run_fixture("mixed_rebind_ok.py") == [
+        "[(5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3)]",
+        "n3 65",
+        "three_n 59",
+        "n34 56",
+    ]
+
+
 def test_recursive_alias_operands_do_not_crash() -> None:
     # The mixed-shape guard walked recursive aliases forever
     # (RecursionError, an INTERNAL ERROR) on any numpy call.

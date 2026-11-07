@@ -8,9 +8,11 @@ What it does:
 - zeros/ones/empty with a fully literal shape return a precise
   ndarray[tuple[Literal[...], ...], ...], even through assignment. A
   tuple display mixing literals with plain int dims keeps the literals
-  ((n, 3) -> tuple[int, Literal[3]]); ops the solver leaves to the stubs
-  widen them back unless they keep the shape (_guard_mixed). Anything
-  else bails out to mypy's default instead of erroring.
+  ((n, 3) -> tuple[int, Literal[3]]). reshape, dot/matmul and
+  transposes carry them through (_reshape_dynamic_dims, _mixed_parts);
+  ops the solver leaves to the stubs widen them back unless they keep
+  the shape (_guard_mixed). Anything else bails out to mypy's default
+  instead of erroring.
 - numty.matmul solves inner dims for any rank, broadcasts the batch
   dims with NumPy rules, and propagates the outer dims. Dtype is taken
   from the left operand. Over a shared *Ts, (*Ts, N, M) pairs solve the
@@ -1592,6 +1594,10 @@ def _ndarrays_in(tp: Type, seen: set[TypeAliasType] | None = None) -> Iterator[I
     walked once: seen holds the ones already being expanded.
     """
     if isinstance(tp, TypeAliasType) and tp.is_recursive:
+        # One set for the whole walk, shared by sibling branches too: an
+        # alias met again anywhere (not only below itself) is skipped.
+        # That only drops repeats, since an alias always expands to the
+        # same ndarrays, and the callers ask whether one exists.
         seen = set() if seen is None else seen
         if tp in seen:
             return
@@ -1615,6 +1621,13 @@ def _has_literal_dim(arr: Instance) -> bool:
     )
 
 
+def _has_int_dim(arr: Instance) -> bool:
+    shape = get_proper_type(arr.args[0]) if arr.args else None
+    return isinstance(shape, TupleType) and any(
+        _is_plain_int(get_proper_type(i)) for i in shape.items
+    )
+
+
 def _is_mixed_shape(arr: Instance) -> bool:
     """A shape with both a Literal dim and a plain `int` one (a builder's
     mixed result, see _builder_shape)."""
@@ -1627,22 +1640,38 @@ def _is_mixed_shape(arr: Instance) -> bool:
     )
 
 
-def _mixed_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
+def _is_plain_int(d: int | Type) -> bool:
+    """A plain `int` dim (dynamic size) from _mixed_parts."""
+    return isinstance(d, Instance) and d.type.fullname == INT_FULLNAME
+
+
+def _has_mixed_operand(*types: Type) -> bool:
+    return any(
+        isinstance(p, Instance) and p.type.fullname == NDARRAY_FULLNAME and _is_mixed_shape(p)
+        for p in map(get_proper_type, types)
+    )
+
+
+def _mixed_parts(tp: Type, partner: bool = False) -> tuple[list[int | Type], Type] | None:
     """(dims, dtype) of a mixed-shape ndarray, plain `int` dims as types.
 
-    Only for ops that move dims without reading them (transposes): the
-    rest of the solver keeps bailing on int dims via _ndarray_parts.
+    Only for ops that move dims without reading them (transposes) or
+    that only pass dims through and treat a plain `int` as matching
+    anything (matmul/dot, see _matmul_inner): the rest of the solver
+    keeps bailing on int dims via _ndarray_parts. partner also accepts
+    a shape with no Literal dim, for the other operand of a mixed one.
     """
     proper = get_proper_type(tp)
     if not (
         isinstance(proper, Instance)
         and proper.type.fullname == NDARRAY_FULLNAME
         and len(proper.args) == 2
-        and _is_mixed_shape(proper)
+        and (partner or _is_mixed_shape(proper))
     ):
         return None
     shape = get_proper_type(proper.args[0])
-    assert isinstance(shape, TupleType)
+    if not isinstance(shape, TupleType):
+        return None
     dims: list[int | Type] = []
     for item in shape.items:
         value = _dim_value(item)
@@ -1650,40 +1679,71 @@ def _mixed_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
         if value is not None:
             dims.append(value)
         elif isinstance(plain, Instance) and plain.type.fullname == INT_FULLNAME:
-            dims.append(plain)
+            dims.append(plain.copy_modified(last_known_value=None))
         else:
             return None
     return dims, proper.args[1]
 
 
-def _widen_literal_dims(tp: Type) -> Type:
+def _literal_positions(arrays: list[Instance]) -> dict[int, set[int]]:
+    """Per rank, the axes where some mixed array has a Literal dim."""
+    out: dict[int, set[int]] = {}
+    for arr in arrays:
+        if not _is_mixed_shape(arr):
+            continue
+        shape = get_proper_type(arr.args[0])
+        assert isinstance(shape, TupleType)
+        axes = out.setdefault(len(shape.items), set())
+        axes.update(
+            k for k, i in enumerate(shape.items) if isinstance(get_proper_type(i), LiteralType)
+        )
+    return out
+
+
+def _widen_literal_dims(
+    tp: Type, int_axes: dict[int, set[int]] | None = None, literals: bool = True
+) -> Type:
     """tp with every Literal dim of its ndarray shapes made unknown (Any).
 
     Any rather than int: a widened dim must still fit wherever the
     literal was expected (np.diff(x, axis=0) returned as x's
     tuple[int, Literal[3]] type), since unknown is not an error. A
-    recursive alias is left as is: it cannot be rebuilt widened, and
-    expanding it would not terminate.
+    plain `int` dim goes unknown too where int_axes (rank -> axes, see
+    _literal_positions) says a mixed operand of the same rank had a
+    literal there: np.resize(x, x.shape) answers tuple[int, int] for x's
+    tuple[int, Literal[3]], which would not fit x again. A recursive
+    alias is left as is: it cannot be rebuilt widened, and expanding it
+    would not terminate. literals=False widens only those int dims, for
+    a result the plugin solved itself (_mixed_result).
     """
     if isinstance(tp, TypeAliasType) and tp.is_recursive:
         return tp
     proper = get_proper_type(tp)
     if isinstance(proper, UnionType):
-        return UnionType.make_union([_widen_literal_dims(i) for i in proper.items])
+        return UnionType.make_union(
+            [_widen_literal_dims(i, int_axes, literals) for i in proper.items]
+        )
     if isinstance(proper, TupleType):
-        return proper.copy_modified(items=[_widen_literal_dims(i) for i in proper.items])
+        return proper.copy_modified(
+            items=[_widen_literal_dims(i, int_axes, literals) for i in proper.items]
+        )
     if not isinstance(proper, Instance):
         return tp
     if proper.type.fullname == NDARRAY_FULLNAME and len(proper.args) == 2:
         shape = get_proper_type(proper.args[0])
         if isinstance(shape, TupleType):
+            axes = (int_axes or {}).get(len(shape.items), set())
             items = [
-                AnyType(TypeOfAny.explicit) if isinstance(i, LiteralType) else i
-                for i in map(get_proper_type, shape.items)
+                AnyType(TypeOfAny.explicit)
+                if (literals and isinstance(i, LiteralType)) or (k in axes and _is_plain_int(i))
+                else i
+                for k, i in enumerate(map(get_proper_type, shape.items))
             ]
             shape = shape.copy_modified(items=items)
         return proper.copy_modified(args=[shape, proper.args[1]])
-    return proper.copy_modified(args=[_widen_literal_dims(a) for a in proper.args])
+    return proper.copy_modified(
+        args=[_widen_literal_dims(a, int_axes, literals) for a in proper.args]
+    )
 
 
 # numpy ops whose stub answer keeps the shape of their one array operand:
@@ -1721,7 +1781,11 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
     keeps its one array operand's shape (_SHAPE_KEEPERS, *_like without
     shape=), the stubs' answer widens its Literal dims to unknown (Any;
     see _widen_literal_dims). Builder results got int dims there before
-    they kept literals (#34); Any accepts everything int did.
+    they kept literals (#34); Any accepts everything int did. Its plain
+    `int` dims on axes where a mixed operand had a literal go unknown as
+    well: the stubs answer int there for ops that keep or rebuild the
+    shape (np.resize), and int would not fit back where the literal is
+    expected. A result the plugin built itself is never touched.
     """
     if hook is None and not fullname.startswith("numpy."):
         return None
@@ -1749,10 +1813,11 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
             if isinstance(ctx, MethodContext):
                 operands.append(ctx.type)
         result = hook(ctx) if hook is not None else default
-        # Only a stub answer holding a Literal dim can be widened, so most
-        # calls (np.isscalar, .shape, scalar reductions) skip the operands.
+        # Only a stub answer holding a Literal or plain `int` dim can be
+        # widened, so most calls (np.isscalar, .shape, scalar reductions)
+        # skip the operands.
         if result is not default or not any(
-            _has_literal_dim(a) for a in _ndarrays_in(default)
+            _has_literal_dim(a) or _has_int_dim(a) for a in _ndarrays_in(default)
         ):
             return result
         arrays = [a for t in operands for a in _ndarrays_in(t)]
@@ -1760,7 +1825,7 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
             return result
         if len(arrays) == 1 and keeps(ctx):
             return result
-        return _widen_literal_dims(result)
+        return _widen_literal_dims(result, _literal_positions(arrays))
 
     return guarded
 
@@ -1807,8 +1872,10 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
 
 def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
     """(match, error) for inner dims: match on equality, error when both
-    ints differ, and (False, None) to bail on anything unprovable."""
-    if _dim_eq(x, y):
+    ints differ, and (False, None) to bail on anything unprovable. A
+    plain `int` (dynamic) dim is assumed to match: it never reaches the
+    output, and unknown is not an error."""
+    if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
     if isinstance(x, int) and isinstance(y, int):
         return False, f"matmul inner dimensions disagree: {x} vs {y}"
@@ -1949,9 +2016,40 @@ def _matmul_promoted(
     return _ndarray_type(ctx, dims, dtype)
 
 
-def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+def _operand_parts(
+    left: Type, right: Type
+) -> tuple[tuple[list[int | Type], Type] | None, tuple[list[int | Type], Type] | None]:
+    """Both operands' (dims, dtype) for a contraction (matmul, dot).
+
+    With a mixed operand ((n, 3) from np.zeros((n, 3))), plain `int`
+    dims ride along as types (_mixed_parts) so the literal dims that
+    reach the output stay: (n, 3) @ (3, 3) is (int, 3), not the stubs'
+    (int, int). Pass the result through _mixed_result.
+    """
     parts_a = _ndarray_parts(left)
     parts_b = _ndarray_parts(right)
+    if (parts_a is None or parts_b is None) and _has_mixed_operand(left, right):
+        return _mixed_parts(left, partner=True), _mixed_parts(right, partner=True)
+    return parts_a, parts_b
+
+
+def _mixed_result(result: Type, *operands: Type) -> Type:
+    """A contraction's result over mixed operands, see _operand_parts.
+
+    Its literal dims are solved and stay. A plain `int` dim lands where a
+    mixed operand of the same rank had a literal only when it is another
+    operand's dynamic size ((n, 3) by (3, k) is (n, k)), and nothing
+    proves k is not 3: that dim goes unknown, as the stubs' answers do
+    in _guard_mixed, so x = np.dot(x, w) keeps fitting x.
+    """
+    arrays = [a for t in operands for a in _ndarrays_in(t)]
+    if not any(_is_mixed_shape(a) for a in arrays):
+        return result
+    return _widen_literal_dims(result, _literal_positions(arrays), literals=False)
+
+
+def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    parts_a, parts_b = _operand_parts(left, right)
     if parts_a is not None and parts_b is not None:
         (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
         dims, message = _matmul_result(dims_a, dims_b)
@@ -1960,7 +2058,7 @@ def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type)
             return ctx.default_return_type
         if dims is None:
             return ctx.default_return_type
-        return _matmul_promoted(ctx, dims, dtype_a, dtype_b)
+        return _mixed_result(_matmul_promoted(ctx, dims, dtype_a, dtype_b), left, right)
     dims, message, dtype_a, dtype_b = _matmul_unpack_dims(left, right)
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
@@ -2044,7 +2142,7 @@ def _contract_pair(
     to bail on anything unprovable. Mirrors _matmul_inner with an
     op-specific message.
     """
-    if _dim_eq(x, y):
+    if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
     if isinstance(x, int) and isinstance(y, int):
         return False, f"{op} contracted dimensions disagree: {x} vs {y}"
@@ -2068,8 +2166,7 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
     pair = _two_arrays(ctx)
     if pair is None:
         return ctx.default_return_type
-    parts_a = _ndarray_parts(pair[0])
-    parts_b = _ndarray_parts(pair[1])
+    parts_a, parts_b = _operand_parts(pair[0], pair[1])
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
@@ -2096,7 +2193,7 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if not matched:
         return ctx.default_return_type
-    return _matmul_promoted(ctx, out, dtype_a, dtype_b)
+    return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), pair[0], pair[1])
 
 
 def inner_function_hook(ctx: FunctionContext) -> Type:
@@ -4267,9 +4364,99 @@ def _solve_reshape_unpack(
     return ctx.default_return_type
 
 
+def _reshape_dynamic_dims(
+    pairs: list[tuple[Type, Expression | None]],
+) -> list[int | Type] | None:
+    """Target dims of a reshape, plain `int` sizes as types, else None.
+
+    reshape(n, 3), reshape((n, 3)) and reshape(x.shape) with n: int: the
+    sizes the caller spells are the result's, whatever the input, so the
+    literal ones are kept next to plain `int`s instead of the stubs'
+    all-int answer (#34). Same argument forms as _reshape_new_dims, plus
+    a tuple-typed shape value; None when anything is unproven.
+    """
+    if not pairs:
+        return None
+    first_tp, first_expr = pairs[0]
+    first = get_proper_type(first_tp)
+    entries: list[tuple[Type, Expression | None]]
+    if isinstance(first_expr, TupleExpr):
+        if not isinstance(first, TupleType) or len(first.items) != len(first_expr.items):
+            return None
+        entries = list(zip(first.items, first_expr.items))
+    elif isinstance(first, TupleType):
+        entries = [(item, None) for item in first.items]
+    else:
+        entries = []
+        for tp, expr in pairs:
+            proper = get_proper_type(tp)
+            if isinstance(proper, Instance) and proper.type.fullname == STR_FULLNAME:
+                break
+            entries.append((tp, expr))
+    dims: list[int | Type] = []
+    for tp, expr in entries:
+        if isinstance(expr, StarExpr) or isinstance(get_proper_type(tp), UnpackType):
+            return None
+        value = _fold_int(expr) if expr is not None else None
+        dim = value if value is not None else _dim_value(tp)
+        if dim is not None:
+            dims.append(dim)
+            continue
+        plain = get_proper_type(tp)
+        if not (isinstance(plain, Instance) and plain.type.fullname == INT_FULLNAME):
+            return None
+        dims.append(plain.copy_modified(last_known_value=None))
+    return dims
+
+
+def _solve_reshape_dynamic(
+    ctx: FunctionContext | MethodContext, old: Type, dims: list[int | Type]
+) -> Type:
+    """The requested shape of a reshape that names a plain `int` size or
+    whose input shape the exact paths cannot read (_solve_reshape).
+
+    Holds by construction whenever the call is legal at runtime, and its
+    legality is not provable with a dynamic size: nothing is reported
+    here. -1 next to only literal sizes is the input's size over theirs,
+    a plain `int` like the input's dynamic dims ((n, 3) -> (-1, 3) is
+    (int, 3)). Next to a plain `int` size it is a ratio the caller may
+    know to be fixed ((n, 3) -> (n, -1) is (n, 3) again), so it is
+    unknown (Any), which fits where a literal was expected. With
+    neither a literal nor an unknown dim, the stubs' all-int answer is
+    as good, so it stays.
+    """
+    proper = get_proper_type(old)
+    if not (
+        isinstance(proper, Instance)
+        and proper.type.fullname == NDARRAY_FULLNAME
+        and len(proper.args) == 2
+    ):
+        return ctx.default_return_type
+    ints = [d for d in dims if isinstance(d, int)]
+    if any(d < -1 for d in ints) or ints.count(-1) > 1:
+        return ctx.default_return_type
+    inferred: Type = ctx.api.named_generic_type(INT_FULLNAME, [])
+    if any(_is_plain_int(d) for d in dims):
+        inferred = AnyType(TypeOfAny.explicit)
+    if not any(d >= 0 for d in ints) and not (
+        -1 in ints and isinstance(inferred, AnyType)
+    ):
+        return ctx.default_return_type
+    out = [inferred if d == -1 else d for d in dims]
+    return _ndarray_type(ctx, out, proper.args[1])
+
+
 def _solve_reshape(
     ctx: FunctionContext | MethodContext, old: Type, pairs: list[tuple[Type, Expression | None]]
 ) -> Type:
+    # A plain `int` target size, or an input whose shape the exact paths
+    # below cannot read (mixed, all-int): keep the requested literals.
+    dynamic = _reshape_dynamic_dims(pairs)
+    if dynamic is not None and (
+        any(_is_plain_int(d) for d in dynamic)
+        or (_ndarray_parts(old) is None and _unpack_shape(old) is None)
+    ):
+        return _solve_reshape_dynamic(ctx, old, dynamic)
     parts = _ndarray_parts(old)
     if parts is None:
         split = _unpack_shape(old)

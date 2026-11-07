@@ -877,21 +877,34 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
   `full`, `*_like(shape=...)`, `Generator` `size=`) keeps the literal dims
   of a tuple display next to plain `int` ones: `np.zeros((n, 3))` is
-  `tuple[int, Literal[3]]`, also once assigned. The solver does not read
-  `int` dims, so ops on such an array (or on one annotated that way) use
-  numpy's stubs. Shape-keeping ones (arithmetic, `astype`, `copy`,
-  `flip`, sorts along an axis, ...) keep the literal, and transposes move
-  it with its axis. For the rest it becomes unknown (`Any`), because the
-  stubs would leave it on the wrong axis after `swapaxes`, `pad` or
-  `diff`; unknown still fits where the literal was expected, so
-  `x = np.diff(x, axis=0)` keeps type checking. Later stub ops on such a
-  result may answer `ndarray[Any, Any]`. Since a transpose moves the
-  literal, rebinding a name to its own transpose (`e = np.zeros((n, 3))`
-  then `e = e.T`) is an assignment error, as it already was for
-  all-literal shapes: bind the transpose to a new name. Written
-  inline as an argument whose expected literal differs, a builder falls
-  through to numpy's catch-all overload and goes unchecked, as before.
-  Assign it to a name first to have it checked.
+  `tuple[int, Literal[3]]`, also once assigned. Most of the solver does
+  not read `int` dims. The exceptions: `reshape` keeps the literal sizes
+  it is asked for whenever one of them is a plain `int` or the input's
+  shape cannot be read (`x.reshape(-1, 3)`, `x.reshape(n, 3)` and
+  `x.reshape(x.shape)` are `tuple[int, Literal[3]]`; a `-1` next to an
+  `int` size is unknown, so `x.reshape(n, -1)` is `tuple[int, Any]`);
+  `np.dot`/`np.matmul` take an `int` dim as matching and keep the outer
+  dims (`(n, 3)` by `(3, 3)` is `tuple[int, Literal[3]]`, while 3 against
+  4 is an error as for literal shapes; an `int` dim landing on an axis
+  where an operand has a literal turns unknown, so `(n, 3)` by `(3, k)`
+  is `tuple[Any, Any]`); transposes move the literal with its axis.
+  Other ops on such an array (or on one annotated that way) use numpy's
+  stubs. Shape-keeping ones (arithmetic, `astype`, `copy`, `flip`, sorts
+  along an axis, ...) keep the literal. For the rest the stubs' answer turns
+  unknown (`Any`) at its literal dims, because the stubs would leave
+  them on the wrong axis after `swapaxes`, `pad` or `diff`, and at its
+  `int` dims on axes where an operand had a literal (`np.resize(x,
+  x.shape)` is `tuple[int, Any]`, not `tuple[int, int]`). Unknown still
+  fits where the literal was expected, so `x = np.diff(x, axis=0)` keeps
+  type checking, as does every rebinding in
+  `tests/fixtures/mixed_rebind_ok.py`. Later stub ops on such a result
+  may answer `ndarray[Any, Any]`, losing the dtype as well. Since a
+  transpose moves the literal, rebinding a name to its own transpose
+  (`e = np.zeros((n, 3))` then `e = e.T`) is an assignment error, as it
+  already was for all-literal shapes: bind the transpose to a new name.
+  Written inline as an argument whose expected literal differs, a
+  builder falls through to numpy's catch-all overload and goes
+  unchecked, as before. Assign it to a name first to have it checked.
 - An explicit `dtype=` is honored when it resolves (`np.float32`,
   `"float64"`, bare `int`/`float`/`bool`, ...); exotic forms bail out.
   Same for unknown `keepdims`.
