@@ -17,13 +17,20 @@ matched shape; the exact safety condition lives on each transform.
     the operator means something else (concatenation, unbounded ints,
     `True + True == 2`, ZeroDivisionError), so every site that is not
     known to be an array is left alone and reported as a warning; each
-    rewritten site is reported too. Annotations are trusted, not
-    checked: an `np.matrix` (where `*` is matmul) or a list passed into
-    a parameter annotated `np.ndarray` is still rewritten, so run the
-    test suite after rewriting. A module-level star import, splatted
-    positionals or `linspace`'s positional `retstep` count as unknown,
-    and nothing inside an f-string is rewritten (`f"{x * x=}"` prints
-    its own source).
+    rewritten site is reported too. An annotation admits ndarray
+    subclasses that override operators (`np.matrix` makes `*` a matrix
+    product and `**` a matrix power; `np.ma.MaskedArray` masks nan
+    results of `/` and `**`), so `*`, `**` and `/` are only rewritten
+    where every binding of x is an `np.<constructor>(...)` call (a
+    base-class ndarray); annotation-only sites are left alone and
+    reported. `+` and `-` give the same values, mask and type on numpy's
+    own subclasses (only the data under a mask can differ) and are still
+    rewritten on an annotation, with the report saying so: the
+    annotation is trusted, not checked, so a list or a user subclass
+    overriding `+` passed in still changes the result. A module-level
+    star import, splatted positionals or `linspace`'s positional
+    `retstep` count as unknown, and nothing inside an f-string is
+    rewritten (`f"{x * x=}"` prints its own source).
 --unpack-displays: in `a, b = RHS` unpacking, identity comprehensions
     and wrappers over a literal display become the display itself:
     `(x for x in D)`, `[x for x in D]`, `tuple(x for x in D)`,
@@ -51,6 +58,16 @@ _SELF_OP_UFUNCS = {
     ast.Mult: "multiply",
     ast.Div: "divide",
     ast.Pow: "power",
+}
+# Operators an ndarray subclass numpy ships overrides so that the ufunc
+# gives a different result: an annotation admits every subclass, so these
+# are only rewritten on names bound from an np.<constructor>(...) call.
+# `+` and `-` give the same values, mask and type on np.matrix,
+# np.ma.MaskedArray, np.char.chararray, np.recarray and np.memmap.
+_SUBCLASS_OVERRIDES = {
+    ast.Mult: "np.matrix makes `*` a matrix product",
+    ast.Pow: "np.matrix makes `**` a matrix power",
+    ast.Div: "np.ma.MaskedArray masks nan results of `/` that np.divide keeps",
 }
 
 
@@ -107,11 +124,12 @@ class _Scope:
     def __init__(self, kind: str, parent: "_Scope | None") -> None:
         self.kind = kind  # module, function, class, comprehension
         self.parent = parent
-        # name -> (kind, expr, scope the expr evaluates in). Kinds:
-        # "ann" (annotation), "value" (assigned expr), "aug" (augmented
-        # assignment / del: keeps an array an array), an import kind
-        # ("numpy", "numpy.typing", "numty", "type") or "other".
-        self.bindings: dict[str, list[tuple[str, ast.expr | None, _Scope]]] = {}
+        # name -> (kind, node, scope the node evaluates in). Kinds:
+        # "ann" (annotation), "value" (assigned expr), "annassign" (the
+        # `x: T = v` statement), "aug" (augmented assignment / del: keeps
+        # an array an array), an import kind ("numpy", "numpy.typing",
+        # "numty", "type") or "other".
+        self.bindings: dict[str, list[tuple[str, ast.AST | None, _Scope]]] = {}
         self.globals: set[str] = set()
         # `from m import *` (module level only) may rebind any name.
         self.star = False
@@ -126,7 +144,10 @@ class _ArrayNames:
     from an `np.<constructor>(...)` call -- and there is at least one.
     Augmented assignment keeps an array an array. Anything else (no
     binding, a builtin, a loop or unpacking target, an import, a plain
-    call, a `nonlocal` rebinding) means "not known".
+    call, a `nonlocal` rebinding) means "not known". An annotation
+    admits ndarray subclasses (np.matrix, np.ma.MaskedArray), so names
+    only some annotation vouches for are told apart from names every
+    binding of which builds a base-class ndarray.
     """
 
     def __init__(self, tree: ast.Module) -> None:
@@ -145,7 +166,7 @@ class _ArrayNames:
         name: str,
         scope: _Scope,
         kind: str,
-        node: ast.expr | None = None,
+        node: ast.AST | None = None,
     ) -> None:
         where = scope
         if scope.kind != "comprehension" and name in scope.globals:
@@ -228,6 +249,8 @@ class _ArrayNames:
                 self._visit(node.target, scope)
             elif node.value is not None and _is_type_alias_ann(node.annotation):
                 self._bind(node.target.id, scope, "value", node.value)
+            elif node.value is not None:
+                self._bind(node.target.id, scope, "annassign", node)
             else:
                 self._bind(node.target.id, scope, "ann", node.annotation)
         elif isinstance(node, ast.AugAssign):
@@ -347,24 +370,37 @@ class _ArrayNames:
             alias, "numpy"
         )
 
-    def is_array(self, name: str, scope: _Scope) -> bool:
+    def array_evidence(self, name: str, scope: _Scope) -> str | None:
+        """Why name is an ndarray where scope reads it, or None.
+
+        "constructor": every binding builds a base-class ndarray.
+        "annotation": some binding is only vouched for by an annotation,
+        which also admits ndarray subclasses.
+        """
         owner = self._resolve(name, scope)
         if owner is None or (owner.kind == "function" and name in self._nonlocal):
-            return False
+            return None
         if owner is self.module and self.module.star:
-            return False  # a star import may rebind it
-        found = False
+            return None  # a star import may rebind it
+        found = None
         for kind, node, where in owner.bindings[name]:
             if kind == "aug":
                 continue
-            if node is None:
-                return False
+            if isinstance(node, ast.AnnAssign):
+                assert node.value is not None
+                if self._array_value(node.value, where):
+                    found = found or "constructor"
+                    continue
+                node = node.annotation
+                kind = "ann"
+            if not isinstance(node, ast.expr):
+                return None
             if kind == "ann" and self._array_type(node):
-                found = True
+                found = "annotation"
             elif kind == "value" and self._array_value(node, where):
-                found = True
+                found = found or "constructor"
             else:
-                return False
+                return None
         return found
 
     def _array_value(self, node: ast.expr, scope: _Scope) -> bool:
@@ -430,7 +466,9 @@ class _ArrayNames:
         self._alias_stack.add(name)
         try:
             return bool(records) and all(
-                kind == "value" and node is not None and self._array_type(node)
+                kind == "value"
+                and isinstance(node, ast.expr)
+                and self._array_type(node)
                 for kind, node, _ in records
             )
         finally:
@@ -452,6 +490,8 @@ def _self_op_edits(
     On anything else the operator means something the ufunc does not
     (list/tuple/str concatenation, unbounded int, bool arithmetic,
     ZeroDivisionError), so those sites stay as written and are reported.
+    So do `*`, `**` and `/` on names only an annotation vouches for: an
+    ndarray subclass the annotation admits overrides them.
     """
     names = _ArrayNames(tree)
     edits: list[Edit] = []
@@ -459,10 +499,19 @@ def _self_op_edits(
     for node, scope in names.sites:
         assert isinstance(node.left, ast.Name)
         name = node.left.id
-        if not names.is_array(name, scope):
+        evidence = names.array_evidence(name, scope)
+        if evidence is None:
             warnings.append(
                 f"line {node.lineno}: self-ops skipped: {name} is not known"
                 " to be an array"
+            )
+            continue
+        override = _SUBCLASS_OVERRIDES.get(type(node.op))
+        if evidence == "annotation" and override is not None:
+            warnings.append(
+                f"line {node.lineno}: self-ops skipped: {name} is only"
+                f" known to be an array from an annotation, which admits"
+                f" ndarray subclasses ({override})"
             )
             continue
         if not names.numpy_ok(np_alias, scope):
@@ -475,7 +524,10 @@ def _self_op_edits(
         start, end = source.span(node)
         new = f"{np_alias}.{ufunc}({name}, {name})"
         edits.append((start, end, new))
-        warnings.append(f"line {node.lineno}: self-ops rewrote to {new}")
+        trusted = ""
+        if evidence == "annotation":
+            trusted = f" (trusting the annotation of {name})"
+        warnings.append(f"line {node.lineno}: self-ops rewrote to {new}{trusted}")
     return edits, warnings
 
 
@@ -601,7 +653,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--self-ops",
         action="store_true",
-        help="rewrite `x + x` (and -, *, /, **) to `np.<ufunc>(x, x)`",
+        help="rewrite `x + x` (and -, *, /, **) to `np.<ufunc>(x, x)` where"
+        " x is known to be an ndarray; `*`, `/` and `**` only where x is"
+        " built by an np.<constructor>(...) call, since an annotation"
+        " admits subclasses such as np.matrix",
     )
     parser.add_argument(
         "--unpack-displays",
