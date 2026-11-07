@@ -585,6 +585,138 @@ def test_f64_ok_clean_and_runs() -> None:
     ]
 
 
+def test_storage_heads_ok_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "storage_heads_ok.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "storage_heads_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == [
+        "(5, 2)",
+        "(4, 7)",
+        "(6,)",
+        "(32, 48, 3)",
+        "(4, 5)",
+        "(3, 23)",
+    ]
+
+
+def test_storage_head_dtype_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_storage_dtype.py"),
+        'Argument 1 to "show"',
+        "dtype[signedinteger[_8Bit]]",
+        "dtype[unsignedinteger[_8Bit]]",
+    )
+
+
+def test_mixed_builders_keep_literals() -> None:
+    # #34: one dynamic dim no longer erases the literal ones, so a stored
+    # builder result fits a field pinned to 2 / 23. Ops that would move
+    # the literal to the wrong axis widen it to unknown (Any) instead.
+    result = run_mypy(FIXTURES / "mixed_builders_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [
+        line.split("Revealed type is ")[1].replace("numpy._typing._nbit_base.", "")
+        for line in result.stdout.splitlines()
+        if "Revealed type" in line
+    ]
+    mixed3 = '"numpy.ndarray[tuple[int, Literal[3]], numpy.dtype[numpy.float64]]"'
+    widened = '"numpy.ndarray[tuple[int, Any], numpy.dtype[numpy.float64]]"'
+    assert notes == [
+        '"numpy.ndarray[tuple[Literal[0], int, Literal[23], Literal[2]],'
+        ' numpy.dtype[numpy.float64]]"',
+        mixed3,  # ones
+        mixed3,  # empty
+        mixed3,  # full
+        '"numpy.ndarray[tuple[int, Literal[4]], numpy.dtype[numpy.float64]]"',
+        # A sampler's mixed size= stays with the stubs: its answer is
+        # final, so a literal there could not be rebound to (n, d).
+        '"numpy.ndarray[tuple[Any, ...], numpy.dtype[numpy.float64]]"',
+        '"numpy.ndarray[tuple[Any, ...], numpy.dtype[numpy.signedinteger[_64Bit]]]"',
+        # A dim read from .shape stays symbolic (this crashed before).
+        '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.float64]]"',
+        # nothing provable: the stubs' answer
+        '"numpy.ndarray[tuple[int, int], numpy.dtype[numpy.float64]]"',
+        mixed3,  # a * 2
+        '"numpy.ndarray[tuple[int, Literal[3]],'
+        ' numpy.dtype[numpy.floating[_32Bit]]]"',
+        '"numpy.ndarray[tuple[Literal[3], int], numpy.dtype[numpy.float64]]"',  # .T
+        widened,  # swapaxes
+        widened,  # pad
+        widened,  # diff
+        widened,  # keepdims sum
+    ], result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "mixed_builders_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(4, 7, 2) (4, 7, 23)"]
+
+
+def test_mixed_widened_results_fit_literal_types() -> None:
+    # Widened dims are unknown, not int: diff/pad/clip of a mixed array
+    # still return or rebind as the input's tuple[int, Literal[3]] type.
+    result = run_mypy(FIXTURES / "mixed_widen_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert _run_fixture("mixed_widen_ok.py") == [
+        "(4, 3) (3, 3) (6, 3)",
+        "(4, 3, 3, 3, 6, 5)",
+    ]
+
+
+def test_mixed_rebinding_to_own_op_stays_accepted() -> None:
+    # A name first bound to np.zeros((n, 3)) is tuple[int, Literal[3]];
+    # rebinding it to a fitting op on itself was accepted when builders
+    # answered tuple[int, int] and must stay so. reshape and dot/matmul
+    # now solve to the literal; the stubs' int dims where the literal
+    # was turn unknown.
+    result = run_mypy(FIXTURES / "mixed_rebind_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [
+        line.split("Revealed type is ")[1]
+        for line in result.stdout.splitlines()
+        if "Revealed type" in line
+    ]
+    mixed3 = '"numpy.ndarray[tuple[int, Literal[3]], numpy.dtype[numpy.float64]]"'
+    widened = '"numpy.ndarray[tuple[int, Any], numpy.dtype[numpy.float64]]"'
+    # (n, 3) by (3, k): k sits where o has its 3, n where w has its 3.
+    unknown = '"numpy.ndarray[tuple[Any, Any], numpy.dtype[numpy.float64]]"'
+    assert notes == [mixed3] * 5 + [widened] * 2 + [unknown], result.stdout
+    assert _run_fixture("mixed_rebind_ok.py") == [
+        "[(5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3)]",
+        "[(5, 3), (3, 5), (5, 3, 4), (5, 3), (5, 3), (5, 3), (5, 3), (5, 3)]",
+        "[(5, 3), (5, 3, 4), (5, 3, 4), (5, 3)]",
+        "n3 65",
+        "three_n 59",
+        "n34 56",
+    ]
+
+
+def test_recursive_alias_operands_do_not_crash() -> None:
+    # The mixed-shape guard walked recursive aliases forever
+    # (RecursionError, an INTERNAL ERROR) on any numpy call.
+    result = run_mypy(FIXTURES / "recursive_alias_ok.py")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _run_fixture("recursive_alias_ok.py") == ["False True"]
+
+
+def test_mixed_builder_literal_conflict() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mixed_builder.py"),
+        'Argument 1 to "Positions"',
+        "tuple[int, Literal[3]]",
+        "tuple[int, Literal[2]]",
+    )
+
+
 def test_f64_callsite_conflict() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_conflict.py"),
@@ -1140,6 +1272,16 @@ def test_gradient_axis_mismatch() -> None:
     assert_rank_mismatch(
         run_mypy(FIXTURES / "bad_gradient_axis.py"),
         "gradient axis 5 is out of range for 2 dimensions",
+        '"gradient"',
+    )
+
+
+def test_gradient_axis_mismatch_dynamic_dims() -> None:
+    # Gradient's axis checks need only the rank, so a plain int dim
+    # (here from np.zeros((n, 3))) no longer skips them.
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_gradient_axis_dynamic.py"),
+        "gradient axis 5 is out of range for 2 dimensions (shape (?, 3))",
         '"gradient"',
     )
 

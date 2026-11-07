@@ -10,7 +10,9 @@ from typing import Any
 import numpy as np
 import pytest
 
-from numty import F32, F64, I32, I64, Bool, NarrowError, batch, ident, matmul, narrow
+from numty import (
+    F16, F32, F64, I8, I16, I32, I64, U8, Bool, NarrowError, batch, ident, matmul, narrow,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -112,7 +114,11 @@ def test_narrow_rejects_mismatch_under_O(call: str, message: str) -> None:
 
 @pytest.mark.parametrize(
     "head, dtype",
-    [(F64, np.float64), (F32, np.float32), (I64, np.int64), (I32, np.int32), (Bool, np.bool_)],
+    [
+        (F64, np.float64), (F32, np.float32), (F16, np.float16),
+        (I64, np.int64), (I32, np.int32), (I16, np.int16), (I8, np.int8),
+        (U8, np.uint8), (Bool, np.bool_),
+    ],
 )
 def test_isinstance_against_head_checks_ndarray_and_dtype(head: Any, dtype: Any) -> None:
     assert isinstance(np.zeros(3, dtype=dtype), head)
@@ -135,6 +141,31 @@ def test_isinstance_picks_array_branch() -> None:
 def test_head_is_not_constructible() -> None:
     with pytest.raises(TypeError, match="shape annotation"):
         F64()
+
+
+def test_every_head_is_known_to_plugin_and_codmod() -> None:
+    # The head list lives in three places (numty, the plugin's dtype map,
+    # numty_codmod's trusted array types); a head missing from the plugin
+    # would analyze as a plain generic class, not an ndarray.
+    import numty
+    import numty_codmod
+    import numty_plugin
+
+    heads = {
+        name: obj._numty_dtype
+        for name, obj in vars(numty).items()
+        if isinstance(obj, type) and getattr(obj, "_numty_dtype", None) is not None
+    }
+    assert set(heads) == {"F64", "F32", "F16", "I64", "I32", "I16", "I8", "U8", "Bool"}
+    plugin = {
+        full.removeprefix("numty."): scalar
+        for full, scalar in numty_plugin._FAM_HEAD_DTYPES.items()
+    }
+    assert set(plugin) == set(heads)
+    for name, dtype in heads.items():
+        scalar = plugin[name].removeprefix("numpy.")
+        assert np.dtype(getattr(np, scalar)) == dtype, name
+    assert set(heads) <= numty_codmod._NUMTY_ARRAY_TYPES
 
 
 def test_heads_still_work_as_runtime_annotations() -> None:

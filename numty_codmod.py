@@ -91,14 +91,18 @@ _NUMTY_ARRAY_TYPES = {
     "Array1D",
     "Array2D",
     "Bool",
+    "F16",
     "F32",
     "F64",
     "FlexArray",
     "FloatArray",
+    "I8",
+    "I16",
     "I32",
     "I64",
     "LooseArray",
     "Matrix",
+    "U8",
     "Vector",
 }
 # `np.<name>(...)` calls that build an ndarray unless an input dispatches

@@ -240,8 +240,47 @@ error: call-site shape conflict for 'hid': 8 (argument 'w', axis 1) vs 2 (argume
 Fixed sizes spell as integers (`F64[3, 4]`), rank polymorphism as
 `Unpack[Ts]` with a declared TypeVarTuple (one `# type: ignore[type-var]`
 per signature — numpy's own stub bound can't see through `*Ts`, same as
-with `FlexArray`). Heads cover the workhorses: `F64`, `F32`, `I64`,
-`I32`, `Bool`.
+with `FlexArray`). Heads cover the compute workhorses and the common
+storage dtypes, so a float16 or int8 block is one head per field rather
+than a spelled-out `FlexArray[..., np.dtype[np.float16]]`:
+
+| Head | dtype | Head | dtype |
+| --- | --- | --- | --- |
+| `F64` | `float64` | `I64` | `int64` |
+| `F32` | `float32` | `I32` | `int32` |
+| `F16` | `float16` | `I16` | `int16` |
+| `Bool` | `bool` | `I8` | `int8` |
+| | | `U8` | `uint8` (images) |
+
+Storage blocks are usually built from runtime sizes. A builder keeps the
+literal dims of its shape next to the dynamic ones, so a fixed channel
+width can be pinned instead of spelled as one more `TypeVar`
+(`tests/fixtures/bad_mixed_builder.py`):
+
+```python
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+import numpy as np
+
+from numty import F16
+
+NB = TypeVar("NB", bound=int)
+
+
+@dataclass(frozen=True)
+class Positions(Generic[NB]):
+    xy: F16[NB, 2]
+
+
+def build(n: int) -> Positions[int]:
+    xy = np.zeros((n, 3), dtype=np.float16)  # tuple[int, Literal[3]]
+    return Positions(xy)
+```
+
+```text
+error: Argument 1 to "Positions" has incompatible type "ndarray[tuple[int, Literal[3]], dtype[floating[_16Bit]]]"; expected "ndarray[tuple[int, Literal[2]], dtype[floating[_16Bit]]]"  [arg-type]
+```
 
 Prefer jaxtyping's string look? Write that instead — one spec per
 parameter, shared names tie the signature together, same solver
@@ -668,8 +707,9 @@ so it still runs under `python -O`.
 
 At runtime the heads are annotations, not array classes: calling
 `F64()` raises `TypeError`. `isinstance(x, F64)` is true exactly when
-`x` is an `ndarray` whose dtype equals native float64 (likewise `F32`,
-`I64`, `I32`, `Bool`; a byte-swapped `'>f8'` array is not an `F64`), so
+`x` is an `ndarray` whose dtype equals native float64 (likewise every
+head with its own dtype, e.g. `U8` and uint8; a byte-swapped `'>f8'`
+array is not an `F64`), so
 when mypy narrows a union of arrays by head, the runtime branch agrees.
 Rank and dims are not checked at runtime. A subscripted head
 (`isinstance(x, F64[3])`) raises `TypeError` like any subscripted
@@ -831,7 +871,7 @@ suggests: rank aliases still catch rank mixups, but mypy widens a
 constructor's sizes to `int` once the array is assigned to a name, so
 exact-size aliases then reject correct code. `mypy demo.py` with no
 plugin configured reports 4 errors, 3 of them on correct code, and
-misses the 3x2 size bug. The `F64`/`F32`/`I64`/`I32`/`Bool` heads need
+misses the 3x2 size bug. The `F64`-style heads (`F32`, `U8`, ...) need
 the plugin: without it a correct call is rejected (`f(np.zeros((2, 3)))`
 against `F64[batch, features]` fails with `expected "F64[Never,
 Never]"` under plain mypy) and results become `F64[Any, Any]`
@@ -872,7 +912,45 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   [#5](https://github.com/sofeikov/numty/issues/5).
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
-  left alone. Unknown is not an error.
+  left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
+  `full`, `*_like(shape=...)`) keeps the literal dims of a tuple
+  display next to plain `int` ones: `np.zeros((n, 3))` is
+  `tuple[int, Literal[3]]`, also once assigned. A `Generator` sampler's
+  mixed `size=` keeps the stubs' `tuple[Any, ...]`: its answer is final
+  (no overload takes the shape from the assignment), so a name first
+  bound to `(n, 3, 4)` could not be rebound to `size=(n, d, 4)`. A
+  `reshape` from an input with no literal axis (`x.ravel().reshape(n,
+  d)`) makes its `int` sizes unknown for the same reason. Most of the
+  solver does not read `int` dims. The exceptions: `reshape` keeps the literal sizes
+  it is asked for whenever one of them is a plain `int` or the input's
+  shape cannot be read (`x.reshape(-1, 3)`, `x.reshape(n, 3)` and
+  `x.reshape(x.shape)` are `tuple[int, Literal[3]]`; a `-1` next to an
+  `int` size is unknown, so `x.reshape(n, -1)` is `tuple[int, Any]`, and
+  so is an `int` target size on an axis where the input had a literal:
+  `x.reshape(-1, d)` is `tuple[Any, Any]`); `gradient` along one axis
+  keeps the operand's type and still checks the axis;
+  `np.dot`/`np.matmul` take an `int` dim as matching and keep the outer
+  dims (`(n, 3)` by `(3, 3)` is `tuple[int, Literal[3]]`, while 3 against
+  4 is an error as for literal shapes; an `int` dim landing on an axis
+  where an operand has a literal turns unknown, so `(n, 3)` by `(3, k)`
+  is `tuple[Any, Any]`); transposes move the literal with its axis.
+  Other ops on such an array (or on one annotated that way) use numpy's
+  stubs. Shape-keeping ones (arithmetic, `astype`, `copy`, `flip`, sorts
+  along an axis, ...) keep the literal. For the rest the stubs' answer turns
+  unknown (`Any`) at its literal dims, because the stubs would leave
+  them on the wrong axis after `swapaxes`, `pad` or `diff`, and at its
+  `int` dims on axes where an operand had a literal (`np.resize(x,
+  x.shape)` is `tuple[int, Any]`, not `tuple[int, int]`). Unknown still
+  fits where the literal was expected, so `x = np.diff(x, axis=0)` keeps
+  type checking, as does every rebinding in
+  `tests/fixtures/mixed_rebind_ok.py`. Later stub ops on such a result
+  may answer `ndarray[Any, Any]`, losing the dtype as well. Since a
+  transpose moves the literal, rebinding a name to its own transpose
+  (`e = np.zeros((n, 3))` then `e = e.T`) is an assignment error, as it
+  already was for all-literal shapes: bind the transpose to a new name.
+  Written inline as an argument whose expected literal differs, a
+  builder falls through to numpy's catch-all overload and goes
+  unchecked, as before. Assign it to a name first to have it checked.
 - An explicit `dtype=` is honored when it resolves (`np.float32`,
   `"float64"`, bare `int`/`float`/`bool`, ...); exotic forms bail out.
   Same for unknown `keepdims`.

@@ -108,6 +108,12 @@ class F32(_StringDims, Generic[Unpack[TsFam]]):
     _numty_dtype = np.dtype(np.float32)
 
 
+class F16(_StringDims, Generic[Unpack[TsFam]]):
+    """float16 array with flat dims, e.g. F16[batch, features]."""
+
+    _numty_dtype = np.dtype(np.float16)
+
+
 class I64(_StringDims, Generic[Unpack[TsFam]]):
     """int64 array with flat dims, e.g. I64[batch, count]."""
 
@@ -118,6 +124,24 @@ class I32(_StringDims, Generic[Unpack[TsFam]]):
     """int32 array with flat dims, e.g. I32[batch, count]."""
 
     _numty_dtype = np.dtype(np.int32)
+
+
+class I16(_StringDims, Generic[Unpack[TsFam]]):
+    """int16 array with flat dims, e.g. I16[batch, count]."""
+
+    _numty_dtype = np.dtype(np.int16)
+
+
+class I8(_StringDims, Generic[Unpack[TsFam]]):
+    """int8 array with flat dims, e.g. I8[batch, features]."""
+
+    _numty_dtype = np.dtype(np.int8)
+
+
+class U8(_StringDims, Generic[Unpack[TsFam]]):
+    """uint8 array with flat dims, e.g. U8[height, width, 3] for an image."""
+
+    _numty_dtype = np.dtype(np.uint8)
 
 
 class Bool(_StringDims, Generic[Unpack[TsFam]]):
