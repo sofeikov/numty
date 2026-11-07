@@ -72,8 +72,10 @@ from mypy.nodes import (
     AssignmentStmt,
     CallExpr,
     Context,
+    Decorator,
     EllipsisExpr,
     Expression,
+    FuncDef,
     GeneratorExpr,
     IntExpr,
     ListComprehension,
@@ -94,6 +96,7 @@ from mypy.nodes import (
     Var,
 )
 from mypy.messages import callable_name
+from mypy.operators import op_methods_to_symbols
 from mypy.plugin import (
     AnalyzeTypeContext,
     AttributeContext,
@@ -227,7 +230,46 @@ class NumtyPlugin(Plugin):
         # check stays function-only.
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
+        # A hook here would make every method call in the program (list,
+        # dict and str ones included) walk the plugin chain and scan its
+        # arguments. A method none of whose parameters is declared with an
+        # ndarray can never get a note, so leave it unhooked: mypy then
+        # asks the later plugins itself.
+        if not self._method_may_take_array(fullname):
+            return None
         return partial(self.method_signature_hook, fullname)
+
+    def _method_may_take_array(self, fullname: str) -> bool:
+        """False when `fullname`'s declared parameters mention no ndarray.
+
+        A cheap, conservative look at the declaration: anything it cannot
+        resolve counts as possibly taking an array.
+        """
+        class_name, _, method = fullname.rpartition(".")
+        if method in _OPERATOR_DUNDERS:
+            return False  # never noted, see _rank_mismatch_notes
+        try:
+            sym = self.lookup_fully_qualified(class_name)
+        except Exception:
+            return True
+        if sym is None or not isinstance(sym.node, TypeInfo):
+            return True
+        member = sym.node.get(method)
+        if member is None:
+            return True
+        node = member.node
+        if isinstance(node, Decorator):
+            node = node.var
+        tp = get_proper_type(getattr(node, "type", None))
+        if tp is None and isinstance(node, FuncDef):
+            return False  # unannotated: every parameter is Any
+        if isinstance(tp, CallableType):
+            items = [tp]
+        elif isinstance(tp, Overloaded):
+            items = tp.items
+        else:
+            return True
+        return any(_mentions_ndarray(arg) for item in items for arg in item.arg_types)
 
     def method_signature_hook(self, fullname: str, ctx: MethodSigContext) -> Type:
         # This hook covers every method, so first run whatever a later
@@ -1543,11 +1585,28 @@ def _rank_mismatch_notes(
         return []
     if len(ctx.args) != len(sig.arg_types):
         return []
+    # Only explicit calls: an operator, index or `in` reaches its dunder
+    # through this hook too, but mypy reports those under other codes
+    # ([operator], [index], [assignment]), which the note's arg-type would
+    # not match. Explicit `x.__add__(y)` calls get the operator wording too.
+    call = ctx.context
+    if not isinstance(call, CallExpr):
+        return []
+    callee = callable_name(sig)
+    if callee is None or _reported_as_operator(callee):
+        return []
     notes: list[tuple[str, Context]] = []
     for i, (formal, kind) in enumerate(zip(sig.arg_types, sig.arg_kinds)):
         if kind not in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT):
             continue
         if len(ctx.args[i]) != 1:
+            continue
+        # Only plain positional or keyword actuals: a *args/**kwargs
+        # actual spreads its elements, it is not the array itself.
+        arg_index = next(
+            (j for j, e in enumerate(call.args) if e is ctx.args[i][0]), None
+        )
+        if arg_index is None or call.arg_kinds[arg_index] not in (ARG_POS, ARG_NAMED):
             continue
         proper = get_proper_type(formal)
         members = proper.relevant_items() if isinstance(proper, UnionType) else [proper]
@@ -1565,7 +1624,6 @@ def _rank_mismatch_notes(
             continue
         name = sig.arg_names[i]
         param = f'parameter "{name}"' if name else f"parameter {i + 1}"
-        callee = callable_name(sig) or "the callee"
         wanted = " or ".join(_shape_note_str(s) for s in declared)
         ranks = f"rank {len(actual.items)}"
         if len(declared) == 1:
@@ -1578,6 +1636,44 @@ def _rank_mismatch_notes(
             )
         )
     return notes
+
+
+# Methods whose bad arguments mypy words as operator/index errors, even
+# when called explicitly (MessageBuilder.incompatible_argument): those
+# carry [index], [assignment] or [operator], never arg-type.
+_OPERATOR_DUNDERS = frozenset(
+    ["__getitem__", "__setitem__"]
+    + [m for op in op_methods_to_symbols for m in (op, "__r" + op[2:])]
+)
+
+
+def _reported_as_operator(callee: str) -> bool:
+    """Whether `callee` (callable_name text) is a method in _OPERATOR_DUNDERS."""
+    return any(callee.startswith(f'"{m}" of') for m in _OPERATOR_DUNDERS)
+
+
+def _mentions_ndarray(tp: Type, depth: int = 0) -> bool:
+    """Whether `tp` mentions numpy.ndarray (True when nested too deep to tell).
+
+    Hand-rolled: mypy's TypeQuery visitors are compiled classes, which a
+    plugin cannot subclass.
+    """
+    if depth > 8:
+        return True
+    proper = get_proper_type(tp)
+    if isinstance(proper, Instance):
+        if proper.type.fullname == NDARRAY_FULLNAME:
+            return True
+        parts: list[Type] = list(proper.args)
+    elif isinstance(proper, (UnionType, TupleType)):
+        parts = list(proper.items)
+    elif isinstance(proper, CallableType):
+        parts = [*proper.arg_types, proper.ret_type]
+    elif isinstance(proper, UnpackType):
+        parts = [proper.type]
+    else:
+        return False
+    return any(_mentions_ndarray(part, depth + 1) for part in parts)
 
 
 def _note_rank_mismatches(ctx: FunctionSigContext | MethodSigContext, sig: Type) -> None:

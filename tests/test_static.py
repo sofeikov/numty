@@ -612,7 +612,7 @@ def test_rank_mismatch_note_names_declared_dims() -> None:
     assert result.returncode == 1, result.stdout
     lines = [line.split(":", 1)[1] for line in result.stdout.splitlines()[:-1]]
     errors = [line for line in lines if ": error:" in line]
-    assert len(errors) == 7, result.stdout
+    assert len(errors) == 8, result.stdout
     assert all(line.endswith("  [arg-type]") for line in errors), result.stdout
     assert 'expected "ndarray[tuple[Never], dtype[floating[_32Bit]]]"' in errors[0]
     assert [line for line in lines if ": note:" in line] == [
@@ -635,8 +635,11 @@ def test_rank_mismatch_note_names_declared_dims() -> None:
             assert lines[i - 1].split(":")[0] == line.split(":")[0], result.stdout
             assert ": error:" in lines[i - 1], result.stdout
     # Same-rank literal mismatch: mypy already names Literal[3], no note.
-    assert errors[-1].startswith("31: error:"), result.stdout
-    assert 'expected "ndarray[tuple[Literal[3]]' in errors[-1], result.stdout
+    assert errors[-2].startswith("31: error:"), result.stdout
+    assert 'expected "ndarray[tuple[Literal[3]]' in errors[-2], result.stdout
+    # A Callable-typed callee has no name, and mypy prints tuple[A]: no note.
+    assert errors[-1].startswith("33: error:"), result.stdout
+    assert 'expected "ndarray[tuple[A]' in errors[-1], result.stdout
 
 
 def test_rank_mismatch_note_follows_arg_type_ignores() -> None:
@@ -646,6 +649,25 @@ def test_rank_mismatch_note_follows_arg_type_ignores() -> None:
     )
     assert result.returncode == 0, result.stdout
     assert "note:" not in result.stdout, result.stdout
+
+
+def test_rank_mismatch_note_skips_star_args_and_operators() -> None:
+    # Only explicit calls with plain arguments get the note: a *pair
+    # actual is not the array passed, and operators, indexing and `in`
+    # report under [operator]/[index]/[assignment], whose ignores and
+    # disables the note's arg-type would escape.
+    fixture = FIXTURES / "rank_dim_names_ok.py"
+    for flags in (
+        ("--warn-unused-ignores",),
+        tuple(
+            arg
+            for code in ("operator", "index", "assignment")
+            for arg in ("--disable-error-code", code)
+        ),
+    ):
+        result = run_mypy(fixture, flags=flags)
+        assert result.returncode == 0, result.stdout
+        assert result.stdout == "Success: no issues found in 1 source file\n", result.stdout
 
 
 def test_f64_return_mismatch() -> None:

@@ -1,5 +1,5 @@
 """Wrong-rank arguments: mypy's error shows Never, numty's note the dim names (#35)."""
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 import numpy as np
 
@@ -21,7 +21,7 @@ class Policy:
     def act(self, action: F32[A]) -> None: ...
 
 
-def run(x: F32[N, A], v: F32[4]) -> None:
+def run(x: F32[N, A], v: F32[4], f: Callable[[F32[A]], None]) -> None:
     act(x)
     act(action=x)
     Policy().act(x)
@@ -30,3 +30,4 @@ def run(x: F32[N, A], v: F32[4]) -> None:
     maybe(x)
     act3(v)
     act(x[0])
+    f(x)  # no callee name: mypy's error already shows tuple[A]
