@@ -252,6 +252,36 @@ than a spelled-out `FlexArray[..., np.dtype[np.float16]]`:
 | `Bool` | `bool` | `I8` | `int8` |
 | | | `U8` | `uint8` (images) |
 
+Storage blocks are usually built from runtime sizes. A builder keeps the
+literal dims of its shape next to the dynamic ones, so a fixed channel
+width can be pinned instead of spelled as one more `TypeVar`
+(`tests/fixtures/bad_mixed_builder.py`):
+
+```python
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+import numpy as np
+
+from numty import F16
+
+NB = TypeVar("NB", bound=int)
+
+
+@dataclass(frozen=True)
+class Positions(Generic[NB]):
+    xy: F16[NB, 2]
+
+
+def build(n: int) -> Positions[int]:
+    xy = np.zeros((n, 3), dtype=np.float16)  # tuple[int, Literal[3]]
+    return Positions(xy)
+```
+
+```text
+error: Argument 1 to "Positions" has incompatible type "ndarray[tuple[int, Literal[3]], dtype[floating[_16Bit]]]"; expected "ndarray[tuple[int, Literal[2]], dtype[floating[_16Bit]]]"  [arg-type]
+```
+
 Prefer jaxtyping's string look? Write that instead — one spec per
 parameter, shared names tie the signature together, same solver
 underneath:
@@ -844,7 +874,18 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   [#5](https://github.com/sofeikov/numty/issues/5).
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
-  left alone. Unknown is not an error.
+  left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
+  `full`, `*_like(shape=...)`, `Generator` `size=`) keeps the literal dims
+  of a tuple display next to plain `int` ones: `np.zeros((n, 3))` is
+  `tuple[int, Literal[3]]`, also once assigned. The solver does not read
+  `int` dims, so ops on such an array (or on one annotated that way) use
+  numpy's stubs. Shape-keeping ones (arithmetic, `astype`, `copy`,
+  `flip`, sorts along an axis, ...) keep the literal, and transposes move
+  it with its axis. For the rest it widens to `int`, because the stubs
+  would leave it on the wrong axis after `swapaxes`, `pad` or `diff`. Written
+  inline as an argument whose expected literal differs, a builder falls
+  through to numpy's catch-all overload and goes unchecked, as before.
+  Assign it to a name first to have it checked.
 - An explicit `dtype=` is honored when it resolves (`np.float32`,
   `"float64"`, bare `int`/`float`/`bool`, ...); exotic forms bail out.
   Same for unknown `keepdims`.

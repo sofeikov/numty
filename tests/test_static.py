@@ -614,6 +614,60 @@ def test_storage_head_dtype_mismatch() -> None:
     )
 
 
+def test_mixed_builders_keep_literals() -> None:
+    # #34: one dynamic dim no longer erases the literal ones, so a stored
+    # builder result fits a field pinned to 2 / 23. Ops that would move
+    # the literal to the wrong axis widen it instead.
+    result = run_mypy(FIXTURES / "mixed_builders_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [
+        line.split("Revealed type is ")[1].replace("numpy._typing._nbit_base.", "")
+        for line in result.stdout.splitlines()
+        if "Revealed type" in line
+    ]
+    mixed3 = '"numpy.ndarray[tuple[int, Literal[3]], numpy.dtype[numpy.float64]]"'
+    widened = '"numpy.ndarray[tuple[int, int], numpy.dtype[numpy.float64]]"'
+    assert notes == [
+        '"numpy.ndarray[tuple[Literal[0], int, Literal[23], Literal[2]],'
+        ' numpy.dtype[numpy.float64]]"',
+        mixed3,  # ones
+        mixed3,  # empty
+        mixed3,  # full
+        '"numpy.ndarray[tuple[int, Literal[4]], numpy.dtype[numpy.float64]]"',
+        mixed3,  # rng.normal(size=)
+        '"numpy.ndarray[tuple[int, Literal[3]],'
+        ' numpy.dtype[numpy.signedinteger[_64Bit]]]"',
+        # A dim read from .shape stays symbolic (this crashed before).
+        '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.float64]]"',
+        widened,  # nothing provable: the stubs' answer
+        mixed3,  # a * 2
+        '"numpy.ndarray[tuple[int, Literal[3]],'
+        ' numpy.dtype[numpy.floating[_32Bit]]]"',
+        '"numpy.ndarray[tuple[Literal[3], int], numpy.dtype[numpy.float64]]"',  # .T
+        widened,  # swapaxes
+        widened,  # pad
+        widened,  # diff
+        widened,  # keepdims sum
+    ], result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "mixed_builders_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == ["(4, 7, 2) (4, 7, 23)"]
+
+
+def test_mixed_builder_literal_conflict() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mixed_builder.py"),
+        'Argument 1 to "Positions"',
+        "tuple[int, Literal[3]]",
+        "tuple[int, Literal[2]]",
+    )
+
+
 def test_f64_callsite_conflict() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_conflict.py"),
