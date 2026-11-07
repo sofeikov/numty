@@ -596,8 +596,20 @@ _OVERRIDES = {
         # One annotation-only binding is enough to keep the site.
         "def f(x: np.ndarray, reset: bool):\n"
         "    if reset:\n        x = np.zeros(3)\n    return x {op} x\n",
+        # A bare declaration with no other binding in this module: x is
+        # set from elsewhere, and only the annotation vouches for it.
+        "x: np.ndarray\ndef f():\n    return x {op} x\n",
     ],
-    ids=["ndarray", "NDArray", "F64", "FlexArray", "annassign", "alias", "mixed"],
+    ids=[
+        "ndarray",
+        "NDArray",
+        "F64",
+        "FlexArray",
+        "annassign",
+        "alias",
+        "mixed",
+        "decl-only",
+    ],
 )
 def test_self_op_annotation_only_skips_subclass_ops(body: str, op: str) -> None:
     src = _ANNOTATION_HEADER + body.format(op=op)
@@ -640,6 +652,11 @@ for x in (mat, masked, np.char.array(["a", "bc"]),
     if x.dtype.kind == "f":
         print(same(x - x, np.subtract(x, x)), end=" ")
 print()
+# inf - inf is nan: neither np.matrix nor MaskedArray masks it.
+for x in (np.matrix([[np.inf, -np.inf]]),
+          np.ma.array([np.inf, -np.inf, 1.0], mask=[0, 0, 1])):
+    print(same(x + x, np.add(x, x)), same(x - x, np.subtract(x, x)), end=" ")
+print()
 """
     assert _run_python(src, tmp_path, "evidence.py").splitlines() == [
         "False",
@@ -647,6 +664,7 @@ print()
         "False",
         "False",
         "True True True True True True True ",
+        "True True True True ",
     ]
 
 
@@ -681,3 +699,167 @@ def test_self_op_constructor_bindings_rewrite_every_op(tmp_path: Path) -> None:
     before = _run_python(src, tmp_path, "before.py")
     assert before.startswith("[[1.0, 4.0], [9.0, 16.0]]")
     assert _run_python(out, tmp_path, "after.py") == before
+
+
+# Every _NP_CONSTRUCTORS entry fed np.matrix, a MaskedArray and a user
+# subclass overriding `*`, `/` and `**`. Most of them drop the subclass,
+# so every operator is the ufunc; np.linspace / logspace / geomspace keep
+# it unless their endpoints (and logspace's base) are numeric literals.
+_SUBCLASS_INPUTS = """import warnings
+import numpy as np
+warnings.simplefilter("ignore")
+
+
+class Sub(np.ndarray):
+    def __mul__(self, other):
+        return np.multiply(self, other) + 100
+
+    def __truediv__(self, other):
+        return np.divide(self, other) + 100
+
+    def __pow__(self, other):
+        return np.power(self, other) + 100
+
+
+def show(a):
+    x = {expr}
+    return [type(x).__name__, x * x, x ** x, x / x, x + x, x - x]
+
+
+for a in (
+    np.matrix([[0.0, 2.0]]),
+    np.ma.array([0.0, 1.0, 2.0], mask=[0, 0, 1]),
+    np.arange(0.0, 3.0).view(Sub),
+):
+    try:
+        print(show(a))
+    except Exception as e:
+        print(type(e).__name__)
+"""
+_SELF_OP_SITES = ["x * x", "x ** x", "x / x", "x + x", "x - x"]
+_SELF_OP_CALLS = [
+    "np.multiply(x, x)",
+    "np.power(x, x)",
+    "np.divide(x, x)",
+    "np.add(x, x)",
+    "np.subtract(x, x)",
+]
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "np.array(a)",
+        "np.asarray(a)",
+        "np.ascontiguousarray(a)",
+        "np.asfortranarray(a)",
+        "np.full(np.shape(a), a)",
+        "np.zeros(np.shape(a))",
+        "np.ones(np.shape(a))",
+        "np.empty((np.size(a), 0))",
+        "np.arange(np.size(a))",
+        "np.eye(np.size(a))",
+        "np.identity(np.size(a))",
+        "np.linspace(-1, 2.5, np.size(a))",
+        "np.logspace(0, -1, 3, base=2)",
+        "np.logspace(start=1, stop=+2, num=np.size(a))",
+        "np.geomspace(1, 1e3, 4)",
+    ],
+)
+def test_self_op_base_class_constructors_rewrite(tmp_path: Path, expr: str) -> None:
+    src = _SUBCLASS_INPUTS.replace("{expr}", expr)
+    out, warnings = codemod_source(src, self_ops=True)
+    assert warnings == [
+        f"line 19: self-ops rewrote to {call}" for call in _SELF_OP_CALLS
+    ]
+    before = _run_python(src, tmp_path, "before.py")
+    assert _run_python(out, tmp_path, "after.py") == before
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "np.linspace(a, 2 * a, 2)",
+        "np.linspace(0, a, 2)",
+        "np.linspace(start=a, stop=1.0, num=2)",
+        "np.logspace(a, 2 * a, 2)",
+        "np.logspace(0, 1, 2, True, a)",
+        "np.logspace(0, 1, 2, base=a)",
+        "np.geomspace(a + 1, 2 * a + 1, 2)",
+    ],
+)
+def test_self_op_spaced_keep_subclass(tmp_path: Path, expr: str) -> None:
+    src = _SUBCLASS_INPUTS.replace("{expr}", expr)
+    out, warnings = codemod_source(src, self_ops=True)
+    fn = expr.split("(")[0]
+    vouch = (
+        f"x is only known to be an array from {fn}(...) on non-literal"
+        " endpoints, which keeps their ndarray subclass"
+    )
+    trusted = f"(trusting the {fn} endpoints of x)"
+    assert warnings == [
+        f"line 19: self-ops skipped: {vouch} ({_OVERRIDES[op]})"
+        for op in ("*", "**", "/")
+    ] + [
+        f"line 19: self-ops rewrote to {call} {trusted}"
+        for call in _SELF_OP_CALLS[3:]
+    ]
+    before = _run_python(src, tmp_path, "before.py")
+    assert _run_python(out, tmp_path, "after.py") == before
+    # The skips are what keep it: rewriting every site changes the output.
+    naive = src
+    for site, call in zip(_SELF_OP_SITES, _SELF_OP_CALLS):
+        naive = naive.replace(site, call)
+    assert _run_python(naive, tmp_path, "naive.py") != before
+
+
+def test_self_op_bare_declaration_defers_to_value() -> None:
+    # `x: T` binds nothing, so x holds what its assignments build; an
+    # annotation with a value is ignored when the value is a constructor
+    # call, whatever the annotation says (intended: the value decides).
+    src = (
+        "from typing import Any\n"
+        "import numpy as np\n"
+        "\n"
+        "def f():\n"
+        "    x: np.ndarray\n"
+        "    x = np.zeros(3)\n"
+        "    return x * x\n"
+        "\n"
+        "def g():\n"
+        "    y: Any = np.zeros(3)\n"
+        "    return y / y\n"
+        "\n"
+        "def h():\n"
+        "    z: list[int]\n"
+        "    z = np.ones(2)\n"
+        "    return z ** z\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True)
+    assert warnings == [
+        "line 7: self-ops rewrote to np.multiply(x, x)",
+        "line 11: self-ops rewrote to np.divide(y, y)",
+        "line 16: self-ops rewrote to np.power(z, z)",
+    ]
+    assert out.count("np.") == src.count("np.") + 3
+
+
+def test_self_op_annotated_spaced_value() -> None:
+    # The value, not the annotation, decides: literal endpoints build a
+    # base-class ndarray, others may keep the endpoints' subclass.
+    src = (
+        "import numpy as np\n"
+        "\n"
+        "def f(n: int, lo: np.ndarray):\n"
+        "    x: np.ndarray = np.linspace(-1, 1, n)\n"
+        "    y: np.ndarray = np.geomspace(lo, 1.0)\n"
+        "    return x * x, y * y\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True)
+    assert warnings == [
+        "line 6: self-ops rewrote to np.multiply(x, x)",
+        "line 6: self-ops skipped: y is only known to be an array from"
+        " np.geomspace(...) on non-literal endpoints, which keeps their"
+        f" ndarray subclass ({_OVERRIDES['*']})",
+    ]
+    assert "return np.multiply(x, x), y * y" in out
