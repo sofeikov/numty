@@ -760,6 +760,35 @@ then asks for the narrower code (`Unused "type: ignore" comment, use
 narrower [numty-shape] instead of [misc] code`), so switch those
 comments to the `numty-*` code when upgrading.
 
+An argument of the wrong rank is rejected by mypy itself, with its own
+`arg-type` error. The parameter's dim TypeVars cannot be solved from a
+shape of another length, so that error prints them as `Never`; numty
+adds a note under it with the dims as declared. For `rank.py`:
+
+```python
+from typing import TypeVar
+
+from numty import F32
+
+N = TypeVar("N", bound=int)
+A = TypeVar("A", bound=int)
+
+
+def act(action: F32[A]) -> None: ...
+
+
+def run(batch: F32[N, A]) -> None:
+    act(batch)  # forgot the [i]
+```
+
+```text
+rank.py:13: error: Argument 1 to "act" has incompatible type "ndarray[tuple[N, A], dtype[floating[_32Bit]]]"; expected "ndarray[tuple[Never], dtype[floating[_32Bit]]]"  [arg-type]
+rank.py:13: note: "act" declares parameter "action" with shape (A,); the argument has shape (N, A) (rank 2, not 1)
+```
+
+The note carries the same `arg-type` code, so `# type: ignore[arg-type]`
+or `disable_error_code = arg-type` silences both.
+
 ## How it works
 
 Three layers, each building on the previous one:
