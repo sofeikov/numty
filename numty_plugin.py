@@ -165,8 +165,12 @@ DTYPE_FULLNAME = "numpy.dtype"
 _FAM_HEAD_DTYPES = {
     "numty.F64": "numpy.float64",
     "numty.F32": "numpy.float32",
+    "numty.F16": "numpy.float16",
     "numty.I64": "numpy.int64",
     "numty.I32": "numpy.int32",
+    "numty.I16": "numpy.int16",
+    "numty.I8": "numpy.int8",
+    "numty.U8": "numpy.uint8",
     "numty.Bool": "numpy.bool",
 }
 
@@ -284,7 +288,7 @@ class NumtyPlugin(Plugin):
             )
         return sig
 
-    # Familiar-style heads (F64, F32, I64, I32, Bool in numty.py): the
+    # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty.py): the
     # dtype rides the head name, dims ride flat args. Hooked here because
     # mypy resolves `Head[...]` through Annotated-free generic application,
     # so the raw args (quoted names included) still reach us.

@@ -240,8 +240,17 @@ error: call-site shape conflict for 'hid': 8 (argument 'w', axis 1) vs 2 (argume
 Fixed sizes spell as integers (`F64[3, 4]`), rank polymorphism as
 `Unpack[Ts]` with a declared TypeVarTuple (one `# type: ignore[type-var]`
 per signature — numpy's own stub bound can't see through `*Ts`, same as
-with `FlexArray`). Heads cover the workhorses: `F64`, `F32`, `I64`,
-`I32`, `Bool`.
+with `FlexArray`). Heads cover the compute workhorses and the common
+storage dtypes, so a float16 or int8 block is one head per field rather
+than a spelled-out `FlexArray[..., np.dtype[np.float16]]`:
+
+| Head | dtype | Head | dtype |
+| --- | --- | --- | --- |
+| `F64` | `float64` | `I64` | `int64` |
+| `F32` | `float32` | `I32` | `int32` |
+| `F16` | `float16` | `I16` | `int16` |
+| `Bool` | `bool` | `I8` | `int8` |
+| | | `U8` | `uint8` (images) |
 
 Prefer jaxtyping's string look? Write that instead — one spec per
 parameter, shared names tie the signature together, same solver
@@ -668,8 +677,9 @@ so it still runs under `python -O`.
 
 At runtime the heads are annotations, not array classes: calling
 `F64()` raises `TypeError`. `isinstance(x, F64)` is true exactly when
-`x` is an `ndarray` whose dtype equals native float64 (likewise `F32`,
-`I64`, `I32`, `Bool`; a byte-swapped `'>f8'` array is not an `F64`), so
+`x` is an `ndarray` whose dtype equals native float64 (likewise every
+head with its own dtype, e.g. `U8` and uint8; a byte-swapped `'>f8'`
+array is not an `F64`), so
 when mypy narrows a union of arrays by head, the runtime branch agrees.
 Rank and dims are not checked at runtime. A subscripted head
 (`isinstance(x, F64[3])`) raises `TypeError` like any subscripted
@@ -793,7 +803,7 @@ suggests: rank aliases still catch rank mixups, but mypy widens a
 constructor's sizes to `int` once the array is assigned to a name, so
 exact-size aliases then reject correct code. `mypy demo.py` with no
 plugin configured reports 4 errors, 3 of them on correct code, and
-misses the 3x2 size bug. The `F64`/`F32`/`I64`/`I32`/`Bool` heads need
+misses the 3x2 size bug. The `F64`-style heads (`F32`, `U8`, ...) need
 the plugin: without it a correct call is rejected (`f(np.zeros((2, 3)))`
 against `F64[batch, features]` fails with `expected "F64[Never,
 Never]"` under plain mypy) and results become `F64[Any, Any]`

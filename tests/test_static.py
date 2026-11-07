@@ -585,6 +585,35 @@ def test_f64_ok_clean_and_runs() -> None:
     ]
 
 
+def test_storage_heads_ok_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "storage_heads_ok.py")
+    assert result.returncode == 0, result.stdout
+    run = subprocess.run(
+        [sys.executable, str(FIXTURES / "storage_heads_ok.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip().splitlines() == [
+        "(5, 2)",
+        "(4, 7)",
+        "(6,)",
+        "(32, 48, 3)",
+        "(4, 5)",
+        "(3, 23)",
+    ]
+
+
+def test_storage_head_dtype_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_storage_dtype.py"),
+        'Argument 1 to "show"',
+        "dtype[signedinteger[_8Bit]]",
+        "dtype[unsignedinteger[_8Bit]]",
+    )
+
+
 def test_f64_callsite_conflict() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_conflict.py"),
