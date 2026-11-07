@@ -180,7 +180,7 @@ def test_self_op_array_bindings_still_rewrite(tmp_path: Path) -> None:
         "    return x + x\n"
         "\n"
         "def g(x: npt.NDArray[np.float64], y: 'np.ndarray', z: Alias | Vec):\n"
-        "    return x * x, y / y, z ** z, [a - a for _ in range(1)]\n"
+        "    return x + x, y - y, z + z, [a - a for _ in range(1)]\n"
         "\n"
         "def h(v: FlexArray[tuple[int], np.dtype[np.float64]]):\n"
         "    w: np.ndarray = v\n"
@@ -192,7 +192,7 @@ def test_self_op_array_bindings_still_rewrite(tmp_path: Path) -> None:
     assert _non_reports(warnings) == []
     for rewritten in [
         "return np.add(x, x)",
-        "return np.multiply(x, x), np.divide(y, y), np.power(z, z),"
+        "return np.add(x, x), np.subtract(y, y), np.add(z, z),"
         " [np.subtract(a, a) for _ in range(1)]",
         "return np.add(v, v), np.add(w, w), np.add(b, b)",
     ]:
@@ -527,3 +527,339 @@ def test_self_op_star_import_blocks_numpy_alias() -> None:
     )
     out, _ = codemod_source(src, self_ops=True)
     assert out == src
+
+
+# Issue #79: an annotation admits ndarray subclasses, and np.matrix makes
+# `*` a matrix product. The `*` site must stay; `+` (identical on numpy's
+# own subclasses) is still rewritten, and its report says it trusted the
+# annotation.
+MATRIX_REPRO = """import numpy as np
+
+
+def square(x: np.ndarray) -> np.ndarray:
+    return x * x
+
+
+def double(x: np.ndarray) -> np.ndarray:
+    return x + x
+
+
+mat = np.matrix([[1, 2], [3, 4]])
+masked = np.ma.array([1.0, np.nan, 3.0], mask=[0, 0, 1])
+print(square(mat).tolist(), type(square(mat)).__name__)
+for arr in (mat, masked):
+    d = double(arr)
+    print(type(d).__name__, d.tolist(), np.ma.getmaskarray(d).tolist())
+"""
+
+
+def test_self_op_matrix_annotation_keeps_matmul(tmp_path: Path) -> None:
+    out, warnings = codemod_source(MATRIX_REPRO, self_ops=True)
+    assert out == MATRIX_REPRO.replace("return x + x", "return np.add(x, x)")
+    assert warnings == [
+        "line 5: self-ops skipped: x is only known to be an array from an"
+        " annotation, which admits ndarray subclasses (np.matrix makes `*`"
+        " a matrix product)",
+        "line 9: self-ops rewrote to np.add(x, x) (trusting the annotation of x)",
+    ]
+    before = _run_python(MATRIX_REPRO, tmp_path, "before.py")
+    assert before.splitlines()[0] == "[[7, 10], [15, 22]] matrix"
+    assert _run_python(out, tmp_path, "after.py") == before
+
+
+_ANNOTATION_HEADER = (
+    "import numpy as np\n"
+    "import numpy.typing as npt\n"
+    "from numty import F64, FlexArray\n"
+)
+_OVERRIDES = {
+    "*": "np.matrix makes `*` a matrix product",
+    "**": "np.matrix makes `**` a matrix power",
+    "/": "np.ma.MaskedArray masks nan results of `/` that np.divide keeps",
+}
+
+
+@pytest.mark.parametrize("op", list(_OVERRIDES))
+@pytest.mark.parametrize(
+    "body",
+    [
+        "def f(x: np.ndarray):\n    return x {op} x\n",
+        "def f(x: npt.NDArray[np.float64]):\n    return x {op} x\n",
+        # numty heads check only ndarray + dtype: a float64 np.matrix
+        # passes isinstance and narrow, so they are annotations too.
+        "def f(x: F64[2, 2]):\n    return x {op} x\n",
+        "def f(x: FlexArray[tuple[int], np.dtype[np.float64]]):\n"
+        "    return x {op} x\n",
+        "def f(v):\n    x: np.ndarray = v\n    return x {op} x\n",
+        "Arr = np.ndarray[tuple[int], np.dtype[np.float64]]\n"
+        "def f(x: Arr):\n    return x {op} x\n",
+        # One annotation-only binding is enough to keep the site.
+        "def f(x: np.ndarray, reset: bool):\n"
+        "    if reset:\n        x = np.zeros(3)\n    return x {op} x\n",
+        # A bare declaration with no other binding in this module: x is
+        # set from elsewhere, and only the annotation vouches for it.
+        "x: np.ndarray\ndef f():\n    return x {op} x\n",
+    ],
+    ids=[
+        "ndarray",
+        "NDArray",
+        "F64",
+        "FlexArray",
+        "annassign",
+        "alias",
+        "mixed",
+        "decl-only",
+    ],
+)
+def test_self_op_annotation_only_skips_subclass_ops(body: str, op: str) -> None:
+    src = _ANNOTATION_HEADER + body.format(op=op)
+    out, warnings = codemod_source(src, self_ops=True)
+    assert out == src
+    line = len(src.splitlines())
+    assert warnings == [
+        f"line {line}: self-ops skipped: x is only known to be an array from"
+        f" an annotation, which admits ndarray subclasses ({_OVERRIDES[op]})"
+    ]
+
+
+def test_self_op_subclass_evidence(tmp_path: Path) -> None:
+    # Why _OVERRIDES holds `*`, `**` and `/` but not `+` and `-`: each of
+    # the three differs from its ufunc on a subclass numpy ships, while
+    # `+` and `-` agree (values, mask, type) on all of them.
+    src = """import warnings
+import numpy as np
+warnings.simplefilter("ignore")
+mat = np.matrix([[1.0, 2.0], [3.0, 4.0]])
+masked = np.ma.array([-1.5, np.nan, 2.0], mask=[0, 0, 1])
+def same(a, b):
+    return (type(a) is type(b)
+        and np.ma.getmaskarray(a).tolist() == np.ma.getmaskarray(b).tolist()
+        and np.array_equal(np.ma.filled(a, 0), np.ma.filled(b, 0),
+                           equal_nan=a.dtype.kind == "f"))
+def raises(f, x):
+    try:
+        f(x, x)
+    except TypeError:
+        return True
+    return False
+print(same(mat * mat, np.multiply(mat, mat)))
+print(raises(lambda a, b: a ** b, mat), raises(np.power, mat))
+print(same(masked / masked, np.divide(masked, masked)))
+print(same(masked ** masked, np.power(masked, masked)))
+for x in (mat, masked, np.char.array(["a", "bc"]),
+          np.arange(3.0).view(np.recarray)):
+    print(same(x + x, np.add(x, x)), end=" ")
+    if x.dtype.kind == "f":
+        print(same(x - x, np.subtract(x, x)), end=" ")
+print()
+# inf - inf is nan: neither np.matrix nor MaskedArray masks it.
+for x in (np.matrix([[np.inf, -np.inf]]),
+          np.ma.array([np.inf, -np.inf, 1.0], mask=[0, 0, 1])):
+    print(same(x + x, np.add(x, x)), same(x - x, np.subtract(x, x)), end=" ")
+print()
+"""
+    assert _run_python(src, tmp_path, "evidence.py").splitlines() == [
+        "False",
+        "True False",
+        "False",
+        "False",
+        "True True True True True True True ",
+        "True True True True ",
+    ]
+
+
+def test_self_op_constructor_bindings_rewrite_every_op(tmp_path: Path) -> None:
+    # np.<constructor>(...) builds a base-class ndarray even from a
+    # subclass, so every operator is the ufunc there.
+    src = (
+        "import numpy as np\n"
+        "mat = np.matrix([[1.0, 2.0], [3.0, 4.0]])\n"
+        "a = np.asarray(mat)\n"
+        "b = np.array(np.ma.array([1.0, 0.0], mask=[0, 1]))\n"
+        "\n"
+        "def f():\n"
+        "    c: np.ndarray = np.ones((2, 2))\n"
+        "    c += 1\n"
+        "    return (c * c).tolist(), (c ** c).tolist(), (c / c).tolist()\n"
+        "\n"
+        "print((a * a).tolist(), (a ** a).tolist(), (a / a).tolist())\n"
+        "print((b / b).tolist(), type(b * b).__name__, f())\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True)
+    assert _non_reports(warnings) == []
+    assert not any("trusting" in w for w in warnings)
+    for rewritten in [
+        "return (np.multiply(c, c)).tolist(), (np.power(c, c)).tolist(),"
+        " (np.divide(c, c)).tolist()",
+        "print((np.multiply(a, a)).tolist(), (np.power(a, a)).tolist(),"
+        " (np.divide(a, a)).tolist())",
+        "print((np.divide(b, b)).tolist(), type(np.multiply(b, b)).__name__",
+    ]:
+        assert rewritten in out
+    before = _run_python(src, tmp_path, "before.py")
+    assert before.startswith("[[1.0, 4.0], [9.0, 16.0]]")
+    assert _run_python(out, tmp_path, "after.py") == before
+
+
+# Every _NP_CONSTRUCTORS entry fed np.matrix, a MaskedArray and a user
+# subclass overriding `*`, `/` and `**`. Most of them drop the subclass,
+# so every operator is the ufunc; np.linspace / logspace / geomspace keep
+# it unless their endpoints (and logspace's base) are numeric literals.
+_SUBCLASS_INPUTS = """import warnings
+import numpy as np
+warnings.simplefilter("ignore")
+
+
+class Sub(np.ndarray):
+    def __mul__(self, other):
+        return np.multiply(self, other) + 100
+
+    def __truediv__(self, other):
+        return np.divide(self, other) + 100
+
+    def __pow__(self, other):
+        return np.power(self, other) + 100
+
+
+def show(a):
+    x = {expr}
+    return [type(x).__name__, x * x, x ** x, x / x, x + x, x - x]
+
+
+for a in (
+    np.matrix([[0.0, 2.0]]),
+    np.ma.array([0.0, 1.0, 2.0], mask=[0, 0, 1]),
+    np.arange(0.0, 3.0).view(Sub),
+):
+    try:
+        print(show(a))
+    except Exception as e:
+        print(type(e).__name__)
+"""
+_SELF_OP_SITES = ["x * x", "x ** x", "x / x", "x + x", "x - x"]
+_SELF_OP_CALLS = [
+    "np.multiply(x, x)",
+    "np.power(x, x)",
+    "np.divide(x, x)",
+    "np.add(x, x)",
+    "np.subtract(x, x)",
+]
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "np.array(a)",
+        "np.asarray(a)",
+        "np.ascontiguousarray(a)",
+        "np.asfortranarray(a)",
+        "np.full(np.shape(a), a)",
+        "np.zeros(np.shape(a))",
+        "np.ones(np.shape(a))",
+        "np.empty((np.size(a), 0))",
+        "np.arange(np.size(a))",
+        "np.eye(np.size(a))",
+        "np.identity(np.size(a))",
+        "np.linspace(-1, 2.5, np.size(a))",
+        "np.logspace(0, -1, 3, base=2)",
+        "np.logspace(start=1, stop=+2, num=np.size(a))",
+        "np.geomspace(1, 1e3, 4)",
+    ],
+)
+def test_self_op_base_class_constructors_rewrite(tmp_path: Path, expr: str) -> None:
+    src = _SUBCLASS_INPUTS.replace("{expr}", expr)
+    out, warnings = codemod_source(src, self_ops=True)
+    assert warnings == [
+        f"line 19: self-ops rewrote to {call}" for call in _SELF_OP_CALLS
+    ]
+    before = _run_python(src, tmp_path, "before.py")
+    assert _run_python(out, tmp_path, "after.py") == before
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "np.linspace(a, 2 * a, 2)",
+        "np.linspace(0, a, 2)",
+        "np.linspace(start=a, stop=1.0, num=2)",
+        "np.logspace(a, 2 * a, 2)",
+        "np.logspace(0, 1, 2, True, a)",
+        "np.logspace(0, 1, 2, base=a)",
+        "np.geomspace(a + 1, 2 * a + 1, 2)",
+    ],
+)
+def test_self_op_spaced_keep_subclass(tmp_path: Path, expr: str) -> None:
+    src = _SUBCLASS_INPUTS.replace("{expr}", expr)
+    out, warnings = codemod_source(src, self_ops=True)
+    fn = expr.split("(")[0]
+    vouch = (
+        f"x is only known to be an array from {fn}(...) on non-literal"
+        " arguments, which keeps their ndarray subclass"
+    )
+    trusted = f"(trusting the {fn} arguments of x)"
+    assert warnings == [
+        f"line 19: self-ops skipped: {vouch} ({_OVERRIDES[op]})"
+        for op in ("*", "**", "/")
+    ] + [
+        f"line 19: self-ops rewrote to {call} {trusted}"
+        for call in _SELF_OP_CALLS[3:]
+    ]
+    before = _run_python(src, tmp_path, "before.py")
+    assert _run_python(out, tmp_path, "after.py") == before
+    # The skips are what keep it: rewriting every site changes the output.
+    naive = src
+    for site, call in zip(_SELF_OP_SITES, _SELF_OP_CALLS):
+        naive = naive.replace(site, call)
+    assert _run_python(naive, tmp_path, "naive.py") != before
+
+
+def test_self_op_bare_declaration_defers_to_value() -> None:
+    # `x: T` binds nothing, so x holds what its assignments build; an
+    # annotation with a value is ignored when the value is a constructor
+    # call, whatever the annotation says (intended: the value decides).
+    src = (
+        "from typing import Any\n"
+        "import numpy as np\n"
+        "\n"
+        "def f():\n"
+        "    x: np.ndarray\n"
+        "    x = np.zeros(3)\n"
+        "    return x * x\n"
+        "\n"
+        "def g():\n"
+        "    y: Any = np.zeros(3)\n"
+        "    return y / y\n"
+        "\n"
+        "def h():\n"
+        "    z: list[int]\n"
+        "    z = np.ones(2)\n"
+        "    return z ** z\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True)
+    assert warnings == [
+        "line 7: self-ops rewrote to np.multiply(x, x)",
+        "line 11: self-ops rewrote to np.divide(y, y)",
+        "line 16: self-ops rewrote to np.power(z, z)",
+    ]
+    assert out.count("np.") == src.count("np.") + 3
+
+
+def test_self_op_annotated_spaced_value() -> None:
+    # The value, not the annotation, decides: literal endpoints build a
+    # base-class ndarray, others may keep the endpoints' subclass.
+    src = (
+        "import numpy as np\n"
+        "\n"
+        "def f(n: int, lo: np.ndarray):\n"
+        "    x: np.ndarray = np.linspace(-1, 1, n)\n"
+        "    y: np.ndarray = np.geomspace(lo, 1.0)\n"
+        "    return x * x, y * y\n"
+    )
+    out, warnings = codemod_source(src, self_ops=True)
+    assert warnings == [
+        "line 6: self-ops rewrote to np.multiply(x, x)",
+        "line 6: self-ops skipped: y is only known to be an array from"
+        " np.geomspace(...) on non-literal arguments, which keeps their"
+        f" ndarray subclass ({_OVERRIDES['*']})",
+    ]
+    assert "return np.multiply(x, x), y * y" in out
