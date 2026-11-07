@@ -786,8 +786,15 @@ rank.py:13: error: Argument 1 to "act" has incompatible type "ndarray[tuple[N, A
 rank.py:13: note: "act" declares parameter "action" with shape (A,); the argument has shape (N, A) (rank 2, not 1)
 ```
 
+mypy's error line still says `Never`; the names are in the note only.
+An argument dim numty knows only as a plain `int` (say from
+`np.zeros((n, 3))`) prints as `int` there: `(int, 3)`.
+
 The note carries the same `arg-type` code, so `# type: ignore[arg-type]`
-or `disable_error_code = arg-type` silences both.
+or `disable_error_code = arg-type` silences both. It is added only to
+explicit calls with plain arguments: not to `*args`/`**kwargs` actuals,
+and not to operators, indexing or `in`, which mypy reports under
+`operator`, `index` or `assignment` instead.
 
 ## How it works
 
