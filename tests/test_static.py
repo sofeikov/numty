@@ -617,7 +617,7 @@ def test_storage_head_dtype_mismatch() -> None:
 def test_mixed_builders_keep_literals() -> None:
     # #34: one dynamic dim no longer erases the literal ones, so a stored
     # builder result fits a field pinned to 2 / 23. Ops that would move
-    # the literal to the wrong axis widen it instead.
+    # the literal to the wrong axis widen it to unknown (Any) instead.
     result = run_mypy(FIXTURES / "mixed_builders_ok.py")
     assert result.returncode == 0, result.stdout
     notes = [
@@ -626,7 +626,7 @@ def test_mixed_builders_keep_literals() -> None:
         if "Revealed type" in line
     ]
     mixed3 = '"numpy.ndarray[tuple[int, Literal[3]], numpy.dtype[numpy.float64]]"'
-    widened = '"numpy.ndarray[tuple[int, int], numpy.dtype[numpy.float64]]"'
+    widened = '"numpy.ndarray[tuple[int, Any], numpy.dtype[numpy.float64]]"'
     assert notes == [
         '"numpy.ndarray[tuple[Literal[0], int, Literal[23], Literal[2]],'
         ' numpy.dtype[numpy.float64]]"',
@@ -639,7 +639,8 @@ def test_mixed_builders_keep_literals() -> None:
         ' numpy.dtype[numpy.signedinteger[_64Bit]]]"',
         # A dim read from .shape stays symbolic (this crashed before).
         '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.float64]]"',
-        widened,  # nothing provable: the stubs' answer
+        # nothing provable: the stubs' answer
+        '"numpy.ndarray[tuple[int, int], numpy.dtype[numpy.float64]]"',
         mixed3,  # a * 2
         '"numpy.ndarray[tuple[int, Literal[3]],'
         ' numpy.dtype[numpy.floating[_32Bit]]]"',
@@ -657,6 +658,25 @@ def test_mixed_builders_keep_literals() -> None:
     )
     assert run.returncode == 0, run.stderr
     assert run.stdout.strip().splitlines() == ["(4, 7, 2) (4, 7, 23)"]
+
+
+def test_mixed_widened_results_fit_literal_types() -> None:
+    # Widened dims are unknown, not int: diff/pad/clip of a mixed array
+    # still return or rebind as the input's tuple[int, Literal[3]] type.
+    result = run_mypy(FIXTURES / "mixed_widen_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert _run_fixture("mixed_widen_ok.py") == [
+        "(4, 3) (3, 3) (6, 3)",
+        "(4, 3, 3, 3, 6, 5)",
+    ]
+
+
+def test_recursive_alias_operands_do_not_crash() -> None:
+    # The mixed-shape guard walked recursive aliases forever
+    # (RecursionError, an INTERNAL ERROR) on any numpy call.
+    result = run_mypy(FIXTURES / "recursive_alias_ok.py")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _run_fixture("recursive_alias_ok.py") == ["False True"]
 
 
 def test_mixed_builder_literal_conflict() -> None:

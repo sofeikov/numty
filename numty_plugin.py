@@ -114,6 +114,7 @@ from mypy.types import (
     RawExpressionType,
     TupleType,
     Type,
+    TypeAliasType,
     TypeOfAny,
     TypeVarId,
     TypeVarLikeType,
@@ -1584,18 +1585,34 @@ def _builder_shape(
     return out
 
 
-def _ndarrays_in(tp: Type) -> Iterator[Instance]:
-    """Every ndarray type in tp, through unions, tuples and generics."""
+def _ndarrays_in(tp: Type, seen: set[TypeAliasType] | None = None) -> Iterator[Instance]:
+    """Every ndarray type in tp, through unions, tuples and generics.
+
+    A recursive alias (JSON = dict[str, "JSON"] | list["JSON"] | int) is
+    walked once: seen holds the ones already being expanded.
+    """
+    if isinstance(tp, TypeAliasType) and tp.is_recursive:
+        seen = set() if seen is None else seen
+        if tp in seen:
+            return
+        seen.add(tp)
     proper = get_proper_type(tp)
     if isinstance(proper, (UnionType, TupleType)):
         for item in proper.items:
-            yield from _ndarrays_in(item)
+            yield from _ndarrays_in(item, seen)
     elif isinstance(proper, Instance):
         if proper.type.fullname == NDARRAY_FULLNAME:
             yield proper
         else:
             for arg in proper.args:
-                yield from _ndarrays_in(arg)
+                yield from _ndarrays_in(arg, seen)
+
+
+def _has_literal_dim(arr: Instance) -> bool:
+    shape = get_proper_type(arr.args[0]) if arr.args else None
+    return isinstance(shape, TupleType) and any(
+        isinstance(get_proper_type(i), LiteralType) for i in shape.items
+    )
 
 
 def _is_mixed_shape(arr: Instance) -> bool:
@@ -1640,7 +1657,16 @@ def _mixed_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
 
 
 def _widen_literal_dims(tp: Type) -> Type:
-    """tp with every Literal dim of its ndarray shapes widened to int."""
+    """tp with every Literal dim of its ndarray shapes made unknown (Any).
+
+    Any rather than int: a widened dim must still fit wherever the
+    literal was expected (np.diff(x, axis=0) returned as x's
+    tuple[int, Literal[3]] type), since unknown is not an error. A
+    recursive alias is left as is: it cannot be rebuilt widened, and
+    expanding it would not terminate.
+    """
+    if isinstance(tp, TypeAliasType) and tp.is_recursive:
+        return tp
     proper = get_proper_type(tp)
     if isinstance(proper, UnionType):
         return UnionType.make_union([_widen_literal_dims(i) for i in proper.items])
@@ -1652,7 +1678,7 @@ def _widen_literal_dims(tp: Type) -> Type:
         shape = get_proper_type(proper.args[0])
         if isinstance(shape, TupleType):
             items = [
-                i.fallback if isinstance(i, LiteralType) else i
+                AnyType(TypeOfAny.explicit) if isinstance(i, LiteralType) else i
                 for i in map(get_proper_type, shape.items)
             ]
             shape = shape.copy_modified(items=items)
@@ -1693,15 +1719,18 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
     resize axes (.T, pad, rot90, rfft, split, swapaxes, diff, keepdims
     reductions, ...): the 3 would sit on the wrong axis. Unless the op
     keeps its one array operand's shape (_SHAPE_KEEPERS, *_like without
-    shape=), the stubs' answer widens its Literal dims to int, which is
-    what those ops gave builder results before they kept literals (#34).
+    shape=), the stubs' answer widens its Literal dims to unknown (Any;
+    see _widen_literal_dims). Builder results got int dims there before
+    they kept literals (#34); Any accepts everything int did.
     """
     if hook is None and not fullname.startswith("numpy."):
         return None
     short = fullname.rsplit(".", 1)[-1]
     keeper = short in _SHAPE_KEEPERS
     # zeros_like & co keep the prototype's shape unless shape= replaces
-    # it; view() keeps it unless a dtype of another width is named.
+    # it. view() counts as keeping only with no argument at all: a dtype
+    # (or type) argument may change the last dim's width, and its width
+    # is not compared here.
     like = short in ("zeros_like", "ones_like", "empty_like", "full_like")
 
     def keeps(ctx: FunctionContext | MethodContext | AttributeContext) -> bool:
@@ -1720,7 +1749,11 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
             if isinstance(ctx, MethodContext):
                 operands.append(ctx.type)
         result = hook(ctx) if hook is not None else default
-        if result is not default:
+        # Only a stub answer holding a Literal dim can be widened, so most
+        # calls (np.isscalar, .shape, scalar reductions) skip the operands.
+        if result is not default or not any(
+            _has_literal_dim(a) for a in _ndarrays_in(default)
+        ):
             return result
         arrays = [a for t in operands for a in _ndarrays_in(t)]
         if not any(_is_mixed_shape(a) for a in arrays):

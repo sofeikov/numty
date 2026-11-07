@@ -881,8 +881,14 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   `int` dims, so ops on such an array (or on one annotated that way) use
   numpy's stubs. Shape-keeping ones (arithmetic, `astype`, `copy`,
   `flip`, sorts along an axis, ...) keep the literal, and transposes move
-  it with its axis. For the rest it widens to `int`, because the stubs
-  would leave it on the wrong axis after `swapaxes`, `pad` or `diff`. Written
+  it with its axis. For the rest it becomes unknown (`Any`), because the
+  stubs would leave it on the wrong axis after `swapaxes`, `pad` or
+  `diff`; unknown still fits where the literal was expected, so
+  `x = np.diff(x, axis=0)` keeps type checking. Later stub ops on such a
+  result may answer `ndarray[Any, Any]`. Since a transpose moves the
+  literal, rebinding a name to its own transpose (`e = np.zeros((n, 3))`
+  then `e = e.T`) is an assignment error, as it already was for
+  all-literal shapes: bind the transpose to a new name. Written
   inline as an argument whose expected literal differs, a builder falls
   through to numpy's catch-all overload and goes unchecked, as before.
   Assign it to a name first to have it checked.
