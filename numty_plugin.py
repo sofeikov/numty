@@ -61,17 +61,21 @@ from collections.abc import Callable, Iterator
 from functools import partial
 from typing import NamedTuple, cast
 
-from mypy.errorcodes import MISC, ErrorCode
+from mypy.errorcodes import ARG_TYPE, MISC, ErrorCode
 from mypy.nodes import (
     ARG_NAMED,
+    ARG_NAMED_OPT,
     ARG_OPT,
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
     AssignmentStmt,
     CallExpr,
+    Context,
+    Decorator,
     EllipsisExpr,
     Expression,
+    FuncDef,
     GeneratorExpr,
     IntExpr,
     ListComprehension,
@@ -91,12 +95,15 @@ from mypy.nodes import (
     UnaryExpr,
     Var,
 )
+from mypy.messages import callable_name
+from mypy.operators import op_methods_to_symbols
 from mypy.plugin import (
     AnalyzeTypeContext,
     AttributeContext,
     FunctionContext,
     FunctionSigContext,
     MethodContext,
+    MethodSigContext,
     Plugin,
 )
 from mypy.typeanal import TypeAnalyser
@@ -210,9 +217,87 @@ class NumtyPlugin(Plugin):
 
     def callsite_signature_hook(self, ctx: FunctionSigContext) -> Type:
         try:
-            return self._callsite_check(ctx)
+            sig = self._callsite_check(ctx)
         except Exception:
             return ctx.default_signature
+        _note_rank_mismatches(ctx, sig)
+        return sig
+
+    def get_method_signature_hook(
+        self, fullname: str
+    ) -> Callable[[MethodSigContext], Type] | None:
+        # Methods only get the rank-mismatch notes; the call-site conflict
+        # check stays function-only.
+        if fullname.startswith("numpy.") or fullname.startswith("numty."):
+            return None
+        # A hook here would make every method call in the program (list,
+        # dict and str ones included) walk the plugin chain and scan its
+        # arguments. A method none of whose parameters is declared with an
+        # ndarray can never get a note, so leave it unhooked: mypy then
+        # asks the later plugins itself.
+        if not self._method_may_take_array(fullname):
+            return None
+        return partial(self.method_signature_hook, fullname)
+
+    def _method_may_take_array(self, fullname: str) -> bool:
+        """False when `fullname`'s declared parameters mention no ndarray.
+
+        A cheap, conservative look at the declaration: anything it cannot
+        resolve counts as possibly taking an array.
+        """
+        class_name, _, method = fullname.rpartition(".")
+        if method in _OPERATOR_DUNDERS:
+            return False  # never noted, see _rank_mismatch_notes
+        try:
+            sym = self.lookup_fully_qualified(class_name)
+        except Exception:
+            return True
+        if sym is None or not isinstance(sym.node, TypeInfo):
+            return True
+        member = sym.node.get(method)
+        if member is None:
+            return True
+        node = member.node
+        if isinstance(node, Decorator):
+            node = node.var
+        tp = get_proper_type(getattr(node, "type", None))
+        if tp is None and isinstance(node, FuncDef):
+            return False  # unannotated: every parameter is Any
+        if isinstance(tp, CallableType):
+            items = [tp]
+        elif isinstance(tp, Overloaded):
+            items = tp.items
+        else:
+            return True
+        return any(_mentions_ndarray(arg) for item in items for arg in item.arg_types)
+
+    def method_signature_hook(self, fullname: str, ctx: MethodSigContext) -> Type:
+        # This hook covers every method, so first run whatever a later
+        # plugin (mypy's default one included) would have hooked here.
+        sig: Type = ctx.default_signature
+        hook = self._later_plugin_hook(ctx, "get_method_signature_hook", fullname)
+        if hook is not None:
+            sig = hook(ctx)
+        _note_rank_mismatches(ctx, sig)
+        return sig
+
+    def _later_plugin_hook(
+        self, ctx: MethodSigContext, getter: str, fullname: str
+    ) -> Callable[[MethodSigContext], Type] | None:
+        """The hook the plugins after this one return for `fullname`.
+
+        mypy asks plugins in order and takes the first hook, so a
+        catch-all hook here would hide theirs. Reaches through the
+        checker's ChainedPlugin (`_plugins`; pinned with mypy).
+        """
+        chain = getattr(getattr(ctx.api, "plugin", None), "_plugins", None)
+        if not isinstance(chain, list) or self not in chain:
+            return None
+        for plugin in chain[chain.index(self) + 1 :]:
+            hook = getattr(plugin, getter)(fullname)
+            if hook is not None:
+                return hook
+        return None
 
     def _callsite_check(self, ctx: FunctionSigContext) -> Type:
         sig = ctx.default_signature
@@ -1446,6 +1531,175 @@ def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, Ty
         if positions:
             out.append((i, positions))
     return out
+
+
+def _fixed_shape(tp: Type) -> TupleType | None:
+    """The shape tuple of an ndarray type of fixed rank (no *Ts), else None."""
+    proper = get_proper_type(tp)
+    if (
+        not isinstance(proper, Instance)
+        or proper.type.fullname != NDARRAY_FULLNAME
+        or len(proper.args) != 2
+    ):
+        return None
+    shape = get_proper_type(proper.args[0])
+    if not isinstance(shape, TupleType):
+        return None
+    if any(isinstance(get_proper_type(i), UnpackType) for i in shape.items):
+        return None
+    return shape
+
+
+def _shape_note_str(shape: TupleType) -> str:
+    """Shape for notes: declared names, literals, and plain `int` dims."""
+    parts: list[str] = []
+    for item in shape.items:
+        value = _dim_value(item)
+        if value is not None:
+            parts.append(_dim_str(value))
+        else:
+            proper = get_proper_type(item)
+            parts.append(proper.type.name if isinstance(proper, Instance) else "?")
+    inner = ", ".join(parts)
+    return f"({inner},)" if len(parts) == 1 else f"({inner})"
+
+
+def _rank_mismatch_notes(
+    ctx: FunctionSigContext | MethodSigContext, sig: CallableType
+) -> list[tuple[str, Context]]:
+    """Notes naming the declared shape for each wrong-rank array argument.
+
+    A shape tuple of another length gives mypy's inference no
+    constraints, so a dim TypeVar seen only there solves to Never and
+    the arg-type error reads `expected "ndarray[tuple[Never], ...]"`
+    (#35). mypy's error stands; the note says what the parameter
+    declares (`(A,)`) next to what was passed. Only formals that are
+    fixed-rank arrays with a dim TypeVar qualify (union members too,
+    when every non-None member misses the actual's rank), and only
+    actuals of known rank, so the note only lands on a call that the
+    rank alone already rejects. Overload items are left out: there
+    the error is "No overload variant", not per argument.
+    """
+    # Overload items reach this as @overload Decorators (or FuncDefs).
+    if getattr(sig.definition, "is_overload", False):
+        return []
+    if len(ctx.args) != len(sig.arg_types):
+        return []
+    # Only explicit calls: an operator, index or `in` reaches its dunder
+    # through this hook too, but mypy reports those under other codes
+    # ([operator], [index], [assignment]), which the note's arg-type would
+    # not match. Explicit `x.__add__(y)` calls get the operator wording too.
+    call = ctx.context
+    if not isinstance(call, CallExpr):
+        return []
+    callee = callable_name(sig)
+    if callee is None or _reported_as_operator(callee):
+        return []
+    notes: list[tuple[str, Context]] = []
+    for i, (formal, kind) in enumerate(zip(sig.arg_types, sig.arg_kinds)):
+        if kind not in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT):
+            continue
+        if len(ctx.args[i]) != 1:
+            continue
+        # Only plain positional or keyword actuals: a *args/**kwargs
+        # actual spreads its elements, it is not the array itself.
+        arg_index = next(
+            (j for j, e in enumerate(call.args) if e is ctx.args[i][0]), None
+        )
+        if arg_index is None or call.arg_kinds[arg_index] not in (ARG_POS, ARG_NAMED):
+            continue
+        proper = get_proper_type(formal)
+        members = proper.relevant_items() if isinstance(proper, UnionType) else [proper]
+        members = [m for m in members if not isinstance(get_proper_type(m), NoneType)]
+        shapes = [_fixed_shape(m) for m in members]
+        if not shapes or any(s is None for s in shapes):
+            continue
+        declared = [s for s in shapes if s is not None]
+        if not any(
+            isinstance(get_proper_type(d), TypeVarType) for s in declared for d in s.items
+        ):
+            continue
+        actual = _fixed_shape(ctx.api.get_expression_type(ctx.args[i][0]))
+        if actual is None or any(len(s.items) == len(actual.items) for s in declared):
+            continue
+        name = sig.arg_names[i]
+        param = f'parameter "{name}"' if name else f"parameter {i + 1}"
+        wanted = " or ".join(_shape_note_str(s) for s in declared)
+        ranks = f"rank {len(actual.items)}"
+        if len(declared) == 1:
+            ranks += f", not {len(declared[0].items)}"
+        notes.append(
+            (
+                f"{callee} declares {param} with shape {wanted}; "
+                f"the argument has shape {_shape_note_str(actual)} ({ranks})",
+                ctx.args[i][0],
+            )
+        )
+    return notes
+
+
+# Methods whose bad arguments mypy words as operator/index errors, even
+# when called explicitly (MessageBuilder.incompatible_argument): those
+# carry [index], [assignment] or [operator], never arg-type.
+_OPERATOR_DUNDERS = frozenset(
+    ["__getitem__", "__setitem__"]
+    + [m for op in op_methods_to_symbols for m in (op, "__r" + op[2:])]
+)
+
+
+def _reported_as_operator(callee: str) -> bool:
+    """Whether `callee` (callable_name text) is a method in _OPERATOR_DUNDERS."""
+    return any(callee.startswith(f'"{m}" of') for m in _OPERATOR_DUNDERS)
+
+
+def _mentions_ndarray(tp: Type, depth: int = 0) -> bool:
+    """Whether `tp` mentions numpy.ndarray (True when nested too deep to tell).
+
+    Hand-rolled: mypy's TypeQuery visitors are compiled classes, which a
+    plugin cannot subclass.
+    """
+    if depth > 8:
+        return True
+    proper = get_proper_type(tp)
+    if isinstance(proper, Instance):
+        if proper.type.fullname == NDARRAY_FULLNAME:
+            return True
+        parts: list[Type] = list(proper.args)
+    elif isinstance(proper, (UnionType, TupleType)):
+        parts = list(proper.items)
+    elif isinstance(proper, CallableType):
+        parts = [*proper.arg_types, proper.ret_type]
+    elif isinstance(proper, UnpackType):
+        parts = [proper.type]
+    else:
+        return False
+    return any(_mentions_ndarray(part, depth + 1) for part in parts)
+
+
+def _note_rank_mismatches(ctx: FunctionSigContext | MethodSigContext, sig: Type) -> None:
+    """Emit _rank_mismatch_notes, each printed after mypy's arg-type error.
+
+    Signature hooks run before mypy checks the arguments, and messages
+    at one position keep emission order, so each note goes on the
+    argument's first line but past its first column (at its end when
+    it fits on that line): mypy sorts it after the error, which sits at
+    the argument's start (another note at that argument, such as a
+    reveal_type, can still print between them). The note shares that
+    error's code, so `ignore[arg-type]` and `--disable-error-code
+    arg-type` silence both.
+    """
+    try:
+        if not isinstance(sig, CallableType):
+            return
+        for message, arg in _rank_mismatch_notes(ctx, sig):
+            where = Context()
+            if arg.end_line == arg.line and arg.end_column is not None:
+                where.set_line(arg.line, arg.end_column)
+            else:
+                where.set_line(arg.line, arg.column + 1)
+            ctx.api.note(message, where, code=ARG_TYPE)
+    except Exception:
+        return
 
 
 def _ndarray_type(

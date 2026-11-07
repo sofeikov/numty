@@ -604,6 +604,72 @@ def test_f64_callsite_same_argument_names_axes() -> None:
     assert _run_fixture("bad_callsite_same_arg.py") == ["(4,)"]
 
 
+def test_rank_mismatch_note_names_declared_dims() -> None:
+    # #35: a wrong-rank argument leaves the parameter's dim TypeVars
+    # unsolved, so mypy's own error prints them as Never. That error is
+    # kept as is; a note under it names the declared dims.
+    result = run_mypy(FIXTURES / "bad_rank_dim_names.py")
+    assert result.returncode == 1, result.stdout
+    lines = [line.split(":", 1)[1] for line in result.stdout.splitlines()[:-1]]
+    errors = [line for line in lines if ": error:" in line]
+    assert len(errors) == 8, result.stdout
+    assert all(line.endswith("  [arg-type]") for line in errors), result.stdout
+    assert 'expected "ndarray[tuple[Never], dtype[floating[_32Bit]]]"' in errors[0]
+    assert [line for line in lines if ": note:" in line] == [
+        '25: note: "act" declares parameter "action" with shape (A,);'
+        " the argument has shape (N, A) (rank 2, not 1)",
+        '26: note: "act" declares parameter "action" with shape (A,);'
+        " the argument has shape (N, A) (rank 2, not 1)",
+        '27: note: "act" of "Policy" declares parameter "action" with shape (A,);'
+        " the argument has shape (N, A) (rank 2, not 1)",
+        '28: note: "head" declares parameter "x" with shape (3, K);'
+        " the argument has shape (4,) (rank 1, not 2)",
+        '29: note: "spec" declares parameter "x" with shape (rows, cols);'
+        " the argument has shape (4,) (rank 1, not 2)",
+        '30: note: "maybe" declares parameter "x" with shape (A,);'
+        " the argument has shape (N, A) (rank 2, not 1)",
+    ], result.stdout
+    # Each note prints right under the error it explains.
+    for i, line in enumerate(lines):
+        if ": note:" in line:
+            assert lines[i - 1].split(":")[0] == line.split(":")[0], result.stdout
+            assert ": error:" in lines[i - 1], result.stdout
+    # Same-rank literal mismatch: mypy already names Literal[3], no note.
+    assert errors[-2].startswith("31: error:"), result.stdout
+    assert 'expected "ndarray[tuple[Literal[3]]' in errors[-2], result.stdout
+    # A Callable-typed callee has no name, and mypy prints tuple[A]: no note.
+    assert errors[-1].startswith("33: error:"), result.stdout
+    assert 'expected "ndarray[tuple[A]' in errors[-1], result.stdout
+
+
+def test_rank_mismatch_note_follows_arg_type_ignores() -> None:
+    # The note carries arg-type, so silencing the error silences it too.
+    result = run_mypy(
+        FIXTURES / "bad_rank_dim_names.py", flags=("--disable-error-code", "arg-type")
+    )
+    assert result.returncode == 0, result.stdout
+    assert "note:" not in result.stdout, result.stdout
+
+
+def test_rank_mismatch_note_skips_star_args_and_operators() -> None:
+    # Only explicit calls with plain arguments get the note: a *pair
+    # actual is not the array passed, and operators, indexing and `in`
+    # report under [operator]/[index]/[assignment], whose ignores and
+    # disables the note's arg-type would escape.
+    fixture = FIXTURES / "rank_dim_names_ok.py"
+    for flags in (
+        ("--warn-unused-ignores",),
+        tuple(
+            arg
+            for code in ("operator", "index", "assignment")
+            for arg in ("--disable-error-code", code)
+        ),
+    ):
+        result = run_mypy(fixture, flags=flags)
+        assert result.returncode == 0, result.stdout
+        assert result.stdout == "Success: no issues found in 1 source file\n", result.stdout
+
+
 def test_f64_return_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_return.py"),
