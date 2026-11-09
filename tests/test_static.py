@@ -726,6 +726,59 @@ def test_storage_head_dtype_mismatch() -> None:
     )
 
 
+def test_pad_time_kernel_clean_and_runs() -> None:
+    # #33: a leading dim plus Unpack[Ts] in a head needs no type: ignore,
+    # (n, target, *frames.shape[1:]) builds (int, int, *Ts) past numpy's
+    # shape bound, `int` names the runtime counts, and the kernel runs on
+    # 2-D and 3-D frames.
+    result = run_mypy(FIXTURES / "pad_time_ok.py", flags=("--warn-unused-ignores",))
+    assert result.returncode == 0, result.stdout
+    assert "# type: ignore" not in (FIXTURES / "pad_time_ok.py").read_text()
+    assert _run_fixture("pad_time_ok.py") == [
+        "(2, 4, 2) (2, 4, 3, 2)",
+        "[0.0, 0.0, 2.0, 4.0] [8.0, 10.0, 12.0, 14.0]",
+        "(2, 3, 2)",
+    ]
+
+
+def test_pad_time_kernel_keeps_time_axis() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_pad_time_axis.py"),
+        "Incompatible return value",
+        "tuple[int, int, total, *Ts]",
+        "tuple[int, int, *Ts]",
+    )
+
+
+def test_pad_time_kernel_swapped_frame_axes() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_pad_time_swap.py"),
+        "tuple[Literal[8], Literal[3], Literal[2]]",
+        "tuple[Literal[8], Literal[2], Literal[3]]",
+    )
+
+
+def test_gather_over_ts_prefix_solves() -> None:
+    # A lone integer array on the known prefix of (total, *Ts) gathers in
+    # place, so the wrong leading dim is caught instead of going Any.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_gather_ts.py"),
+        "Incompatible return value",
+        "tuple[K, *Ts]",
+        "tuple[total, *Ts]",
+    )
+
+
+def test_mask_over_ts_prefix_counts_once() -> None:
+    # A k-d mask consumes k prefix axes for one data-dependent count.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mask_ts.py"),
+        "Incompatible return value",
+        "tuple[?U@12, *Ts]",
+        "tuple[N, *Ts]",
+    )
+
+
 def test_mixed_builders_keep_literals() -> None:
     # #34: one dynamic dim no longer erases the literal ones, so a stored
     # builder result fits a field pinned to 2 / 23. Ops that would move

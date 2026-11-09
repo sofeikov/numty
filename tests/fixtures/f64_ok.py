@@ -32,7 +32,7 @@ def masked(a: F64[batch, features], keep: Bool[batch, features]) -> F64[batch, f
     return np.where(keep, a, 0.0)
 
 
-def ident(a: F64[Unpack[Ts]]) -> F64[Unpack[Ts]]:  # type: ignore[type-var]
+def ident(a: F64[Unpack[Ts]]) -> F64[Unpack[Ts]]:
     return a
 
 

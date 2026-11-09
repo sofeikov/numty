@@ -425,10 +425,22 @@ class NumtyPlugin(Plugin):
             return AnyType(TypeOfAny.from_error)
         line, column = ctx.context.line, ctx.context.column
         int_inst = ctx.api.named_type("builtins.int", [], line, column)
+        int_tuple = ctx.api.named_type("builtins.tuple", [int_inst], line, column)
         items: list[Type] = []
         for d in dims:
             if isinstance(d, int):
                 items.append(LiteralType(d, int_inst, line, column))
+            elif isinstance(d, UnpackType) and isinstance(
+                get_proper_type(d.type), TypeVarTupleType
+            ):
+                # A TypeVarTuple is bounded at tuple[object, ...], so
+                # numpy's tuple[int, ...] shape bound rejects any shape
+                # holding it (and every builder fed a slice of it, e.g.
+                # np.zeros((n, *x.shape[1:]))). In a shape every member
+                # is an int, so say so on this occurrence: same id, so
+                # binding, inference and identity are unchanged.
+                tvt = cast(TypeVarTupleType, get_proper_type(d.type))
+                items.append(UnpackType(tvt.copy_modified(upper_bound=int_tuple)))
             else:
                 items.append(d)
         shape = TupleType(
@@ -681,6 +693,15 @@ class NumtyPlugin(Plugin):
             return analyzed
         if isinstance(analyzed, TypeVarTupleType):
             return UnpackType(analyzed)
+        if (
+            isinstance(analyzed, Instance)
+            and analyzed.type.fullname == INT_FULLNAME
+            and not analyzed.args
+        ):
+            # A runtime size nothing can name (F32[int, int, Unpack[Ts]]
+            # for a gather over runtime counts): the same plain int dim a
+            # builder fed a runtime value produces, never solved or unified.
+            return analyzed
         if isinstance(analyzed, AnyType):
             if analyzed.type_of_any == TypeOfAny.from_error:
                 raise _FamBail
@@ -6831,6 +6852,22 @@ def _consume_prefix(
         if i >= len(prefix):
             # Reaches into *Ts: the dim is unknowable, so bail out.
             return None
+        if item[0] in ("fancy", "mask"):
+            # The caller admits only a lone advanced index, which stays
+            # in place: a gather over the known prefix keeps *Ts and the
+            # rest untouched. A k-d mask consumes k prefix axes for one
+            # data-dependent count; one reaching into *Ts bails like any
+            # other index.
+            if item[0] == "fancy":
+                out.extend(item[1])
+                i += 1
+                continue
+            rank = item[1]
+            if rank == 0 or i + rank > len(prefix):
+                return None
+            out.append(_fresh_unknown(ctx, "mask", i))
+            i += rank
+            continue
         frag = _consume_one(ctx, item, prefix[i], str(i), shape_repr)
         if frag is None:
             return None
@@ -6883,8 +6920,11 @@ def _solve_getitem_unpack(
     An ellipsis aligns the index with the unknown middle; without one,
     leading items consume the known prefix (a `None` inserts 1 in
     place, exactly like the fixed-rank path) and the unknown block plus
-    the suffix pass through. Anything reaching into *Ts bails out, as
-    do fancy indices, which need concrete ranks to place.
+    the suffix pass through. Anything reaching into *Ts bails out. A
+    lone integer array or boolean mask on the known prefix gathers in
+    place (`frames[idx]` on (total, *Ts) is (K, *Ts)); several advanced
+    indices, an integer beside one, or one on the suffix bails, since
+    numpy may move their block to the front.
     """
     pairs = _index_pairs(ctx, pair)
     if pairs is None:
@@ -6898,6 +6938,14 @@ def _solve_getitem_unpack(
             ctx.context,
             code=NUMTY_AXIS,
         )
+        return ctx.default_return_type
+    if any(item[0] in ("fancy", "mask") for item in items) and (
+        sum(1 for item in items if item[0] in ("fancy", "mask", "int", "int_any", "fancy0d"))
+        > 1
+    ):
+        # Beside an array index numpy treats integers as advanced indices
+        # too, and a block split by a slice or ellipsis moves to the
+        # front: only a lone array index has a place we can name.
         return ctx.default_return_type
     positions = [n for n, item in enumerate(items) if item[0] == "ellipsis"]
     if not positions:
