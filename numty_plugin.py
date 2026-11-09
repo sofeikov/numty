@@ -822,6 +822,11 @@ class NumtyPlugin(Plugin):
         # T lives on the shared _ArrayOrScalarCommon base in the stubs.
         if fullname == "numpy._ArrayOrScalarCommon.T":
             return t_attribute_hook
+        if fullname in {
+            "numpy.ndarray.mT",
+            "numpy._ArrayOrScalarCommon.mT",
+        }:
+            return mt_attribute_hook
         return None
 
     def _method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
@@ -939,6 +944,8 @@ class NumtyPlugin(Plugin):
             return cumsum_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "take":
             return take_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "swapaxes":
+            return swapaxes_method_hook
         return None
 
 
@@ -6509,6 +6516,442 @@ def transpose_function_hook(ctx: FunctionContext) -> Type:
     return ctx.default_return_type
 
 
+def _swapaxes_solve(
+    ctx: FunctionContext | MethodContext,
+    dims: list[int | Type],
+    dtype: Type,
+    axis1: int,
+    axis2: int,
+) -> Type:
+    ndim = len(dims)
+    n1 = _normalize_axis(axis1, ndim)
+    n2 = _normalize_axis(axis2, ndim)
+    if n1 is None:
+        ctx.api.fail(
+            f"swapaxes axis1 {axis1} is out of range for {ndim} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    if n2 is None:
+        ctx.api.fail(
+            f"swapaxes axis2 {axis2} is out of range for {ndim} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    out[n1], out[n2] = out[n2], out[n1]
+    return _ndarray_type(ctx, out, dtype)
+
+
+def swapaxes_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 3:
+        # Try formals: a, axis1, axis2
+        if not _picture_complete(ctx, "a"):
+            return ctx.default_return_type
+        arr_pair = _formal_pair(ctx, "a") or (pairs[0] if pairs else None)
+        a1_pair = _formal_pair(ctx, "axis1")
+        a2_pair = _formal_pair(ctx, "axis2")
+        if a1_pair is None and len(pairs) > 1:
+            a1_pair = pairs[1]
+        if a2_pair is None and len(pairs) > 2:
+            a2_pair = pairs[2]
+        if arr_pair is None:
+            return ctx.default_return_type
+        parts = _ndarray_parts(arr_pair[0])
+        if parts is None:
+            return ctx.default_return_type
+        dims, dtype = parts
+        ax1 = _int_or_none(a1_pair)
+        ax2 = _int_or_none(a2_pair)
+        if ax1 in (None, "bail") or ax2 in (None, "bail"):
+            return ctx.default_return_type
+        assert isinstance(ax1, int) and isinstance(ax2, int)
+        return _swapaxes_solve(ctx, dims, dtype, ax1, ax2)
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    ax1 = _int_or_none(pairs[1])
+    ax2 = _int_or_none(pairs[2])
+    if ax1 in (None, "bail") or ax2 in (None, "bail"):
+        return ctx.default_return_type
+    assert isinstance(ax1, int) and isinstance(ax2, int)
+    return _swapaxes_solve(ctx, dims, dtype, ax1, ax2)
+
+
+def swapaxes_method_hook(ctx: MethodContext) -> Type:
+    parts = _ndarray_parts(ctx.type)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    ax1 = _int_or_none(pairs[0])
+    ax2 = _int_or_none(pairs[1])
+    if ax1 in (None, "bail") or ax2 in (None, "bail"):
+        return ctx.default_return_type
+    assert isinstance(ax1, int) and isinstance(ax2, int)
+    return _swapaxes_solve(ctx, dims, dtype, ax1, ax2)
+
+
+def _moveaxis_permutation(
+    ndim: int, source: list[int], dest: list[int]
+) -> list[int] | None:
+    """Permutation for moveaxis: dest positions hold source axes."""
+    if len(source) != len(dest):
+        return None
+    if len(set(source)) != len(source):
+        return None
+    if len(set(dest)) != len(dest):
+        return None
+    # Normalize already done by caller; just validate range here.
+    for s in source:
+        if not 0 <= s < ndim:
+            return None
+    for d in dest:
+        if not 0 <= d < ndim:
+            return None
+    res: list[int | None] = [None] * ndim
+    for s, d in zip(source, dest):
+        if res[d] is not None:
+            return None
+        res[d] = s
+    remaining = [i for i in range(ndim) if i not in source]
+    it = iter(remaining)
+    for i in range(ndim):
+        if res[i] is None:
+            try:
+                res[i] = next(it)
+            except StopIteration:
+                return None
+    # res now holds original axis indices in new order
+    return [int(x) for x in res if x is not None]
+
+
+def _parse_shape_like(pair: tuple[Type, Expression | None] | None) -> list[int] | None:
+    if pair is None:
+        return None
+    return _shape_from_arg(pair[0], pair[1])
+
+
+def moveaxis_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    ndim = len(dims)
+    # source and destination: formal names source, destination
+    src_pair = _formal_pair(ctx, "source")
+    dst_pair = _formal_pair(ctx, "destination")
+    if src_pair is None and len(pairs) > 1:
+        src_pair = pairs[1]
+    if dst_pair is None and len(pairs) > 2:
+        dst_pair = pairs[2]
+    src_list = _parse_shape_like(src_pair)
+    dst_list = _parse_shape_like(dst_pair)
+    if src_list is None or dst_list is None:
+        return ctx.default_return_type
+    # Normalize
+    norm_src: list[int] = []
+    for ax in src_list:
+        n = _normalize_axis(ax, ndim)
+        if n is None:
+            ctx.api.fail(
+                f"moveaxis source axis {ax} is out of range for {ndim} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
+            return ctx.default_return_type
+        norm_src.append(n)
+    norm_dst: list[int] = []
+    for ax in dst_list:
+        n = _normalize_axis(ax, ndim)
+        if n is None:
+            ctx.api.fail(
+                f"moveaxis destination axis {ax} is out of range for {ndim} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
+            return ctx.default_return_type
+        norm_dst.append(n)
+    perm = _moveaxis_permutation(ndim, norm_src, norm_dst)
+    if perm is None:
+        ctx.api.fail(
+            f"moveaxis source {tuple(src_list)} and destination {tuple(dst_list)} "
+            f"must have same length and no duplicates",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = [dims[i] for i in perm]
+    return _ndarray_type(ctx, out, dtype)
+
+
+def rollaxis_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    ndim = len(dims)
+    # axis formal
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 1:
+        axis_pair = pairs[1]
+    start_pair = _formal_pair(ctx, "start")
+    if start_pair is None and len(pairs) > 2:
+        start_pair = pairs[2]
+    ax_val = _int_or_none(axis_pair)
+    if ax_val in (None, "bail"):
+        return ctx.default_return_type
+    assert isinstance(ax_val, int)
+    norm_ax = _normalize_axis(ax_val, ndim)
+    if norm_ax is None:
+        ctx.api.fail(
+            f"rollaxis axis {ax_val} is out of range for {ndim} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    if start_pair is None:
+        start = 0
+    else:
+        s_val = _int_or_none(start_pair)
+        if s_val in (None, "bail"):
+            return ctx.default_return_type
+        assert isinstance(s_val, int)
+        start = s_val
+    # start can be 0..ndim inclusive, normalized with ndim
+    if start < 0:
+        norm_start = start + ndim
+    else:
+        norm_start = start
+    if not 0 <= norm_start <= ndim:
+        ctx.api.fail(
+            f"rollaxis start {start} is out of range for {ndim} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    # Rollaxis algorithm per numpy docs
+    # If start <= axis, move axis to start, else to start-1 after removal
+    # Equivalent to: remove axis, then insert at start position
+    remaining = [d for i, d in enumerate(dims) if i != norm_ax]
+    # Adjust start for removal
+    if norm_start > norm_ax:
+        ins = norm_start - 1
+    else:
+        ins = norm_start
+    out = remaining[:ins] + [dims[norm_ax]] + remaining[ins:]
+    return _ndarray_type(ctx, out, dtype)
+
+
+def _matrix_transpose_solve(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
+) -> Type:
+    ndim = len(dims)
+    if ndim < 2:
+        return _ndarray_type(ctx, list(dims), dtype)
+    out = list(dims)
+    out[-2], out[-1] = out[-1], out[-2]
+    return _ndarray_type(ctx, out, dtype)
+
+
+def matrix_transpose_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    return _matrix_transpose_solve(ctx, dims, dtype)
+
+
+def mt_attribute_hook(ctx: AttributeContext) -> Type:
+    parts = _ndarray_parts(ctx.type) or _mixed_parts(ctx.type)
+    if parts is None:
+        return ctx.default_attr_type
+    dims, dtype = parts
+    return _matrix_transpose_solve(ctx, dims, dtype)
+
+
+def permute_dims_function_hook(ctx: FunctionContext) -> Type:
+    # permute_dims is alias to transpose: first arg array, second optional axes
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0]) or _mixed_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if len(pairs) == 1:
+        # No axes: reverse
+        return _ndarray_type(ctx, list(reversed(dims)), dtype)
+    # axes as second positional or formal "axes"
+    axes_pair = _formal_pair(ctx, "axes")
+    if axes_pair is None and len(pairs) > 1:
+        axes_pair = pairs[1]
+    if axes_pair is None:
+        return ctx.default_return_type
+    axes = _shape_from_arg(axes_pair[0], axes_pair[1])
+    if axes is None:
+        return ctx.default_return_type
+    return _apply_permutation(ctx, dims, dtype, axes)
+
+
+def append_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    parts_a = _ndarray_parts(pairs[0][0])
+    parts_b = _ndarray_parts(pairs[1][0])
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = parts_a
+    dims_b, dtype_b = parts_b
+    dtype = _promote_all(ctx, [dtype_a, dtype_b])
+    if dtype is None:
+        return ctx.default_return_type
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 2:
+        axis_pair = pairs[2]
+    axis_val = _int_or_none(axis_pair)
+    if axis_val is None:
+        # axis=None: flatten and concat -> 1-D
+        # total = product(a) + product(b) if concrete, else unknown
+        if all(isinstance(d, int) for d in dims_a) and all(isinstance(d, int) for d in dims_b):
+            prod_a = 1
+            for d in dims_a:
+                assert isinstance(d, int)
+                prod_a *= d
+            prod_b = 1
+            for d in dims_b:
+                assert isinstance(d, int)
+                prod_b *= d
+            return _ndarray_type(ctx, [prod_a + prod_b], dtype)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "append", 0)], dtype)
+    if axis_val == "bail":
+        return ctx.default_return_type
+    assert isinstance(axis_val, int)
+    # axis specified: must be valid for both, ranks must match?
+    # Reuse concat logic: out dims same except axis summed
+    # For append, values can be 1-D? but we check ranks equal for simplicity, else bail to Any-like (unknown)
+    if len(dims_a) != len(dims_b):
+        # If ranks differ, numpy still allows? Actually append with axis requires same shape except axis.
+        # We'll bail if ranks differ.
+        return ctx.default_return_type
+    norm = _normalize_axis(axis_val, len(dims_a))
+    if norm is None:
+        ctx.api.fail(
+            f"append axis {axis_val} is out of range for {len(dims_a)} dimensions "
+            f"(shape {_dims_str(dims_a)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims_a)
+    for i, (da, db) in enumerate(zip(dims_a, dims_b)):
+        if i == norm:
+            continue
+        if not _dim_eq(da, db):
+            if isinstance(da, int) and isinstance(db, int):
+                ctx.api.fail(
+                    f"append dimension {i} differs: {da} vs {db} "
+                    f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+                    ctx.context,
+                    code=NUMTY_SHAPE,
+                )
+                return ctx.default_return_type
+            return ctx.default_return_type
+    out[norm] = _dim_add2(ctx, "append", norm, dims_a[norm], dims_b[norm])
+    return _ndarray_type(ctx, out, dtype)
+
+
+def insert_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 3:
+        # insert(arr, obj, values, axis) -> axis is 4th? Actually signature: arr, obj, values, axis
+        # positionals: arr, obj, values, axis
+        axis_pair = pairs[3] if len(pairs) > 3 else None
+    if axis_pair is None:
+        # axis=None flattens -> 1-D unknown (insertion increases size, but hard to know)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "insert", 0)], dtype)
+    axis_val = _int_or_none(axis_pair)
+    if axis_val == "bail":
+        return ctx.default_return_type
+    if axis_val is None:
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "insert", 0)], dtype)
+    assert isinstance(axis_val, int)
+    norm = _normalize_axis(axis_val, len(dims))
+    if norm is None:
+        ctx.api.fail(
+            f"insert axis {axis_val} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    out[norm] = _fresh_unknown(ctx, "insert", norm)
+    return _ndarray_type(ctx, out, dtype)
+
+
+def delete_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 2:
+        axis_pair = pairs[2]
+    if axis_pair is None:
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "delete", 0)], dtype)
+    axis_val = _int_or_none(axis_pair)
+    if axis_val == "bail":
+        return ctx.default_return_type
+    if axis_val is None:
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "delete", 0)], dtype)
+    assert isinstance(axis_val, int)
+    norm = _normalize_axis(axis_val, len(dims))
+    if norm is None:
+        ctx.api.fail(
+            f"delete axis {axis_val} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    out[norm] = _fresh_unknown(ctx, "delete", norm)
+    return _ndarray_type(ctx, out, dtype)
+
+
 def squeeze_method_hook(ctx: MethodContext) -> Type:
     parts = _ndarray_parts(ctx.type)
     if parts is None:
@@ -9281,6 +9724,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "sum": reduction_function_hook,
             "take": take_function_hook,
             "transpose": transpose_function_hook,
+            "swapaxes": swapaxes_function_hook,
+            "matrix_transpose": matrix_transpose_function_hook,
             "var": reduction_function_hook,
             **{
                 op: partial(arg_function_hook, op=op)
@@ -9319,6 +9764,10 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "ones_like": like_function_hook,
             "outer": outer_function_hook,
             "roll": roll_function_hook,
+            "moveaxis": moveaxis_function_hook,
+            "rollaxis": rollaxis_function_hook,
+            "swapaxes": swapaxes_function_hook,
+            "matrix_transpose": matrix_transpose_function_hook,
             "tensordot": tensordot_function_hook,
             "zeros_like": like_function_hook,
         },
@@ -9349,6 +9798,9 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "gradient": gradient_function_hook,
             "median": reduction_function_hook,
             "rot90": rot90_function_hook,
+            "append": append_function_hook,
+            "insert": insert_function_hook,
+            "delete": delete_function_hook,
             "sinc": partial(ufunc_function_hook, group="float"),
         },
         "numpy.lib._nanfunctions_impl": {
@@ -9407,6 +9859,24 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
                     "svd",
                 )
             },
+        },
+        "numpy._core": {
+            "moveaxis": moveaxis_function_hook,
+            "swapaxes": swapaxes_function_hook,
+            "rollaxis": rollaxis_function_hook,
+            "matrix_transpose": matrix_transpose_function_hook,
+            "permute_dims": permute_dims_function_hook,
+        },
+        "numpy": {
+            "moveaxis": moveaxis_function_hook,
+            "swapaxes": swapaxes_function_hook,
+            "rollaxis": rollaxis_function_hook,
+            "matrix_transpose": matrix_transpose_function_hook,
+            "permute_dims": permute_dims_function_hook,
+            "append": append_function_hook,
+            "insert": insert_function_hook,
+            "delete": delete_function_hook,
+            "transpose": transpose_function_hook,
         },
     }
     return {
