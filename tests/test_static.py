@@ -978,6 +978,49 @@ def test_mask_over_ts_prefix_counts_once() -> None:
     )
 
 
+def test_mask_nd_collapses_to_rank_one() -> None:
+    # Issue #49: an n-D mask consumes n axes for one count, so x[x > 0]
+    # on (N, M) is rank 1 and (4, 5, 3) masked on the first two axes is
+    # (?U, 3); numpy agrees on rank and trailing dims.
+    result = run_mypy(FIXTURES / "mask_nd_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 2, result.stdout
+    assert "tuple[?U@14]" in notes[0], result.stdout
+    assert "tuple[?U@18, Literal[3]]" in notes[1], result.stdout
+    assert _run_fixture("mask_nd_ok.py") == ["ok"]
+
+
+def test_split_advanced_moves_to_front() -> None:
+    # Issue #49: int/mask advanced indices split by a slice move their
+    # block to the front: (5, 3) not (3, 5), (?U, 3) not (3, ?U).
+    result = run_mypy(FIXTURES / "adv_sep_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 2, result.stdout
+    assert "tuple[Literal[5], Literal[3]]" in notes[0], result.stdout
+    assert "tuple[?U@13, Literal[3]]" in notes[1], result.stdout
+    assert _run_fixture("adv_sep_ok.py") == ["ok"]
+
+
+def test_mask_length_mismatch() -> None:
+    # Issue #49: a Bool[6] mask on a size-4 axis fails with numpy's wording.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mask_len.py"),
+        "boolean index did not match indexed array along axis 0",
+        "size of axis is 4 but size of corresponding boolean axis is 6",
+    )
+
+
+def test_mask_nd_axis_out_of_range() -> None:
+    # Issue #49: the 2-D mask is rank 1, so mean(axis=1) is an axis error.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mask_nd_axis.py"),
+        "axis 1 is out of range for 1 dimensions",
+        "(?U@8,)",
+    )
+
+
 def test_mixed_builders_keep_literals() -> None:
     # #34: one dynamic dim no longer erases the literal ones, so a stored
     # builder result fits a field pinned to 2 / 23. Ops that would move
