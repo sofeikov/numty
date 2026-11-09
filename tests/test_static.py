@@ -1318,9 +1318,8 @@ def test_f64_str_bad_token_rejected() -> None:
 
 
 def test_reduce15_ok_clean() -> None:
-    # Issue #71: the symbolic diff answer is pinned by golden reveal, not
-    # by an annotation Any would satisfy. The reveal pins today's (N, M);
-    # the oracle prints numpy's (4, 7): #32 owns closing that gap.
+    # Issue #32 soundness half: the symbolic diff answer is pinned by
+    # golden reveal plus a runtime oracle.
     result = run_mypy(FIXTURES / "reduce15_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
@@ -1328,9 +1327,9 @@ def test_reduce15_ok_clean() -> None:
     i64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"
     f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
     assert reveals_by_line(result) == {
-        41: f'"{f64.format("N, M")}"',
-        42: f'"{i32.format("Literal[3]")}"',
-        43: f'"{i64.format("N")}"',
+        40: f'"{f64.format("N-1, M")}"',
+        41: f'"{i32.format("Literal[3]")}"',
+        42: f'"{i64.format("N")}"',
     }, result.stdout
     assert _run_fixture("reduce15_ok.py") == ["(4, 7)", "(3,)", "(5,)"]
 
@@ -1379,6 +1378,15 @@ def test_diff_size_mismatch() -> None:
         run_mypy(FIXTURES / "bad_diff_size.py"),
         "tuple[Literal[127], Literal[6]]",
         "tuple[Literal[126], Literal[6]]",
+    )
+
+
+def test_diff_symbolic_mismatch() -> None:
+    # Issue #32: np.diff on a symbolic axis is N-1, not N.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_diff_symbolic.py"),
+        "tuple[N-1, M]",
+        "tuple[N, M]",
     )
 
 

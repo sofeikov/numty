@@ -7670,12 +7670,14 @@ def diff_function_hook(ctx: FunctionContext) -> Type:
         # only the stubs' dedicated overload tracks.
         return ctx.default_return_type
     size = dims[ax]
-    if not isinstance(size, int):
-        # Symbolic dims cannot spell a subtraction: track rank and dtype
-        # only (exactly what the stubs claim); concrete dims solve exactly.
-        return _ndarray_type(ctx, list(dims), dtype)
     out = list(dims)
-    out[ax] = max(0, size - n)
+    if isinstance(size, int):
+        out[ax] = max(0, size - n)
+    else:
+        # Symbolic dims spell the subtraction (N-1, N-2, ?U-1): never
+        # reuse the input dim, or diff would claim the length is unchanged
+        # and real broadcast errors would pass (issue #32).
+        out[ax] = _dim_add_const(ctx, "diff", ax, size, -n)
     # Diff preserves dtype exactly, so solve from the input: the result
     # is identical for every overload candidate, which keeps mypy's
     # overload resolution from discarding it as ambiguous.
