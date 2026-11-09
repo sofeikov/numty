@@ -44,7 +44,8 @@ What it does:
 - comparisons broadcast shapes and return bool arrays; argmax/argsort
   drop or keep the axis; Generator/RandomState methods solve from size=.
 - getitem solves integer-array (fancy) indices and take_along_axis;
-  boolean masks track the axis with a fresh unknown (?U), float indices
+  boolean masks consume n axes for one fresh unknown (?U) with lengths
+  checked, and a split advanced block moves to the front; float indices
   error. Over *Ts, leading items consume the known prefix without an
   ellipsis (rank-generic bodies still spell the ellipsis for the middle).
 - dims may be symbolic TypeVars: same name unifies, ranks and counts
@@ -8308,8 +8309,9 @@ def _parse_index_item(
     """One index: int drops the axis, slice keeps it, None adds one.
 
     Integer arrays are fancy indices (their shape replaces the axis);
-    0-d integer arrays act like scalars. Bool arrays are masks (bail:
-    the selected count is data-dependent); other dtypes always raise.
+    0-d integer arrays act like scalars. Bool arrays are masks (an n-D
+    mask consumes n axes for one data-dependent count); other dtypes
+    always raise.
     """
     if _is_none_type(tp):
         return ("newaxis",)
@@ -8323,7 +8325,9 @@ def _parse_index_item(
         if kind in ("i", "u"):
             return ("fancy0d",) if not part[0] else ("fancy", part[0])
         if kind == "b":
-            return ("mask", len(part[0]))
+            # Keep the full mask shape: an n-D mask consumes n axes for
+            # one data-dependent count (issue #49).
+            return ("mask", list(part[0]))
         return ("badindex",)
     if isinstance(expr, SliceExpr):
         begin = _fold_index_bound(ctx, expr.begin_index)
@@ -8503,9 +8507,22 @@ def _consume_prefix(
                 out.extend(item[1])
                 i += 1
                 continue
-            rank = item[1]
+            mask_dims: list[int | Type] = list(item[1])
+            rank = len(mask_dims)
             if rank == 0 or i + rank > len(prefix):
                 return None
+            for off, (md, pd) in enumerate(zip(mask_dims, prefix[i : i + rank])):
+                if _dim_eq(md, pd):
+                    continue
+                if isinstance(md, int) and isinstance(pd, int):
+                    ctx.api.fail(
+                        f"boolean index did not match indexed array along axis {i + off}; "
+                        f"size of axis is {pd} but size of corresponding boolean axis is {md} "
+                        f"(shape {shape_repr})",
+                        ctx.context,
+                        code=NUMTY_AXIS,
+                    )
+                    return None
             out.append(_fresh_unknown(ctx, "mask", i))
             i += rank
             continue
@@ -8627,9 +8644,14 @@ def _solve_getitem(
         )
         return ctx.default_return_type
     ndim = len(dims)
-    consuming = sum(
-        1 for item in items if item[0] in ("int", "int_any", "slice", "fancy", "fancy0d")
-    )
+    # A k-d mask consumes k axes for one count (issue #49); a 0-d mask
+    # adds a leading axis like newaxis.
+    consuming = 0
+    for item in items:
+        if item[0] in ("int", "int_any", "slice", "fancy", "fancy0d"):
+            consuming += 1
+        elif item[0] == "mask":
+            consuming += len(item[1])
     if consuming > ndim:
         ctx.api.fail(
             f"too many indices for {ndim} dimensions "
@@ -8638,40 +8660,53 @@ def _solve_getitem(
             code=NUMTY_AXIS,
         )
         return ctx.default_return_type
-    fancy_positions = [n for n, item in enumerate(items) if item[0] == "fancy"]
-    if len(fancy_positions) > 1:
-        between = items[fancy_positions[0] + 1 : fancy_positions[-1]]
-        if any(item[0] not in ("int", "fancy", "fancy0d", "newaxis") for item in between):
-            # Advanced indices separated by a slice/ellipsis broadcast to
-            # the front; that reshuffle is out of scope, so bail out.
-            return ctx.default_return_type
-    fancy_dims: list[int | Type] = []
-    for n in fancy_positions:
-        assert items[n][0] == "fancy"
-        shape = items[n][1]
-        if not fancy_dims:
-            fancy_dims = shape
-            continue
-        merged, cause = _broadcast_result(fancy_dims, shape, ctx)
-        if cause is not None:
-            ctx.api.fail(
-                f"indexing arrays could not be broadcast together: {cause}",
-                ctx.context,
-                code=NUMTY_BROADCAST,
-            )
-            return ctx.default_return_type
-        assert merged is not None
-        fancy_dims = merged
-    out: list[int | Type] = []
+
+    def _is_advanced(item: tuple) -> bool:
+        if item[0] in ("int", "int_any", "fancy", "fancy0d"):
+            return True
+        return item[0] == "mask" and len(item[1]) > 0
+
+    has_trigger = any(
+        item[0] == "fancy" or (item[0] == "mask" and len(item[1]) > 0)
+        for item in items
+    )
+    if has_trigger and any(item[0] == "mask" and len(item[1]) == 0 for item in items):
+        # 0-d mask plus another advanced index: placement is unclear.
+        return ctx.default_return_type
+    front = False
+    first_adv = -1
+    last_adv = -1
+    if has_trigger:
+        adv_positions = [n for n, item in enumerate(items) if _is_advanced(item)]
+        first_adv, last_adv = adv_positions[0], adv_positions[-1]
+        # NumPy moves the advanced block to the front whenever a slice,
+        # ellipsis, newaxis (or any other non-advanced index) separates
+        # two advanced indices.
+        front = any(
+            not _is_advanced(items[n]) for n in range(first_adv, last_adv + 1)
+        )
+    span = ndim - consuming
+    # First pass: validate (int bounds, mask lengths, slice steps) and
+    # collect kept dims plus the broadcast advanced block.
+    kept_before: list[int | Type] = []
+    kept_after: list[int | Type] = []
+    adv_block: list[int | Type] = []
+    adv_seen = False
     dim = 0
-    fancy_emitted = False
-    for item in items:
+    for n, item in enumerate(items):
         kind = item[0]
+        is_adv = _is_advanced(item) if has_trigger else False
+        # Kept fragments before the first advanced index stay before the
+        # block in place; everything else non-advanced goes after it.
+        # Under front placement the split is irrelevant (block leads).
+        target = kept_after if (has_trigger and not front and adv_seen) else kept_before
         if kind == "newaxis":
-            out.append(1)
+            # A newaxis inside a contiguous block cannot happen (it
+            # would force front); under front it stays with the kept
+            # dims in order.
+            (kept_after if (has_trigger and not front and adv_seen) else kept_before).append(1)
         elif kind == "ellipsis":
-            span = ndim - consuming
-            out.extend(dims[dim : dim + span])
+            target.extend(dims[dim : dim + span])
             dim += span
         elif kind in ("int", "int_any"):
             size = dims[dim]
@@ -8686,27 +8721,69 @@ def _solve_getitem(
                     )
                     return ctx.default_return_type
             dim += 1
+            if has_trigger:
+                adv_seen = adv_seen or is_adv
         elif kind == "fancy0d":
             dim += 1
+            if has_trigger:
+                adv_seen = adv_seen or is_adv
         elif kind == "fancy":
-            if not fancy_emitted:
-                out.extend(fancy_dims)
-                fancy_emitted = True
-            dim += 1
-        elif kind == "mask":
-            # Boolean masks select a data-dependent count: track the axis
-            # with a fresh unknown instead of failing. A 0-d mask adds a
-            # leading axis (newaxis); combined advanced indices collapse
-            # to one block whose rank is unknowable, so bail there.
-            if sum(1 for it in items if it[0] in ("fancy", "mask")) > 1:
-                return ctx.default_return_type
-            if item[1] == 0:
-                out.append(1)
+            shape: list[int | Type] = list(item[1])
+            if not adv_block:
+                adv_block = shape
             else:
-                if dim >= len(dims):
+                merged, cause = _broadcast_result(adv_block, shape, ctx)
+                if cause is not None:
+                    ctx.api.fail(
+                        f"indexing arrays could not be broadcast together: {cause}",
+                        ctx.context,
+                        code=NUMTY_BROADCAST,
+                    )
                     return ctx.default_return_type
-                out.append(_fresh_unknown(ctx, "mask", dim))
-                dim += 1
+                if merged is None:
+                    return ctx.default_return_type
+                adv_block = merged
+            dim += 1
+            if has_trigger:
+                adv_seen = True
+        elif kind == "mask":
+            mask_dims: list[int | Type] = list(item[1])
+            if not mask_dims:
+                (kept_after if (has_trigger and not front and adv_seen) else kept_before).append(1)
+            else:
+                k = len(mask_dims)
+                if dim + k > len(dims):
+                    return ctx.default_return_type
+                for off, (md, pd) in enumerate(zip(mask_dims, dims[dim : dim + k])):
+                    if _dim_eq(md, pd):
+                        continue
+                    if isinstance(md, int) and isinstance(pd, int):
+                        ctx.api.fail(
+                            f"boolean index did not match indexed array along axis {dim + off}; "
+                            f"size of axis is {pd} but size of corresponding boolean axis is {md} "
+                            f"(shape {_dims_str(dims)})",
+                            ctx.context,
+                            code=NUMTY_AXIS,
+                        )
+                        return ctx.default_return_type
+                unk = _fresh_unknown(ctx, "mask", dim)
+                if not adv_block:
+                    adv_block = [unk]
+                else:
+                    merged, cause = _broadcast_result(adv_block, [unk], ctx)
+                    if cause is not None:
+                        ctx.api.fail(
+                            f"indexing arrays could not be broadcast together: {cause}",
+                            ctx.context,
+                            code=NUMTY_BROADCAST,
+                        )
+                        return ctx.default_return_type
+                    if merged is None:
+                        return ctx.default_return_type
+                    adv_block = merged
+                dim += k
+                if has_trigger:
+                    adv_seen = True
         elif kind == "badindex":
             ctx.api.fail(
                 "arrays used as indices must be of integer (or boolean) type",
@@ -8721,36 +8798,42 @@ def _solve_getitem(
             # unit-stride slice keeps the dim.
             _, begin, end, stride = item
             size = dims[dim]
+            frag: int | Type
             if isinstance(size, int):
                 if "unknown" in (begin, end, stride):
-                    out.append(_fresh_unknown(ctx, "slice", dim))
+                    frag = _fresh_unknown(ctx, "slice", dim)
                 else:
                     bounds = tuple(
                         None if b == "missing" else b for b in (begin, end, stride)
                     )
                     try:
-                        out.append(len(range(*slice(*bounds).indices(size))))
+                        frag = len(range(*slice(*bounds).indices(size)))
                     except ValueError:
                         ctx.api.fail(
                             "slice step is zero", ctx.context, code=NUMTY_AXIS
                         )
                         return ctx.default_return_type
-                dim += 1
-                continue
-            if begin == "missing" and end == "missing":
+            elif begin == "missing" and end == "missing":
                 if stride == "missing" or stride in (1, -1):
-                    out.append(size)
+                    frag = size
                 elif stride == 0:
                     ctx.api.fail(
                         "slice step is zero", ctx.context, code=NUMTY_AXIS
                     )
                     return ctx.default_return_type
                 else:
-                    out.append(_fresh_unknown(ctx, "slice", dim))
+                    frag = _fresh_unknown(ctx, "slice", dim)
             else:
-                out.append(_fresh_unknown(ctx, "slice", dim))
+                frag = _fresh_unknown(ctx, "slice", dim)
+            (kept_after if (has_trigger and not front and adv_seen) else kept_before).append(frag)
             dim += 1
-    out.extend(dims[dim:])
+    if not has_trigger:
+        kept_before.extend(dims[dim:])
+        out = kept_before
+    elif front:
+        out = [*adv_block, *kept_before, *kept_after, *dims[dim:]]
+    else:
+        out = [*kept_before, *adv_block, *kept_after, *dims[dim:]]
     if not out:
         # Every axis consumed by integers: a numpy scalar, not an array.
         return ctx.default_return_type

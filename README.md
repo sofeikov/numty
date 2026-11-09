@@ -541,15 +541,18 @@ a[Slots.VX]       # error: index 2 is out of range for axis 0 with size 2
 Slicing past the end clips like NumPy (`a[1:99]` on a size-2 axis is
 size 1); a 1-D boolean mask turns its axis into a fresh unknown
 (`a[np.ones(3, dtype=bool)]` on `(3, 4)` is `(?U0, 4)`, see unknown dims
-above), and unknown bounds bail out. An n-D mask is still typed as if it
-masked only the first axis (`a[a > 0]` on `(3, 4)` is `(?U0, 4)`, numpy returns
-1-D; [#49](https://github.com/sofeikov/numty/issues/49)). A full slice on a
+above), and unknown bounds bail out. An n-D mask consumes n axes for
+one count (`a[a > 0]` on `(3, 4)` is `(?U0,)`, numpy returns 1-D), and a
+mask whose length provably mismatches its axis errors with NumPy's
+wording. A full slice on a
 symbolic axis keeps the TypeVar (`a[:, :]` on `(N, K)` stays `(N, K)`);
 a bounded slice on one (`a[:, :k]`) bails out. Indexing every axis
 with integers yields a scalar, which the plugin leaves to the stubs.
 
 Integer arrays index fancy-style: the index shape replaces the axis,
-broadcast when there are several; `take_along_axis` broadcasts the two
+broadcast when there are several, and an advanced block split by a
+slice moves to the front as NumPy does (`x[0, :, idx]` on `(2, 3, 4)`
+with `idx: (5,)` is `(5, 3)`); `take_along_axis` broadcasts the two
 shapes, with the index winning along the axis (even a size-1 index:
 `take_along_axis(a, idx, axis=1)` with `a: (3, 4)`, `idx: (3, 1)` is
 typed `(3, 1)`, as numpy returns):
