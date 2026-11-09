@@ -369,6 +369,46 @@ def test_inplace_shapes_match_numpy() -> None:
     assert w.shape == (3, 4)
 
 
+def test_setitem_shapes_match_numpy() -> None:
+    # Issue #51: every bad indexed assignment raises at runtime; every ok
+    # one keeps its shape.
+    with pytest.raises(ValueError, match="could not broadcast"):
+        m = np.zeros((5, 3))
+        m[:, 0] = np.zeros(4)
+    with pytest.raises(ValueError, match="could not broadcast"):
+        m = np.zeros((5, 3))
+        m[:2] = np.zeros((3, 3))
+    with pytest.raises(ValueError, match="could not broadcast"):
+        a = np.zeros((3, 4))
+        a[0] = np.zeros(3)
+    with pytest.raises(ValueError, match="could not broadcast"):
+        a = np.zeros((2, 3))
+        a[...] = np.zeros((2, 1, 3))
+    with pytest.raises((ValueError, TypeError)):
+        a = np.zeros((5, 3))
+        a[[0, 1]] = np.zeros((3, 3))
+    with pytest.raises(TypeError, match="0 or 1-dimensional"):
+        x = np.zeros(5)
+        x[np.ones(5, bool)] = np.zeros((2, 2))
+    with pytest.raises(IndexError):
+        m = np.zeros((5, 3))
+        m[5] = np.zeros(3)
+    with pytest.raises(IndexError):
+        a = np.zeros((5, 3))
+        a[-6] = 0.0
+    with pytest.raises(IndexError):
+        a = np.zeros((5, 3))
+        a[:, 3] = 0.0
+    with pytest.raises(IndexError, match="boolean index did not match"):
+        x = np.zeros(5)
+        x[np.ones(4, bool)] = 0.0
+    a = np.zeros((5, 3))
+    a[:] = np.zeros(3)
+    a[:, :] = np.zeros((5, 1))
+    a[:, 0] = 1.0
+    assert a.shape == (5, 3)
+
+
 def test_einsum_values() -> None:
     a = np.arange(6, dtype=np.float64).reshape(2, 3)
     b = np.arange(12, dtype=np.float64).reshape(3, 4)
