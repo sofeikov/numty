@@ -271,7 +271,7 @@ def test_unknown_slice_keeps_sibling_dims() -> None:
         f'numpy.ndarray[tuple[Literal[5], ?U], {f64}]"',
         f'numpy.ndarray[tuple[Literal[5], Literal[3]], {f64}]"',
         f'numpy.ndarray[tuple[N, Literal[3]], {f64}]"',
-        f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
+        f'numpy.ndarray[tuple[N-1, Literal[3]], {f64}]"',
     ], result.stdout
     assert _run_fixture("unknown_slice_ok.py") == [
         "(32, 3)",
@@ -509,6 +509,67 @@ def test_einsum_rank_mismatch() -> None:
     )
 
 
+def test_everyday_ok() -> None:
+    # Issue #62: ordinary numpy code checks clean — int bookkeeping on
+    # .shape/.len, 0-d results as numpy scalars, size-1 einsum labels,
+    # shadowed string-spec words, axis 0/-1 on 0-d arrays, plain NDArray
+    # into a head, and literal slices on linear dims.
+    result = run_mypy(FIXTURES / "everyday_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = {
+        line: re.sub(r"\?U@\d+[a-z]?", "?U", shape)
+        for line, shape in reveals_by_line(result).items()
+    }
+    assert notes == {
+        43: '"float"',
+        45: '"float"',
+        47: '"float"',
+        49: '"float"',
+        51: '"numpy.bool[bool]"',
+        55: '"numpy.ndarray[tuple[time, freq], numpy.dtype[numpy.float64]]"',
+        56: '"numpy.ndarray[tuple[n, d], numpy.dtype[numpy.float64]]"',
+        57: '"numpy.ndarray[tuple[batch, input], numpy.dtype[numpy.float64]]"',
+        62: '"numpy.float64"',
+        63: '"numpy.ndarray[tuple[Literal[1]], numpy.dtype[numpy.float64]]"',
+        64: '"numpy.ndarray[tuple[Literal[2]], numpy.dtype[numpy.float64]]"',
+        65: '"numpy.ndarray[tuple[()], numpy.dtype[numpy.float64]]"',
+        85: '"numpy.ndarray[tuple[Literal[2], Literal[3]], numpy.dtype[numpy.float64]]"',
+        86: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.float64]]"',
+        87: '"numpy.ndarray[tuple[int], numpy.dtype[numpy.float64]]"',
+    }, result.stdout
+    assert _run_fixture("everyday_ok.py") == ["ok"]
+
+
+def test_everyday_bad_still_fails() -> None:
+    # The same idioms with real bugs: size clashes, diagonal collapse,
+    # and out-of-range 0-d axes keep failing loudly.
+    result = run_mypy(FIXTURES / "bad_everyday.py")
+    assert result.returncode == 1, result.stdout
+    lines = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert any(
+        "einsum label 'j' has conflicting sizes: 2 vs 3" in line for line in lines
+    ), result.stdout
+    assert any(
+        "einsum label 'i' has conflicting sizes: 1 vs 3" in line for line in lines
+    ), result.stdout
+    assert sum("out of range for 0 dimensions" in line for line in lines) == 3, (
+        result.stdout
+    )
+
+
+def test_alias_int_dims_ok() -> None:
+    # Issue #62: bare ints never survive an alias definition (mypy core
+    # checks the right-hand side itself), so spell the sizes with
+    # Literal; every alias form then checks and infers exactly.
+    result = run_mypy(FIXTURES / "alias_int_dims_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        27: '"numpy.ndarray[tuple[Literal[3], Literal[4]], numpy.dtype[numpy.float64]]"',
+        28: '"numpy.ndarray[tuple[Literal[3], Literal[4]], numpy.dtype[numpy.float64]]"',
+    }, result.stdout
+    assert _run_fixture("alias_int_dims_ok.py") == ["ok"]
+
+
 def test_solve_square_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_solve_square.py"),
@@ -674,7 +735,9 @@ def test_dtype_ok_stays_clean() -> None:
     assert len(notes) == 11, result.stdout
     assert sum("_32Bit" in n for n in notes) == 4, result.stdout
     assert sum("_16Bit" in n for n in notes) == 3, result.stdout
-    assert sum("float64" in n and "tuple[()]" in n for n in notes) == 1, result.stdout
+    # Scalar-only calls are numpy scalars (issue #62), not 0-d arrays:
+    # np.divide(7, 2) reveals exactly numpy.float64.
+    assert sum('"numpy.float64"' in n and "tuple" not in n for n in notes) == 1, result.stdout
     assert _run_fixture("dtype_ok.py") == ["ok"]
 
 

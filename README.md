@@ -328,7 +328,11 @@ any plugin runs, so it still needs a resolvable name: one of the
 thirteen prelude dims or a one-line `hid = TypeVar("hid", bound=int)`.
 Proven with a lobotomized-hook experiment (hook returning `Any` without
 touching args still yields the `Name "hid" is not defined` error), so no
-plugin-side fix exists on this mypy version.
+plugin-side fix exists on this mypy version. Words also shadow
+same-named variables, modules, and builtins (`F64["time freq"]` after
+`import time`, `F64["n d"]` with a module-level `n = 10`): dims live in
+their own namespace, like jaxtyping, except `Final` ints (which stay
+real dims) and the bare name `int` (which stays the dynamic dim).
 
 Two rules, both honest. First, every bare name must resolve: mypy binds
 function type variables by looking names up *before* any plugin runs,
@@ -1133,6 +1137,17 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   over bare names to the display).
 - Different TypeVars (`N` vs `M`) never conflict, even when provably
   different at a call site — only same-name TypeVars are unified.
+- Bare ints are rejected in alias definitions by mypy itself, before
+  any plugin runs (`Mat34 = F64[3, 4]` errors exactly like
+  `X = list[3]` does). Spell the sizes with `Literal`
+  (`Mat34: TypeAlias = F64[Literal[3], Literal[4]]`, or the PEP 695
+  `type` form); uses then check and infer exactly.
+- Integer bookkeeping on a *symbolic* dim keeps the dim, like plain
+  mypy for generic containers (`n = x.shape[0]` infers `N`, so
+  `n //= 2` is an error). Concrete dims widen to `int` (keeping the
+  value for direct uses like `reshape(x.shape[0], 3)`), and unknown
+  (`?U`) dims are plain `int`. For a loop counter over a symbolic
+  axis, write `int(...)` explicitly (`n = int(x.shape[0])`).
 
 ## Layout
 
