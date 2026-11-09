@@ -624,7 +624,11 @@ errors.
 `repeat`/`tile` multiply (`N*2`), `pad` adds (`N+2`), `convolve` adds
 lengths (`N+M-1`), `rfft` halves (`N//2+1`), `split` divides (`N//2`),
 and reshape proves `N*2` vs `2*N` (dividing `-1` exactly); mismatches
-error with readable formulas. `sliding_window_view` appends the window
+error with readable formulas. Products of distinct symbolic dims track
+as monomials (`H*D`, `C*H*W`): flattening `(B, C, H, W)` with `-1`
+infers `(B, C*H*W)`, `(N, K)` reshaped to `(N, -1)` infers `(N, K)`,
+and the round-trip back proves clean by commutativity.
+`sliding_window_view` appends the window
 after the shrunken dims (`N-w+1`, symbolic included — the conv-output
 formula falls out).
 

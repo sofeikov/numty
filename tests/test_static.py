@@ -1521,6 +1521,35 @@ def test_symexpr_product_mismatch() -> None:
     )
 
 
+def test_nonlinear_ok_clean() -> None:
+    # Issue #40 stepping stone: monomial products stay exact, not ?U.
+    result = run_mypy(FIXTURES / "nonlinear_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        29: f'"{f64.format("B, C*H*W")}"',
+        31: f'"{f64.format("N, K")}"',
+        33: f'"{f64.format("K, N")}"',
+        39: f'"{f64.format("B, S, D*H")}"',
+    }, result.stdout
+    assert _run_fixture("nonlinear_ok.py") == [
+        "(2, 70)",
+        "(5, 7)",
+        "(7, 5)",
+        "(2, 3, 35)",
+    ]
+
+
+def test_nonlinear_size_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_nonlinear_size.py"),
+        "reshape changes total size: M*N -> 12*N",
+        "(N, M)",
+        "(N, 3, 4)",
+    )
+
+
 def test_sliding_ok_clean() -> None:
     result = run_mypy(FIXTURES / "sliding_ok.py")
     assert result.returncode == 0, result.stdout
