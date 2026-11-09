@@ -1913,6 +1913,26 @@ def test_offsets_calls_mismatch() -> None:
     )
 
 
+def test_same_tvar_roundtrip_ok() -> None:
+    # Issue #43: two byte-identical bodies sharing one TypeVar check
+    # identically. The reshape -1 roundtrip (repeat -> N*2 -> N) used to
+    # return the first-seen N@first for the second function, failing with
+    # `got tuple[2, N@first], expected tuple[2, N@second]`.
+    result = run_mypy(FIXTURES / "same_tvar_roundtrip_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        24: f'"{f64.format("Literal[2], N")}"',
+        30: f'"{f64.format("Literal[2], N")}"',
+    }, result.stdout
+    assert _run_fixture("same_tvar_roundtrip_ok.py") == [
+        "(2, 5)",
+        "(2, 6)",
+        "ok",
+    ]
+
+
 def test_dataclass_implicit_method_ok() -> None:
     # Issue #29: methods (including dataclass methods) with undeclared
     # string dims infer like functions instead of rigid-failing.
