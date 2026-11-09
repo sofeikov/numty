@@ -549,11 +549,9 @@ with integers yields a scalar, which the plugin leaves to the stubs.
 
 Integer arrays index fancy-style: the index shape replaces the axis,
 broadcast when there are several; `take_along_axis` broadcasts the two
-shapes, with the index winning along the axis. Known bug: an index of
-size 1 along the axis keeps the array's dim instead
-(`take_along_axis(a, idx, axis=1)` with `a: (3, 4)`, `idx: (3, 1)` is
-typed `(3, 4)`, numpy returns `(3, 1)`;
-[#46](https://github.com/sofeikov/numty/issues/46)):
+shapes, with the index winning along the axis (even a size-1 index:
+`take_along_axis(a, idx, axis=1)` with `a: (3, 4)`, `idx: (3, 1)` is
+typed `(3, 1)`, as numpy returns):
 
 ```python
 table[ids]                        # (5, 4): index shape + trailing dims

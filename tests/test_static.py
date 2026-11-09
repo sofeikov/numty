@@ -1895,6 +1895,75 @@ def test_stack_ok_clean() -> None:
     assert "error:" not in result.stdout
 
 
+def test_construct_shapes_ok_clean_and_runs() -> None:
+    # Issue #46: hooked ops used to claim precise-but-wrong literal
+    # shapes (a wrong concrete shape is worse than Any). Each reveal is
+    # pinned against the runtime oracle below.
+    result = run_mypy(FIXTURES / "construct_shapes_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    i64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"
+    notes = {
+        line: re.sub(r"\?U@\d+[a-z]?", "?U", note)
+        for line, note in reveals_by_line(result).items()
+    }
+    assert notes == {
+        41: f'"{f64.format("?U")}"',
+        42: f'"{f64.format("?U")}"',
+        43: f'"{f64.format("?U")}"',
+        44: f'"{f64.format("N+2")}"',
+        49: f'"{f64.format("Literal[2], Literal[3], Literal[1]")}"',
+        50: f'"{f64.format("Literal[2], Literal[3], Literal[2]")}"',
+        51: f'"{f64.format("Literal[12]")}"',
+        52: f'"{f64.format("Literal[5]")}"',
+        55: f'"{f64.format("Literal[8], Literal[4]")}"',
+        56: f'"{f64.format("Literal[2], Literal[3], Literal[4]")}"',
+        57: f'"{f64.format("Literal[10], Literal[5]")}"',
+        58: f'"{f64.format("Literal[2], Literal[3]")}"',
+        59: f'"{f64.format("Literal[2], Literal[1]")}"',
+        60: f'"{i64.format("Literal[5]")}"',
+        61: f'"{i64.format("Literal[4]")}"',
+        62: f'"{f64.format("Literal[1], Literal[1], Literal[5]")}"',
+    }, result.stdout
+    assert _run_fixture("construct_shapes_ok.py") == [
+        "(2, 3, 1)",
+        "(2, 3, 2)",
+        "(12,)",
+        "(5,)",
+        "(8, 4)",
+        "(2, 3, 4)",
+        "(10, 5)",
+        "(2, 3)",
+        "(2, 1)",
+        "(5,)",
+        "(4,)",
+        "(1, 1, 5)",
+        "(6,)",
+        "(4,)",
+        "(4,)",
+        "(8,)",
+    ]
+
+
+def test_construct_shapes_mismatch() -> None:
+    # Issue #46: every wrong concrete shape must fail, loudly.
+    result = run_mypy(FIXTURES / "bad_construct_shapes.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 9, result.stdout
+    assert errors[0].startswith("tests/fixtures/bad_construct_shapes.py:11: error:"), result.stdout
+    assert "tuple[Literal[2], Literal[3], Literal[1]]" in errors[0], result.stdout
+    assert "dstack dimension 1 differs: 3 vs 4" in errors[1], result.stdout
+    assert "tuple[Literal[12]]" in errors[2] and "tuple[Literal[36]]" in errors[2], result.stdout
+    assert "broadcast_to of shape (3, 4) is incompatible with target shape (3, 5)" in errors[3], result.stdout
+    assert "cannot broadcast to scalar shape ()" in errors[4], result.stdout
+    assert "tuple[Literal[2], Literal[1]]" in errors[5], result.stdout
+    assert "tuple[Literal[8], Literal[4]]" in errors[6], result.stdout
+    assert "tuple[Literal[5]]" in errors[7] and "tuple[Literal[10]]" in errors[7], result.stdout
+    assert "tuple[Literal[1], Literal[1], Literal[5]]" in errors[8], result.stdout
+
+
 def test_hstack_rank_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_hstack_rank.py"),
