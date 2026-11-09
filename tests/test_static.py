@@ -634,6 +634,38 @@ def test_logical_broadcast_mismatch() -> None:
     )
 
 
+def test_arith_ok_stays_clean() -> None:
+    # Issue #54: floordiv/mod/divmod/xor/shift/int-&/|/bool-flag keep shapes.
+    result = run_mypy(FIXTURES / "arith_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 10, result.stdout
+    assert sum("tuple[Literal[2], Literal[3]]" in n and "float64" in n for n in notes) == 3
+    assert sum("signedinteger" in n for n in notes) == 5
+    assert sum("numpy.bool" in n for n in notes) == 2
+    assert _run_fixture("arith_ok.py") == ["ok"]
+
+
+def test_arith_broadcast_mismatch() -> None:
+    # Issue #54: the newly hooked operators fail with the binary wording.
+    result = run_mypy(FIXTURES / "bad_arith_broadcast.py")
+    assert result.returncode == 1, result.stdout
+    ours = [
+        line
+        for line in result.stdout.splitlines()
+        if "broadcast shapes disagree at trailing axis 0" in line
+    ]
+    assert len(ours) == 4, result.stdout
+    for line in ours:
+        assert "3 vs 5" in line and "(2, 3)" in line and "(5,)" in line, result.stdout
+    rest = [
+        line
+        for line in result.stdout.splitlines()
+        if ": error:" in line and line not in ours
+    ]
+    assert rest and all("Unsupported operand" in line for line in rest), result.stdout
+
+
 def test_any_axis_out_of_range() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_any_axis.py"),

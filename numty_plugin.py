@@ -20,9 +20,11 @@ What it does:
   lone concrete 1-D/2-D operand contributes an empty batch). The @
   operator is accepted but unchecked (see the method-hook note below).
 - __add__/__mul__ unify operand shapes with NumPy broadcast rules, so
-  precision survives whole function bodies. Scalars pass through;
-  unknown dims bail out. In-place ops (__iadd__ and friends) reuse the
-  broadcast check and additionally require the result to fit the target.
+  precision survives whole function bodies. `//`, `%`, `divmod`, `^`,
+  `<<`, `>>` and int/bool `&`/`|` use the same broadcast (divmod
+  returns a tuple of two). Scalars pass through; unknown dims bail out.
+  In-place ops (__iadd__ and friends) reuse the broadcast check and
+  additionally require the result to fit the target.
 - reshape (method and np.reshape) checks total-size conservation and
   infers a single -1, returning the precise new shape. A -1 divides the
   canonical total (linear and monomial products alike: N*K/N=K,
@@ -1130,6 +1132,8 @@ class NumtyPlugin(Plugin):
     def _function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         if fullname == "builtins.len":
             return len_function_hook
+        if fullname == "builtins.divmod":
+            return divmod_function_hook
         # Raw np.matmul solves through the ufunc __call__ hook; the
         # numty.matmul wrapper below stays as a convenience alias.
         if fullname == "numty.matmul":
@@ -1182,8 +1186,23 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__rsub__",
             "numpy.ndarray.__pow__",
             "numpy.ndarray.__rpow__",
+            "numpy.ndarray.__floordiv__",
+            "numpy.ndarray.__rfloordiv__",
+            "numpy.ndarray.__mod__",
+            "numpy.ndarray.__rmod__",
+            "numpy.ndarray.__xor__",
+            "numpy.ndarray.__rxor__",
+            "numpy.ndarray.__lshift__",
+            "numpy.ndarray.__rlshift__",
+            "numpy.ndarray.__rshift__",
+            "numpy.ndarray.__rrshift__",
         }:
             return broadcast_method_hook
+        if fullname in {
+            "numpy.ndarray.__divmod__",
+            "numpy.ndarray.__rdivmod__",
+        }:
+            return divmod_method_hook
         if fullname in {
             "numpy.ndarray.__iadd__",
             "numpy.ndarray.__isub__",
@@ -5559,6 +5578,31 @@ def broadcast_method_hook(ctx: MethodContext) -> Type:
     return _solve_broadcast(ctx, ctx.type, args[0])
 
 
+def divmod_method_hook(ctx: MethodContext) -> Type:
+    """`divmod(a, b)` / `a.__divmod__(b)`: tuple of two broadcasts (issue #54)."""
+    args = _positional_actuals(ctx, 1)
+    if args is None:
+        return ctx.default_return_type
+    result = _solve_broadcast(ctx, ctx.type, args[0])
+    parts = _ndarray_parts(result)
+    if parts is None:
+        return ctx.default_return_type
+    # Same result twice: quotient and remainder share shape and dtype.
+    return _linalg_tuple(ctx, [result, result])
+
+
+def divmod_function_hook(ctx: FunctionContext) -> Type:
+    """Builtin `divmod(a, b)` on arrays: same tuple as the method (issue #54)."""
+    args = _positional_actuals(ctx, 2)
+    if args is None:
+        return ctx.default_return_type
+    result = _solve_broadcast(ctx, args[0], args[1])
+    parts = _ndarray_parts(result)
+    if parts is None:
+        return ctx.default_return_type
+    return _linalg_tuple(ctx, [result, result])
+
+
 def inplace_method_hook(ctx: MethodContext) -> Type:
     """Shape-check `a <op>= b`: broadcast must equal the LHS (issue #50).
 
@@ -9138,10 +9182,11 @@ def _compare_types(ctx: FunctionContext | MethodContext, left: Type, right: Type
 
 
 def logical_method_hook(ctx: MethodContext) -> Type:
-    """& and | on bool arrays: broadcast shapes, bool out.
+    """`&` and `|` on bool/int arrays: broadcast shapes (issue #54).
 
-    Anything else (int arrays, exotic scalars) bails to the stubs,
-    exactly like before this hook existed.
+    Bool pairs keep bool out; int/uint pairs promote like add. Plain
+    `bool` variables (not just literals) count as bool scalars.
+    Anything else bails to the stubs.
     """
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
@@ -9152,23 +9197,66 @@ def logical_method_hook(ctx: MethodContext) -> Type:
     return _logical_types(ctx, ctx.type, pairs[0][0])
 
 
+def _is_plain_bool(tp: Type) -> bool:
+    proper = get_proper_type(tp)
+    return isinstance(proper, Instance) and proper.type.fullname == "builtins.bool"
+
+
+def _is_builtin_int(tp: Type) -> bool:
+    proper = get_proper_type(tp)
+    return isinstance(proper, Instance) and proper.type.fullname == "builtins.int"
+
+
 def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
     parts = _parts_or_unpack(left)
-    if parts is None or _dtype_base(parts[1]) != "b":
+    if parts is None:
+        return ctx.default_return_type
+    base = _dtype_base(parts[1])
+    if base not in ("b", "i", "u"):
         return ctx.default_return_type
     other = _parts_or_unpack(right)
     if other is not None:
-        if _dtype_base(other[1]) != "b":
+        if _dtype_base(other[1]) not in ("b", "i", "u"):
             return ctx.default_return_type
-    elif _bool_value(right) is None:
-        return ctx.default_return_type
-    dims = _broadcast_dims(ctx, left, right)
-    if dims is None:
-        return ctx.default_return_type
-    dtype = _construct_dtype(ctx, "numpy.bool")
-    if dtype is None:
-        return ctx.default_return_type
-    return _ndarray_type(ctx, dims, dtype)
+        # Bool pairs keep bool out; int pairs promote like add.
+        if base == "b" and _dtype_base(other[1]) == "b":
+            dims = _broadcast_dims(ctx, left, right)
+            if dims is None:
+                return ctx.default_return_type
+            dtype = _construct_dtype(ctx, "numpy.bool")
+            if dtype is None:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, dims, dtype)
+        return _solve_broadcast(ctx, left, right)
+    if _bool_value(right) is not None or _is_plain_bool(right):
+        if base != "b":
+            # int & bool variable: a scalar always fits — keep left dims.
+            left_parts = _ndarray_parts(left)
+            if left_parts is None:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, left_parts[0], left_parts[1])
+        dims = _broadcast_dims(ctx, left, right)
+        if dims is None:
+            # Plain bool scalar: _broadcast_dims bails on non-literal,
+            # but a scalar always fits — keep the left dims.
+            left_parts = _ndarray_parts(left)
+            if left_parts is None:
+                return ctx.default_return_type
+            dims = left_parts[0]
+        dtype = _construct_dtype(ctx, "numpy.bool")
+        if dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, dtype)
+    if _scalar_key(right) is not None:
+        # Python int literal / numpy concrete scalar: broadcast keeps dims.
+        return _solve_broadcast(ctx, left, right)
+    if _is_builtin_int(right):
+        # Plain int variable: a scalar always fits — keep left dims/dtype.
+        left_parts = _ndarray_parts(left)
+        if left_parts is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, left_parts[0], left_parts[1])
+    return ctx.default_return_type
 
 
 def isclose_function_hook(ctx: FunctionContext) -> Type:
