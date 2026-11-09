@@ -1239,8 +1239,6 @@ class NumtyPlugin(Plugin):
             "argmax",
             "argmin",
             "argsort",
-            "sort",
-            "partition",
             "argpartition",
         }:
             return partial(arg_method_hook, op=short)
@@ -6522,6 +6520,16 @@ def _reduction_bool_types(
         if split is None:
             return ctx.default_return_type
         return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype, dtype)
+    if axis == "absent":
+        # An omitted axis reduces every axis, exactly like axis=None.
+        axis = "none"
+    if axis == "none":
+        if keepdims is None or has_dtype:
+            return ctx.default_return_type
+        if keepdims:
+            return _ndarray_type(ctx, [1] * len(dims), dtype)
+        scalar = _scalar_of_dtype(dtype)
+        return scalar if scalar is not None else ctx.default_return_type
     return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, dtype)
 
 
@@ -8239,6 +8247,9 @@ def _reduction_types(
         if split is None:
             return ctx.default_return_type
         return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype)
+    if axis == "absent":
+        # An omitted axis reduces every axis, exactly like axis=None.
+        axis = "none"
     if axis == "none":
         # Explicit axis=None reduces every axis: keepdims keeps them all
         # as 1s, otherwise the result is a scalar of the output dtype
@@ -8976,8 +8987,23 @@ def isclose_function_hook(ctx: FunctionContext) -> Type:
 def _solve_argdrop(
     ctx: FunctionContext | MethodContext, dims: list[int], axis: list[int] | None | str
 ) -> Type:
-    """argmax/argmin/argpartition: drop the axis, integer positions out."""
+    """argmax/argmin: drop the axis, integer positions out (issue #47).
+
+    With keepdims=True the dropped axes stay as size 1; an omitted (or
+    None) axis flattens, so keepdims gives all ones and the plain form
+    stays with the stubs (a scalar). An undecidable keepdims bails.
+    """
+    keep_pair = _formal_pair(ctx, "keepdims")
+    keepdims = False if keep_pair is None else _fold_flag(keep_pair)
     if not isinstance(axis, list):
+        if axis in ("absent", "none"):
+            if keepdims is None:
+                return ctx.default_return_type
+            if keepdims:
+                return _ndarray_type(ctx, [1] * len(dims), _default_dtype(ctx))
+            return ctx.default_return_type
+        return ctx.default_return_type
+    if keepdims is None:
         return ctx.default_return_type
     ndim = len(dims)
     normalized: list[int] = []
@@ -8996,6 +9022,10 @@ def _solve_argdrop(
             return ctx.default_return_type
         normalized.append(norm)
     chosen = set(normalized)
+    if keepdims:
+        return _ndarray_type(
+            ctx, [d if i not in chosen else 1 for i, d in enumerate(dims)], _default_dtype(ctx)
+        )
     return _ndarray_type(ctx, [d for i, d in enumerate(dims) if i not in chosen], _default_dtype(ctx))
 
 
@@ -9092,8 +9122,8 @@ def _kth_in_bounds(
     return True
 
 
-ARG_DROP = frozenset({"argmax", "argmin", "nanargmax", "nanargmin", "argpartition"})
-ARG_SAME_INT = frozenset({"argsort"})
+ARG_DROP = frozenset({"argmax", "argmin", "nanargmax", "nanargmin"})
+ARG_SAME_INT = frozenset({"argsort", "argpartition"})
 ARG_SAME = frozenset({"sort", "partition"})
 
 
@@ -9388,6 +9418,23 @@ def _check_average_weights(
     if len(wdims) != 1 or _same_dims(wdims, adims):
         return None
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis in ("absent", "none"):
+        # With no axis numpy requires weights shaped exactly like the
+        # input ("Axis must be specified when shapes of a and weights
+        # differ"), so 1-D weights only fit a 1-D input of the same size.
+        if len(adims) != 1:
+            return (
+                f"average weights with shape {_dims_str(wdims)} need axis= "
+                f"to match shape {_dims_str(adims)}"
+            )
+        if not isinstance(adims[0], int) or not isinstance(wdims[0], int):
+            return None
+        if adims[0] == wdims[0]:
+            return None
+        return (
+            f"average weights length {wdims[0]} does not match "
+            f"size {adims[0]} (shape {_dims_str(adims)})"
+        )
     if not isinstance(axis, list) or len(axis) != 1:
         return None
     norm = _normalize_axis(axis[0], len(adims))
@@ -9416,7 +9463,15 @@ def average_function_hook(ctx: FunctionContext) -> Type:
         if message is not None:
             ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
-    return _reduction_inputs(ctx, pairs[0][0])
+    returned_pair = _formal_pair(ctx, "returned")
+    returned = False if returned_pair is None else _fold_flag(returned_pair)
+    if returned is None:
+        return ctx.default_return_type
+    avg = _reduction_inputs(ctx, pairs[0][0])
+    if not returned:
+        return avg
+    # returned=True: (average, sum_of_weights), same shape for both.
+    return _linalg_tuple(ctx, [avg, avg])
 
 
 def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
@@ -10039,15 +10094,27 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     dims_a, dtype_a = part_a
     dims_b, dtype_b = part_b
-    if len(dims_a) < 2:
+    # lstsq is not a gufunc: a must be 2-D and b at most 2-D (numpy
+    # raises LinAlgError otherwise), so there is no batch to broadcast.
+    if len(dims_a) != 2:
         ctx.api.fail(
-            f"linalg.lstsq requires a with at least 2 dimensions, got shape "
+            f"linalg.lstsq requires a 2-dimensional array, got shape "
             f"{_dims_str(dims_a)}",
             ctx.context,
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
+    if len(dims_b) > 2:
+        ctx.api.fail(
+            f"linalg.lstsq requires b with at most 2 dimensions, got shape "
+            f"{_dims_str(dims_b)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
     rows, cols = dims_a[-2], dims_a[-1]
+    if not dims_b:
+        return ctx.default_return_type
     if len(dims_b) == 1:
         if not _check_dim_eq(
             ctx,
@@ -10057,7 +10124,6 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
             f"{_dim_str(dims_b[0])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
         ):
             return ctx.default_return_type
-        batch_b: list[int | Type] = []
         core = [cols]
     else:
         if not _check_dim_eq(
@@ -10068,25 +10134,14 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
             f"{_dim_str(dims_b[-2])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
         ):
             return ctx.default_return_type
-        batch_b = dims_b[:-2]
         core = [cols, dims_b[-1]]
-    batch, cause = _broadcast_result(dims_a[:-2], batch_b, ctx)
-    if cause is not None:
-        ctx.api.fail(
-            f"linalg.lstsq batch dimensions disagree: {_dims_str(dims_a[:-2])} vs "
-            f"{_dims_str(batch_b)} ({cause})",
-            ctx.context,
-            code=NUMTY_SHAPE,
-        )
-        return ctx.default_return_type
-    assert batch is not None
     dtype = _promoted_result_type(ctx, dtype_a, dtype_b)
     if dtype is None:
         return ctx.default_return_type
     # Only the solution is provable (residuals depend on runtime rank),
     # so the remaining items stay Any.
     rest = [AnyType(TypeOfAny.explicit)] * 3
-    return _linalg_tuple(ctx, [_ndarray_type(ctx, [*batch, *core], dtype), *rest])
+    return _linalg_tuple(ctx, [_ndarray_type(ctx, core, dtype), *rest])
 
 
 def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -> bool:
