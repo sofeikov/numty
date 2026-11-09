@@ -1976,6 +1976,40 @@ def test_parameterized_shape_generic_stays_clean() -> None:
     assert _run_fixture("bare_generic_ok.py") == ["ok"]
 
 
+def test_star_kwargs_ok() -> None:
+    # Issue #52: *tuple stars expand, shape=/axes=/min=/max= fall back
+    # from keywords, and out=/dtype= select the result. All match runtime.
+    result = run_mypy(FIXTURES / "star_kwargs_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    f32 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"
+    assert reveals_by_line(result) == {
+        28: f'"{f64.format("Literal[4], Literal[5], Literal[6]")}"',
+        29: f'"{f64.format("Literal[2], Literal[4]")}"',
+        30: f'"{f64.format("Literal[2], Literal[4], Literal[3]")}"',
+        31: f'"{f64.format("Literal[4], Literal[3], Literal[2]")}"',
+        32: f'"{f64.format("Literal[3], Literal[2], Literal[4]")}"',
+        33: f'"{f64.format("Literal[2], Literal[3]")}"',
+        34: f'"{f64.format("Literal[2], Literal[3]")}"',
+        35: f'"{f32.format("Literal[2], Literal[3]")}"',
+        36: f'"{f64.format("Literal[4], Literal[2], Literal[3]")}"',
+    }, result.stdout
+    assert _run_fixture("star_kwargs_ok.py") == ["ok"]
+
+
+def test_star_kwargs_bad() -> None:
+    # Issue #52: dropped bounds/shapes/out used to pass silently with the
+    # wrong shape; now each fails loudly.
+    result = run_mypy(FIXTURES / "bad_star_kwargs.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 4, result.stdout
+    assert "clip shapes disagree" in errors[0], result.stdout
+    assert "reshape changes total size: 6 -> 8" in errors[1], result.stdout
+    assert "output shape mismatch" in errors[2], result.stdout
+    assert "output shape mismatch" in errors[3], result.stdout
+
+
 def test_expr_dims_rejected() -> None:
     # Expression dims stay linear: name*name and division fail loudly
     # instead of going quietly Any.

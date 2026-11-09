@@ -3111,9 +3111,15 @@ def _dims_fit_intp(ctx: FunctionContext | MethodContext, dims: list[int | Type])
 
 def zeros_like_hook(ctx: FunctionContext) -> Type:
     shape_arg = _single_shape_arg(ctx)
+    shape_expr = _single_shape_expr(ctx)
+    if shape_arg is None:
+        # numpy >= 2 spellings like np.zeros(shape=(2, 3)).
+        named = _formal_pair(ctx, "shape")
+        if named is not None:
+            shape_arg, shape_expr = named
     if shape_arg is None:
         return ctx.default_return_type
-    dims = _builder_shape(shape_arg, _single_shape_expr(ctx), ctx.default_return_type)
+    dims = _builder_shape(shape_arg, shape_expr, ctx.default_return_type)
     if dims is None:
         return ctx.default_return_type
     if not _dims_fit_intp(ctx, dims):
@@ -6238,6 +6244,41 @@ def _all_positionals(ctx: FunctionContext | MethodContext) -> list[tuple[Type, E
     return out
 
 
+def _all_positionals_expanded(
+    ctx: FunctionContext | MethodContext,
+) -> list[tuple[Type, Expression | None]] | None:
+    """Positionals with fixed `*tuple` stars expanded; None on dynamic unpack.
+
+    An ARG_STAR whose type is a fixed-length TupleType contributes one
+    entry per item (expression unknown, so None). Anything else unpacked
+    (`*list`, `*variadic`, `**kwargs`) cannot be solved precisely: return
+    None so the caller bails to the stubs instead of solving the wrong
+    arity (issue #52).
+    """
+    out: list[tuple[Type, Expression | None]] = []
+    seen_star: set[int] = set()
+    for kinds, types, exprs in zip(ctx.arg_kinds, ctx.arg_types, ctx.args):
+        for kind, tp, expr in zip(kinds, types, exprs):
+            if kind == ARG_POS:
+                out.append((tp, expr))
+            elif kind == ARG_STAR:
+                # One star actual can be bound to several formals when the
+                # callee is overloaded (same expression object twice):
+                # count it once.
+                if id(expr) in seen_star:
+                    continue
+                seen_star.add(id(expr))
+                proper = get_proper_type(tp)
+                if isinstance(proper, TupleType):
+                    for item in proper.items:
+                        out.append((item, None))
+                else:
+                    return None
+            elif kind == ARG_STAR2:
+                return None
+    return out
+
+
 def _formal_pair(
     ctx: FunctionContext | MethodContext, name: str
 ) -> tuple[Type, Expression | None] | None:
@@ -7057,6 +7098,61 @@ def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
         name = _DTYPE_STRINGS.get(expr.value)
         return _construct_dtype(ctx, name) if name is not None else None
     return None
+
+
+def _apply_out_dtype(
+    ctx: FunctionContext | MethodContext, result: Type
+) -> Type:
+    """Apply explicit out=/dtype= to a solved ufunc/reduction result.
+
+    NumPy writes into out and returns it, and dtype= selects the loop:
+    when either is present the stubs' shape is not the answer. A
+    provable out shape clash fails loudly; anything unprovable keeps
+    out's own type (it carries the requested dtype and shape). A dtype=
+    the plugin cannot resolve bails out instead of guessing (issue #52).
+    """
+    if result is ctx.default_return_type:
+        return result
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        parts = _parts_or_unpack(result)
+        if parts is None:
+            return ctx.default_return_type
+        dims, _ = parts
+        result = _ndarray_type(ctx, list(dims), named)
+    out_pair = _formal_pair(ctx, "out")
+    if out_pair is None or _is_none_type(out_pair[0]):
+        return result
+    out_parts = _parts_or_unpack(out_pair[0])
+    if out_parts is None:
+        return out_pair[0]
+    out_dims, _ = out_parts
+    res_parts = _parts_or_unpack(result)
+    if res_parts is None:
+        return out_pair[0]
+    res_dims, _ = res_parts
+    if all(isinstance(d, int) for d in res_dims) and all(
+        isinstance(d, int) for d in out_dims
+    ):
+        assert all(isinstance(d, int) for d in res_dims)
+        assert all(isinstance(d, int) for d in out_dims)
+        rdims = cast(list[int], res_dims)
+        odims = cast(list[int], out_dims)
+        fits = len(odims) >= len(rdims) and all(
+            r == o or r == 1
+            for r, o in zip(rdims, odims[len(odims) - len(rdims):])
+        ) if rdims else True
+        if not fits:
+            ctx.api.fail(
+                f"output shape mismatch: computed shape {_dims_str(res_dims)} "
+                f"does not fit out shape {_dims_str(out_dims)}",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
+    return out_pair[0]
 
 
 def like_function_hook(ctx: FunctionContext) -> Type:
@@ -7897,26 +7993,45 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
 
 
 def reshape_method_hook(ctx: MethodContext) -> Type:
-    return _solve_reshape(ctx, ctx.type, _all_positionals(ctx))
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
+        return ctx.default_return_type
+    return _solve_reshape(ctx, ctx.type, pairs)
 
 
 def reshape_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if len(pairs) < 2:
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
         return ctx.default_return_type
+    if len(pairs) < 2:
+        shape_pair = _formal_pair(ctx, "shape")
+        if shape_pair is not None and not _is_none_type(shape_pair[0]):
+            pairs = pairs + [shape_pair]
+    if len(pairs) < 2:
+        # First positional may itself be spelled as a= keyword.
+        first = _formal_pair(ctx, "a")
+        if first is not None and pairs:
+            pairs = [first] + pairs[1:]
+        elif first is not None:
+            pairs = [first]
+        if len(pairs) < 2:
+            return ctx.default_return_type
     return _solve_reshape(ctx, pairs[0][0], pairs[1:])
 
 
 def transpose_method_hook(ctx: MethodContext) -> Type:
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
+        return ctx.default_return_type
     parts = _ndarray_parts(ctx.type) or _mixed_parts(ctx.type)
     if parts is not None:
         dims, dtype = parts
-        return _solve_transpose(ctx, dims, dtype, _all_positionals(ctx))
+        return _solve_transpose(ctx, dims, dtype, pairs)
     split = _unpack_shape(ctx.type)
     if split is None:
         return ctx.default_return_type
     (prefix, unpack, suffix), dtype = split
-    return _solve_transpose_unpack(ctx, prefix, unpack, suffix, dtype, _all_positionals(ctx))
+    return _solve_transpose_unpack(ctx, prefix, unpack, suffix, dtype, pairs)
 
 
 def _has_unknown_shape(tp: Type) -> bool:
@@ -7939,9 +8054,14 @@ def _has_unknown_shape(tp: Type) -> bool:
 
 
 def transpose_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if not pairs:
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
         return ctx.default_return_type
+    if not pairs:
+        first = _formal_pair(ctx, "a")
+        if first is None:
+            return ctx.default_return_type
+        pairs = [first]
     parts = _ndarray_parts(pairs[0][0]) or _mixed_parts(pairs[0][0])
     if parts is None:
         split = _unpack_shape(pairs[0][0])
@@ -7959,9 +8079,23 @@ def transpose_function_hook(ctx: FunctionContext) -> Type:
     dims, dtype = parts
     rest = pairs[1:]
     if not rest:
+        axes_pair = _formal_pair(ctx, "axes")
+        if axes_pair is not None and not _is_none_type(axes_pair[0]):
+            axes = _shape_from_arg(axes_pair[0], axes_pair[1])
+            if axes is None:
+                return ctx.default_return_type
+            return _apply_permutation(ctx, dims, dtype, axes)
         return _apply_permutation(ctx, dims, dtype, list(reversed(range(len(dims)))))
     if len(rest) > 1:
-        return ctx.default_return_type
+        folded: list[int] = []
+        for tp, expr in rest:
+            value = _fold_int(expr) if expr is not None else None
+            if value is None:
+                value = _int_value(tp)
+            if value is None:
+                return ctx.default_return_type
+            folded.append(value)
+        return _apply_permutation(ctx, dims, dtype, folded)
     tp, expr = rest[0]
     if _is_none_type(tp):
         return _apply_permutation(ctx, dims, dtype, list(reversed(range(len(dims)))))
@@ -8500,8 +8634,8 @@ def _reduction_inputs(
         [array], lambda t: _reduction_types(ctx, t, axis, keepdims, has_dtype, op)
     )
     if dist is not None:
-        return dist
-    return _reduction_types(ctx, array, axis, keepdims, has_dtype, op)
+        return _apply_out_dtype(ctx, dist)
+    return _apply_out_dtype(ctx, _reduction_types(ctx, array, axis, keepdims, has_dtype, op))
 
 
 def _reduction_types(
@@ -9911,7 +10045,9 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
 
 
 def reduction_function_hook(ctx: FunctionContext, op: str = "sum") -> Type:
-    pairs = _all_positionals(ctx)
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
+        return ctx.default_return_type
     if not pairs:
         return ctx.default_return_type
     return _reduction_inputs(ctx, pairs[0][0], op)
@@ -10170,7 +10306,9 @@ def _parse_einsum_term(term: str) -> tuple[list[str], list[str], bool] | None:
 
 
 def einsum_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
+        return ctx.default_return_type
     if not pairs:
         return ctx.default_return_type
     _, eq_expr = pairs[0]
@@ -11077,11 +11215,14 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
 
 
 def _solve_clip(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
+        return ctx.default_return_type
     if not pairs:
         return ctx.default_return_type
     # Keyword bounds not already covered positionally still broadcast.
-    for name, position in (("a_min", 2), ("a_max", 3)):
+    # NumPy >= 2.1 also spells them min=/max=.
+    for name, position in (("a_min", 2), ("a_max", 3), ("min", 2), ("max", 3)):
         if len(pairs) < position:
             named = _formal_pair(ctx, name)
             if named is not None and not _is_none_type(named[0]):
@@ -11342,16 +11483,17 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
 
 
 def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
-    pairs = _all_positionals(ctx)
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
+        return ctx.default_return_type
     if len(pairs) != 1:
         return ctx.default_return_type
-    for name in ("out", "where", "dtype"):
-        if _formal_pair(ctx, name) is not None:
-            return ctx.default_return_type
+    if _formal_pair(ctx, "where") is not None:
+        return ctx.default_return_type
     dist = _distribute_solve([pairs[0][0]], lambda t: _ufunc_types(ctx, group, t))
     if dist is not None:
-        return dist
-    return _ufunc_types(ctx, group, pairs[0][0])
+        return _apply_out_dtype(ctx, dist)
+    return _apply_out_dtype(ctx, _ufunc_types(ctx, group, pairs[0][0]))
 
 
 def _smallest_float(name: str) -> str | None:
@@ -11720,7 +11862,17 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
 
 
 def clip_method_hook(ctx: MethodContext) -> Type:
-    pairs = _all_positionals(ctx)
+    pairs = _all_positionals_expanded(ctx)
+    if pairs is None:
+        return ctx.default_return_type
+    # Method form also accepts named bounds: a.clip(min=w, max=v).
+    # One entry per slot; aliases resolve to the first spelling present.
+    for aliases in (("a_min", "min"), ("a_max", "max")):
+        for name in aliases:
+            named = _formal_pair(ctx, name)
+            if named is not None and not _is_none_type(named[0]):
+                pairs.append(named)
+                break
     if not pairs:
         return ctx.default_return_type
     types = [ctx.type] + [tp for tp, _ in pairs]
@@ -11773,6 +11925,10 @@ def _ufunc_name(ctx: FunctionContext | MethodContext) -> str | None:
 
 
 def ufunc_call_hook(ctx: MethodContext) -> Type:
+    return _apply_out_dtype(ctx, _ufunc_call_solve(ctx))
+
+
+def _ufunc_call_solve(ctx: MethodContext) -> Type:
     proper = get_proper_type(ctx.type)
     if isinstance(proper, Instance) and "Nout2" in proper.type.fullname:
         # Two-output ufuncs (frexp, modf): the stubs own the tuple.
@@ -11783,7 +11939,9 @@ def ufunc_call_hook(ctx: MethodContext) -> Type:
     if name in _UFUNC_KEEP:
         # Per-loop tables (issue #61): bool square -> int8; bool
         # sign/negative and float/complex invert have no loop -> fail.
-        pairs = _all_positionals(ctx)
+        pairs = _all_positionals_expanded(ctx)
+        if pairs is None:
+            return ctx.default_return_type
         if len(pairs) == 1:
             tp = pairs[0][0]
             part = _parts_or_unpack(tp)
@@ -11821,19 +11979,25 @@ def ufunc_call_hook(ctx: MethodContext) -> Type:
     if name in _UFUNC_BOOL:
         return _solve_ufunc(ctx, "bool")
     if name == "matmul":
-        pairs = _all_positionals(ctx)
+        pairs = _all_positionals_expanded(ctx)
+        if pairs is None:
+            return ctx.default_return_type
         if len(pairs) != 2:
             return ctx.default_return_type
         if not _matmul_has_dims(ctx, [pairs[0][0], pairs[1][0]]):
             return ctx.default_return_type
         return _solve_matmul(ctx, pairs[0][0], pairs[1][0])
     if name in {"divide", "true_divide"}:
-        pairs = _all_positionals(ctx)
+        pairs = _all_positionals_expanded(ctx)
+        if pairs is None:
+            return ctx.default_return_type
         if len(pairs) != 2:
             return ctx.default_return_type
         return _solve_truediv_pair(ctx, pairs[0][0], pairs[1][0])
     if name in _UFUNC_BINARY_PROMOTE:
-        pairs = _all_positionals(ctx)
+        pairs = _all_positionals_expanded(ctx)
+        if pairs is None:
+            return ctx.default_return_type
         if len(pairs) != 2:
             return ctx.default_return_type
         if name == "subtract" and _is_bool_operand(pairs[0][0]) and _is_bool_operand(pairs[1][0]):
@@ -11857,12 +12021,16 @@ def ufunc_call_hook(ctx: MethodContext) -> Type:
             return _ndarray_type(ctx, dims, dtype)
         return _solve_broadcast(ctx, pairs[0][0], pairs[1][0])
     if name in _UFUNC_BINARY_FLOAT:
-        pairs = _all_positionals(ctx)
+        pairs = _all_positionals_expanded(ctx)
+        if pairs is None:
+            return ctx.default_return_type
         if len(pairs) != 2:
             return ctx.default_return_type
         return _solve_ufunc_binary_float(ctx, pairs[0][0], pairs[1][0])
     if name in _UFUNC_BINARY_BOOL:
-        pairs = _all_positionals(ctx)
+        pairs = _all_positionals_expanded(ctx)
+        if pairs is None:
+            return ctx.default_return_type
         if len(pairs) != 2:
             return ctx.default_return_type
         return _solve_ufunc_binary_bool(ctx, pairs[0][0], pairs[1][0])
