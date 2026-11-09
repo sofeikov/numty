@@ -428,6 +428,21 @@ def test_arith_shapes_match_numpy() -> None:
         _ = np.zeros((2, 3), dtype=np.int64) ^ np.zeros(5, dtype=np.int64)
 
 
+def test_dtypes_match_numpy() -> None:
+    # Issue #61: dtype claims equal NumPy's result_type (shapes already checked).
+    rng = np.random.default_rng(0)
+    assert rng.standard_normal((2, 3), dtype=np.float32).dtype == np.float32
+    u8 = np.ones(4, dtype=np.uint8)
+    assert np.sqrt(u8).dtype == np.float16
+    assert np.divide(7, 2).dtype == np.float64
+    i32 = np.ones(4, dtype=np.int32)
+    assert (i32 * np.int64(2)).dtype == np.int64
+    z = np.ones((3, 4), dtype=np.complex128)
+    assert z.std(axis=0).dtype == np.float64
+    ai = np.eye(2, dtype=np.int64)
+    assert np.linalg.solve(ai, np.ones(2, dtype=np.int64)).dtype == np.float64
+
+
 def test_einsum_values() -> None:
     a = np.arange(6, dtype=np.float64).reshape(2, 3)
     b = np.arange(12, dtype=np.float64).reshape(3, 4)

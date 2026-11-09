@@ -703,13 +703,14 @@ def f(u: F64[N], w: F64[N, K]) -> None:
 **Elementwise, einsum, linalg, random.** Operators and bare `np.*`
 ufuncs alike — broadcast shapes and promote dtypes. In-place ops
 (`+=`, `-=`, …) reuse the broadcast check and additionally require the
-result to fit the target (`(3,) += (2, 3)` errors). Add-style promotion
-(`+`, `-`, `*`) matches NumPy (verified against `np.result_type` over
-the full dtype matrix, plus weak Python scalars). True division mixing a
-`float16`/`float32` with a bool or 8/16-bit int, and float ufuncs on
-small ints, do not yet: they are typed `float64` where NumPy picks a smaller float
-(`float32 / uint8` and `np.sqrt` of `int8` give `float32` and `float16`
-in NumPy; [#61](https://github.com/sofeikov/numty/issues/61)).
+result to fit the target (`(3,) += (2, 3)` errors). Promotion matches
+NumPy (`np.result_type` over the full dtype matrix, plus weak Python
+and numpy scalars): float ufuncs pick the smallest float (`sqrt(uint8)`
+is `float16`), true division of ints is `float64` (`f32 / u8` stays
+`float32`), `rng(..., dtype=np.float32)` is honored, `clip` promotes
+across all operands, `linalg.solve` maps ints to `float64` and rejects
+`float16`, and reductions keep NumPy dtypes (`sum` of ints is `int64`,
+`mean` is `float64`, complex `std` is real).
 `einsum` parses the subscript string (explicit, implicit,
 ellipsis, diagonals) and `linalg` checks squareness and inner dims while
 tracking dtypes (`eigh` stays real, `svd` shrinks with

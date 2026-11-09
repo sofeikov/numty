@@ -140,6 +140,7 @@ from mypy.types import (
     TypeVarTupleType,
     TypeVarType,
     UnboundType,
+    UninhabitedType,
     UnionType,
     UnpackType,
     get_proper_type,
@@ -1182,14 +1183,6 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__radd__",
             "numpy.ndarray.__mul__",
             "numpy.ndarray.__rmul__",
-            "numpy.ndarray.__sub__",
-            "numpy.ndarray.__rsub__",
-            "numpy.ndarray.__pow__",
-            "numpy.ndarray.__rpow__",
-            "numpy.ndarray.__floordiv__",
-            "numpy.ndarray.__rfloordiv__",
-            "numpy.ndarray.__mod__",
-            "numpy.ndarray.__rmod__",
             "numpy.ndarray.__xor__",
             "numpy.ndarray.__rxor__",
             "numpy.ndarray.__lshift__",
@@ -1198,6 +1191,20 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__rrshift__",
         }:
             return broadcast_method_hook
+        if fullname in {
+            "numpy.ndarray.__sub__",
+            "numpy.ndarray.__rsub__",
+        }:
+            return subtract_method_hook
+        if fullname in {
+            "numpy.ndarray.__pow__",
+            "numpy.ndarray.__rpow__",
+            "numpy.ndarray.__floordiv__",
+            "numpy.ndarray.__rfloordiv__",
+            "numpy.ndarray.__mod__",
+            "numpy.ndarray.__rmod__",
+        }:
+            return floordiv_mod_pow_method_hook
         if fullname in {
             "numpy.ndarray.__divmod__",
             "numpy.ndarray.__rdivmod__",
@@ -1316,7 +1323,7 @@ class NumtyPlugin(Plugin):
             "std",
             "var",
         }:
-            return reduction_method_hook
+            return partial(reduction_method_hook, op=short)
         if fullname.startswith("numpy.ndarray.") and short in {"cumsum", "cumprod"}:
             return cumsum_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "take":
@@ -4161,11 +4168,11 @@ def correlate_function_hook(ctx: FunctionContext) -> Type:
 
 
 def _complex_dtype(ctx: FunctionContext, dtype: Type) -> Type:
-    """complex128 for an fft-family input, complex64 for float32."""
+    """complex64 for float16/float32, else complex128 (issue #61)."""
     name = _dtype_fullname(dtype)
     if name is None:
         return _default_dtype(ctx)
-    out = "numpy.complex64" if name == "numpy.float32" else "numpy.complex128"
+    out = "numpy.complex64" if name in ("numpy.float16", "numpy.float32") else "numpy.complex128"
     built = _construct_dtype(ctx, out)
     return built if built is not None else _default_dtype(ctx)
 
@@ -4385,6 +4392,19 @@ def _fftn_solve(
             return ctx.default_return_type
         sizes = list(s) if s is not None else [None] * len(eff)
     out = list(dims)
+    if not eff:
+        # axes=(): no transform. fftn returns the input untouched;
+        # rfftn raises IndexError at runtime.
+        if rfft:
+            ctx.api.fail(
+                f"{op} with empty axes raises IndexError",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
+            return ctx.default_return_type
+        part = _ndarray_parts(arg)
+        assert part is not None
+        return _ndarray_type(ctx, out, part[1])
     for ax, size in zip(eff, sizes):
         if size is None:
             continue
@@ -5462,7 +5482,11 @@ def _solve_broadcast_scalar(
     """Array/scalar promotion keeping the array dims, or default."""
     key = _scalar_key(other)
     if key is None:
-        return ctx.default_return_type
+        # Numpy scalars (np.int64(3), x.max()) are strong (issue #61).
+        name = _scalar_ret_name(other)
+        if name is None:
+            return ctx.default_return_type
+        key = ("strong", name)
     strong = _dtype_fullname(dtype)
     if strong is None:
         return ctx.default_return_type
@@ -5572,18 +5596,70 @@ def _broadcast_types(ctx: FunctionContext | MethodContext, left: Type, right: Ty
 
 
 def broadcast_method_hook(ctx: MethodContext) -> Type:
+    # Never replace a stub Never (no loop) with a valid array (issue #61).
+    if isinstance(get_proper_type(ctx.default_return_type), UninhabitedType):
+        return ctx.default_return_type
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
     return _solve_broadcast(ctx, ctx.type, args[0])
 
 
-def divmod_method_hook(ctx: MethodContext) -> Type:
-    """`divmod(a, b)` / `a.__divmod__(b)`: tuple of two broadcasts (issue #54)."""
+def _is_bool_operand(tp: Type) -> bool:
+    part = _parts_or_unpack(tp)
+    if part is not None:
+        return _dtype_base(part[1]) == "b"
+    return _bool_value(tp) is not None or _is_plain_bool(tp)
+
+
+def subtract_method_hook(ctx: MethodContext) -> Type:
+    """`a - b`: bool subtract has no loop, fail instead of bool (issue #61)."""
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
-    result = _solve_broadcast(ctx, ctx.type, args[0])
+    if _is_bool_operand(ctx.type) and _is_bool_operand(args[0]):
+        ctx.api.fail(
+            "numpy boolean subtract, the `-` operator, is not supported",
+            ctx.context,
+            code=NUMTY_BROADCAST,
+        )
+        return ctx.default_return_type
+    return _solve_broadcast(ctx, ctx.type, args[0])
+
+
+def floordiv_mod_pow_method_hook(ctx: MethodContext) -> Type:
+    """`//`, `%`, `**`: bool+bool is int8, not bool (issue #61)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    arg = pairs[0][0]
+    if _is_bool_operand(ctx.type) and _is_bool_operand(arg):
+        dims = _broadcast_dims(ctx, ctx.type, arg)
+        if dims is None:
+            return ctx.default_return_type
+        dtype = _construct_dtype(ctx, "numpy.int8")
+        if dtype is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, dtype)
+    return _solve_broadcast(ctx, ctx.type, arg)
+
+
+def divmod_method_hook(ctx: MethodContext) -> Type:
+    """`divmod(a, b)` / `a.__divmod__(b)`: tuple of two broadcasts (issue #54)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    arg = pairs[0][0]
+    if _is_bool_operand(ctx.type) and _is_bool_operand(arg):
+        dims = _broadcast_dims(ctx, ctx.type, arg)
+        if dims is None:
+            return ctx.default_return_type
+        dtype = _construct_dtype(ctx, "numpy.int8")
+        if dtype is None:
+            return ctx.default_return_type
+        result = _ndarray_type(ctx, dims, dtype)
+        return _linalg_tuple(ctx, [result, result])
+    result = _solve_broadcast(ctx, ctx.type, arg)
     parts = _ndarray_parts(result)
     if parts is None:
         return ctx.default_return_type
@@ -5596,6 +5672,15 @@ def divmod_function_hook(ctx: FunctionContext) -> Type:
     args = _positional_actuals(ctx, 2)
     if args is None:
         return ctx.default_return_type
+    if _is_bool_operand(args[0]) and _is_bool_operand(args[1]):
+        dims = _broadcast_dims(ctx, args[0], args[1])
+        if dims is None:
+            return ctx.default_return_type
+        dtype = _construct_dtype(ctx, "numpy.int8")
+        if dtype is None:
+            return ctx.default_return_type
+        result = _ndarray_type(ctx, dims, dtype)
+        return _linalg_tuple(ctx, [result, result])
     result = _solve_broadcast(ctx, args[0], args[1])
     parts = _ndarray_parts(result)
     if parts is None:
@@ -6173,7 +6258,20 @@ def _dtype_kind_size(dtype: Type) -> tuple[str, int] | None:
         "numpy.signedinteger": "i",
         "numpy.unsignedinteger": "u",
     }.get(element.type.fullname)
-    if base is None or len(element.args) != 1:
+    if base is None:
+        return None
+    if base == "c" and len(element.args) == 2:
+        # complexfloating[_32Bit, _32Bit]: two identical width tags.
+        sizes = [_nbit_bytes(a) for a in element.args]
+        if len(sizes) != 2 or sizes[0] is None or sizes[0] != sizes[1]:
+            return None
+        assert sizes[0] is not None
+        # 2x4-byte -> 8 bytes (complex64), 2x8-byte -> 16 (complex128).
+        total = sizes[0] * 2
+        if total not in (8, 16):
+            return None
+        return base, total
+    if len(element.args) != 1:
         return None
     size = _nbit_bytes(element.args[0])
     if size is None:
@@ -6494,6 +6592,51 @@ def _solve_expand_dims(
     for ax in sorted(normalized):
         out.insert(ax, 1)
     return _ndarray_type(ctx, out, dtype)
+
+
+def _reduction_out_dtype(
+    ctx: FunctionContext | MethodContext, op: str, dtype: Type
+) -> Type | None:
+    """Output dtype for sum/prod/mean/std/var/max/min (issue #61).
+
+    sum/prod of bool/int -> int64 (uint -> uint64); mean/std/var of
+    bool/int/uint -> float64; std/var of complex -> real float; max/min
+    keep the input dtype. Anything else bails.
+    """
+    name = _dtype_fullname(dtype)
+    if name is None:
+        ks = _dtype_kind_size(dtype)
+        if ks is None:
+            return None
+        kind, _ = ks
+        # Unresolvable generic (e.g. floating[Any]): keep dims with Any? Bail.
+        return None
+    kind = _kind_of(name)
+    if kind is None:
+        return None
+    base = op.removeprefix("nan")
+    if base in ("sum", "prod"):
+        if kind == "u":
+            return _construct_dtype(ctx, "numpy.uint64")
+        if kind in ("b", "i"):
+            return _construct_dtype(ctx, "numpy.int64")
+        return dtype
+    if base in ("mean", "std", "var"):
+        if kind in ("b", "i", "u"):
+            return _construct_dtype(ctx, "numpy.float64")
+        if kind == "c" and base in ("std", "var"):
+            ks = _dtype_kind_size(dtype)
+            if ks is None:
+                return None
+            _, size = ks
+            real = _linalg_real_name("c", size)
+            if real is None:
+                return None
+            return _construct_dtype(ctx, real)
+        return dtype
+    if base in ("max", "min", "ptp", "amax", "amin"):
+        return dtype
+    return None
 
 
 def _solve_reduction(
@@ -8263,7 +8406,7 @@ def _solve_reduction_unpack(
 
 
 def _reduction_inputs(
-    ctx: FunctionContext | MethodContext, array: Type
+    ctx: FunctionContext | MethodContext, array: Type, op: str = "sum"
 ) -> Type:
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     keep_pair = _formal_pair(ctx, "keepdims")
@@ -8271,11 +8414,11 @@ def _reduction_inputs(
     dtype_pair = _formal_pair(ctx, "dtype")
     has_dtype = dtype_pair is not None and not _is_none_type(dtype_pair[0])
     dist = _distribute_solve(
-        [array], lambda t: _reduction_types(ctx, t, axis, keepdims, has_dtype)
+        [array], lambda t: _reduction_types(ctx, t, axis, keepdims, has_dtype, op)
     )
     if dist is not None:
         return dist
-    return _reduction_types(ctx, array, axis, keepdims, has_dtype)
+    return _reduction_types(ctx, array, axis, keepdims, has_dtype, op)
 
 
 def _reduction_types(
@@ -8284,6 +8427,7 @@ def _reduction_types(
     axis: list[int] | None | str,
     keepdims: bool | None,
     has_dtype: bool,
+    op: str = "sum",
 ) -> Type:
     parts = _parts_or_unpack(array)
     if parts is None:
@@ -8294,6 +8438,9 @@ def _reduction_types(
         if split is None:
             return ctx.default_return_type
         return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype)
+    out_dtype = _reduction_out_dtype(ctx, op, dtype)
+    if out_dtype is None:
+        return ctx.default_return_type
     if axis == "absent":
         # An omitted axis reduces every axis, exactly like axis=None.
         axis = "none"
@@ -8303,19 +8450,17 @@ def _reduction_types(
         # (the stubs leave explicit None as Any).
         if keepdims is None or has_dtype:
             return ctx.default_return_type
-        if _dtype_fullname(dtype) not in REDUCTION_DTYPES:
-            return ctx.default_return_type
         if keepdims:
             return _solve_reduction(
-                ctx, dims, dtype, list(range(len(dims))), True, has_dtype
+                ctx, dims, dtype, list(range(len(dims))), True, has_dtype, out_dtype
             )
-        scalar = _scalar_of_dtype(dtype)
+        scalar = _scalar_of_dtype(out_dtype)
         return scalar if scalar is not None else ctx.default_return_type
-    return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype)
+    return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, out_dtype)
 
 
-def reduction_method_hook(ctx: MethodContext) -> Type:
-    return _reduction_inputs(ctx, ctx.type)
+def reduction_method_hook(ctx: MethodContext, op: str) -> Type:
+    return _reduction_inputs(ctx, ctx.type, op)
 
 
 def _enum_member_value(modules: dict, tp: Type) -> int | None:
@@ -9472,6 +9617,15 @@ def rng_method_hook(ctx: MethodContext, op: str) -> Type:
         size = _parse_size_arg(ctx)
         if not isinstance(size, list):
             return ctx.default_return_type
+        # random/standard_normal take dtype= (float32/float64); normal and
+        # uniform have no dtype parameter and stay float64 (issue #61).
+        if op in ("random", "standard_normal"):
+            named = _named_dtype(ctx)
+            if named is not None:
+                name = _dtype_fullname(named)
+                if name not in ("numpy.float32", "numpy.float64"):
+                    return ctx.default_return_type
+                return _ndarray_type(ctx, size, named)
         dtype = _construct_dtype(ctx, "numpy.float64")
         if dtype is None:
             return ctx.default_return_type
@@ -9673,11 +9827,11 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
 
 
 
-def reduction_function_hook(ctx: FunctionContext) -> Type:
+def reduction_function_hook(ctx: FunctionContext, op: str = "sum") -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    return _reduction_inputs(ctx, pairs[0][0])
+    return _reduction_inputs(ctx, pairs[0][0], op)
 
 
 def _scalar_of_dtype(dtype: Type) -> Type | None:
@@ -10187,7 +10341,7 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     assert batch is not None
-    dtype = _promoted_result_type(ctx, dtype_a, dtype_b)
+    dtype = _linalg_solve_dtype(ctx, dtype_a, dtype_b)
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, [*batch, *core], dtype)
@@ -10218,6 +10372,8 @@ def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
         f"{_dims_str(dims)}",
     ):
         return ctx.default_return_type
+    if _reject_float16_linalg(ctx, dtype, op):
+        return ctx.default_return_type
     ks = _dtype_kind_size(dtype)
     if ks is None:
         return ctx.default_return_type
@@ -10231,6 +10387,39 @@ def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
     if out_dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, dims, out_dtype)
+
+
+def _reject_float16_linalg(ctx: FunctionContext | MethodContext, dtype: Type, op: str) -> bool:
+    """Fail for float16 linalg inputs (unsupported), else False."""
+    if _dtype_fullname(dtype) == "numpy.float16":
+        ctx.api.fail(
+            f"array type float16 is unsupported in linalg.{op}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return True
+    return False
+
+
+def _linalg_solve_dtype(
+    ctx: FunctionContext, dtype_a: Type, dtype_b: Type
+) -> Type | None:
+    """Promotion for solve/lstsq: ints become float64, float16 rejected."""
+    if _reject_float16_linalg(ctx, dtype_a, "solve") or _reject_float16_linalg(
+        ctx, dtype_b, "solve"
+    ):
+        return None
+    name = _promote_dtypes(dtype_a, dtype_b)
+    if name is None:
+        return None
+    kind = _kind_of(name)
+    if kind in ("i", "u", "b"):
+        return _construct_dtype(ctx, "numpy.float64")
+    if name == _dtype_fullname(dtype_a):
+        return dtype_a
+    if name == _dtype_fullname(dtype_b):
+        return dtype_b
+    return _construct_dtype(ctx, name)
 
 
 def _linalg_pinv(ctx: FunctionContext) -> Type:
@@ -10430,7 +10619,7 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
         ):
             return ctx.default_return_type
         core = [cols, dims_b[-1]]
-    dtype = _promoted_result_type(ctx, dtype_a, dtype_b)
+    dtype = _linalg_solve_dtype(ctx, dtype_a, dtype_b)
     if dtype is None:
         return ctx.default_return_type
     # Only the solution is provable (residuals depend on runtime rank),
@@ -10619,9 +10808,13 @@ def _operand_spec(tp: Type) -> tuple[list[int | Type] | None, str, str] | None:
             return None
         return (part[0], "strong", name)
     key = _scalar_key(tp)
-    if key is None:
-        return None
-    return (None, key[0], key[1])
+    if key is not None:
+        return (None, key[0], key[1])
+    # Numpy scalars (np.int64(3), x.max()) are strong (NEP 50).
+    name = _scalar_ret_name(tp)
+    if name is not None:
+        return (None, "strong", name)
+    return None
 
 
 _WEAK_DEFAULT = {
@@ -10822,7 +11015,7 @@ def _solve_clip(ctx: FunctionContext) -> Type:
 
 
 def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type:
-    # clip preserves the first array operand's dtype (bounds cast to it).
+    # NumPy 2 promotes across all operands (like a ufunc).
     specs = [_operand_spec(tp) for tp in types]
     if any(spec is None for spec in specs):
         return ctx.default_return_type
@@ -10833,12 +11026,16 @@ def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type
     dims = _broadcast_shapes(ctx, shapes, "clip")
     if dims is None:
         return ctx.default_return_type
-    for tp, (arr_dims, _, _) in zip(types, specs):
-        if arr_dims is not None:
-            part = _parts_or_unpack(tp)
-            assert part is not None
-            return _ndarray_type(ctx, dims, part[1])
-    return ctx.default_return_type
+    branches = [(kind, name) for _, kind, name in specs]
+    array_dtypes = []
+    for tp in types:
+        part = _parts_or_unpack(tp)
+        if part is not None:
+            array_dtypes.append(part[1])
+    dtype = _specs_dtype(ctx, branches, array_dtypes)
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
 
 
 def _solve_broadcast_to(ctx: FunctionContext) -> Type:
@@ -11074,9 +11271,54 @@ def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
     return _ufunc_types(ctx, group, pairs[0][0])
 
 
+def _smallest_float(name: str) -> str | None:
+    """Smallest float holding an int/uint/bool dtype (issue #61).
+
+    `result_type(name, float16)`: 1-byte -> float16, 2-byte -> float32,
+    larger -> float64. Floats/complex pass through.
+    """
+    if name.startswith("numpy.float") or name.startswith("numpy.complex"):
+        return name
+    return _promote_strong(name, "numpy.float16")
+
+
 def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> Type:
     part = _parts_or_unpack(tp)
     if part is None:
+        # Scalar input (np.sqrt(4.0)): map to the matching numpy scalar
+        # instead of the stub's Any (issue #61).
+        if group in ("float", "abs", "real"):
+            key = _scalar_key(tp)
+            if key is None:
+                name = _scalar_ret_name(tp)
+                if name is None:
+                    return ctx.default_return_type
+                key = ("strong", name)
+            kind, sname = key
+            if kind == "weak":
+                # Python scalars: float -> float64, int/bool -> smallest float.
+                if sname == "builtins.float":
+                    out = "numpy.float64"
+                elif sname in ("builtins.int", "builtins.bool"):
+                    out = _smallest_float("numpy.int64")
+                    if out is None:
+                        return ctx.default_return_type
+                elif sname == "builtins.complex":
+                    out = "numpy.complex128"
+                else:
+                    return ctx.default_return_type
+            else:
+                if _kind_of(sname) in ("f", "c"):
+                    out = sname
+                else:
+                    out = _smallest_float(sname)
+                    if out is None:
+                        return ctx.default_return_type
+            dtype = _construct_dtype(ctx, out)
+            if dtype is None:
+                return ctx.default_return_type
+            scalar = _scalar_of_dtype(dtype)
+            return scalar if scalar is not None else ctx.default_return_type
         return ctx.default_return_type
     dims, dtype = part
     if group == "keep":
@@ -11103,7 +11345,16 @@ def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> 
     else:
         if kind in ("f", "c"):
             return _ndarray_type(ctx, dims, dtype)
-        name = "numpy.float64"
+        fullname = _dtype_fullname(dtype)
+        if fullname is None:
+            return ctx.default_return_type
+        name = _smallest_float(fullname)
+    if name is None:
+        return ctx.default_return_type
+    out_dtype = _linalg_dtype(ctx, dtype, name)
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, out_dtype)
     if name is None:
         return ctx.default_return_type
     out_dtype = _linalg_dtype(ctx, dtype, name)
@@ -11159,16 +11410,15 @@ def _truediv_types(
         part = _ndarray_parts(tp)
         if part is not None:
             array_dtypes.append(part[1])
-    # Division by (or of) an integer array yields the default float.
-    strong_int = any(
-        kind == "strong" and _kind_of(name) in ("i", "u", "b")
-        for kind, name in ((kind_l, name_l), (kind_r, name_r))
-    )
-    if strong_int and not any(_kind_of(name) == "c" for name in names):
-        dtype = _construct_dtype(ctx, "numpy.float64")
-        if dtype is None:
-            return ctx.default_return_type
-        return _ndarray_type(ctx, dims, dtype)
+    # Division with no float/complex operand yields the default float;
+    # weak Python ints count like strong ones (np.divide(7, 2) -> float64).
+    # With a float present, normal promotion applies (f32/u8 -> f32).
+    if not any(_kind_of(name) in ("f", "c") for name in names):
+        if any(_kind_of(name) in ("i", "u", "b") for name in names):
+            dtype = _construct_dtype(ctx, "numpy.float64")
+            if dtype is None:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, dims, dtype)
     dtype = _specs_dtype(ctx, [(kind_l, name_l), (kind_r, name_r)], array_dtypes)
     if dtype is None:
         return ctx.default_return_type
@@ -11410,11 +11660,9 @@ _UFUNC_BINARY_PROMOTE = frozenset(
         "maximum",
         "fmin",
         "fmax",
-        "logaddexp",
-        "logaddexp2",
     }
 )
-_UFUNC_BINARY_FLOAT = frozenset({"hypot", "arctan2"})
+_UFUNC_BINARY_FLOAT = frozenset({"hypot", "arctan2", "logaddexp", "logaddexp2"})
 _UFUNC_BINARY_BOOL = frozenset(
     {
         "equal",
@@ -11450,6 +11698,36 @@ def ufunc_call_hook(ctx: MethodContext) -> Type:
     if name is None:
         return ctx.default_return_type
     if name in _UFUNC_KEEP:
+        # Per-loop tables (issue #61): bool square -> int8; bool
+        # sign/negative and float/complex invert have no loop -> fail.
+        pairs = _all_positionals(ctx)
+        if len(pairs) == 1:
+            tp = pairs[0][0]
+            part = _parts_or_unpack(tp)
+            if part is not None:
+                base = _dtype_base(part[1])
+                if name == "square" and base == "b":
+                    dims = _broadcast_dims(ctx, tp, tp)
+                    if dims is None:
+                        return ctx.default_return_type
+                    dtype = _construct_dtype(ctx, "numpy.int8")
+                    if dtype is None:
+                        return ctx.default_return_type
+                    return _ndarray_type(ctx, dims, dtype)
+                if name in ("sign", "negative") and base == "b":
+                    ctx.api.fail(
+                        f"ufunc '{name}' has no loop for bool inputs",
+                        ctx.context,
+                        code=NUMTY_BROADCAST,
+                    )
+                    return ctx.default_return_type
+                if name in ("invert", "bitwise_not") and base in ("f", "c"):
+                    ctx.api.fail(
+                        f"ufunc '{name}' not supported for float inputs",
+                        ctx.context,
+                        code=NUMTY_BROADCAST,
+                    )
+                    return ctx.default_return_type
         return _solve_ufunc(ctx, "keep")
     if name in _UFUNC_ABS:
         return _solve_ufunc(ctx, "abs")
@@ -11475,6 +11753,25 @@ def ufunc_call_hook(ctx: MethodContext) -> Type:
         pairs = _all_positionals(ctx)
         if len(pairs) != 2:
             return ctx.default_return_type
+        if name == "subtract" and _is_bool_operand(pairs[0][0]) and _is_bool_operand(pairs[1][0]):
+            ctx.api.fail(
+                "numpy boolean subtract is not supported, use bitwise_xor instead",
+                ctx.context,
+                code=NUMTY_BROADCAST,
+            )
+            return ctx.default_return_type
+        if (
+            name in ("floor_divide", "remainder", "fmod", "power")
+            and _is_bool_operand(pairs[0][0])
+            and _is_bool_operand(pairs[1][0])
+        ):
+            dims = _broadcast_dims(ctx, pairs[0][0], pairs[1][0])
+            if dims is None:
+                return ctx.default_return_type
+            dtype = _construct_dtype(ctx, "numpy.int8")
+            if dtype is None:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, dims, dtype)
         return _solve_broadcast(ctx, pairs[0][0], pairs[1][0])
     if name in _UFUNC_BINARY_FLOAT:
         pairs = _all_positionals(ctx)
@@ -11517,7 +11814,10 @@ def _ufunc_float_types(
     if kind in ("f", "c"):
         out_name = combined
     elif kind in ("i", "u", "b"):
-        out_name = "numpy.float64"
+        out = _smallest_float(combined)
+        if out is None:
+            return ctx.default_return_type
+        out_name = out
     else:
         return ctx.default_return_type
     array_dtypes = []
@@ -11579,22 +11879,22 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "clip": clip_function_hook,
             "cumprod": cumsum_function_hook,
             "cumsum": cumsum_function_hook,
-            "max": reduction_function_hook,
-            "mean": reduction_function_hook,
-            "min": reduction_function_hook,
+            "max": partial(reduction_function_hook, op="max"),
+            "mean": partial(reduction_function_hook, op="mean"),
+            "min": partial(reduction_function_hook, op="min"),
             "nonzero": nonzero_function_hook,
-            "prod": reduction_function_hook,
+            "prod": partial(reduction_function_hook, op="prod"),
             "repeat": repeat_function_hook,
             "reshape": reshape_function_hook,
             "searchsorted": searchsorted_function_hook,
             "squeeze": squeeze_function_hook,
-            "std": reduction_function_hook,
-            "sum": reduction_function_hook,
+            "std": partial(reduction_function_hook, op="std"),
+            "sum": partial(reduction_function_hook, op="sum"),
             "take": take_function_hook,
             "transpose": transpose_function_hook,
             "swapaxes": swapaxes_function_hook,
             "matrix_transpose": matrix_transpose_function_hook,
-            "var": reduction_function_hook,
+            "var": partial(reduction_function_hook, op="var"),
             **{
                 op: partial(arg_function_hook, op=op)
                 for op in (
@@ -11678,7 +11978,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "diff": diff_function_hook,
             "flip": flip_function_hook,
             "gradient": gradient_function_hook,
-            "median": reduction_function_hook,
+            "median": partial(reduction_function_hook, op="median"),
             "percentile": percentile_function_hook,
             "quantile": percentile_function_hook,
             "rot90": rot90_function_hook,
@@ -11692,16 +11992,16 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "nanargmin": partial(arg_function_hook, op="nanargmin"),
             "nancumprod": cumsum_function_hook,
             "nancumsum": cumsum_function_hook,
-            "nanmax": reduction_function_hook,
-            "nanmean": reduction_function_hook,
-            "nanmedian": reduction_function_hook,
-            "nanmin": reduction_function_hook,
+            "nanmax": partial(reduction_function_hook, op="nanmax"),
+            "nanmean": partial(reduction_function_hook, op="nanmean"),
+            "nanmedian": partial(reduction_function_hook, op="nanmedian"),
+            "nanmin": partial(reduction_function_hook, op="nanmin"),
             "nanpercentile": percentile_function_hook,
-            "nanprod": reduction_function_hook,
+            "nanprod": partial(reduction_function_hook, op="nanprod"),
             "nanquantile": percentile_function_hook,
-            "nanstd": reduction_function_hook,
-            "nansum": reduction_function_hook,
-            "nanvar": reduction_function_hook,
+            "nanstd": partial(reduction_function_hook, op="nanstd"),
+            "nansum": partial(reduction_function_hook, op="nansum"),
+            "nanvar": partial(reduction_function_hook, op="nanvar"),
         },
         "numpy.lib._shape_base_impl": {
             "column_stack": column_stack_function_hook,
