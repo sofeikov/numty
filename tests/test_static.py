@@ -666,6 +666,70 @@ def test_callsite_conflict() -> None:
     assert "'a'" in errors[2] and "'b'" in errors[2], result.stdout
 
 
+def test_callsite_conflict_in_comprehension() -> None:
+    # Issue #44: the process-lifetime `_seen_conflicts` dedup consumed the
+    # single allowed emission during mypy's throw-away inference pass
+    # inside comprehensions / generator expressions / lambdas, so the pass
+    # that counts stayed quiet. All seven calls must error, exactly once.
+    result = run_mypy(FIXTURES / "bad_callsite_conflict_comp.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 7, result.stdout
+    assert [int(line.split(":")[1]) for line in errors] == [12, 13, 14, 15, 16, 17, 18]
+    for line in errors:
+        assert "call-site shape conflict for 'features'" in line, result.stdout
+        assert "[numty-callsite]" in line, result.stdout
+
+
+def test_callsite_conflict_survives_dmypy_recheck(tmp_path: Path) -> None:
+    # Issue #44: dmypy keeps one plugin instance across checks, so the
+    # process-lifetime dedup hid the conflict after any recheck. Both the
+    # cold check and the check after a comment-only edit must report it.
+    dmypy = Path(sys.executable).parent / "dmypy"
+    if not dmypy.exists():
+        pytest.skip("dmypy is not installed")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    src = proj / "repro.py"
+    src.write_text(
+        "import numpy as np\n"
+        "from numty import F64, batch, features, hid\n"
+        "\n"
+        "\n"
+        "def proj(x: F64[batch, features], w: F64[features, hid]) -> F64[batch, hid]:\n"
+        "    return np.matmul(x, w)\n"
+        "\n"
+        "\n"
+        "bad = proj(np.zeros((4, 3)), np.ones((2, 5)))\n"
+        "# edit-marker v1\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "MYPYPATH": str(ROOT)}
+    status = tmp_path / "dmypy.json"
+    cache = tmp_path / "cache"
+    base = [str(dmypy), "--status-file", str(status)]
+    try:
+        start = subprocess.run(
+            [*base, "start", "--", "--config-file", str(ROOT / "mypy.ini"),
+             "--cache-dir", str(cache)],
+            cwd=proj, env=env, capture_output=True, text=True, timeout=300,
+        )
+        assert start.returncode == 0, start.stdout + start.stderr
+        first = subprocess.run(
+            [*base, "check", "repro.py"],
+            cwd=proj, env=env, capture_output=True, text=True, timeout=300,
+        )
+        assert "call-site shape conflict for 'features'" in first.stdout, first.stdout
+        src.write_text(src.read_text().replace("edit-marker v1", "edit-marker v2"))
+        second = subprocess.run(
+            [*base, "check", "repro.py"],
+            cwd=proj, env=env, capture_output=True, text=True, timeout=300,
+        )
+        assert "call-site shape conflict for 'features'" in second.stdout, second.stdout
+    finally:
+        subprocess.run([*base, "stop"], cwd=proj, env=env,
+                       capture_output=True, text=True, timeout=120)
+
+
 def test_fancy_dtype_mismatch() -> None:
     assert_rank_mismatch(
         run_mypy(FIXTURES / "bad_fancy_dtype.py"),
