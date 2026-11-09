@@ -1588,6 +1588,27 @@ def test_offsets_calls_mismatch() -> None:
     )
 
 
+def test_dataclass_implicit_method_ok() -> None:
+    # Issue #29: methods (including dataclass methods) with undeclared
+    # string dims infer like functions instead of rigid-failing.
+    # `c.m(concrete)` and `a.with_grid(dynamic)` used to report
+    # `expected tuple[P, Q, ...]`; now they infer.
+    result = run_mypy(FIXTURES / "dataclass_implicit_method_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f32 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"
+    assert reveals_by_line(result) == {
+        33: f'"{f32.format("U, V, Literal[2]")}"',
+        40: f'"{f32.format("Literal[9], Literal[23], Literal[2]")}"',
+        44: f'"{f32.format("T, X, Literal[2]")}"',
+    }, result.stdout
+    assert _run_fixture("dataclass_implicit_method_ok.py") == [
+        "(9, 23, 2)",
+        "(9, 23, 2)",
+        "(4, 5, 2)",
+    ]
+
+
 def test_expr_dims_rejected() -> None:
     # Expression dims stay linear: name*name and division fail loudly
     # instead of going quietly Any.

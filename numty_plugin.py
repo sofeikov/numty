@@ -392,6 +392,29 @@ class NumtyPlugin(Plugin):
         hook = self._later_plugin_hook(ctx, "get_method_signature_hook", fullname)
         if hook is not None:
             sig = hook(ctx)
+        # Dataclass __init__ (issue #29): string-spec words bound late
+        # (see _fam_bind_words) are missing from the method's variables,
+        # so `A1(grid=int-dims)` rigid-fails instead of inferring the
+        # implicit dims like a generic function does. Add exactly those
+        # back, same as the function call-site hook does.
+        try:
+            if isinstance(sig, CallableType):
+                have = {v.fullname for v in sig.variables}
+                missing: list[TypeVarLikeType] = []
+                for formal in list(sig.arg_types) + [sig.ret_type]:
+                    for tvar in _iter_tvarlikes(formal):
+                        if (
+                            tvar.fullname in self._fam_late_bound
+                            and tvar.fullname not in have
+                        ):
+                            have.add(tvar.fullname)
+                            missing.append(tvar)
+                if missing:
+                    sig = sig.copy_modified(
+                        variables=tuple(sig.variables) + tuple(missing)
+                    )
+        except Exception:
+            pass
         _note_rank_mismatches(ctx, sig)
         return sig
 
