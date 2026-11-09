@@ -1526,6 +1526,77 @@ def test_average_weights_mismatch() -> None:
     )
 
 
+def test_reduce_keepdims_ok_clean_and_runs() -> None:
+    # Issue #47: keepdims keeps size-1 axes, argpartition keeps the input
+    # shape, average(returned=True) is a shape-matched tuple, reductions
+    # without axis reduce every axis, and lstsq stays 2-D. Golden reveals
+    # plus a runtime oracle.
+    result = run_mypy(FIXTURES / "reduce_keepdims_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    iu = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]]"
+    notes = {
+        line: re.sub(r"\?U@\d+[a-z]?", "?U", note)
+        for line, note in reveals_by_line(result).items()
+    }
+    assert notes == {
+        30: f'"{iu.format("Literal[5], Literal[1]")}"',
+        31: f'"{iu.format("Literal[1], Literal[7]")}"',
+        32: f'"{iu.format("Literal[5], Literal[1]")}"',
+        34: f'"{iu.format("Literal[5], Literal[7]")}"',
+        36: f'"{iu.format("Literal[5], Literal[7]")}"',
+        39: f'"{f64.format("Literal[4]")}"',
+        40: f'"{f64.format("Literal[4]")}"',
+        42: f'"{f64.format("Literal[1], Literal[1]")}"',
+        43: f'"{f64.format("Literal[1], Literal[1]")}"',
+        44: f'"{f64.format("Literal[1], Literal[1]")}"',
+        45: f'"numpy.ndarray[tuple[Literal[1], Literal[1]], numpy.dtype[numpy.bool[bool]]]"',
+        46: f'"{iu.format("Literal[1], Literal[1]")}"',
+        47: f'"{f64.format("Literal[1], Literal[1]")}"',
+        48: f'"{f64.format("Literal[3]")}"',
+    }, result.stdout
+    assert _run_fixture("reduce_keepdims_ok.py") == [
+        "(5, 1)",
+        "(1, 7)",
+        "(5, 1)",
+        "(5, 7)",
+        "(5, 3)",
+        "(5, 7)",
+        "(4,)",
+        "(4,)",
+        "(1, 1)",
+        "(1, 1)",
+        "(1, 1)",
+        "(1, 1)",
+        "(1, 1)",
+        "(1, 1)",
+        "(3,)",
+    ]
+
+
+def test_reduce_shapes_mismatch() -> None:
+    # Issue #47: every wrong reduction/sort shape must fail loudly.
+    result = run_mypy(FIXTURES / "bad_reduce_shapes.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 9, result.stdout
+    assert errors[0].startswith("tests/fixtures/bad_reduce_shapes.py:14: error:"), result.stdout
+    assert "tuple[Literal[1], Literal[1]]" in errors[0], result.stdout
+    assert "tuple[Literal[3], Literal[4]]" in errors[0], result.stdout
+    assert errors[1].startswith("tests/fixtures/bad_reduce_shapes.py:18: error:"), result.stdout
+    assert "tuple[N, Literal[4]]" in errors[1], result.stdout
+    assert errors[2].startswith("tests/fixtures/bad_reduce_shapes.py:23: error:"), result.stdout
+    assert "tuple[Literal[5], Literal[3]]" in errors[2], result.stdout
+    assert errors[3].startswith("tests/fixtures/bad_reduce_shapes.py:27: error:"), result.stdout
+    assert '"sort" of "ndarray" does not return a value' in errors[3], result.stdout
+    assert errors[4].startswith("tests/fixtures/bad_reduce_shapes.py:28: error:"), result.stdout
+    assert errors[5].startswith("tests/fixtures/bad_reduce_shapes.py:32: error:"), result.stdout
+    assert "average weights with shape (20,) need axis=" in errors[5], result.stdout
+    assert errors[6].startswith("tests/fixtures/bad_reduce_shapes.py:36: error:"), result.stdout
+    assert "linalg.lstsq requires a 2-dimensional array, got shape (2, 5, 3)" in errors[7], result.stdout
+
+
 def test_diff_axis_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_diff_axis.py"),
