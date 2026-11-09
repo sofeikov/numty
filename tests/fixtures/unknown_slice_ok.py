@@ -34,7 +34,7 @@ def partial(x: F64[5, 7], i: int, k: int) -> None:
 
 def symbolic(s: F64[N, 3]) -> None:
     reveal_type(s[::-1])  # R: (N, 3)
-    reveal_type(s[1:])  # R: (?U, 3)
+    reveal_type(s[1:])  # R: (N-1, 3)
 
 
 if __name__ == "__main__":

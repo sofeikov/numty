@@ -489,6 +489,15 @@ class NumtyPlugin(Plugin):
         except Exception:
             return False
 
+    def _is_fam_int_name(self, fullname: str) -> bool:
+        """Whether a resolved name denotes the bare-int dim (issue #62).
+
+        `F64[int, ...]` spells a dynamic dim; the same word in a string
+        spec (`F64["int ..."]`) must mean the same thing rather than
+        minting a fresh implicit dim.
+        """
+        return fullname == "builtins.int"
+
     def _callsite_check(self, ctx: FunctionSigContext) -> Type:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType):
@@ -1032,11 +1041,28 @@ class NumtyPlugin(Plugin):
                 if sym.fullname:
                     self._fam_late_bound.add(sym.fullname)
                 continue
-            if sym is not None:
+            if sym is not None and isinstance(sym.node, Var) and sym.node.is_final:
+                # A Final int is a real dim; the normal path resolves it.
                 continue
-            minted[word] = self._fam_ensure_implicit(
-                ctx, analyzer, scope, word, node
-            )
+            if sym is not None and self._is_fam_int_name(
+                getattr(sym.node, "fullname", "") or ""
+            ):
+                # The bare-int dim spelled by name: same as F64[int, ...].
+                continue
+            if sym is not None and not isinstance(sym.node, TypeVarLikeExpr):
+                # A same-named module, variable, function or builtin is
+                # not a dim. Dims live in their own namespace (jaxtyping
+                # style), so mint an implicit dim instead of erroring
+                # (issue #62): `F64["time freq"]` after `import time`,
+                # `F64["n d"]` with a module-level `n = 10`.
+                minted[word] = self._fam_ensure_implicit(
+                    ctx, analyzer, scope, word, node
+                )
+                continue
+            if sym is None:
+                minted[word] = self._fam_ensure_implicit(
+                    ctx, analyzer, scope, word, node
+                )
         return minted
 
     def _fam_ensure_implicit(
@@ -2621,6 +2647,27 @@ def _callsite_expr_bindings(
                                 bindings[m_full] = found
             except Exception:
                 continue
+    # Unknown-rank actuals (plain NDArray) never infer: bind the
+    # formal's still-unbound tvars to a fresh unknown so the result
+    # keeps its rank instead of collapsing to Never (issue #62).
+    for i, positions in formals:
+        if i >= len(ctx.args):
+            continue
+        actuals = ctx.args[i]
+        if len(actuals) != 1:
+            continue
+        try:
+            actual_tp = ctx.api.get_expression_type(actuals[0])
+        except Exception:
+            continue
+        if not _has_unknown_shape(actual_tp):
+            continue
+        for dim, tvar in positions:
+            if tvar.fullname not in bindings:
+                try:
+                    bindings[tvar.fullname] = _fresh_unknown(ctx, "callsite", dim)
+                except Exception:
+                    continue
     return bindings
 
 
@@ -3645,6 +3692,9 @@ def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type)
             return ctx.default_return_type
         if dims is None:
             return ctx.default_return_type
+        if not dims:
+            # 1-D @ 1-D is a scalar, like dot/inner/vdot (issue #62).
+            return _promoted_scalar(ctx, dtype_a, dtype_b)
         return _mixed_result(_matmul_promoted(ctx, dims, dtype_a, dtype_b), left, right)
     dims, message, dtype_a, dtype_b = _matmul_unpack_dims(left, right)
     if message is not None:
@@ -5106,7 +5156,7 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
                 ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
             )
         return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
-    target = _normalize_axis(axis, len(dims))
+    target = _normalize_axis_0d(axis, len(dims))
     if target is None:
         ctx.api.fail(
             f"repeat axis {axis} is out of range for {len(dims)} dimensions "
@@ -5115,6 +5165,11 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
             code=NUMTY_AXIS,
         )
         return ctx.default_return_type
+    if not dims:
+        # A 0-d input with axis 0/-1 repeats the scalar (issue #62).
+        if isinstance(count, int):
+            return _ndarray_type(ctx, [count], dtype)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
     out = list(dims)
     if isinstance(size, int):
         out[target] = size
@@ -5185,7 +5240,7 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
                 ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
             )
         return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
-    target = _normalize_axis(axis, len(dims))
+    target = _normalize_axis_0d(axis, len(dims))
     if target is None:
         ctx.api.fail(
             f"repeat axis {axis} is out of range for {len(dims)} dimensions "
@@ -5194,6 +5249,11 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
             code=NUMTY_AXIS,
         )
         return ctx.default_return_type
+    if not dims:
+        # A 0-d input with axis 0/-1 repeats the scalar (issue #62).
+        if isinstance(count, int):
+            return _ndarray_type(ctx, [count], dtype)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
     out = list(dims)
     if isinstance(size, int):
         out[target] = size
@@ -6663,6 +6723,14 @@ def _normalize_axis(ax: int, ndim: int) -> int | None:
     return norm if 0 <= norm < ndim else None
 
 
+def _normalize_axis_0d(ax: int, ndim: int) -> int | None:
+    """Like _normalize_axis, but numpy also accepts axis 0/-1 on 0-d
+    input for reductions, cumsum, repeat and squeeze (issue #62)."""
+    if ndim == 0 and ax in (0, -1):
+        return 0
+    return _normalize_axis(ax, ndim)
+
+
 def _nbit_bytes(tp: Type) -> int | None:
     """Byte size of a bit-width tag (_32Bit class, literal, ...)."""
     proper = get_proper_type(tp)
@@ -6991,7 +7059,7 @@ def _solve_squeeze(
         return ctx.default_return_type
     chosen: list[int] = []
     for ax in axis:
-        norm = _normalize_axis(ax, ndim)
+        norm = _normalize_axis_0d(ax, ndim)
         if norm is None:
             ctx.api.fail(
                 f"squeeze axis {ax} is out of range for {ndim} dimensions "
@@ -7000,6 +7068,10 @@ def _solve_squeeze(
                 code=NUMTY_AXIS,
             )
             return ctx.default_return_type
+        if ndim == 0:
+            # 0-d input with axis 0/-1: nothing to squeeze.
+            chosen.append(norm)
+            continue
         if not isinstance(dims[norm], int):
             return ctx.default_return_type
         if dims[norm] != 1:
@@ -7104,7 +7176,7 @@ def _solve_reduction(
     ndim = len(dims)
     normalized: list[int] = []
     for ax in axis:
-        norm = _normalize_axis(ax, ndim)
+        norm = _normalize_axis_0d(ax, ndim)
         if norm is None:
             ctx.api.fail(
                 f"axis {ax} is out of range for {ndim} dimensions "
@@ -7120,7 +7192,7 @@ def _solve_reduction(
     chosen = set(normalized)
     if keepdims:
         return _ndarray_type(ctx, [1 if i in chosen else d for i, d in enumerate(dims)], out_dtype)
-    return _ndarray_type(ctx, [d for i, d in enumerate(dims) if i not in chosen], out_dtype)
+    return _maybe_scalar(ctx, [d for i, d in enumerate(dims) if i not in chosen], out_dtype)
 
 
 def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) -> Type:
@@ -9618,6 +9690,27 @@ def _solve_getitem(
                     return ctx.default_return_type
                 else:
                     frag = _fresh_unknown(ctx, "slice", dim)
+            elif (stride == "missing" or stride == 1) and (
+                begin == "missing" or (isinstance(begin, int) and begin >= 0)
+            ) and (end == "missing" or (isinstance(end, int) and end < 0)):
+                # Literal [s:e] on a linear dim N+c removes s from the
+                # front and -e from the back: (N+2)[1:-1] is (N,)
+                # (issue #62). Anything else (negative starts, positive
+                # ends, steps) depends on the runtime length: bail out.
+                fa = _resolve_dim(size)
+                if isinstance(fa, _LinForm):
+                    s = 0 if begin == "missing" else begin
+                    e = 0 if end == "missing" else end
+                    assert isinstance(s, int) and isinstance(e, int)
+                    frag = _materialize_dim(
+                        ctx,
+                        "slice",
+                        dim,
+                        _LinForm(fa.coeffs, fa.const + e - s),
+                        prefer=size if isinstance(size, TypeVarType) else None,
+                    )
+                else:
+                    frag = _fresh_unknown(ctx, "slice", dim)
             else:
                 frag = _fresh_unknown(ctx, "slice", dim)
             (kept_after if (has_trigger and not front and adv_seen) else kept_before).append(frag)
@@ -9989,7 +10082,7 @@ def _solve_argdrop(
     ndim = len(dims)
     normalized: list[int] = []
     for ax in axis:
-        norm = _normalize_axis(ax, ndim)
+        norm = _normalize_axis_0d(ax, ndim)
         if norm is None:
             ctx.api.fail(
                 f"axis {ax} is out of range for {ndim} dimensions "
@@ -10387,6 +10480,21 @@ def _scalar_of_dtype(dtype: Type) -> Type | None:
     return None
 
 
+def _maybe_scalar(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
+) -> Type:
+    """An ndarray for the dims, or the numpy scalar when none are left.
+
+    Fully reduced results (and scalar-only ufunc calls) are numpy
+    scalars at runtime, not 0-d arrays, so `total: float = ...` checks
+    (issue #62). Falls back to the stubs when the dtype has no scalar.
+    """
+    if dims:
+        return _ndarray_type(ctx, dims, dtype)
+    scalar = _scalar_of_dtype(dtype)
+    return scalar if scalar is not None else ctx.default_return_type
+
+
 def _same_dims(a: list[int | Type], b: list[int | Type]) -> bool:
     """Provably-equal dim lists: same ints, same TypeVars by fullname."""
     return len(a) == len(b) and all(_dim_eq(x, y) for x, y in zip(a, b))
@@ -10488,7 +10596,7 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
             axis = [0]
         else:
             return ctx.default_return_type
-    norm = _normalize_axis(axis[0], len(dims))
+    norm = _normalize_axis_0d(axis[0], len(dims))
     if norm is None:
         ctx.api.fail(
             f"axis {axis[0]} is out of range for {len(dims)} dimensions "
@@ -10497,6 +10605,8 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
             code=NUMTY_AXIS,
         )
         return ctx.default_return_type
+    # A 0-d input with axis 0/-1 accumulates to one element (issue #62).
+    out_dims = [1] if not dims else list(dims)
     dtype_pair = _formal_pair(ctx, "dtype")
     if dtype_pair is not None and not _is_none_type(dtype_pair[0]):
         return ctx.default_return_type
@@ -10509,16 +10619,16 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
         promoted = _construct_dtype(ctx, "numpy.int64")
         if promoted is None:
             return ctx.default_return_type
-        return _ndarray_type(ctx, list(dims), promoted)
+        return _ndarray_type(ctx, out_dims, promoted)
     if name in ("numpy.uint8", "numpy.uint16", "numpy.uint32", "numpy.uint64"):
         promoted = _construct_dtype(ctx, "numpy.uint64")
         if promoted is None:
             return ctx.default_return_type
-        return _ndarray_type(ctx, list(dims), promoted)
+        return _ndarray_type(ctx, out_dims, promoted)
     if name is None or name not in REDUCTION_DTYPES:
         # Non-numeric dtypes (strings, datetime64, ...): the stubs own it.
         return ctx.default_return_type
-    return _ndarray_type(ctx, list(dims), dtype)
+    return _ndarray_type(ctx, out_dims, dtype)
 
 
 def cumsum_function_hook(ctx: FunctionContext) -> Type:
@@ -10665,9 +10775,10 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     label_size: dict[str, int | Type] = {}
+    label_first_operand: dict[str, int] = {}
     counts: dict[str, int] = {}
     ell_inputs: list[list[int | Type]] = []
-    for (dims, _), term in zip(parts, terms):
+    for oi, ((dims, _), term) in enumerate(zip(parts, terms)):
         parsed = _parse_einsum_term(term)
         if parsed is None:
             return ctx.default_return_type
@@ -10696,13 +10807,27 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                 )
                 return ctx.default_return_type
             bound = list(zip(pre, dims))
+        bound_labels_seen: set[str] = set()
         for label, size in bound:
             counts[label] = counts.get(label, 0) + 1
             known = label_size.get(label)
             if known is None:
                 label_size[label] = size
+                label_first_operand[label] = oi
             elif not _dim_eq(known, size):
-                if isinstance(known, int) and isinstance(size, int):
+                if (
+                    isinstance(known, int)
+                    and isinstance(size, int)
+                    and (known == 1 or size == 1)
+                    and label_first_operand[label] != oi
+                    and label not in bound_labels_seen
+                ):
+                    # A size-1 label broadcasts across operands
+                    # (issue #62): keep the larger size. A repeated
+                    # label within one operand ('ii' with (1, 3))
+                    # still conflicts, as it does in numpy.
+                    label_size[label] = max(known, size)
+                elif isinstance(known, int) and isinstance(size, int):
                     ctx.api.fail(
                         f"einsum label '{label}' has conflicting sizes: "
                         f"{known} vs {size} (shape {_dims_str(dims)})",
@@ -10710,8 +10835,10 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                         code=NUMTY_SHAPE,
                     )
                     return ctx.default_return_type
-                # Symbolic vs anything unprovable: bail out.
-                return ctx.default_return_type
+                else:
+                    # Symbolic vs anything unprovable: bail out.
+                    return ctx.default_return_type
+            bound_labels_seen.add(label)
     broadcast: list[int | Type] | None = None
     for edims in ell_inputs:
         if broadcast is None:
@@ -11967,11 +12094,11 @@ def _truediv_types(
             dtype = _construct_dtype(ctx, "numpy.float64")
             if dtype is None:
                 return ctx.default_return_type
-            return _ndarray_type(ctx, dims, dtype)
+            return _maybe_scalar(ctx, dims, dtype)
     dtype = _specs_dtype(ctx, [(kind_l, name_l), (kind_r, name_r)], array_dtypes)
     if dtype is None:
         return ctx.default_return_type
-    return _ndarray_type(ctx, dims, dtype)
+    return _maybe_scalar(ctx, dims, dtype)
 
 
 def truediv_method_hook(ctx: MethodContext) -> Type:
@@ -12030,9 +12157,20 @@ def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
         return ctx.default_attr_type
     dims, _ = parts
     int_fallback = ctx.api.named_generic_type("builtins.int", [])
-    items: list[Type] = [
-        LiteralType(v, fallback=int_fallback) if isinstance(v, int) else v for v in dims
-    ]
+    items: list[Type] = []
+    for v in dims:
+        if isinstance(v, int):
+            # mypy's widening form: a plain int carrying its literal
+            # value. Fresh locals widen to int (so `k = x.shape[0]; k -= 1`
+            # checks), while _int_value/_dim_value still read the value
+            # back for direct uses like reshape(x.shape[0], 3) (issue #62).
+            items.append(
+                int_fallback.copy_modified(
+                    last_known_value=LiteralType(v, fallback=int_fallback)
+                )
+            )
+        else:
+            items.append(v)
     fallback = ctx.api.named_generic_type(
         TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
     )
@@ -12103,10 +12241,19 @@ def len_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     first = dims[0]
     if isinstance(first, TypeVarType):
+        if first.fullname.startswith("__numty_unknown__."):
+            # Unknown (data-dependent) lengths are plain ints: nothing
+            # nameable is lost, and `k = len(masked); k = max(k, 1)`
+            # checks (issue #62). Named dims stay exact.
+            return int_fallback
         return first
     if not isinstance(first, int):
         return ctx.default_return_type
-    return LiteralType(first, fallback=int_fallback)
+    # Same widening form as .shape items (issue #62): fresh locals get
+    # plain int (`k = len(x); k -= 1`), direct uses still read the value.
+    return int_fallback.copy_modified(
+        last_known_value=LiteralType(first, fallback=int_fallback)
+    )
 
 
 def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
@@ -12403,7 +12550,7 @@ def _ufunc_float_types(
     dtype = _specs_dtype(ctx, [("strong", out_name)], array_dtypes)
     if dtype is None:
         return ctx.default_return_type
-    return _ndarray_type(ctx, dims, dtype)
+    return _maybe_scalar(ctx, dims, dtype)
 
 
 def _solve_ufunc_binary_bool(
@@ -12431,7 +12578,7 @@ def _ufunc_bool_types(
     bool_dtype = _construct_dtype(ctx, "numpy.bool")
     if bool_dtype is None:
         return ctx.default_return_type
-    return _ndarray_type(ctx, dims, bool_dtype)
+    return _maybe_scalar(ctx, dims, bool_dtype)
 
 
 def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
