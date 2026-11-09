@@ -146,10 +146,13 @@ align, batches broadcast through the unpack), `transpose`/`.T`
 reversal (`(*Ts, 2)` reverses to `(2, *Ts)`), block-preserving
 `reshape` (`(*Ts, 2, 3)` to `(*Ts, 6)`), and leading `None`/slice
 indexing without an ellipsis (`v[0]` on `(5, *Ts, 7)` is `(*Ts, 7)`).
-Anything that would need the unknown length or order — fancy indexing,
-an index reaching into `*Ts` itself, reducing over `*Ts` itself,
+Anything that would need the unknown length or order — several array
+indices or an integer beside one (numpy may move their block to the
+front), an index reaching into `*Ts` itself, reducing over `*Ts` itself,
 mixing different `Ts` declarations, explicit transpose axes, a `-1`
-that would absorb `*Ts` — bails out instead of guessing.
+that would absorb `*Ts` — bails out instead of guessing. A lone integer
+array or boolean mask on the known prefix gathers in place
+(`frames[idx]` on `(total, *Ts)` is `(K, *Ts)`).
 
 ## Bugs, caught while you type
 
@@ -237,10 +240,13 @@ the call site:
 error: call-site shape conflict for 'hid': 8 (argument 'w', axis 1) vs 2 (argument 'b', axis 0)
 ```
 
-Fixed sizes spell as integers (`F64[3, 4]`), rank polymorphism as
-`Unpack[Ts]` with a declared TypeVarTuple (one `# type: ignore[type-var]`
-per signature — numpy's own stub bound can't see through `*Ts`, same as
-with `FlexArray`). Heads cover the compute workhorses and the common
+Fixed sizes spell as integers (`F64[3, 4]`), runtime sizes nothing can
+name as `int` (`F32[int, int, Unpack[Ts]]` for a gather over runtime
+counts, see `tests/fixtures/pad_time_ok.py`), rank polymorphism as
+`Unpack[Ts]` with a declared TypeVarTuple, mixed freely with other dims
+(`F32[total, Unpack[Ts]]`) and with no `type: ignore` — unlike
+`FlexArray`, whose `*Ts` numpy's `tuple[int, ...]` stub bound cannot see
+through. Heads cover the compute workhorses and the common
 storage dtypes, so a float16 or int8 block is one head per field rather
 than a spelled-out `FlexArray[..., np.dtype[np.float16]]`:
 
@@ -1003,8 +1009,11 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
 - Rank-polymorphic helpers (`(..., 2)` → `...`) spell the shape
   through `FlexArray` with one `*Ts` signature: each signature carries
   two `type: ignore[type-var]` notes (the `tuple[int, ...]` stub bound
-  cannot see through an unsolved `*Ts`), while bodies and call sites
-  check fully. A provable `*Ts` error may draw the stubs' own echo next
+  cannot see through an unsolved `*Ts`), as does each builder fed a
+  `*Ts` slice (`np.zeros((n, *x.shape[1:]))`), while bodies and call
+  sites check fully. The familiar heads need none of these: they mark
+  their `*Ts` int-only. mypy itself rejects `shape[1:]` on a bare
+  `(*Ts,)` (ambiguous variadic slice); name the leading axis. A provable `*Ts` error may draw the stubs' own echo next
   to ours (an `[index]` complaint on unpack shapes); ours names the
   axis, the size, and the `(*Ts, ...)` shape.
 - Rank arithmetic over `*Ts` keeps the unknown block ordered, never

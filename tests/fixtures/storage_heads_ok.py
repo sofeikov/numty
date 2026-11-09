@@ -26,7 +26,7 @@ def to_unit(img: U8[height, width, 3]) -> F32[height, width, 3]:
     return img.astype(np.float32) / np.float32(255)
 
 
-def first_channel(x: F16[Unpack[Ts], 2]) -> F16[Unpack[Ts]]:  # type: ignore[type-var]
+def first_channel(x: F16[Unpack[Ts], 2]) -> F16[Unpack[Ts]]:
     return x[..., 0]
 
 
