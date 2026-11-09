@@ -63,7 +63,9 @@ What it does:
 from __future__ import annotations
 
 import ast
+import json
 import keyword
+import os
 from collections.abc import Callable, Iterator
 from functools import partial
 from typing import NamedTuple, cast
@@ -167,6 +169,106 @@ NUMTY_BAIL = ErrorCode(
 NUMTY_ANNOTATION = ErrorCode(
     "numty-annotation", "Invalid numty shape annotation", "numty", sub_code_of=MISC
 )
+NUMTY_UNSOLVED = ErrorCode(
+    "numty-unsolved",
+    "numty could not prove this shape; the result is unchecked",
+    "numty",
+    sub_code_of=MISC,
+)
+
+
+def _numty_trace_path() -> str | None:
+    """JSONL trace sink from NUMTY_TRACE, or None when tracing is off."""
+    path = os.environ.get("NUMTY_TRACE")
+    return path if path else None
+
+
+def _numty_strict() -> bool:
+    """Whether NUMTY_STRICT=1 asks for a loud error on every lost shape."""
+    return os.environ.get("NUMTY_STRICT") == "1"
+
+
+def _trace_event(
+    ctx: FunctionContext | MethodContext | AttributeContext,
+    op: str,
+    outcome: str,
+    reason: str,
+) -> None:
+    """Append one {file, line, col, op, outcome, reason} record to NUMTY_TRACE.
+
+    Only modules that are actually re-checked emit events, so run mypy
+    with a fresh --cache-dir when collecting a trace. Failures to write
+    never break checking.
+    """
+    path = _numty_trace_path()
+    if path is None:
+        return
+    try:
+        api: object = getattr(ctx, "api", None)
+        file = str(getattr(api, "path", "") or "")
+        context = getattr(ctx, "context", None)
+        line = int(getattr(context, "line", 0) or 0)
+        col = int(getattr(context, "column", 0) or 0)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "file": file,
+                        "line": line,
+                        "col": col,
+                        "op": op,
+                        "outcome": outcome,
+                        "reason": reason,
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        return
+
+
+def _operands_have_known_shape(operands: list[Type]) -> bool:
+    """Whether any operand is a known-rank ndarray (unhooked trace gate).
+
+    Unhooked numpy.* calls are only traced when precision was actually
+    lost: a known-rank input flowing into a stub Any. *Ts shapes count
+    as known via _parts_or_unpack.
+    """
+    try:
+        for tp in operands:
+            for arr in _ndarrays_in(tp):
+                if _parts_or_unpack(arr) is not None:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _bail(
+    ctx: FunctionContext | MethodContext,
+    op: str,
+    reason: str,
+) -> Type:
+    """Give up on one call: trace it, optionally fail loudly, keep stubs.
+
+    Central helper for the 506 `return ctx.default_return_type` sites:
+    it records {op, bail, reason} to NUMTY_TRACE and, under
+    NUMTY_STRICT=1, reports [numty-unsolved]. Strict fails for every
+    bail, even scalar-only ones like np.sqrt(8): the Any born there
+    poisons the known-shape truediv whose hook mypy then skips, so a
+    known-shape gate would leave that loss silent. New hooks should
+    call this instead of returning the default directly so the reason
+    stays specific; _guard_mixed already applies the same policy
+    generically to every hook that returns the default.
+    """
+    _trace_event(ctx, op, "bail", reason)
+    if _numty_strict():
+        ctx.api.fail(
+            f"numty could not prove {op}: {reason} (result is unchecked)",
+            ctx.context,
+            code=NUMTY_UNSOLVED,
+        )
+    return ctx.default_return_type
 
 
 NDARRAY_FULLNAME = "numpy.ndarray"
@@ -2398,7 +2500,44 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
             operands = [t for ts in ctx.arg_types for t in ts]
             if isinstance(ctx, MethodContext):
                 operands.append(ctx.type)
-        result = hook(ctx) if hook is not None else default
+        if hook is None:
+            # Unhooked numpy.* op: observer hook (issue #60). Return the
+            # stubs' type unchanged, but trace when a known shape flows
+            # in unchecked. Strict does NOT fail here: unhooked numpy
+            # functions are heavily overloaded (e.g. kron has 7
+            # overloads) and any diagnostic inside the hook aborts
+            # overload resolution, turning a correct call into arg-type
+            # noise. Use the trace to find these; strict covers hooked
+            # bails below.
+            if _numty_trace_path() is not None and _operands_have_known_shape(
+                operands
+            ):
+                _trace_event(ctx, fullname, "unhooked", "no hook for this op")
+            result = default
+        else:
+            result = hook(ctx)
+            if result is default:
+                # Generic bail: any hook that kept the stubs' type. This
+                # makes the 506 give-up sites visible without churning
+                # them; specific reasons live in _bail() for new hooks.
+                # Scalar-only bails (e.g. np.sqrt(8)) are traced too so
+                # the trace shows where Any is born. Strict fails for
+                # every bail: the sqrt birth on `... / np.sqrt(8)` has
+                # no known-shape input itself, but its Any poisons the
+                # known-shape truediv whose hook mypy then skips, so
+                # gating on known inputs would leave the repro silent.
+                _trace_event(
+                    ctx, fullname, "bail", "unsolved (default stub type kept)"
+                )
+                if _numty_strict():
+                    ctx.api.fail(
+                        f"numty could not prove {short}: "
+                        "unsolved (result is unchecked)",
+                        ctx.context,
+                        code=NUMTY_UNSOLVED,
+                    )
+            elif _numty_trace_path() is not None:
+                _trace_event(ctx, fullname, "solved", "")
         # Only a stub answer holding a Literal or plain `int` dim can be
         # widened, so most calls (np.isscalar, .shape, scalar reductions)
         # skip the operands.

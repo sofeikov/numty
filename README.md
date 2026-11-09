@@ -791,7 +791,7 @@ your `mypy.ini`) to have the solver check them too.
 
 ## Error codes
 
-Every numty diagnostic carries one of six mypy error codes, so each kind
+Every numty diagnostic carries one of seven mypy error codes, so each kind
 can be silenced or selected on its own:
 
 | Code | Covers | Example message |
@@ -802,6 +802,7 @@ can be silenced or selected on its own:
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack needs a sequence of known length (built dynamically; preallocate or ignore)` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
+| `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 
 For example, `codes.py`:
 
@@ -841,12 +842,46 @@ disable_error_code = numty-bail
 ```
 
 or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
-reports a shape error on that line. All six are sub-codes of `misc`, so
+reports a shape error on that line. All seven are sub-codes of `misc`, so
 an existing `# type: ignore[misc]` or `disable_error_code = misc` keeps
 covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
 then asks for the narrower code (`Unused "type: ignore" comment, use
 narrower [numty-shape] instead of [misc] code`), so switch those
 comments to the `numty-*` code when upgrading.
+
+### Give-up trace and strict mode
+
+When a hook cannot prove a call it keeps mypy's stub type and says
+nothing, so a green run does not tell you which shapes were actually
+checked. Two opt-in knobs make those give-ups visible:
+
+```bash
+rm -rf /tmp/numty-cache
+NUMTY_TRACE=/tmp/numty.jsonl mypy --cache-dir /tmp/numty-cache repro.py
+cat /tmp/numty.jsonl
+```
+
+writes one JSON object per hook call that needed attention:
+`{file, line, col, op, outcome, reason}` with `outcome` one of
+`solved`, `bail` (a hooked call kept the stubs' type) or `unhooked`
+(a `numpy.*` call with no hook where a known shape flowed in
+unchecked, e.g. `np.kron`). Only modules that are actually re-checked
+emit events, so use a fresh `--cache-dir` when collecting a trace.
+
+```bash
+NUMTY_STRICT=1 mypy repro.py
+```
+
+additionally reports every hooked bail as
+`error: numty could not prove <op>: unsolved (result is unchecked)
+[numty-unsolved]`. For example, `np.sqrt(8)` bails (its operand is not
+an array), its `Any` then poisons `... / np.sqrt(8)` whose hook mypy
+skips, so strict flags the `sqrt` birth site itself. Silence one line
+with `# type: ignore[numty-unsolved]`. Unhooked overloaded functions
+(e.g. `kron`, which has seven overloads) are trace-only: any
+diagnostic inside the hook aborts mypy's overload search and turns a
+correct call into `arg-type` noise, so strict leaves those to the
+trace.
 
 An argument of the wrong rank is rejected by mypy itself, with its own
 `arg-type` error. The parameter's dim TypeVars cannot be solved from a
