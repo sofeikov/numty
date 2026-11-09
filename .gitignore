@@ -2,5 +2,11 @@
 __pycache__/
 .mypy_cache/
 .mypy-test-cache/
+.mypy-test-cache-*/
+.mypy-test-cache-flags-*/
+.mypy-convert-cache/
+.mypy-convert-cache-*/
+.mypy-codmod-cache/
+.mypy-codmod-cache-*/
 .pytest_cache/
 dist/
