@@ -2607,45 +2607,46 @@ def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
     return False, None
 
 
-def _solve_matmul_inner(
-    dims: list[int | Type] | None, message: str | None, matched: bool
-) -> tuple[list[int | Type] | None, str | None]:
-    if message is not None:
-        return None, message
-    if not matched:
-        return None, None
-    assert dims is not None
-    return dims, None
-
-
 def _matmul_result(
-    a: list[int | Type], b: list[int | Type]
+    a: list[int | Type],
+    b: list[int | Type],
+    ctx: FunctionContext | MethodContext | None = None,
 ) -> tuple[list[int | Type] | None, str | None]:
-    """Output dims on success; (None, None) to bail; (None, msg) on error."""
+    """Output dims on success; (None, None) to bail; (None, msg) on error.
+
+    An unprovable inner pair (N vs M, ?U vs ?U) is not a clash and the
+    output dims do not depend on it (issue #56), so the outer dims are
+    still returned instead of bailing the whole result to Any.
+    """
     if not a or not b:
         return None, None
     if len(a) == 1 and len(b) == 1:
-        matched, message = _matmul_inner(a[0], b[0])
-        return _solve_matmul_inner([], message, matched)
+        _, message = _matmul_inner(a[0], b[0])
+        if message is not None:
+            return None, message
+        return [], None
     if len(a) == 1:
-        matched, message = _matmul_inner(a[0], b[-2])
-        return _solve_matmul_inner([*b[:-2], b[-1]], message, matched)
+        _, message = _matmul_inner(a[0], b[-2])
+        if message is not None:
+            return None, message
+        return [*b[:-2], b[-1]], None
     if len(b) == 1:
-        matched, message = _matmul_inner(a[-1], b[0])
-        return _solve_matmul_inner(a[:-1], message, matched)
-    matched, message = _matmul_inner(a[-1], b[-2])
+        _, message = _matmul_inner(a[-1], b[0])
+        if message is not None:
+            return None, message
+        return a[:-1], None
+    _, message = _matmul_inner(a[-1], b[-2])
     if message is not None:
         return None, message
-    if not matched:
-        return None, None
     batch_a, batch_b = a[:-2], b[:-2]
-    batch, cause = _broadcast_result(batch_a, batch_b)
+    batch, cause = _broadcast_result(batch_a, batch_b, ctx)
     if cause is not None:
         return None, (
             f"matmul batch dimensions disagree: {_dims_str(batch_a)} vs {_dims_str(batch_b)}"
             f" ({cause})"
         )
-    assert batch is not None
+    if batch is None:
+        return None, None
     return [*batch, a[-2], b[-1]], None
 
 
@@ -2777,7 +2778,7 @@ def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type)
     parts_a, parts_b = _operand_parts(left, right)
     if parts_a is not None and parts_b is not None:
         (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
-        dims, message = _matmul_result(dims_a, dims_b)
+        dims, message = _matmul_result(dims_a, dims_b, ctx)
         if message is not None:
             ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
@@ -4669,11 +4670,18 @@ def _dims_str(dims: list[int | Type]) -> str:
 
 
 def _broadcast_result(
-    a: list[int | Type], b: list[int | Type]
+    a: list[int | Type],
+    b: list[int | Type],
+    ctx: FunctionContext | MethodContext | None = None,
 ) -> tuple[list[int | Type] | None, str | None]:
     """Broadcast two known shapes; (None, None) to bail; (None, msg) on error.
 
-    Same-name TypeVars are equal; anything else unprovable bails out.
+    Same-name TypeVars are equal. Anything else unprovable keeps the
+    axis instead of bailing the whole shape (issue #56): a literal
+    against a symbolic dim is that literal (if the broadcast succeeds
+    the axis is that size), two different symbolics become a fresh
+    unknown. Without ctx the old bail is kept (callers without shape
+    context); every ctx-bearing caller passes it.
     """
     out: list[int | Type] = []
     for k, (x, y) in enumerate(zip(reversed(a), reversed(b))):
@@ -4688,8 +4696,14 @@ def _broadcast_result(
                 f"broadcast shapes disagree at trailing axis {k}: "
                 f"{x} vs {y} (shapes {_dims_str(a)} vs {_dims_str(b)})"
             )
-        else:
+        elif ctx is None:
             return None, None
+        elif isinstance(x, int) and isinstance(y, TypeVarType):
+            out.append(x)
+        elif isinstance(y, int) and isinstance(x, TypeVarType):
+            out.append(y)
+        else:
+            out.append(_fresh_unknown(ctx, "bcast", k))
     shared = min(len(a), len(b))
     prefix = a[: len(a) - shared] + b[: len(b) - shared]
     return [*prefix, *reversed(out)], None
@@ -4868,7 +4882,7 @@ def _broadcast_types(ctx: FunctionContext | MethodContext, left: Type, right: Ty
     name = _promote_dtypes(dtype_a, dtype_b)
     if name is None:
         return ctx.default_return_type
-    dims, message = _broadcast_result(dims_a, dims_b)
+    dims, message = _broadcast_result(dims_a, dims_b, ctx)
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
         return ctx.default_return_type
@@ -7820,14 +7834,14 @@ def _solve_getitem(
             # Advanced indices separated by a slice/ellipsis broadcast to
             # the front; that reshuffle is out of scope, so bail out.
             return ctx.default_return_type
-    fancy_dims: list[int] = []
+    fancy_dims: list[int | Type] = []
     for n in fancy_positions:
         assert items[n][0] == "fancy"
         shape = items[n][1]
         if not fancy_dims:
             fancy_dims = shape
             continue
-        merged, cause = _broadcast_result(fancy_dims, shape)
+        merged, cause = _broadcast_result(fancy_dims, shape, ctx)
         if cause is not None:
             ctx.api.fail(
                 f"indexing arrays could not be broadcast together: {cause}",
@@ -7988,7 +8002,7 @@ def _broadcast_dims_unpack(
 
 def _broadcast_dims(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
-) -> list[int] | None:
+) -> list[int | Type] | None:
     """Broadcast output dims for two operands, else None to bail or fail."""
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
@@ -7996,7 +8010,7 @@ def _broadcast_dims(
         return _broadcast_dims_unpack(ctx, left, right, a, b)
     dims_a, _ = a
     dims_b, _ = b
-    dims, message = _broadcast_result(dims_a, dims_b)
+    dims, message = _broadcast_result(dims_a, dims_b, ctx)
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
         return None
@@ -8599,12 +8613,12 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                     return ctx.default_return_type
                 # Symbolic vs anything unprovable: bail out.
                 return ctx.default_return_type
-    broadcast: list[int] | None = None
+    broadcast: list[int | Type] | None = None
     for edims in ell_inputs:
         if broadcast is None:
             broadcast = edims
             continue
-        out, cause = _broadcast_result(broadcast, edims)
+        out, cause = _broadcast_result(broadcast, edims, ctx)
         if cause is not None:
             ctx.api.fail(
                 f"einsum ellipsis dimensions cannot broadcast: {cause}",
@@ -8763,7 +8777,7 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         batch_b = dims_b[:-2]
         core = dims_b[-2:]
-    batch, cause = _broadcast_result(dims_a[:-2], batch_b)
+    batch, cause = _broadcast_result(dims_a[:-2], batch_b, ctx)
     if cause is not None:
         ctx.api.fail(
             f"linalg.solve batch dimensions disagree: {_dims_str(dims_a[:-2])} vs "
@@ -8973,7 +8987,7 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         batch_b = dims_b[:-2]
         core = [cols, dims_b[-1]]
-    batch, cause = _broadcast_result(dims_a[:-2], batch_b)
+    batch, cause = _broadcast_result(dims_a[:-2], batch_b, ctx)
     if cause is not None:
         ctx.api.fail(
             f"linalg.lstsq batch dimensions disagree: {_dims_str(dims_a[:-2])} vs "
@@ -9233,7 +9247,7 @@ def _broadcast_shapes(
             first = False
             continue
         if not _has_unpack(dims) and not _has_unpack(other):
-            out, cause = _broadcast_result(dims, other)
+            out, cause = _broadcast_result(dims, other, ctx)
             if cause is not None:
                 ctx.api.fail(f"{op} shapes disagree: {cause}", ctx.context, code=NUMTY_BROADCAST)
                 return None
