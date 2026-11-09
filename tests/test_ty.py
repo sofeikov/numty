@@ -31,7 +31,7 @@ def error_lines(result: "subprocess.CompletedProcess[str]") -> list[tuple[str, i
 
 
 def test_quickstart_reports_only_the_demo_errors() -> None:
-    result = run_ty(ROOT / "numty.py", ROOT / "demo.py")
+    result = run_ty(ROOT / "numty" / "__init__.py", ROOT / "demo.py")
     assert result.returncode == 1, result.stdout
     assert error_lines(result) == [("demo.py", 30), ("demo.py", 34)], result.stdout
     assert "Found 2 diagnostics" in result.stdout, result.stdout

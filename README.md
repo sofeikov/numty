@@ -774,15 +774,30 @@ uv pip install mypy numpy pytest ty==0.0.97
 
 ```sh
 PYTHONPATH=. uv run mypy demo.py      # expect 2 errors: rank, size
-uvx ty@0.0.97 check numty.py demo.py  # the same 2 errors, none in numty.py
+uvx ty@0.0.97 check numty/__init__.py demo.py  # the same 2 errors, none in numty/
 uv run pytest                         # full suite: runtime, mypy- and ty-driven
 ```
 
 The ty run ends in `Found 2 diagnostics`, both `invalid-argument-type`
 on `demo.py:30` and `demo.py:34`; `uvx pyright@1.1.408 --pythonpath
-.venv/bin/python numty.py demo.py` reports the same two (without
+.venv/bin/python numty/__init__.py demo.py` reports the same two (without
 `--pythonpath` it cannot find numpy). ty 0.0.97 is pinned in the dev group,
 and `tests/test_ty.py` holds the ty line to exactly those two.
+
+### Installing elsewhere
+
+`numty` ships as a regular package (`numty/__init__.py` plus the
+PEP 561 `numty/py.typed` marker), so an out-of-tree install just works —
+no `PYTHONPATH` or `mypy_path` needed:
+
+```sh
+uv pip install numty
+```
+
+with `plugins = numty_plugin` in your `mypy.ini`. (pip's PEP 660
+editable installs use a custom finder hook mypy cannot see; if
+`from numty import F32` reveals `Any` from an editable checkout, either
+reinstall non-editable or point `mypy_path` at the checkout.)
 
 mypy skips the bodies of unannotated functions by default, so a script
 or notebook cell written as `def main():` gets no shape checking at all.
@@ -1108,10 +1123,11 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
 
 ## Layout
 
-- [numty.py](numty.py) — rank aliases, generic shape
+- [numty](numty/__init__.py) — rank aliases, generic shape
   bases, `FlexArray` rank-polymorphic base, `narrow` witness helper,
   shape-preserving `ident`, loose `matmul` fallback, familiar-style heads
-  (`F64` and friends) with ready-made dims (`batch`, `features`, …).
+  (`F64` and friends) with ready-made dims (`batch`, `features`, …)
+  plus the PEP 561 `py.typed` marker.
 - [numty_plugin.py](numty_plugin.py) — the solver.
 - [demo.py](demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.
@@ -1127,7 +1143,7 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   precise shapes on the good paths. The `f64_ok` + `bad_f64_*` fixtures do
   the same for the familiar-style heads (clean end-to-end MLP included).
 - [tests/test_ty.py](tests/test_ty.py) — runs the pinned ty over
-  `numty.py demo.py` (exactly the 2 demo errors) and over
+  `numty/__init__.py demo.py` (exactly the 2 demo errors) and over
   [flex_portable.py](tests/fixtures/flex_portable.py) (`FlexArray`
   keeps its rank checks without the plugin).
 - [numty_convert.py](numty_convert.py) +

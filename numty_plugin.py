@@ -1,6 +1,6 @@
 """mypy plugin: precise numpy shapes for constructors, matmul, and friends.
 
-mypy-only, registered in mypy.ini. Without the plugin, numty.py still
+mypy-only, registered in mypy.ini. Without the plugin, numty/__init__.py still
 checks with plain annotations; only the general solving below is lost
 (matmul degrades to its loose fallback, stored constructors widen).
 
@@ -277,7 +277,7 @@ TUPLE_FULLNAME = "builtins.tuple"
 FLOAT64_FULLNAME = "numpy.float64"
 DTYPE_FULLNAME = "numpy.dtype"
 
-# Familiar-style heads (defined in numty.py) and the numpy scalar each one
+# Familiar-style heads (defined in numty/__init__.py) and the numpy scalar each one
 # stands for. Bool maps to numpy.bool, matching _DTYPE_STRINGS below.
 _FAM_HEAD_DTYPES = {
     "numty.F64": "numpy.float64",
@@ -517,7 +517,7 @@ class NumtyPlugin(Plugin):
             pass
         return sig
 
-    # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty.py): the
+    # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty/__init__.py): the
     # dtype rides the head name, dims ride flat args. Hooked here because
     # mypy resolves `Head[...]` through Annotated-free generic application,
     # so the raw args (quoted names included) still reach us.
