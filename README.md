@@ -466,7 +466,10 @@ where the actual shapes are still visible: `f(x_5, y_6)` against `(A[N],
 A[N])` errors with the two sizes named. Different TypeVars (`N` vs `M`)
 stay silent by design — their equality is unprovable, and unknown is not
 an error. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
-`A` — a bare generic alias silently means unknown sizes).
+`A` — a bare generic alias silently means unknown sizes). The same holds
+for a dataclass holding shapes: `list[Box]` with `Box(Generic[N])`
+holding `F64[N, 3]` is an error (`Box used bare ... [numty-annotation]`,
+issue #38) — write `list[Box[T_ctx]]` so the field checks end to end.
 
 ## Coming from jaxtyping? Convert once, check forever
 

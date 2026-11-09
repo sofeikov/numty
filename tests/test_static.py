@@ -1954,6 +1954,28 @@ def test_dataclass_implicit_method_ok() -> None:
     ]
 
 
+def test_bare_shape_generic_is_loud() -> None:
+    # Issue #38: list[Box] with Box holding F64[...] was green while every
+    # shape downstream was Any. The bare use now fails loudly so it can be
+    # parameterized as Box[T_ctx].
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_bare_generic.py"),
+        "Box used bare",
+        "parameterize as Box[...]",
+        line=20,
+    )
+
+
+def test_parameterized_shape_generic_stays_clean() -> None:
+    result = run_mypy(FIXTURES / "bare_generic_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        30: '"numpy.ndarray[tuple[T_ctx, Literal[3]], numpy.dtype[numpy.float64]]"',
+        35: '"numpy.ndarray[tuple[Literal[4], Literal[3]], numpy.dtype[numpy.float64]]"',
+    }, result.stdout
+    assert _run_fixture("bare_generic_ok.py") == ["ok"]
+
+
 def test_expr_dims_rejected() -> None:
     # Expression dims stay linear: name*name and division fail loudly
     # instead of going quietly Any.

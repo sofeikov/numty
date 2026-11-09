@@ -534,13 +534,60 @@ class NumtyPlugin(Plugin):
         self, fullname: str
     ) -> Callable[[AnalyzeTypeContext], Type] | None:
         dtype_fullname = _FAM_HEAD_DTYPES.get(fullname)
-        if dtype_fullname is None:
+        if dtype_fullname is not None:
+
+            def hook(ctx: AnalyzeTypeContext) -> Type:
+                return self._fam_head(ctx, dtype_fullname)
+
+            return hook
+        # Issue #38: a bare shape-carrying generic (e.g. list[Box] where
+        # Box has F64[...] fields) silently means Any shapes downstream.
+        # Flag the bare use so it can be parameterized instead.
+        if fullname.startswith(
+            (
+                "builtins.",
+                "typing.",
+                "collections.",
+                "abc.",
+                "numpy.",
+                "numty.",
+                "mypy.",
+                "typing_extensions.",
+            )
+        ):
+            return None
+        try:
+            sym = self.lookup_fully_qualified(fullname)
+        except Exception:
+            return None
+        if sym is None or not isinstance(sym.node, TypeInfo):
+            return None
+        info = sym.node
+        if not info.type_vars:
+            return None
+        if not _info_mentions_array(info):
             return None
 
-        def hook(ctx: AnalyzeTypeContext) -> Type:
-            return self._fam_head(ctx, dtype_fullname)
+        def bare_hook(ctx: AnalyzeTypeContext) -> Type:
+            try:
+                if list(ctx.type.args):
+                    analyzed = [ctx.api.analyze_type(a) for a in ctx.type.args]
+                    return ctx.api.named_type(fullname, analyzed)
+            except Exception:
+                pass
+            short = fullname.rsplit(".", 1)[-1]
+            try:
+                ctx.api.fail(
+                    f"{short} used bare (implicit Any); parameterize as "
+                    f"{short}[...] so shapes check instead of silently going Any",
+                    ctx.context,
+                    code=NUMTY_ANNOTATION,
+                )
+            except Exception:
+                pass
+            return AnyType(TypeOfAny.from_error)
 
-        return hook
+        return bare_hook
 
     def _fam_head(self, ctx: AnalyzeTypeContext, dtype_fullname: str) -> Type:
         """Build the ndarray type for `F64[...]` from flat raw args.
@@ -2594,6 +2641,26 @@ def _mentions_ndarray(tp: Type, depth: int = 0) -> bool:
     else:
         return False
     return any(_mentions_ndarray(part, depth + 1) for part in parts)
+
+
+def _info_mentions_array(info: TypeInfo) -> bool:
+    """Whether a generic class carries array shapes in its fields/bases."""
+    try:
+        for base in info.bases:
+            if _mentions_ndarray(base):
+                return True
+        for name in info.names:
+            try:
+                sym = info.names[name]
+            except Exception:
+                continue
+            node = sym.node
+            tp = getattr(node, "type", None)
+            if tp is not None and _mentions_ndarray(tp):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def _note_rank_mismatches(ctx: FunctionSigContext | MethodSigContext, sig: Type) -> None:
