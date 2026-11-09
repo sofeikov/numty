@@ -481,6 +481,17 @@ class NumtyPlugin(Plugin):
             sig = sig.copy_modified(
                 variables=tuple(sig.variables) + tuple(missing)
             )
+        # Expression returns (issue #32 finish): mypy cannot infer M+1
+        # from M, so callers of `-> I64["M+1"]` saw Any. Substitute the
+        # actual bindings into the return ourselves (plain vars reuse the
+        # caller's object, new exprs reuse the form-keyed global id).
+        try:
+            bindings = _callsite_expr_bindings(sig, formals, ctx)
+            new_ret = _substitute_return_exprs(sig, bindings, ctx)
+            if new_ret is not None:
+                sig = sig.copy_modified(ret_type=new_ret)
+        except Exception:
+            pass
         return sig
 
     # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty.py): the
@@ -856,6 +867,17 @@ class NumtyPlugin(Plugin):
             v = resolved[name]
             if isinstance(v, TypeVarType):
                 _seen_vars.setdefault(v.fullname, v)
+        # Per-scope constituents for #32 finish: diff(M+1)->M looks up M
+        # in the defining scope via the expr's fullname, dodging the
+        # global _seen_vars first-wins leak (#43).
+        try:
+            _expr_constituents[fullname] = {
+                v.fullname: v
+                for v in resolved.values()
+                if isinstance(v, TypeVarType)
+            }
+        except Exception:
+            pass
         return obj
 
     def _fam_bind_words(
@@ -1335,6 +1357,44 @@ class _MonoForm(NamedTuple):
 _expr_forms: dict[str, _LinForm | _DivForm | _MonoForm] = {}
 _expr_ids: dict[str, TypeVarId] = {}
 _seen_vars: dict[str, TypeVarType] = {}
+# Per-expr constituent objects by scope (issue #32 finish): expr fullname
+# -> {constituent fullname -> TypeVarType object from the defining scope}.
+# Lets diff(M+1) -> M return the *current* function's M instead of the
+# first-seen global in _seen_vars (which causes N@first vs N@second).
+_expr_constituents: dict[str, dict[str, TypeVarType]] = {}
+
+
+def _current_scope_vars(
+    ctx: FunctionContext | MethodContext,
+) -> dict[str, TypeVarType]:
+    """TypeVars visible in the current call's actual types, by fullname.
+
+    Walks all positional actual types (and self for method hooks) so
+    materialization prefers the caller's own objects over the process-wide
+    _seen_vars fallback (issue #43 leak scoped to #32's diff path).
+    """
+    found: dict[str, TypeVarType] = {}
+    try:
+        nested: list[Type] = []
+        for group in getattr(ctx, "arg_types", []):
+            # mypy passes groups of overload-candidate types; flatten.
+            if isinstance(group, list):
+                nested.extend(group)
+            else:
+                nested.append(group)
+        self_tp = getattr(ctx, "type", None)
+        if self_tp is not None:
+            nested.append(self_tp)
+        for tp in nested:
+            try:
+                for tv in _iter_tvarlikes(tp):
+                    if isinstance(tv, TypeVarType):
+                        found.setdefault(tv.fullname, tv)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return found
 
 
 def _short_var(fullname: str) -> str:
@@ -1429,7 +1489,7 @@ def _expr_var(
         _expr_ids[fullname] = vid
     _expr_forms[fullname] = form
     upper = ctx.api.named_generic_type("builtins.int", [])
-    return TypeVarType(
+    obj = TypeVarType(
         name=_expr_str(form),
         fullname=fullname,
         id=vid,
@@ -1439,6 +1499,21 @@ def _expr_var(
         line=line,
         column=column,
     )
+    # Remember current-scope constituents so a later diff of this inferred
+    # expr finds its own M (concat N -> N+1 -> diff -> N roundtrip).
+    if isinstance(form, _LinForm) and form.coeffs:
+        try:
+            current = _current_scope_vars(ctx)
+            consts = {
+                fullname_c: current[fullname_c]
+                for fullname_c, _ in form.coeffs
+                if fullname_c in current
+            }
+            if consts:
+                _expr_constituents.setdefault(fullname, {}).update(consts)
+        except Exception:
+            pass
+    return obj
 
 
 def _lin_add(a: _LinForm, b: _LinForm) -> _LinForm:
@@ -1558,7 +1633,21 @@ def _materialize_dim(
         and form.coeffs[0][1] == 1
         and form.const == 0
     ):
-        seen = _seen_vars.get(form.coeffs[0][0])
+        want = form.coeffs[0][0]
+        # 1) diff(M+1)->M: the input expr knows its own scope's M.
+        if isinstance(prefer, TypeVarType):
+            consts = _expr_constituents.get(prefer.fullname)
+            if consts is not None and want in consts:
+                return consts[want]
+        # 2) Current call's own object (reshape/split second-function
+        # leak): prefer it over the process-wide first-wins registry.
+        try:
+            current = _current_scope_vars(ctx)
+            if want in current:
+                return current[want]
+        except Exception:
+            pass
+        seen = _seen_vars.get(want)
         if seen is not None:
             return seen
     return _expr_var(ctx, op, index, form)
@@ -1996,6 +2085,286 @@ def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, Ty
         if positions:
             out.append((i, positions))
     return out
+
+
+def _callsite_expr_bindings(
+    sig: CallableType,
+    formals: list[tuple[int, list[tuple[int, TypeVarType]]]],
+    ctx: FunctionSigContext,
+) -> dict[str, int | Type]:
+    """Callee var fullname -> actual dim for expression returns (issue #32).
+
+    Plain formal dims bind directly to the actual dim object (preserving the
+    caller's TypeVar id, which also dodges the #43 stale-object leak).
+    Expr formal dims of the form M+const solve M from the actual's linear
+    form when it is const or a single var with matching const (M+1 vs K+1,
+    M+1 vs 6); anything fancier bails for that dim.
+    """
+    bindings: dict[str, int | Type] = {}
+    for i, positions in formals:
+        if i >= len(ctx.args):
+            continue
+        actuals = ctx.args[i]
+        if len(actuals) != 1:
+            continue
+        try:
+            actual_tp = ctx.api.get_expression_type(actuals[0])
+        except Exception:
+            continue
+        parts = _ndarray_parts(actual_tp)
+        if parts is None:
+            continue
+        adims, _ = parts
+        for dim, tvar in positions:
+            if dim >= len(adims):
+                continue
+            adim = adims[dim]
+            try:
+                form_f = _expr_forms.get(tvar.fullname)
+                if form_f is None:
+                    # Plain formal: direct bind (first wins).
+                    if tvar.fullname not in bindings:
+                        bindings[tvar.fullname] = adim
+                    continue
+                # Expr formal: only single-var linear M+const for now.
+                if not isinstance(form_f, _LinForm):
+                    continue
+                if len(form_f.coeffs) != 1 or form_f.coeffs[0][1] != 1:
+                    continue
+                m_full, const_f = form_f.coeffs[0][0], form_f.const
+                fa = _resolve_dim(adim)
+                if fa is None or not isinstance(fa, _LinForm):
+                    continue
+                if not fa.coeffs:
+                    # Actual const: M = const_a - const_f.
+                    if tvar.fullname not in bindings and m_full not in bindings:
+                        bindings[m_full] = fa.const - const_f
+                    continue
+                if len(fa.coeffs) == 1 and fa.coeffs[0][1] == 1:
+                    a_full, const_a = fa.coeffs[0][0], fa.const
+                    if const_a != const_f:
+                        continue  # M = A + diff needs new expr; skip.
+                    if m_full in bindings:
+                        continue
+                    if isinstance(adim, TypeVarType) and not (
+                        adim.fullname.startswith("__numty_expr__.")
+                    ):
+                        # Actual plain A: M = A (caller's object).
+                        bindings[m_full] = adim
+                    else:
+                        # Actual expr K+1 with same const: M = K via
+                        # the actual's own constituents (caller's scope).
+                        consts = None
+                        if isinstance(adim, TypeVarType):
+                            consts = _expr_constituents.get(adim.fullname)
+                        if consts is not None and a_full in consts:
+                            bindings[m_full] = consts[a_full]
+                        else:
+                            found = _seen_vars.get(a_full)
+                            if found is not None:
+                                bindings[m_full] = found
+            except Exception:
+                continue
+    return bindings
+
+
+def _substitute_return_exprs(
+    sig: CallableType,
+    bindings: dict[str, int | Type],
+    ctx: FunctionSigContext,
+) -> Type | None:
+    """Return type with callee expr vars substituted by call bindings.
+
+    Returns the new return Type, or None when nothing changed / unsupported.
+    Plain vars use the actual object directly (caller's id); new expr forms
+    reuse the form-keyed global id so an inferred N+1 is the same variable
+    as an annotated I64["N+1"].
+    """
+    if not bindings:
+        return None
+    try:
+        ret_parts = _ndarray_parts(sig.ret_type)
+    except Exception:
+        return None
+    if ret_parts is None:
+        return None
+    rdims, _dtype = ret_parts
+    new_dims: list[int | Type] = []
+    changed = False
+    # For building new expr vars we need constituent objects by fullname.
+    obj_by_fullname: dict[str, TypeVarType] = {}
+    for v in bindings.values():
+        if isinstance(v, TypeVarType):
+            obj_by_fullname.setdefault(v.fullname, v)
+    for consts in _expr_constituents.values():
+        for k, v in consts.items():
+            obj_by_fullname.setdefault(k, v)
+    for k, v in _seen_vars.items():
+        obj_by_fullname.setdefault(k, v)
+    for d in rdims:
+        try:
+            if isinstance(d, int):
+                new_dims.append(d)
+                continue
+            if not isinstance(d, TypeVarType):
+                return None
+            if d.fullname not in _expr_forms:
+                # Plain return var: direct substitution preserves caller id.
+                if d.fullname in bindings:
+                    b = bindings[d.fullname]
+                    new_dims.append(b)
+                    changed = True
+                else:
+                    new_dims.append(d)
+                continue
+            # Expr return var.
+            form_r = _expr_forms.get(d.fullname)
+            if not isinstance(form_r, _LinForm):
+                return None
+            merged: dict[str, int] = {}
+            const = form_r.const
+            substituted = False
+            abort = False
+            for cfull, coeff in form_r.coeffs:
+                if cfull in bindings:
+                    b = bindings[cfull]
+                    if isinstance(b, int):
+                        const += coeff * b
+                        substituted = True
+                    else:
+                        fb = _resolve_dim(b)
+                        if not isinstance(fb, _LinForm):
+                            abort = True
+                            break
+                        for bfull, bcoeff in fb.coeffs:
+                            merged[bfull] = merged.get(bfull, 0) + coeff * bcoeff
+                        const += coeff * fb.const
+                        substituted = True
+                else:
+                    merged[cfull] = merged.get(cfull, 0) + coeff
+            if abort:
+                return None
+            if not substituted:
+                new_dims.append(d)
+                continue
+            merged = {k: v for k, v in merged.items() if v != 0}
+            if not merged:
+                new_dims.append(const)
+                changed = True
+                continue
+            if len(merged) == 1:
+                (only_full, only_coeff) = next(iter(merged.items()))
+                if only_coeff == 1 and const == 0:
+                    # Single var: reuse the caller's object when known.
+                    obj = obj_by_fullname.get(only_full)
+                    if obj is not None:
+                        new_dims.append(obj)
+                    else:
+                        new_dims.append(d)
+                        continue
+                    changed = True
+                    continue
+            new_form = _LinForm(tuple(sorted(merged.items())), const)
+            new_fullname = f"__numty_expr__.{new_form!r}"
+            vid = _expr_ids.get(new_fullname)
+            if vid is None:
+                vid = TypeVarId.new(0)
+                _expr_ids[new_fullname] = vid
+            _expr_forms[new_fullname] = new_form
+            upper = getattr(d, "upper_bound", None)
+            if upper is None:
+                return None
+            new_obj = TypeVarType(
+                name=_expr_str(new_form),
+                fullname=new_fullname,
+                id=vid,
+                values=[],
+                upper_bound=upper,
+                default=AnyType(TypeOfAny.from_omitted_generics),
+                line=getattr(d, "line", 0),
+                column=getattr(d, "column", 0),
+            )
+            # Constituents for later diff() of this inferred expr.
+            try:
+                const_map: dict[str, TypeVarType] = {}
+                for cfull in merged:
+                    o = obj_by_fullname.get(cfull)
+                    if o is not None:
+                        const_map[cfull] = o
+                if const_map:
+                    _expr_constituents.setdefault(new_fullname, {}).update(
+                        const_map
+                    )
+            except Exception:
+                pass
+            new_dims.append(new_obj)
+            changed = True
+        except Exception:
+            return None
+    if not changed:
+        return None
+    # Rebuild the ndarray return with the new dims.
+    try:
+        proper = get_proper_type(sig.ret_type)
+        if not isinstance(proper, Instance) or len(proper.args) != 2:
+            return None
+        shape = get_proper_type(proper.args[0])
+        if not isinstance(shape, TupleType):
+            return None
+        if len(shape.items) != len(new_dims):
+            return None
+        new_items: list[Type] = []
+        for old_item, new_d in zip(shape.items, new_dims):
+            if isinstance(new_d, int):
+                old_proper = get_proper_type(old_item)
+                if isinstance(old_proper, LiteralType):
+                    if old_proper.value == new_d:
+                        new_items.append(old_item)
+                    else:
+                        new_items.append(
+                            LiteralType(
+                                new_d, old_proper.fallback, line=old_proper.line, column=old_proper.column
+                            )
+                        )
+                elif isinstance(old_proper, TypeVarType) and isinstance(
+                    get_proper_type(old_proper.upper_bound), Instance
+                ):
+                    fb = get_proper_type(old_proper.upper_bound)
+                    assert isinstance(fb, Instance)
+                    new_items.append(
+                        LiteralType(new_d, fb, line=old_proper.line, column=old_proper.column)
+                    )
+                else:
+                    # Int from a plain bound var: reuse its Literal fallback
+                    # when the bound object carries one, else bail.
+                    made: Type | None = None
+                    for v in bindings.values():
+                        if isinstance(v, int):
+                            continue
+                        vp = get_proper_type(v)
+                        if isinstance(vp, LiteralType):
+                            made = LiteralType(
+                                new_d, vp.fallback, line=vp.line, column=vp.column
+                            )
+                            break
+                    if made is None:
+                        return None
+                    new_items.append(made)
+            else:
+                if new_d is old_item:
+                    new_items.append(old_item)
+                else:
+                    new_items.append(new_d)
+        try:
+            new_shape = shape.copy_modified(items=new_items)
+        except Exception:
+            new_shape = TupleType(new_items, shape.fallback, line=shape.line, column=shape.column)
+        try:
+            return proper.copy_modified(args=[new_shape, proper.args[1]])
+        except Exception:
+            return Instance(proper.type, [new_shape, proper.args[1]], line=proper.line, column=proper.column)
+    except Exception:
+        return None
 
 
 def _fixed_shape(tp: Type) -> TupleType | None:
