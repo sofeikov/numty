@@ -695,7 +695,9 @@ def f(u: F64[N], w: F64[N, K]) -> None:
 ```
 
 **Elementwise, einsum, linalg, random.** Operators and bare `np.*`
-ufuncs alike — broadcast shapes and promote dtypes. Add-style promotion
+ufuncs alike — broadcast shapes and promote dtypes. In-place ops
+(`+=`, `-=`, …) reuse the broadcast check and additionally require the
+result to fit the target (`(3,) += (2, 3)` errors). Add-style promotion
 (`+`, `-`, `*`) matches NumPy (verified against `np.result_type` over
 the full dtype matrix, plus weak Python scalars). True division mixing a
 `float16`/`float32` with a bool or 8/16-bit int, and float ufuncs on

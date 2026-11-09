@@ -21,7 +21,8 @@ What it does:
   operator is accepted but unchecked (see the method-hook note below).
 - __add__/__mul__ unify operand shapes with NumPy broadcast rules, so
   precision survives whole function bodies. Scalars pass through;
-  unknown dims bail out.
+  unknown dims bail out. In-place ops (__iadd__ and friends) reuse the
+  broadcast check and additionally require the result to fit the target.
 - reshape (method and np.reshape) checks total-size conservation and
   infers a single -1, returning the precise new shape. A -1 divides the
   canonical total (linear and monomial products alike: N*K/N=K,
@@ -1182,6 +1183,21 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__rpow__",
         }:
             return broadcast_method_hook
+        if fullname in {
+            "numpy.ndarray.__iadd__",
+            "numpy.ndarray.__isub__",
+            "numpy.ndarray.__imul__",
+            "numpy.ndarray.__itruediv__",
+            "numpy.ndarray.__ifloordiv__",
+            "numpy.ndarray.__imod__",
+            "numpy.ndarray.__ipow__",
+            "numpy.ndarray.__iand__",
+            "numpy.ndarray.__ior__",
+            "numpy.ndarray.__ixor__",
+            "numpy.ndarray.__ilshift__",
+            "numpy.ndarray.__irshift__",
+        }:
+            return inplace_method_hook
         if fullname == "numpy.ndarray.clip":
             return clip_method_hook
         # Bare ufunc objects (np.sqrt, np.add, ...) are stub variables, not
@@ -5538,6 +5554,52 @@ def broadcast_method_hook(ctx: MethodContext) -> Type:
     if args is None:
         return ctx.default_return_type
     return _solve_broadcast(ctx, ctx.type, args[0])
+
+
+def inplace_method_hook(ctx: MethodContext) -> Type:
+    """Shape-check `a <op>= b`: broadcast must equal the LHS (issue #50).
+
+    Broadcast mismatches fail with the binary wording; a broadcast that
+    succeeds but would grow the target fails as non-broadcastable output.
+    Scalars, unpack shapes and unprovable symbolic dims bail silently,
+    keeping the stubs' dtype checking and Self return.
+    """
+    args = _positional_actuals(ctx, 1)
+    if args is None:
+        return ctx.default_return_type
+    lhs = _ndarray_parts(ctx.type)
+    if lhs is None:
+        return ctx.default_return_type
+    lhs_dims, _ = lhs
+    if _scalar_key(args[0]) is not None:
+        return ctx.default_return_type
+    rhs = _ndarray_parts(args[0])
+    if rhs is None:
+        return ctx.default_return_type
+    rhs_dims, _ = rhs
+    dims, message = _broadcast_result(lhs_dims, rhs_dims, ctx)
+    if message is not None:
+        ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
+        return ctx.default_return_type
+    if dims is None:
+        return ctx.default_return_type
+    if len(dims) != len(lhs_dims) or any(
+        not _dim_eq(d, l) for d, l in zip(dims, lhs_dims)
+    ):
+        # Only fail when provably different: rank growth always is;
+        # same-rank needs an int mismatch. Symbolic mismatches stay
+        # silent like the binary hook.
+        if len(dims) != len(lhs_dims) or any(
+            isinstance(d, int) and isinstance(l, int) and d != l
+            for d, l in zip(dims, lhs_dims)
+        ):
+            ctx.api.fail(
+                f"in-place result {_dims_str(dims)} does not fit "
+                f"target {_dims_str(lhs_dims)}",
+                ctx.context,
+                code=NUMTY_BROADCAST,
+            )
+    return ctx.default_return_type
 
 
 STR_FULLNAME = "builtins.str"

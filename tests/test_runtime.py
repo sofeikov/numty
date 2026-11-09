@@ -344,6 +344,31 @@ def test_ts_reshape_and_transpose_match_numpy() -> None:
     assert transpose_mod.flip(np.zeros((3, 4, 2))).shape == (2, 4, 3)
 
 
+def test_inplace_shapes_match_numpy() -> None:
+    # Issue #50: every bad in-place snippet raises ValueError at runtime;
+    # every ok snippet keeps its shape.
+    with pytest.raises(ValueError, match="could not be broadcast"):
+        a = np.zeros((2, 3))
+        a -= np.zeros(4)
+    with pytest.raises(ValueError, match="could not be broadcast"):
+        x = np.zeros((3, 4))
+        x[:, 0] += np.zeros(4)
+    for op in ("__iadd__", "__imul__"):
+        with pytest.raises(ValueError, match="non-broadcastable"):
+            a = np.zeros((3,) if op == "__iadd__" else (1, 3))
+            b = np.zeros((2, 3) if op == "__iadd__" else (4, 3))
+            getattr(a, op)(b)
+    with pytest.raises(ValueError, match="non-broadcastable"):
+        acc = np.zeros(4)
+        acc += np.zeros((5, 4))
+    a = np.zeros((2, 3))
+    a += np.zeros(3)
+    assert a.shape == (2, 3)
+    w = np.zeros((3, 4))
+    w -= 0.1 * np.zeros((3, 4))
+    assert w.shape == (3, 4)
+
+
 def test_einsum_values() -> None:
     a = np.arange(6, dtype=np.float64).reshape(2, 3)
     b = np.arange(12, dtype=np.float64).reshape(3, 4)
