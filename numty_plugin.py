@@ -311,7 +311,6 @@ def plugin(version: str) -> type[Plugin]:
 class NumtyPlugin(Plugin):
     def __init__(self, options) -> None:
         super().__init__(options)
-        self._seen_conflicts: set[tuple[str, int, str]] = set()
         # Fullnames of TypeVars first bound from inside a string dim spec
         # (see _fam_bind_words). The pre-pass never saw them, so they are
         # missing from the analyzed function's variables; the call-site
@@ -479,10 +478,14 @@ class NumtyPlugin(Plugin):
                         f"{first[2]} (argument '{first[0]}', axis {first[1]}) vs "
                         f"{other[2]} (argument '{other[0]}', axis {other[1]})"
                     )
-                    key = (ctx.api.path, ctx.context.line, message)
-                    if key not in self._seen_conflicts:
-                        self._seen_conflicts.add(key)
-                        ctx.api.fail(message, ctx.context, code=NUMTY_CALLSITE)
+                    # No dedup here (issue #44): mypy already collapses
+                    # identical messages on one line, and a process-lifetime
+                    # set hides real errors — under dmypy the daemon keeps
+                    # one plugin instance across rechecks, and in plain mypy
+                    # the throw-away inference pass inside comprehensions /
+                    # generator expressions / lambdas consumes the single
+                    # allowed emission, so the pass that counts stays quiet.
+                    ctx.api.fail(message, ctx.context, code=NUMTY_CALLSITE)
                     break
         # String-spec words bound late (see _fam_bind_words) are missing
         # from the function's variables, so core checking would reject
