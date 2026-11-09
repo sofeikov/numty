@@ -1021,6 +1021,43 @@ def test_mask_nd_axis_out_of_range() -> None:
     )
 
 
+def test_inplace_ok_stays_clean() -> None:
+    # Issue #50: legal in-place updates keep their shape and stay clean.
+    result = run_mypy(FIXTURES / "inplace_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 2, result.stdout
+    assert "tuple[Literal[2], Literal[3]]" in notes[0], result.stdout
+    assert "tuple[Literal[3], Literal[4]]" in notes[1], result.stdout
+    assert _run_fixture("inplace_ok.py") == ["ok"]
+
+
+def test_inplace_broadcast_mismatch() -> None:
+    # Issue #50: in-place uses the binary broadcast wording.
+    result = run_mypy(FIXTURES / "bad_inplace_broadcast.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert "broadcast shapes disagree at trailing axis 0" in errors[0], result.stdout
+    assert "(2, 3)" in errors[0] and "(4,)" in errors[0], result.stdout
+    assert "broadcast shapes disagree at trailing axis 0" in errors[1], result.stdout
+    assert "(3,)" in errors[1] and "(4,)" in errors[1], result.stdout
+
+
+def test_inplace_grow_does_not_fit() -> None:
+    # Issue #50: a broadcast that grows the target fails in place.
+    result = run_mypy(FIXTURES / "bad_inplace_grow.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 3, result.stdout
+    assert "in-place result (2, 3) does not fit target (3,)" in errors[0], result.stdout
+    assert "in-place result (4, 3) does not fit target (1, 3)" in errors[1], result.stdout
+    assert (
+        "in-place result (batch, features) does not fit target (features,)"
+        in errors[2]
+    ), result.stdout
+
+
 def test_mixed_builders_keep_literals() -> None:
     # #34: one dynamic dim no longer erases the literal ones, so a stored
     # builder result fits a field pinned to 2 / 23. Ops that would move
