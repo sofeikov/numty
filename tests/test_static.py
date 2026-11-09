@@ -37,12 +37,35 @@ def run_mypy(*paths: Path, flags: tuple[str, ...] = ()) -> "subprocess.Completed
     )
 
 
-def assert_single_error(result: "subprocess.CompletedProcess[str]", *fragments: str) -> None:
+def assert_single_error(
+    result: "subprocess.CompletedProcess[str]",
+    *fragments: str,
+    line: "int | None" = None,
+) -> None:
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 1, result.stdout
     for fragment in fragments:
         assert fragment in errors[0], result.stdout
+    if line is not None:
+        assert int(errors[0].split(":")[1]) == line, result.stdout
+
+
+def reveals_by_line(result: "subprocess.CompletedProcess[str]") -> dict[int, str]:
+    """Index mypy `Revealed type` notes by source line (single-file run).
+
+    Annotation pins accept Any, so exact-shape claims need golden reveals
+    compared per line (issue #71): unordered substring checks let swapped
+    shapes pass.
+    """
+    out: dict[int, str] = {}
+    for text in result.stdout.splitlines():
+        if "Revealed type" not in text:
+            continue
+        lineno = int(text.split(":")[1])
+        assert lineno not in out, result.stdout
+        out[lineno] = text.split("Revealed type is", 1)[1].strip()
+    return out
 
 
 def test_good_code_is_clean() -> None:
@@ -1078,9 +1101,21 @@ def test_f64_str_bad_token_rejected() -> None:
 
 
 def test_reduce15_ok_clean() -> None:
+    # Issue #71: the symbolic diff answer is pinned by golden reveal, not
+    # by an annotation Any would satisfy. The reveal pins today's (N, M);
+    # the oracle prints numpy's (4, 7): #32 owns closing that gap.
     result = run_mypy(FIXTURES / "reduce15_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
+    i32 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit]]]"
+    i64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        41: f'"{f64.format("N, M")}"',
+        42: f'"{i32.format("Literal[3]")}"',
+        43: f'"{i64.format("N")}"',
+    }, result.stdout
+    assert _run_fixture("reduce15_ok.py") == ["(4, 7)", "(3,)", "(5,)"]
 
 
 def test_average_weights_mismatch() -> None:
@@ -1220,9 +1255,29 @@ def test_nan_axis_mismatch() -> None:
 
 
 def test_atleast_ok_clean() -> None:
+    # Issue #71: annotation pins accept Any, so each shape is also pinned
+    # by a golden reveal compared per line, plus a runtime oracle.
     result = run_mypy(FIXTURES / "atleast_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        20: f'"{f64.format("Literal[1], N")}"',
+        21: f'"{f64.format("N, M")}"',
+        22: f'"{f64.format("Literal[1], N, Literal[1]")}"',
+        # numpy appends the new axis for 2-D input, not prepends it.
+        24: f'"{f64.format("N, M, Literal[1]")}"',
+        25: f'"{f64.format("Literal[2], Literal[3], Literal[4]")}"',
+        26: f'"{f64.format("N")}"',
+    }, result.stdout
+    assert _run_fixture("atleast_ok.py") == [
+        "(1, 5)",
+        "(5, 7)",
+        "(1, 5, 1)",
+        "(5, 7, 1)",
+        "(2, 3, 4)",
+        "(5,)",
+    ]
 
 
 def test_stack_ok_clean() -> None:
@@ -1239,9 +1294,15 @@ def test_hstack_rank_mismatch() -> None:
 
 
 def test_shapemath_ok_clean() -> None:
+    # Issue #71: bare-CN annotation meant CN[Any]; the exact rfft answer
+    # is pinned by golden reveal plus a runtime oracle instead.
     result = run_mypy(FIXTURES / "shapemath_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
+    assert reveals_by_line(result) == {
+        58: '"numpy.ndarray[tuple[N//2+1], numpy.dtype[numpy.complex128]]"',
+    }, result.stdout
+    assert _run_fixture("shapemath_ok.py") == ["(6,)"]
 
 
 def test_flip_axis_mismatch() -> None:
@@ -1431,9 +1492,24 @@ def test_where_rank_mismatch() -> None:
 
 
 def test_symexpr_ok_clean() -> None:
+    # Issue #71: the "stay exact, not ?U" comment asserted nothing; each
+    # formula is now pinned by golden reveal plus a runtime oracle.
     result = run_mypy(FIXTURES / "symexpr_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        28: f'"{f64.format("N+2")}"',
+        29: f'"{f64.format("2*N-1")}"',
+        30: f'"list[{f64.format("N//2")}]"',
+        31: '"numpy.ndarray[tuple[N//2+1], numpy.dtype[numpy.complex128]]"',
+    }, result.stdout
+    assert _run_fixture("symexpr_ok.py") == [
+        "(14,)",
+        "(23,)",
+        "[(6,), (6,)]",
+        "(7,)",
+    ]
 
 
 def test_symexpr_product_mismatch() -> None:

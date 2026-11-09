@@ -525,7 +525,8 @@ def symbolic_calls_stay_precise() -> None:
 
 def indexing_stays_precise() -> None:
     a = np.zeros((5, 10, 2))
-    ids = np.arange(15).reshape(5, 3)
+    # In-bounds ids: 0..14 would raise on axis 1 (size 10) at runtime.
+    ids = np.arange(15).reshape(5, 3) % 10
     use_5x3x2(np.take_along_axis(a, ids[..., None], axis=1))
     use_5(np.take_along_axis(np.zeros(10), np.arange(5), axis=None))
     order = np.argsort(~(np.zeros((5, 10)) > 1.0), axis=1)

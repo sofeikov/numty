@@ -1,9 +1,16 @@
 """average/diff/cumsum + scalar reductions: solved shapes, clean."""
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import numpy as np
 
 from numty import F64, I32, I64
+
+if TYPE_CHECKING:
+    from typing import reveal_type
+else:
+    def reveal_type(x):
+        print(x.shape)
+        return x
 
 N = TypeVar("N", bound=int)
 M = TypeVar("M", bound=int)
@@ -29,6 +36,12 @@ def g(y: F64[129, 4]) -> None:
 
 
 def h(a: F64[N, M], c: I32[N]) -> None:
-    ds: F64[N, M] = np.diff(a, axis=0)
-    di: I32[3] = np.diff(np.zeros(4, dtype=np.int32))
-    r: I64[N] = np.cumsum(c, axis=0)
+    # TODO(#32): numpy returns (N-1, M) but the solver keeps N. Pinned as
+    # a reveal rather than an annotation so the #32 fix flips this red.
+    ds = reveal_type(np.diff(a, axis=0))  # R: (N, M), want (N-1, M)
+    di: I32[3] = reveal_type(np.diff(np.zeros(4, dtype=np.int32)))  # R: (3,)
+    r: I64[N] = reveal_type(np.cumsum(c, axis=0))  # R: (N,)
+
+
+if __name__ == "__main__":
+    h(np.zeros((5, 7)), np.zeros(5, dtype=np.int32))
