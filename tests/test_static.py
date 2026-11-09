@@ -666,6 +666,34 @@ def test_arith_broadcast_mismatch() -> None:
     assert rest and all("Unsupported operand" in line for line in rest), result.stdout
 
 
+def test_dtype_ok_stays_clean() -> None:
+    # Issue #61: RNG, float ufuncs, truediv and int ops keep NumPy dtypes.
+    result = run_mypy(FIXTURES / "dtype_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 11, result.stdout
+    assert sum("_32Bit" in n for n in notes) == 4, result.stdout
+    assert sum("_16Bit" in n for n in notes) == 3, result.stdout
+    assert sum("float64" in n and "tuple[()]" in n for n in notes) == 1, result.stdout
+    assert _run_fixture("dtype_ok.py") == ["ok"]
+
+
+def test_dtype_wrong_fails() -> None:
+    # Issue #61: confident wrong dtypes are rejected; float16 linalg fails.
+    result = run_mypy(FIXTURES / "bad_dtype.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 9, result.stdout
+    assert "floating[_32Bit]" in errors[0] and "float64" in errors[0], result.stdout
+    assert "floating[_16Bit]" in errors[1] and "float64" in errors[1], result.stdout
+    assert "floating[_32Bit]" in errors[2] and "float64" in errors[2], result.stdout
+    assert "float64" in errors[3] and "signedinteger[_64Bit]" in errors[3], result.stdout
+    assert "float64" in errors[4] and "signedinteger[_64Bit]" in errors[4], result.stdout
+    assert "unsupported in linalg.solve" in errors[5], result.stdout
+    assert "float64" in errors[7] and "complex128" in errors[7], result.stdout
+    assert "signedinteger[_64Bit]" in errors[8] and "signedinteger[_32Bit]" in errors[8], result.stdout
+
+
 def test_any_axis_out_of_range() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_any_axis.py"),
