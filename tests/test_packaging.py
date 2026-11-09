@@ -61,7 +61,7 @@ def test_wheel_install_checks_out_of_tree(tmp_path: Path) -> None:
     python = venv / "bin" / "python"
     result = _run(
         [uv, "pip", "install", "--python", str(python),
-         str(wheel), "mypy==2.4.1", "numpy>=2"],
+         str(wheel), "mypy==2.4.1", "numpy>=2.5"],
         cwd=tmp_path,
     )
     assert result.returncode == 0, result.stderr
