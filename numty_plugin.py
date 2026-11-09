@@ -4047,7 +4047,14 @@ def _convolve_solve(
         return ctx.default_return_type
     na, nb = dims_a[0], dims_b[0]
     if not isinstance(na, int) or not isinstance(nb, int):
-        size = _dim_add_const(ctx, op, 0, _dim_add2(ctx, op, 0, na, nb), -1)
+        if mode == "full":
+            size: int | Type = _dim_add_const(
+                ctx, op, 0, _dim_add2(ctx, op, 0, na, nb), -1
+            )
+        elif mode == "same":
+            size = _convolve_same_size(ctx, op, na, nb)
+        else:
+            size = _convolve_valid_size(ctx, op, na, nb)
         return _matmul_promoted(ctx, [size], dtype_a, dtype_b)
     if mode == "full":
         n = na + nb - 1
@@ -4056,6 +4063,46 @@ def _convolve_solve(
     else:
         n = max(na, nb) - min(na, nb) + 1
     return _matmul_promoted(ctx, [n], dtype_a, dtype_b)
+
+
+def _convolve_same_size(
+    ctx: FunctionContext, op: str, na: int | Type, nb: int | Type
+) -> int | Type:
+    """Symbolic `same`-mode length: max(na, nb), else a fresh unknown.
+
+    The order of two symbolic lengths is unprovable in general; only an
+    exact match keeps the dim, everything else stays honest instead of
+    claiming the `full` length.
+    """
+    if _dim_eq(na, nb):
+        return na
+    return _fresh_unknown(ctx, op, 0)
+
+
+def _convolve_valid_size(
+    ctx: FunctionContext, op: str, na: int | Type, nb: int | Type
+) -> int | Type:
+    """Symbolic `valid`-mode length: |na - nb| + 1, else a fresh unknown.
+
+    An equal pair gives 1; a constant difference folds exactly, anything
+    whose sign is unprovable stays honest instead of claiming `full`.
+    """
+    fa = _resolve_dim(na)
+    fb = _resolve_dim(nb)
+    if fa is None or fb is None:
+        return _fresh_unknown(ctx, op, 0)
+    if not isinstance(fa, _LinForm) or not isinstance(fb, _LinForm):
+        return _fresh_unknown(ctx, op, 0)
+    coeffs: dict[str, int] = {}
+    for name, coeff in fa.coeffs:
+        coeffs[name] = coeffs.get(name, 0) + coeff
+    for name, coeff in fb.coeffs:
+        coeffs[name] = coeffs.get(name, 0) - coeff
+    const = fa.const - fb.const
+    coeffs = {name: coeff for name, coeff in coeffs.items() if coeff}
+    if not coeffs:
+        return abs(const) + 1
+    return _fresh_unknown(ctx, op, 0)
 
 
 def convolve_function_hook(ctx: FunctionContext) -> Type:
@@ -6990,32 +7037,73 @@ def _arange_symbolic(
     return [stop]
 
 
+def _arange_symbolic_kw(
+    ordered: list[tuple[Type, Expression | None] | None],
+) -> list[int | TypeVarType] | None:
+    """Symbolic arange through keyword-resolved start/stop/step.
+
+    `arange(stop=N)`, `arange(0, stop=N)`, `arange(start=0, stop=N,
+    step=1)`: N elements. Anything else (non-zero start, non-one step,
+    unresolvable stop) stays with the stubs.
+    """
+    if len(ordered) != 3:
+        return None
+    start_p, stop_p, step_p = ordered
+    if stop_p is None:
+        return None
+    if start_p is not None and _fold_single(start_p) != 0:
+        return None
+    if step_p is not None and _fold_single(step_p) != 1:
+        return None
+    stop = _dim_value(stop_p[0])
+    if not isinstance(stop, TypeVarType):
+        return None
+    return [stop]
+
+
 def arange_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
-    if len(pairs) not in (1, 2, 3):
+    if len(pairs) > 3:
         return ctx.default_return_type
-    values: list[int] = []
-    for pair in pairs:
-        value = _fold_single(pair)
-        if value is None:
-            break
-        values.append(value)
-    dims: list[int | TypeVarType] | None
-    if len(values) == len(pairs):
-        if len(values) == 1:
-            start, stop, step = 0, values[0], 1
-        else:
-            start, stop = values[0], values[1]
-            step = values[2] if len(values) == 3 else 1
-        try:
-            dims = [len(range(start, stop, step))]
-        except ValueError:
-            ctx.api.fail("arange step is zero", ctx.context, code=NUMTY_SHAPE)
-            return ctx.default_return_type
+    # start/stop/step may arrive as keywords (issue #46: `stop=`/`step=`
+    # used to be silently ignored). The stubs name the first positional
+    # `start_or_stop`, and it is positional-only (shows up as `None` in
+    # `callee_arg_names`), so take it from call order: with an explicit
+    # `stop` a leading positional is the start, otherwise a lone
+    # positional is the stop (`arange(10)`, `arange(10, step=2)`).
+    step_p = _formal_pair(ctx, "step")
+    stop_p = _formal_pair(ctx, "stop")
+    first_pos = pairs[0] if pairs else None
+    if first_pos is None and stop_p is None and step_p is None:
+        ordered: list[tuple[Type, Expression | None] | None] = list(pairs)
+        by_name = False
     else:
-        dims = _arange_symbolic(pairs)
-        if dims is None:
+        if stop_p is not None:
+            start_p = first_pos
+        else:
+            start_p, stop_p = None, first_pos
+        ordered = [start_p, stop_p, step_p]
+        by_name = True
+    if len(ordered) not in (1, 2, 3):
+        return ctx.default_return_type
+    if by_name:
+        # A name resolved through the formals already accounts for how
+        # mypy bound positionals; a missing stop is an invalid call.
+        if ordered[1] is None:
             return ctx.default_return_type
+        start_v = 0 if ordered[0] is None else _fold_single(ordered[0])
+        stop_v = _fold_single(ordered[1])
+        step_v = 1 if ordered[2] is None else _fold_single(ordered[2])
+        if start_v is not None and stop_v is not None and step_v is not None:
+            try:
+                dims = [len(range(start_v, stop_v, step_v))]
+            except ValueError:
+                ctx.api.fail("arange step is zero", ctx.context, code=NUMTY_SHAPE)
+                return ctx.default_return_type
+        else:
+            dims = _arange_symbolic_kw(ordered)
+            if dims is None:
+                return ctx.default_return_type
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
         if named is None:
@@ -7224,13 +7312,18 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     if axis is None:
         return ctx.default_return_type
     if axis == "none":
-        if any(not isinstance(d, int) for dims, _ in items for d in dims):
-            return ctx.default_return_type
-        total = 1
+        # Flattened size is the sum of each input's size (0-d counts as
+        # 1, the empty product); symbolic sizes add/multiply exactly
+        # (issue #46), never the product of every dim.
+        total: int | Type = 0
         for dims, _ in items:
-            for d in dims:
-                assert isinstance(d, int)
-                total *= d
+            total = _dim_add2(
+                ctx,
+                "concatenate",
+                0,
+                total,
+                _mul_dims(ctx, "concatenate", 0, list(dims)),
+            )
         return _ndarray_type(ctx, [total], dtype)
     if not isinstance(axis, int):
         return ctx.default_return_type
@@ -9074,7 +9167,12 @@ def rng_method_hook(ctx: MethodContext, op: str) -> Type:
     first_tp, first_expr = pairs[0]
     if op == "choice":
         size = _parse_axis_arg(_formal_pair(ctx, "size"))
-        if not isinstance(size, list):
+        if size is None:
+            return ctx.default_return_type
+        if isinstance(size, str):
+            # size=None (or omitted) means a single sample.
+            size = []
+        if any(not isinstance(d, (int, TypeVarType)) for d in size):
             return ctx.default_return_type
         value = _fold_int(first_expr) if first_expr is not None else None
         if value is None:
@@ -9087,8 +9185,26 @@ def rng_method_hook(ctx: MethodContext, op: str) -> Type:
         parts = _ndarray_parts(first_tp)
         if parts is None:
             return ctx.default_return_type
-        _, dtype = parts
-        return _ndarray_type(ctx, size, dtype)
+        dims, dtype = parts
+        axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+        if axis is None or axis == "none":
+            return ctx.default_return_type
+        if axis == "absent":
+            k = 0
+        else:
+            if len(axis) != 1 or not isinstance(axis[0], int):
+                return ctx.default_return_type
+            norm = _normalize_axis(axis[0], len(dims))
+            if norm is None:
+                ctx.api.fail(
+                    f"choice axis {axis[0]} is out of range for "
+                    f"{len(dims)} dimensions (shape {_dims_str(dims)})",
+                    ctx.context,
+                    code=NUMTY_AXIS,
+                )
+                return ctx.default_return_type
+            k = norm
+        return _ndarray_type(ctx, dims[:k] + size + dims[k + 1 :], dtype)
     if op == "permutation":
         value = _fold_int(first_expr) if first_expr is not None else None
         if value is None:
@@ -10398,6 +10514,61 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
     return _broadcast_to_types(ctx, pairs[0][0], dims)
 
 
+def _broadcast_to_compatible(
+    ctx: FunctionContext,
+    arr_dims: list[int | Type],
+    dims: list[int | Type],
+) -> bool:
+    """Whether an array shape broadcasts to the target (issue #46).
+
+    Right-aligns the two shapes: extra leading target dims are fine, a
+    source rank larger than the target rank fails, and each aligned pair
+    must be equal or have a 1 on the source side. Provable mismatches
+    fail loudly; anything involving a symbolic dim that could be 1 bails
+    (returns False) instead of guessing.
+    """
+    if not dims:
+        # Scalar target: every source dim must be 1.
+        for s in arr_dims:
+            if isinstance(s, int):
+                if s != 1:
+                    ctx.api.fail(
+                        f"broadcast_to of shape {_dims_str(arr_dims)} cannot "
+                        f"broadcast to scalar shape {_dims_str(dims)}",
+                        ctx.context,
+                        code=NUMTY_SHAPE,
+                    )
+                    return False
+            else:
+                return False
+        return True
+    if len(arr_dims) > len(dims):
+        ctx.api.fail(
+            f"broadcast_to of shape {_dims_str(arr_dims)} cannot broadcast "
+            f"to fewer dimensions {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return False
+    offset = len(dims) - len(arr_dims)
+    for k, (s, t) in enumerate(zip(arr_dims, dims[offset:])):
+        if _dim_eq(s, t):
+            continue
+        if isinstance(s, int) and s == 1:
+            continue
+        if isinstance(s, int) and isinstance(t, int):
+            ctx.api.fail(
+                f"broadcast_to of shape {_dims_str(arr_dims)} is incompatible "
+                f"with target shape {_dims_str(dims)}: {s} vs {t} at "
+                f"trailing axis {len(arr_dims) - 1 - k}",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return False
+        return False
+    return True
+
+
 def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int]) -> Type:
     spec = _operand_spec(tp)
     if spec is None:
@@ -10409,6 +10580,8 @@ def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int]) -> Type
             return ctx.default_return_type
         part = _ndarray_parts(tp)
         if part is None:
+            return ctx.default_return_type
+        if not _broadcast_to_compatible(ctx, arr_dims, dims):
             return ctx.default_return_type
         return _ndarray_type(ctx, dims, part[1])
     dtype = _construct_dtype(ctx, _WEAK_DEFAULT.get(name, name))
@@ -10443,6 +10616,35 @@ def _display_element_kind(tp: Type, expr: Expression | None) -> str | None:
     return None
 
 
+def _apply_ndmin(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type]
+) -> list[int | Type] | None:
+    """Prepend 1s until the rank reaches `ndmin` (issue #46), else None.
+
+    No `ndmin` argument leaves dims untouched. An unprovable `ndmin`
+    (or one over a `*Ts` shape) bails instead of guessing; a negative
+    one fails loudly.
+    """
+    pair = _formal_pair(ctx, "ndmin")
+    if pair is None:
+        return dims
+    if _has_unpack(dims):
+        return None
+    value = _fold_single(pair)
+    if value is None:
+        return None
+    if value < 0:
+        ctx.api.fail(
+            f"ndmin must be non-negative, got {value}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return None
+    if len(dims) >= value:
+        return dims
+    return [1] * (value - len(dims)) + list(dims)
+
+
 def _asarray_array_type(
     ctx: FunctionContext | MethodContext, tp: Type, named: Type | None
 ) -> Type:
@@ -10450,7 +10652,10 @@ def _asarray_array_type(
     part = _parts_or_unpack(tp)
     if part is None:
         return ctx.default_return_type
-    return _ndarray_type(ctx, part[0], named if named is not None else part[1])
+    dims = _apply_ndmin(ctx, part[0])
+    if dims is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, named if named is not None else part[1])
 
 
 def _solve_asarray(ctx: FunctionContext) -> Type:
@@ -10467,7 +10672,10 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
         return dist
     part = _parts_or_unpack(pairs[0][0])
     if part is not None:
-        return _ndarray_type(ctx, part[0], named if named is not None else part[1])
+        dims = _apply_ndmin(ctx, part[0])
+        if dims is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, named if named is not None else part[1])
     tp, expr = pairs[0]
     elems: list[tuple[Type, Expression | None]] = []
     proper = get_proper_type(tp)
@@ -10497,7 +10705,10 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
     else:
         dtype = named
-    return _ndarray_type(ctx, [len(elems)], dtype)
+    dims = _apply_ndmin(ctx, [len(elems)])
+    if dims is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
 
 
 def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
@@ -10807,12 +11018,10 @@ def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
     out: list[int | Type] = []
     for d, (x, y) in enumerate(zip(dims_a, dims_i)):
         if d == norm:
-            # Along the axis the index wins, except a 1 falls back to
-            # the array dim; anything symbolic is unprovable, so bail.
-            if isinstance(y, int):
-                out.append(x if y == 1 else y)
-            else:
-                return ctx.default_return_type
+            # Along the axis the result is the index's size, even when
+            # that size is 1 (issue #46: the argmax(keepdims=True) ->
+            # take_along_axis idiom); symbolic index dims carry through.
+            out.append(y)
         elif _dim_eq(x, y):
             out.append(x)
         elif isinstance(x, int) and x == 1:
