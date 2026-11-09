@@ -23,12 +23,14 @@ What it does:
   precision survives whole function bodies. Scalars pass through;
   unknown dims bail out.
 - reshape (method and np.reshape) checks total-size conservation and
-  infers a single -1, returning the precise new shape. A -1 over
-  symbolic sizes mints an unknown for the inferred dim, and same-total
-  renames track as-is (legality stays unchecked, never an error). Over
-  *Ts only block-preserving regroups resolve (the unknown middle stays
-  put; -1 would absorb it, so it bails), with provable int-only total
-  clashes failing loudly. Anything dynamic bails out.
+  infers a single -1, returning the precise new shape. A -1 divides the
+  canonical total (linear and monomial products alike: N*K/N=K,
+  B*C*H*W/B=C*H*W); only inexact/inexpressible inferences mint an
+  unknown, and same-total renames track as-is (legality stays unchecked,
+  never an error). Over *Ts only block-preserving regroups resolve (the
+  unknown middle stays put; -1 would absorb it, so it bails), with
+  provable int-only total clashes failing loudly. Anything dynamic bails
+  out.
 - rank-changing ops (transpose, .T, squeeze, expand_dims, sum/prod/mean
   and friends) track the new shape; transpose reversal over *Ts keeps
   the unknown block ordered in place (explicit axes bail). No-axis
@@ -993,12 +995,44 @@ class _DivForm(NamedTuple):
     plus: int
 
 
-_expr_forms: dict[str, _LinForm | _DivForm] = {}
+class _MonoForm(NamedTuple):
+    """Opaque product term: coeff * prod(vars), vars sorted (repeats kept).
+
+    Stepping stone for issue #40 (no Z3): single monomials only, no sums
+    of products. Always holds >= 2 vars; single-var/const cases stay
+    _LinForm so equality and existing paths are untouched. Zero normalizes
+    to coeff 0 with no vars.
+    """
+
+    coeff: int
+    vars: tuple[str, ...]
+
+
+_expr_forms: dict[str, _LinForm | _DivForm | _MonoForm] = {}
 _expr_ids: dict[str, TypeVarId] = {}
 _seen_vars: dict[str, TypeVarType] = {}
 
 
-def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | None:
+def _short_var(fullname: str) -> str:
+    """Display name for a var: ?U name when unknown, else the short name."""
+    return _unknown_names.get(fullname) or fullname.rsplit(".", 1)[-1]
+
+
+def _mono_str(form: _MonoForm) -> str:
+    """Readable product: H*D, 2*M*N, 6, 0."""
+    if form.coeff == 0:
+        return "0"
+    if not form.vars:
+        return str(form.coeff)
+    body = "*".join(_short_var(v) for v in form.vars)
+    if form.coeff == 1:
+        return body
+    if form.coeff == -1:
+        return f"-{body}"
+    return f"{form.coeff}*{body}"
+
+
+def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
     """Canonical form of a dim: ints and TypeVars (expressions included).
 
     Plain TypeVars read as single-term linears, so N and N*1 compare
@@ -1016,8 +1050,10 @@ def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | None:
     return None
 
 
-def _expr_str(form: _LinForm | _DivForm) -> str:
-    """Readable dim formula: 2*N+3, N-1, (N+1)//2, N//2+1."""
+def _expr_str(form: _LinForm | _DivForm | _MonoForm) -> str:
+    """Readable dim formula: 2*N+3, N-1, (N+1)//2, N//2+1, H*D."""
+    if isinstance(form, _MonoForm):
+        return _mono_str(form)
     if isinstance(form, _DivForm):
         inner = _expr_str(form.inner)
         compound = len(form.inner.coeffs) + (form.inner.const != 0) > 1
@@ -1043,7 +1079,7 @@ def _expr_str(form: _LinForm | _DivForm) -> str:
 
 
 def _expr_var(
-    ctx: FunctionContext | MethodContext, op: str, index: int, form: _LinForm | _DivForm
+    ctx: FunctionContext | MethodContext, op: str, index: int, form: _LinForm | _DivForm | _MonoForm
 ) -> TypeVarType:
     """Mint (or reuse) the site-keyed variable denoting a dim expression.
 
@@ -1090,20 +1126,89 @@ def _lin_scale(form: _LinForm, c: int) -> _LinForm:
     return _LinForm(tuple((n, k * c) for n, k in form.coeffs), form.const * c)
 
 
-def _lin_mul(a: _LinForm, b: _LinForm) -> _LinForm | None:
-    """Product, or None when nonlinear (var times var)."""
-    if not a.coeffs:
-        return _lin_scale(b, a.const)
-    if not b.coeffs:
-        return _lin_scale(a, b.const)
+def _mono_normalize(coeff: int, vars: tuple[str, ...]) -> _MonoForm:
+    """Canonical monomial: sorted vars, zero collapsed."""
+    if coeff == 0:
+        return _MonoForm(0, ())
+    return _MonoForm(coeff, tuple(sorted(vars)))
+
+
+def _form_to_coeff_vars(
+    form: _LinForm | _MonoForm,
+) -> tuple[int, tuple[str, ...]] | None:
+    """Pure-product view: (coeff, vars) or None for sums.
+
+    Linear single-terms (c, c*N) and monos map directly; multi-term
+    linears (N+M, N+2 with a var) are polynomial sums — out of scope,
+    bail with None.
+    """
+    if isinstance(form, _MonoForm):
+        return form.coeff, form.vars
+    if not form.coeffs:
+        return form.const, ()
+    if len(form.coeffs) == 1 and form.const == 0:
+        name, c = form.coeffs[0]
+        return c, (name,)
     return None
+
+
+def _coeff_vars_to_form(coeff: int, vars: tuple[str, ...]) -> _LinForm | _MonoForm:
+    """Form for a pure product: linear for <= 1 var, else monomial."""
+    if coeff == 0:
+        return _LinForm((), 0)
+    if len(vars) <= 1:
+        if not vars:
+            return _LinForm((), coeff)
+        return _LinForm(((vars[0], coeff),), 0)
+    return _mono_normalize(coeff, vars)
+
+
+def _form_mul(
+    a: _LinForm | _MonoForm, b: _LinForm | _MonoForm
+) -> _LinForm | _MonoForm | None:
+    """Product of pure-product forms, else None (sums/Div out of scope)."""
+    pa = _form_to_coeff_vars(a)
+    pb = _form_to_coeff_vars(b)
+    if pa is None or pb is None:
+        return None
+    ca, va = pa
+    cb, vb = pb
+    return _coeff_vars_to_form(ca * cb, tuple(sorted(va + vb)))
+
+
+def _canon_div(
+    numer: _LinForm | _MonoForm, denom: _LinForm | _MonoForm
+) -> _LinForm | _MonoForm | None:
+    """Exact quotient numer/denom for pure products, else None.
+
+    Covers int division (N*2/2) and variable cancellation (N*K/N,
+    B*C*H*W/B). Sums and Divs bail.
+    """
+    pn = _form_to_coeff_vars(numer)
+    pd = _form_to_coeff_vars(denom)
+    if pn is None or pd is None:
+        return None
+    cn, vn = pn
+    cd, vd = pd
+    if cd == 0:
+        return None
+    if cn % cd != 0:
+        return None
+    # Multiset subtraction of divisor vars from numerator vars.
+    rest = list(vn)
+    for v in vd:
+        try:
+            rest.remove(v)
+        except ValueError:
+            return None
+    return _coeff_vars_to_form(cn // cd, tuple(sorted(rest)))
 
 
 def _materialize_dim(
     ctx: FunctionContext | MethodContext,
     op: str,
     index: int,
-    form: _LinForm | _DivForm,
+    form: _LinForm | _DivForm | _MonoForm,
     prefer: int | Type | None = None,
 ) -> int | Type:
     """A dim for a canonical form: int, the real variable, or a fresh var.
@@ -1135,7 +1240,7 @@ def _dim_add_const(
     if isinstance(a, int) and isinstance(b, int):
         return a + b
     fa = _resolve_dim(a)
-    if fa is None or isinstance(fa, _DivForm):
+    if fa is None or isinstance(fa, (_DivForm, _MonoForm)):
         return _fresh_unknown(ctx, op, index)
     return _materialize_dim(ctx, op, index, _lin_add(fa, _LinForm((), b)), prefer=a)
 
@@ -1152,7 +1257,12 @@ def _dim_add2(
         return a + b
     fa = _resolve_dim(a)
     fb = _resolve_dim(b)
-    if fa is None or fb is None or isinstance(fa, _DivForm) or isinstance(fb, _DivForm):
+    if (
+        fa is None
+        or fb is None
+        or isinstance(fa, (_DivForm, _MonoForm))
+        or isinstance(fb, (_DivForm, _MonoForm))
+    ):
         return _fresh_unknown(ctx, op, index)
     return _materialize_dim(ctx, op, index, _lin_add(fa, fb))
 
@@ -1160,7 +1270,7 @@ def _dim_add2(
 def _dim_mul_const(
     ctx: FunctionContext | MethodContext, op: str, index: int, a: int | Type, c: int
 ) -> int | Type:
-    """a * c for a constant c: exact linear form, else a fresh unknown."""
+    """a * c for a constant c: exact linear/monomial form, else unknown."""
     if isinstance(a, int):
         return a * c
     if c == 1:
@@ -1170,6 +1280,10 @@ def _dim_mul_const(
     fa = _resolve_dim(a)
     if fa is None or isinstance(fa, _DivForm):
         return _fresh_unknown(ctx, op, index)
+    if isinstance(fa, _MonoForm):
+        return _materialize_dim(
+            ctx, op, index, _mono_normalize(fa.coeff * c, fa.vars), prefer=a
+        )
     return _materialize_dim(ctx, op, index, _lin_scale(fa, c))
 
 
@@ -1187,6 +1301,13 @@ def _dim_div(
     fa = _resolve_dim(a)
     if fa is None or isinstance(fa, _DivForm):
         return _fresh_unknown(ctx, op, index)
+    if isinstance(fa, _MonoForm):
+        # Exact int division of a product keeps it exact (2*N*M//2);
+        # anything else (plus, inexact) bails — no Div-of-monomial.
+        if plus == 0 and fa.coeff % div == 0:
+            q = _coeff_vars_to_form(fa.coeff // div, fa.vars)
+            return _materialize_dim(ctx, op, index, q, prefer=a)
+        return _fresh_unknown(ctx, op, index)
     if isinstance(fa, _LinForm) and not fa.coeffs:
         return fa.const // div + plus
     if all(c % div == 0 for _, c in fa.coeffs) and fa.const % div == 0:
@@ -1200,41 +1321,32 @@ def _dim_div(
 def _mul_dims(
     ctx: FunctionContext | MethodContext, op: str, index: int, dims: list[int | Type]
 ) -> int | Type:
-    """Product of dims: exact linear form, else a fresh unknown."""
-    acc: _LinForm | None = _LinForm((), 1)
+    """Product of dims: exact linear/monomial form, else a fresh unknown."""
+    acc: _LinForm | _MonoForm | None = _LinForm((), 1)
     for d in dims:
         f = _resolve_dim(d)
         if acc is None or f is None or isinstance(f, _DivForm):
             return _fresh_unknown(ctx, op, index)
-        acc = _lin_mul(acc, f)
+        assert isinstance(f, (_LinForm, _MonoForm))
+        acc = _form_mul(acc, f)
         if acc is None:
             return _fresh_unknown(ctx, op, index)
     assert acc is not None
     return _materialize_dim(ctx, op, index, acc)
 
 
-def _linear_product(dims: list[int | Type]) -> _LinForm | None:
-    """Canonical linear product of dims, else None (nonlinear or opaque)."""
-    acc: _LinForm | None = _LinForm((), 1)
+def _linear_product(dims: list[int | Type]) -> _LinForm | _MonoForm | None:
+    """Canonical total product: linear or single monomial, else None."""
+    acc: _LinForm | _MonoForm | None = _LinForm((), 1)
     for d in dims:
         f = _resolve_dim(d)
         if acc is None or f is None or isinstance(f, _DivForm):
             return None
-        acc = _lin_mul(acc, f)
+        assert isinstance(f, (_LinForm, _MonoForm))
+        acc = _form_mul(acc, f)
         if acc is None:
             return None
     return acc
-
-
-def _div_lin_exact(form: _LinForm, known: int) -> _LinForm | None:
-    """form / known when exactly divisible, else None."""
-    if known == 0:
-        return None
-    if not all(c % known == 0 for _, c in form.coeffs):
-        return None
-    if form.const % known != 0:
-        return None
-    return _LinForm(tuple((n, c // known) for n, c in form.coeffs), form.const // known)
 
 
 def _check_dim_eq(
@@ -4791,28 +4903,23 @@ def _solve_reshape(
         for d in raw_ints:
             if d != -1:
                 known *= d
-        if known != 0:
-            # Exact division of the canonical product (N*2 / 2 = N):
-            # beats the ?U below when the quotient is a plain dim.
-            old_form = _linear_product(dims_old)
-            quot = _div_lin_exact(old_form, known) if old_form is not None else None
-            if quot is not None and (
-                not quot.coeffs
-                or (
-                    len(quot.coeffs) == 1
-                    and quot.coeffs[0][1] == 1
-                    and quot.const == 0
-                )
-            ):
-                # A quotient that is just N resolves equal to any N
-                # spelled by the caller, so a fresh variable for the form
-                # is as good as the original object.
-                inferred = _materialize_dim(ctx, "reshape", 0, quot)
-                return _ndarray_type(
-                    ctx,
-                    [inferred if d == -1 else d for d in raw],
-                    dtype,
-                )
+        # Exact division of the canonical total by the known divisor
+        # (ints and symbolic dims alike): N*2/2, N*K/N=K, B*C*H*W/B=C*H*W.
+        # Beats the ?U below whenever exactly divisible.
+        old_form = _linear_product(dims_old)
+        divisor_form = _linear_product([d for d in raw if d != -1])
+        quot = (
+            _canon_div(old_form, divisor_form)
+            if old_form is not None and divisor_form is not None
+            else None
+        )
+        if quot is not None:
+            inferred = _materialize_dim(ctx, "reshape", 0, quot)
+            return _ndarray_type(
+                ctx,
+                [inferred if d == -1 else d for d in raw],
+                dtype,
+            )
         if old_vars != new_vars:
             # The inferred dim would absorb a symbolic size (N * 50 is not
             # expressible): track it with a fresh unknown instead of
