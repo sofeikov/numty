@@ -345,8 +345,9 @@ class NumtyPlugin(Plugin):
     def get_method_signature_hook(
         self, fullname: str
     ) -> Callable[[MethodSigContext], Type] | None:
-        # Methods only get the rank-mismatch notes; the call-site conflict
-        # check stays function-only.
+        # Instance/class/static methods and __call__ get the call-site
+        # conflict check plus rank notes; anything else the checker
+        # resolves without shape generics stays unhooked.
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
         # A hook here would make every method call in the program (list,
@@ -431,6 +432,21 @@ class NumtyPlugin(Plugin):
                     )
         except Exception:
             pass
+        # Call-site shape conflicts (issue #53): the same shared-TypeVar
+        # check free functions get. Skipped for overloads (per-candidate
+        # hooks would false-positive) and guarded separately so a failure
+        # here can never lose the repaired signature above.
+        try:
+            if isinstance(sig, CallableType) and not (
+                isinstance(ctx.context, CallExpr)
+                and isinstance(
+                    ctx.context.callee.node if hasattr(ctx.context.callee, "node") else None,
+                    OverloadedFuncDef,
+                )
+            ):
+                _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
+        except Exception:
+            pass
         _note_rank_mismatches(ctx, sig)
         return sig
 
@@ -484,47 +500,6 @@ class NumtyPlugin(Plugin):
             # The hook runs per overload candidate; a non-matching
             # item would false-positive, so overloaded callees stay out.
             return sig
-        formals = _shape_tvar_formals(sig)
-        if not formals or len(ctx.args) != len(sig.arg_types):
-            return sig
-        by_var: dict[str, tuple[str, list[tuple[str, int, int]]]] = {}
-        for i, positions in formals:
-            actuals = ctx.args[i]
-            if len(actuals) != 1:
-                continue
-            try:
-                actual = ctx.api.get_expression_type(actuals[0])
-            except Exception:
-                continue
-            parts = _ndarray_parts(actual)
-            if parts is None:
-                continue
-            adims, _ = parts
-            formal_name = sig.arg_names[i] or "?"
-            for dim, tvar in positions:
-                if dim >= len(adims) or not isinstance(adims[dim], int):
-                    continue
-                name, occs = by_var.get(tvar.fullname, (tvar.name, []))
-                occs.append((formal_name, dim, adims[dim]))
-                by_var[tvar.fullname] = (name, occs)
-        for _, (name, occs) in by_var.items():
-            first = occs[0]
-            for other in occs[1:]:
-                if other[2] != first[2]:
-                    message = (
-                        f"call-site shape conflict for '{name}': "
-                        f"{first[2]} (argument '{first[0]}', axis {first[1]}) vs "
-                        f"{other[2]} (argument '{other[0]}', axis {other[1]})"
-                    )
-                    # No dedup here (issue #44): mypy already collapses
-                    # identical messages on one line, and a process-lifetime
-                    # set hides real errors — under dmypy the daemon keeps
-                    # one plugin instance across rechecks, and in plain mypy
-                    # the throw-away inference pass inside comprehensions /
-                    # generator expressions / lambdas consumes the single
-                    # allowed emission, so the pass that counts stays quiet.
-                    ctx.api.fail(message, ctx.context, code=NUMTY_CALLSITE)
-                    break
         # String-spec words bound late (see _fam_bind_words) are missing
         # from the function's variables, so core checking would reject
         # concrete actuals against the free typevars. Add exactly those
@@ -557,11 +532,19 @@ class NumtyPlugin(Plugin):
             sig = sig.copy_modified(
                 variables=tuple(sig.variables) + tuple(missing)
             )
+        # A failure here must never lose the repaired signature above,
+        # so it is guarded separately (the outer hook would otherwise
+        # fall back to the default, unrepaired signature).
+        try:
+            _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
+        except Exception:
+            pass
         # Expression returns (issue #32 finish): mypy cannot infer M+1
         # from M, so callers of `-> I64["M+1"]` saw Any. Substitute the
         # actual bindings into the return ourselves (plain vars reuse the
         # caller's object, new exprs reuse the form-keyed global id).
         try:
+            formals = _shape_tvar_formals(sig)
             bindings = _callsite_expr_bindings(sig, formals, ctx)
             new_ret = _substitute_return_exprs(sig, bindings, ctx)
             if new_ret is not None:
@@ -2361,6 +2344,203 @@ def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, Ty
         if positions:
             out.append((i, positions))
     return out
+
+
+def _strip_optional(tp: Type) -> Type:
+    """The single non-None union member, else the type itself."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, UnionType):
+        return tp
+    members = [m for m in proper.relevant_items() if not isinstance(get_proper_type(m), NoneType)]
+    if len(members) != 1:
+        return tp
+    return members[0]
+
+
+_SEQUENCE_FULLNAMES = frozenset(
+    {"builtins.list", "collections.abc.Sequence", "typing.Sequence"}
+)
+
+
+def _sequence_element(tp: Type) -> Type | None:
+    """Element type of a homogeneous list/Sequence formal, else None."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance):
+        return None
+    if proper.type.fullname not in _SEQUENCE_FULLNAMES:
+        return None
+    if len(proper.args) != 1:
+        return None
+    return proper.args[0]
+
+
+def _align_pair(
+    fname: str, fdims: list[int | Type], adims: list[int | Type]
+) -> list[tuple[str, int, TypeVarLikeType, int, int | None]]:
+    """Align formal dims (possibly with one *Ts segment) to actual dims.
+
+    Returns (formal name, axis, tvar, actual size, segment index) for
+    each provable actual int under a shape tvar; unprovable dims are
+    skipped. The segment index scopes *Ts comparisons element-wise:
+    elements of one unpack segment never conflict with each other,
+    only with the same position of another segment.
+    """
+    raw: list[tuple[Type, int | Type, int | None]] = []
+    uidx = -1
+    for k, fd in enumerate(fdims):
+        if isinstance(fd, int):
+            continue
+        if isinstance(get_proper_type(fd), UnpackType):
+            uidx = k
+            break
+    if uidx == -1:
+        raw = [(fd, ad, None) for fd, ad in zip(fdims, adims)]
+    else:
+        pre, suf = fdims[:uidx], fdims[uidx + 1 :]
+        if len(adims) < len(pre) + len(suf):
+            return []
+        raw = [(fd, ad, None) for fd, ad in zip(pre, adims[: len(pre)])]
+        if suf:
+            raw.extend(
+                (fd, ad, None)
+                for fd, ad in zip(suf, adims[len(adims) - len(suf) :])
+            )
+        seg = adims[len(pre) : len(adims) - len(suf) if suf else len(adims)]
+        upack = get_proper_type(fdims[uidx])
+        assert isinstance(upack, UnpackType)
+        tvt = get_proper_type(upack.type)
+        if isinstance(tvt, TypeVarTupleType):
+            raw.extend((tvt, a, j) for j, a in enumerate(seg))
+    out: list[tuple[str, int, TypeVarLikeType, int, int | None]] = []
+    for axis, (fd, ad, seg) in enumerate(raw):
+        if isinstance(fd, (TypeVarType, TypeVarTupleType)) and isinstance(ad, int):
+            out.append((fname, axis, fd, ad, seg))
+    return out
+
+
+def _pairs_for_actual(
+    fname: str, formal_tp: Type, actual_expr: Expression, ctx: FunctionSigContext | MethodSigContext
+) -> list[tuple[str, int, TypeVarLikeType, int, int | None]]:
+    """Pair one formal type with one actual expression (issue #53).
+
+    Bare ndarrays (and single-non-None unions like Optional) align
+    directly; homogeneous list/Sequence element types align element-wise
+    for list displays (and once for stored lists via the joined arg).
+    """
+    fparts = _parts_or_unpack(_strip_optional(formal_tp))
+    if fparts is not None:
+        try:
+            actual_tp = ctx.api.get_expression_type(actual_expr)
+        except Exception:
+            return []
+        aparts = _parts_or_unpack(actual_tp)
+        if aparts is None:
+            return []
+        return _align_pair(fname, fparts[0], aparts[0])
+    elem = _sequence_element(_strip_optional(formal_tp))
+    if elem is None:
+        return []
+    eparts = _parts_or_unpack(elem)
+    if eparts is None:
+        return []
+    edims = eparts[0]
+    if isinstance(actual_expr, (ListExpr, TupleExpr)):
+        out: list[tuple[str, int, TypeVarLikeType, int, int | None]] = []
+        for el in actual_expr.items:
+            if isinstance(el, StarExpr):
+                continue
+            try:
+                el_tp = ctx.api.get_expression_type(el)
+            except Exception:
+                continue
+            el_parts = _parts_or_unpack(el_tp)
+            if el_parts is None:
+                continue
+            out.extend(_align_pair(fname, edims, el_parts[0]))
+        return out
+    try:
+        actual_tp = ctx.api.get_expression_type(actual_expr)
+    except Exception:
+        return []
+    aproper = get_proper_type(actual_tp)
+    if isinstance(aproper, TupleType):
+        out: list[tuple[str, int, TypeVarLikeType, int, int | None]] = []
+        for item in aproper.items:
+            iparts = _parts_or_unpack(item)
+            if iparts is None:
+                continue
+            out.extend(_align_pair(fname, edims, iparts[0]))
+        return out
+    if isinstance(aproper, Instance) and len(aproper.args) == 1:
+        iparts = _parts_or_unpack(aproper.args[0])
+        if iparts is not None:
+            return _align_pair(fname, edims, iparts[0])
+    return []
+
+
+def _conflict_pairs(
+    sig: CallableType, ctx: FunctionSigContext | MethodSigContext
+) -> list[tuple[str, int, TypeVarLikeType, int, int | None]]:
+    """(formal name, axis, tvar, actual size) for the call-site check.
+
+    Covers bare ndarray formals (positional, defaulted, keyword-only
+    and named), single-non-None unions (Optional/PEP-604), homogeneous
+    list/Sequence element types, *args element types (every actual), and
+    *Ts unpack segments element-wise (issue #53).
+    """
+    out: list[tuple[str, int, TypeVarLikeType, int, int | None]] = []
+    if len(ctx.args) != len(sig.arg_types):
+        return out
+    for i, (tp, kind, name) in enumerate(zip(sig.arg_types, sig.arg_kinds, sig.arg_names)):
+        fname = name or "?"
+        actuals = ctx.args[i]
+        if kind in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT):
+            if len(actuals) != 1:
+                continue
+            out.extend(_pairs_for_actual(fname, tp, actuals[0], ctx))
+        elif kind == ARG_STAR:
+            # *args: the formal type is the element type; every actual
+            # binds to it, so each one is checked.
+            for expr in actuals:
+                out.extend(_pairs_for_actual(fname, tp, expr, ctx))
+    return out
+
+
+def _emit_call_site_conflicts(
+    ctx: FunctionSigContext | MethodSigContext,
+    pairs: list[tuple[str, int, TypeVarLikeType, int, int | None]],
+) -> None:
+    """Report shared-TypeVar size conflicts collected from call actuals.
+
+    Occurrences key on (tvar, segment index) so one *Ts segment's own
+    elements never conflict with each other, only with the same
+    position of another segment.
+    """
+    by_var: dict[tuple[str, int | None], tuple[str, list[tuple[str, int, int]]]] = {}
+    for fname, axis, tvar, size, seg in pairs:
+        tname = getattr(tvar, "name", None) or tvar.fullname.rpartition(".")[2]
+        key = (tvar.fullname, seg)
+        name, occs = by_var.get(key, (tname, []))
+        occs.append((fname, axis, size))
+        by_var[key] = (name, occs)
+    for _, (name, occs) in by_var.items():
+        first = occs[0]
+        for other in occs[1:]:
+            if other[2] != first[2]:
+                message = (
+                    f"call-site shape conflict for '{name}': "
+                    f"{first[2]} (argument '{first[0]}', axis {first[1]}) vs "
+                    f"{other[2]} (argument '{other[0]}', axis {other[1]})"
+                )
+                # No dedup here (issue #44): mypy already collapses
+                # identical messages on one line, and a process-lifetime
+                # set hides real errors — under dmypy the daemon keeps
+                # one plugin instance across rechecks, and in plain mypy
+                # the throw-away inference pass inside comprehensions /
+                # generator expressions / lambdas consumes the single
+                # allowed emission, so the pass that counts stays quiet.
+                ctx.api.fail(message, ctx.context, code=NUMTY_CALLSITE)
+                break
 
 
 def _callsite_expr_bindings(

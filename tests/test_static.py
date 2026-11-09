@@ -1276,6 +1276,52 @@ def test_f64_callsite_same_argument_names_axes() -> None:
     assert _run_fixture("bad_callsite_same_arg.py") == ["(4,)"]
 
 
+def test_callsite_conflict_methods() -> None:
+    # Issue #53: instance methods, staticmethods, classmethods and
+    # __call__ report the same conflict a free function reports.
+    result = run_mypy(FIXTURES / "bad_callsite_method.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 4, result.stdout
+    assert "call-site shape conflict for 'I'" in errors[0], result.stdout
+    assert "3 (argument 'x', axis 1) vs 4 (argument 'w', axis 0)" in errors[0]
+    for err in errors[1:]:
+        assert "call-site shape conflict for 'N'" in err, result.stdout
+        assert "3 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)" in err
+
+
+def test_callsite_conflict_flexible_formals() -> None:
+    # Issue #53: Optional/PEP-604 bias, keyword-only args, *args,
+    # Sequence/list elements and *Ts segments report conflicts too.
+    result = run_mypy(FIXTURES / "bad_callsite_flexible.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 7, result.stdout
+    assert "call-site shape conflict for 'M'" in errors[0], result.stdout
+    assert "call-site shape conflict for 'M'" in errors[1], result.stdout
+    for err in errors[2:6]:
+        assert "call-site shape conflict for 'N'" in err, result.stdout
+    assert "call-site shape conflict for 'Ts'" in errors[6], result.stdout
+    assert "4 (argument 'x', axis 1) vs 5 (argument 'y', axis 1)" in errors[6]
+
+
+def test_callsite_strspec_valid_calls_clean() -> None:
+    # Issue #53: valid string-spec calls are clean in every position
+    # that used to reject them, with exact revealed shapes.
+    result = run_mypy(FIXTURES / "callsite_strspec_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        47: '"numpy.ndarray[tuple[Literal[2], Literal[5]], numpy.dtype[numpy.float64]]"',
+        48: '"numpy.ndarray[tuple[Literal[3], Literal[2]], numpy.dtype[numpy.float64]]"',
+        49: '"numpy.ndarray[tuple[Literal[3], Literal[2]], numpy.dtype[numpy.float64]]"',
+        50: '"None"',
+        51: '"None"',
+        52: '"None"',
+        53: '"None"',
+    }, result.stdout
+    assert _run_fixture("callsite_strspec_ok.py") == ["ok"]
+
+
 def test_rank_mismatch_note_names_declared_dims() -> None:
     # #35: a wrong-rank argument leaves the parameter's dim TypeVars
     # unsolved, so mypy's own error prints them as Never. That error is
