@@ -142,10 +142,11 @@ error against the known suffix), same-`*Ts` broadcasts, unary ufuncs,
 comparisons, reductions along axes that resolve to a known dim
 (`.all(axis=-1)` on `(*Ts, 2)` is `(*Ts,)`), and rank arithmetic over
 the unknown middle — `matmul` on `(*Ts, N, M)` pairs (inner dims must
-align, batches broadcast through the unpack), `transpose`/`.T`
-reversal (`(*Ts, 2)` reverses to `(2, *Ts)`), block-preserving
-`reshape` (`(*Ts, 2, 3)` to `(*Ts, 6)`), and leading `None`/slice
+align, batches broadcast through the unpack) and leading `None`/slice
 indexing without an ellipsis (`v[0]` on `(5, *Ts, 7)` is `(*Ts, 7)`).
+`reshape` over `*Ts` returns the spelled target as-is (`(*Ts, 2, 3)`
+to `(6,)`), and `transpose`/`.T` over `*Ts` bails out instead of
+claiming an order no annotation can spell.
 Anything that would need the unknown length or order — several array
 indices or an integer beside one (numpy may move their block to the
 front), an index reaching into `*Ts` itself, reducing over `*Ts` itself,
@@ -608,13 +609,13 @@ comprehensions) leave only the joined axis unknown.
 
 **Reshape.** Conserves the total with symbolic sizes and infers `-1`
 (`(N, 10, 2)` to `(N, 20)` is fine, `(N, 10, 2)` to `(N, 21)` errors,
-`(N, 10)` to `(M, 10)` bails). Regroups block-preserving runs over
-`*Ts` (`(*Ts, 2, 3)` to `(*Ts, 6)` is fine; a `-1` that would absorb
+`(N, 10)` to `(M, 10)` bails). Over `*Ts` the spelled target is the
+whole new shape (`(*Ts, 2, 3)` to `(6,)`; a `-1` that would absorb
 `*Ts`, or a total no `*Ts` can absorb, bails or errors respectively).
 
-**Rank changes.** `transpose`/`.T` (reversal included over `*Ts`),
-`squeeze`, `expand_dims`; bad permutations, repeated axes and non-1
-squeeze axes error.
+**Rank changes.** `transpose`/`.T` (which bail out over `*Ts`: no
+annotation can spell its reversal), `squeeze`, `expand_dims`; bad
+permutations, repeated axes and non-1 squeeze axes error.
 
 **Reductions.** `sum(axis=1)` (plus `median` and every `nan*` twin:
 `nansum`, `nanmean`, `nanargmin`, …), `average` (1-D weights must match
@@ -1099,11 +1100,10 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   `(*Ts,)` (ambiguous variadic slice); name the leading axis. A provable `*Ts` error may draw the stubs' own echo next
   to ours (an `[index]` complaint on unpack shapes); ours names the
   axis, the size, and the `(*Ts, ...)` shape.
-- Rank arithmetic over `*Ts` keeps the unknown block ordered, never
-  reordered: `transpose`/`.T` reversal moves the known runs around a
-  stationary `*Ts` (no annotation can spell its reversal), explicit
-  transpose axes bail, and a `reshape` `-1` bails because the inferred
-  dim would absorb the `*Ts` product. A non-ellipsis index that reaches
+- Rank arithmetic over `*Ts` never reorders the unknown block:
+  `transpose`/`.T` bail out (no annotation can spell its reversal),
+  explicit transpose axes bail, and a `reshape` `-1` bails because the
+  inferred dim would absorb the `*Ts` product. A non-ellipsis index that reaches
   past the known prefix bails — rank-generic bodies spell the ellipsis
   (`a[:, ..., None, :]`); a `1` that aligns against `*Ts` from the
   wrong side bails for the same reason. `matmul` needs one shared

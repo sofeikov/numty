@@ -322,6 +322,28 @@ def test_reshape_minus1_infers() -> None:
     assert a.reshape(-1).shape == (6,)
 
 
+def test_ts_reshape_and_transpose_match_numpy() -> None:
+    # Issue #48: over *Ts the hook claims the spelled target (reshape)
+    # and bails on reversal (transpose). Where the numpy call is legal,
+    # the runtime shapes must agree with those claims.
+    import importlib.util
+
+    def load_fixture(name: str) -> Any:
+        path = ROOT / "tests" / "fixtures" / name
+        spec = importlib.util.spec_from_file_location(
+            f"numty_ts_oracle_{name[:-3]}", path
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    reshape_mod = load_fixture("bad_ts_reshape_tail.py")
+    assert reshape_mod.flatten_tail(np.zeros((1, 2, 3))).shape == (6,)
+    transpose_mod = load_fixture("bad_ts_transpose.py")
+    assert transpose_mod.flip(np.zeros((3, 4, 2))).shape == (2, 4, 3)
+
+
 def test_einsum_values() -> None:
     a = np.arange(6, dtype=np.float64).reshape(2, 3)
     b = np.arange(12, dtype=np.float64).reshape(3, 4)

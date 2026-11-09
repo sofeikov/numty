@@ -676,13 +676,9 @@ def reshape_dynamic_bails_out_safely(n: int) -> None:
 
 
 A2x4x6 = FloatArray[tuple[Literal[2], Literal[4], Literal[6]]]
-A5x6 = FloatArray[tuple[Literal[5], Literal[6]]]
 
 
 def use_2x4x6(m: A2x4x6) -> None: ...
-
-
-def use_5x6(m: A5x6) -> None: ...
 
 
 def ts_matmul(
@@ -705,29 +701,20 @@ def ts_matmul_calls_stay_precise() -> None:
     use_2x4x6(ts_matmul_mixed(np.zeros((2, 4, 5))))
 
 
-def ts_tail2_first(
-    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
-) -> FlexArray[tuple[Literal[2], Unpack[Ts]], np.dtype[np.float64]]:  # type: ignore[type-var]
-    return v.transpose()
-
-
-def ts_transpose_stays_precise(
-    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
-) -> None:
-    reveal_type(v.transpose())
-    reveal_type(np.transpose(v))
-    reveal_type(v.T)
-    use_2x3(ts_tail2_first(np.zeros((3, 2))))
-
-
-def ts_transpose_prefix_stays_precise(
-    v: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[4], Literal[5]], np.dtype[np.float64]],  # type: ignore[type-var]
-) -> None:
-    reveal_type(v.transpose())
-    reveal_type(v.T)
-
-
 def ts_transpose_bails_stay_silent(
+    v: FlexArray[tuple[Unpack[Ts], Literal[2]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    # Reversing would also reverse *Ts itself, which no annotation can
+    # spell, so every *Ts transpose bails out instead of guessing
+    # (issue #48): the default full reversal, np.transpose, .T, an
+    # explicit axis list, and transpose(None) all stay on the stubs.
+    _ = v.transpose()
+    _ = np.transpose(v)
+    _ = v.T
+    _ = v.transpose(None)
+
+
+def ts_transpose_bails_explicit_axes(
     v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
 ) -> None:
     # Explicit axes would pin the rank but cannot order the unknown
@@ -735,31 +722,34 @@ def ts_transpose_bails_stay_silent(
     reveal_type(v.transpose(1, 0))
 
 
-def ts_flatten_tail(
-    v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
-) -> FlexArray[tuple[Unpack[Ts], Literal[6]], np.dtype[np.float64]]:  # type: ignore[type-var]
-    return v.reshape(6)
+def ts_transpose_prefix_bails_stay_silent(
+    v: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[4], Literal[5]], np.dtype[np.float64]],  # type: ignore[type-var]
+) -> None:
+    _ = v.transpose()
+    _ = v.T
 
 
 def ts_reshape_stays_precise(
     v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
     w: FlexArray[tuple[Literal[5], Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
 ) -> None:
+    # Without star args the target is the whole new shape, whatever the
+    # input: *Ts is never put back in (issue #48).
     reveal_type(v.reshape(6))
     reveal_type(v.reshape((2, 3)))
+    reveal_type(v.reshape(5, 6))
     reveal_type(w.reshape((w.shape[0], 6)))
     reveal_type(w.reshape((5, 6)))
-    use_5x6(ts_flatten_tail(np.zeros((5, 2, 3))))
 
 
 def ts_reshape_bails_stay_silent(
     v: FlexArray[tuple[Unpack[Ts], Literal[2], Literal[3]], np.dtype[np.float64]],  # type: ignore[type-var]
 ) -> None:
-    # A -1 would absorb the unknown *Ts product, and a target the known
-    # run neither matches nor contradicts stays possible via *Ts, so the
-    # hook leaves both alone.
+    # A -1 would absorb the unknown *Ts product, so the hook leaves it
+    # alone. (A `*v.shape[:-2]` star splice would carry *Ts through, but
+    # the numpy stubs reject variadic star args before hooks run, so
+    # that spelling stays a stub overload error.)
     _ = v.reshape(-1, 6)
-    _ = v.reshape(5, 6)
 
 
 def ts_head(
