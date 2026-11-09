@@ -308,23 +308,90 @@ def test_unpack_tuple_call_and_starred() -> None:
     )
 
 
-def test_unpack_leaves_risky_forms_alone() -> None:
+def test_unpack_mapped_genexp_unrolls() -> None:
+    out, warnings = codemod(
+        "a, b = (f(x) for x in (p1, p2))\n", unpack_displays=True
+    )
+    assert warnings == []
+    assert out == "a, b = (f(p1), f(p2))"
+
+
+def test_unpack_mapped_listcomp_unrolls() -> None:
+    out, warnings = codemod(
+        "a, b = [f(v) for v in [p1, p2]]\n", unpack_displays=True
+    )
+    assert warnings == []
+    assert out == "a, b = [f(p1), f(p2)]"
+
+
+def test_unpack_mapped_multi_use_unrolls() -> None:
+    out, warnings = codemod(
+        "x, y = (np.where(np.isfinite(v), v, 0.0) for v in (a, b))\n",
+        unpack_displays=True,
+    )
+    assert warnings == []
+    assert out == (
+        "x, y = (np.where(np.isfinite(a), a, 0.0),"
+        " np.where(np.isfinite(b), b, 0.0))"
+    )
+
+
+def test_unpack_mapped_tuple_call_unrolls() -> None:
+    out, warnings = codemod(
+        "a, b = tuple(f(v) for v in (p1, p2))\n", unpack_displays=True
+    )
+    assert warnings == []
+    assert out == "a, b = (f(p1), f(p2))"
+
+
+def test_unpack_mapped_single_unrolls_with_comma() -> None:
+    out, warnings = codemod(
+        "a, = (f(x) for x in (p1,))\n", unpack_displays=True
+    )
+    assert warnings == []
+    assert out == "a, = (f(p1),)"
+
+
+def test_unpack_mapped_leaves_risky_forms_alone() -> None:
     src = (
-        "a, b = (f(x) for x in (p1, p2))\n"
-        "c, d = [x for x in t if c]\n"
-        "e, f = (x for x in t)\n"
-        "g, h = map(f, (p1, p2))\n"
-        "i = (x for x in (p1, p2))\n"
+        "a, b = (f(x) for x in t)\n"
+        "c, d = (f(x) for x in (p1, g()))\n"
+        "e, f = (f(y) for x in (p1, p2))\n"
+        "g, h = (lambda x: x for x in (p1, p2))\n"
+        "i, j = ((w := f(x)) for x in (p1, p2))\n"
+        "k, l = (f(x) for x in (p1, p2) if True)\n"
     )
     out, warnings = codemod(src, unpack_displays=True)
     assert warnings == []
     assert out == "\n".join(
         [
-            "a, b = (f(x) for x in (p1, p2))",
+            "a, b = (f(x) for x in t)",
+            "c, d = (f(x) for x in (p1, g()))",
+            "e, f = (f(y) for x in (p1, p2))",
+            "g, h = (lambda x: x for x in (p1, p2))",
+            "i, j = ((w := f(x)) for x in (p1, p2))",
+            "k, l = (f(x) for x in (p1, p2) if True)",
+        ]
+    )
+
+
+def test_unpack_leaves_risky_forms_alone() -> None:
+    src = (
+        "c, d = [x for x in t if c]\n"
+        "e, f = (x for x in t)\n"
+        "g, h = map(f, (p1, p2))\n"
+        "i = (x for x in (p1, p2))\n"
+        "j, k = (f(x) for x in (p1, g()))\n"
+    )
+    out, warnings = codemod(src, unpack_displays=True)
+    assert warnings == []
+    assert out == "\n".join(
+        [
             "c, d = [x for x in t if c]",
             "e, f = (x for x in t)",
             "g, h = map(f, (p1, p2))",
             "i = (x for x in (p1, p2))",
+            "j, k = (f(x) for x in (p1, g()))",
         ]
     )
 
@@ -382,6 +449,44 @@ def test_unpack_end_to_end_distributes(tmp_path: Path) -> None:
     assert len(notes) == 2, result.stdout
     assert "tuple[Literal[2], Literal[3]]" in notes[0], result.stdout
     assert "tuple[Literal[2], Literal[2]]" in notes[1], result.stdout
+
+
+def test_unpack_mapped_end_to_end_distributes(tmp_path: Path) -> None:
+    # Issue #39: a mapped genexp over heterogeneous names joins to the
+    # union, while the unrolled display keeps per-name precision.
+    src = (
+        "from typing import Literal\n"
+        "import numpy as np\n"
+        "A2x2 = np.ndarray[tuple[Literal[2], Literal[2]], np.dtype[np.float64]]\n"
+        "A2x3 = np.ndarray[tuple[Literal[2], Literal[3]], np.dtype[np.float64]]\n"
+        "def f(p1: A2x3, p2: A2x2) -> None:\n"
+        "    a, b = (np.where(np.isfinite(v), v, 0.0) for v in (p1, p2))\n"
+        "    reveal_type(a)\n"
+        "    reveal_type(b)\n"
+    )
+    (tmp_path / "probe_before.py").write_text(src)
+    before = _run_mypy(tmp_path / "probe_before.py")
+    assert before.returncode == 0, before.stdout
+    union_notes = [
+        line for line in before.stdout.splitlines() if "Revealed type" in line
+    ]
+    assert len(union_notes) == 2, before.stdout
+    assert all("|" in note for note in union_notes), before.stdout
+    out, _ = codemod_source(src, unpack_displays=True)
+    assert (
+        "a, b = (np.where(np.isfinite(p1), p1, 0.0),"
+        " np.where(np.isfinite(p2), p2, 0.0))" in out
+    ), out
+    probe = tmp_path / "probe_unpack_mapped.py"
+    probe.write_text(out)
+    result = _run_mypy(probe)
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 2, result.stdout
+    assert "tuple[Literal[2], Literal[3]]" in notes[0], result.stdout
+    assert "|" not in notes[0], result.stdout
+    assert "tuple[Literal[2], Literal[2]]" in notes[1], result.stdout
+    assert "|" not in notes[1], result.stdout
 
 
 README_NORM = '''# SPDX-License-Identifier: MIT

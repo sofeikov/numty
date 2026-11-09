@@ -559,6 +559,9 @@ a, b = (clean(v) for v in (p1, p2))  # both: the union (body still checked)
 
 So when the shapes must reach the code below, spell the display; when
 only the per-member checking matters, the generator form is fine.
+`numty_codmod --unpack-displays` rewrites the displayable forms for
+you, including mapped comprehensions over bare names
+(`(f(v) for v in (p1, p2))` -> `(f(p1), f(p2))`).
 
 ## The rest of the catalog
 
@@ -1018,7 +1021,9 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   different shapes) assigns the whole union to every name — genexp,
   list comprehension, `tuple(...)`, starred targets, and `map` (which
   dissolves to `Any`) all behave this way. The body still checks per
-  member; per-name precision needs the tuple display.
+  member; per-name precision needs the tuple display (or
+  `numty_codmod --unpack-displays`, which unrolls mapped comprehensions
+  over bare names to the display).
 - Different TypeVars (`N` vs `M`) never conflict, even when provably
   different at a call site — only same-name TypeVars are unified.
 

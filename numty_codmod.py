@@ -41,8 +41,14 @@ matched shape; the exact safety condition lives on each transform.
     `tuple(D)`, `(*D,)` -> `D` (D a tuple/list display). Unpacking
     consumes the iterable fully, so laziness is unobservable, and the
     display distributes per-name where the lazy forms join. Anything
-    else (non-identity elements, filters, non-display iterables, `map`)
-    is left alone.
+    else (filters, non-display iterables, `map`,
+    items that are not bare names, elts that do not mention the loop
+    variable or that shadow / await / yield it) is left alone. Mapped
+    comprehensions over a literal display of bare names also unroll
+    per item: `(f(v) for v in (p1, p2))` -> `(f(p1), f(p2))` (and the
+    listcomp / `tuple(...)` twins), which is value-identical when the
+    display items are side-effect-free names because unpacking consumes
+    the iterable fully in order.
 
 Rewrites are spliced into the original text: only the rewritten
 expressions change, so comments (including the `# type: ignore` notes
@@ -666,6 +672,123 @@ def _display_text(source: Source, disp: ast.expr, as_tuple: bool) -> str:
     return f"({inner})"
 
 
+def _elt_binds_target(elt: ast.expr, target: str) -> bool:
+    """Whether evaluating `elt` could bind `target` itself.
+
+    Any such binding shadows the loop variable, so a textual
+    substitution of the loop variable would hit the wrong names.
+    Conservative: any Store/Del of the name, any argument or def/class
+    name, or any Yield/Await (which would change suspension points once
+    unrolled) counts as binding.
+    """
+    for sub in ast.walk(elt):
+        if isinstance(sub, ast.NamedExpr):
+            return True
+        if isinstance(sub, ast.Name):
+            if sub.id == target and not isinstance(sub.ctx, ast.Load):
+                return True
+        elif isinstance(sub, ast.arg):
+            if sub.arg == target:
+                return True
+        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if sub.name == target:
+                return True
+        elif isinstance(sub, (ast.Yield, ast.YieldFrom, ast.Await)):
+            return True
+    return False
+
+
+def _subst_elt(elt: ast.expr, target: str, item_text: str, source: Source) -> str:
+    """`elt` source with every load of `target` replaced by `item_text`."""
+    elt_start, elt_end = source.span(elt)
+    loads = [
+        sub
+        for sub in ast.walk(elt)
+        if isinstance(sub, ast.Name)
+        and sub.id == target
+        and isinstance(sub.ctx, ast.Load)
+    ]
+    loads.sort(key=lambda n: source.span(n)[0])
+    parts: list[str] = []
+    pos = elt_start
+    for name in loads:
+        start, end = source.span(name)
+        parts.append(source.text[pos:start])
+        parts.append(item_text)
+        pos = end
+    parts.append(source.text[pos:elt_end])
+    return "".join(parts)
+
+
+def _unroll_comp(
+    comp: ast.GeneratorExp | ast.ListComp, source: Source, *, force_tuple: bool
+) -> str | None:
+    """Unroll `(f(v) for v in (p1, p2))` to `(f(p1), f(p2))`, else None.
+
+    Safety: exactly one generator, no `if`s, a single-Name target over a
+    literal tuple/list display whose items are all bare Names (side
+    effect free, so evaluating the display up front versus interleaved
+    with `f` is unobservable), and an element that loads the target at
+    least once without binding / awaiting / yielding it. Unpacking
+    consumes the iterable fully in order, so the eager display calls
+    `f` the same number of times in the same order.
+    """
+    if len(comp.generators) != 1:
+        return None
+    gen = comp.generators[0]
+    if gen.ifs or not isinstance(gen.target, ast.Name):
+        return None
+    target = gen.target.id
+    disp = _as_display(gen.iter)
+    if disp is None:
+        return None
+    if not disp.elts:
+        return "()" if (force_tuple or isinstance(comp, ast.GeneratorExp)) else "[]"
+    for item in disp.elts:
+        if not isinstance(item, ast.Name):
+            return None
+    elt = comp.elt
+    if isinstance(elt, ast.Name) and elt.id == target:
+        return None  # identity case stays with _identity_display
+    loads = [
+        sub
+        for sub in ast.walk(elt)
+        if isinstance(sub, ast.Name)
+        and sub.id == target
+        and isinstance(sub.ctx, ast.Load)
+    ]
+    if not loads:
+        return None
+    if _elt_binds_target(elt, target):
+        return None
+    expanded = [
+        _subst_elt(elt, target, source.segment(item), source)
+        for item in disp.elts
+    ]
+    joined = ", ".join(expanded)
+    if force_tuple or isinstance(comp, ast.GeneratorExp):
+        if len(expanded) == 1:
+            joined += ","
+        return f"({joined})"
+    return f"[{joined}]"
+
+
+def _mapped_replacement(node: ast.expr, source: Source) -> str | None:
+    """Unrolled display for a mapped comprehension over names, else None."""
+    if isinstance(node, (ast.GeneratorExp, ast.ListComp)):
+        return _unroll_comp(node, source, force_tuple=False)
+    if isinstance(node, ast.Call):
+        if not (isinstance(node.func, ast.Name) and node.func.id == "tuple"):
+            return None
+        if len(node.args) != 1 or node.keywords:
+            return None
+        inner = node.args[0]
+        if not isinstance(inner, (ast.GeneratorExp, ast.ListComp)):
+            return None
+        return _unroll_comp(inner, source, force_tuple=True)
+    return None
+
+
 def _unpack_display_edits(tree: ast.Module, source: Source) -> list[Edit]:
     """Normalize unpack sources to literal displays (see _identity_display)."""
     edits: list[Edit] = []
@@ -675,10 +798,15 @@ def _unpack_display_edits(tree: ast.Module, source: Source) -> list[Edit]:
         if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Tuple):
             continue
         found = _identity_display(node.value)
-        if found is None:
+        if found is not None:
+            start, end = source.span(node.value)
+            edits.append((start, end, _display_text(source, *found)))
+            continue
+        replacement = _mapped_replacement(node.value, source)
+        if replacement is None:
             continue
         start, end = source.span(node.value)
-        edits.append((start, end, _display_text(source, *found)))
+        edits.append((start, end, replacement))
     return edits
 
 
