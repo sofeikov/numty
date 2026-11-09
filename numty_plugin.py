@@ -401,17 +401,28 @@ class NumtyPlugin(Plugin):
         # (see _fam_bind_words) are missing from the method's variables,
         # so `A1(grid=int-dims)` rigid-fails instead of inferring the
         # implicit dims like a generic function does. Add exactly those
-        # back, same as the function call-site hook does.
+        # back, same as the function call-site hook does. The registry
+        # behind _fam_late_bound is empty on warm cache hits (issue #42),
+        # so the marker/declared checks there keep this working
+        # incrementally; a tvar owned by the method's own class is never
+        # added (it stays class-bound).
         try:
             if isinstance(sig, CallableType):
+                class_fullname, _, _ = fullname.rpartition(".")
                 have = {v.fullname for v in sig.variables}
                 missing: list[TypeVarLikeType] = []
                 for formal in list(sig.arg_types) + [sig.ret_type]:
                     for tvar in _iter_tvarlikes(formal):
-                        if (
-                            tvar.fullname in self._fam_late_bound
-                            and tvar.fullname not in have
+                        if tvar.fullname in have:
+                            continue
+                        if tvar.fullname in self._fam_late_bound or tvar.fullname.startswith(
+                            _LATE_PREFIXES
                         ):
+                            have.add(tvar.fullname)
+                            missing.append(tvar)
+                        elif self._resolves_to_tvar(
+                            tvar.fullname
+                        ) and not self._is_class_tvar(class_fullname, tvar.fullname):
                             have.add(tvar.fullname)
                             missing.append(tvar)
                 if missing:
@@ -440,6 +451,27 @@ class NumtyPlugin(Plugin):
             if hook is not None:
                 return hook
         return None
+
+    def _resolves_to_tvar(self, fullname: str) -> bool:
+        """Whether `fullname` names a declared type variable."""
+        try:
+            sym = self.lookup_fully_qualified(fullname)
+        except Exception:
+            return False
+        return sym is not None and isinstance(sym.node, TypeVarLikeExpr)
+
+    def _is_class_tvar(self, class_fullname: str, fullname: str) -> bool:
+        """Whether `fullname` is one of the class's own type variables."""
+        try:
+            sym = self.lookup_fully_qualified(class_fullname)
+        except Exception:
+            return False
+        if sym is None or not isinstance(sym.node, TypeInfo):
+            return False
+        try:
+            return any(v.fullname == fullname for v in sym.node.type_vars)
+        except Exception:
+            return False
 
     def _callsite_check(self, ctx: FunctionSigContext) -> Type:
         sig = ctx.default_signature
@@ -498,15 +530,27 @@ class NumtyPlugin(Plugin):
         # concrete actuals against the free typevars. Add exactly those
         # back: the call then checks and infers like a written generic.
         # Names already generic (mixed bare + string) are left alone, so
-        # no fullname ever appears twice.
+        # no fullname ever appears twice. The registry behind
+        # _fam_late_bound is empty on warm cache hits (issue #42), so the
+        # marker/declared checks there keep this working incrementally.
+        # Declared words are only added for real function callees: a
+        # Callable-typed value keeps its free tvars rigid (issue #35).
+        callee_node = None
+        if isinstance(ctx.context, CallExpr):
+            callee_node = getattr(ctx.context.callee, "node", None)
+        is_func = isinstance(callee_node, (FuncDef, Decorator))
         have = {v.fullname for v in sig.variables}
         missing: list[TypeVarLikeType] = []
         for formal in list(sig.arg_types) + [sig.ret_type]:
             for tvar in _iter_tvarlikes(formal):
-                if (
-                    tvar.fullname in self._fam_late_bound
-                    and tvar.fullname not in have
+                if tvar.fullname in have:
+                    continue
+                if tvar.fullname in self._fam_late_bound or tvar.fullname.startswith(
+                    _LATE_PREFIXES
                 ):
+                    have.add(tvar.fullname)
+                    missing.append(tvar)
+                elif is_func and self._resolves_to_tvar(tvar.fullname):
                     have.add(tvar.fullname)
                     missing.append(tvar)
         if missing:
@@ -1437,7 +1481,7 @@ def _dim_str(d: int | Type) -> str:
         name = getattr(inner, "name", None)
         return f"*{name}" if isinstance(name, str) else "*Ts"
     if isinstance(d, TypeVarType):
-        form = _expr_forms.get(d.fullname)
+        form = _form_of(d)
         if form is not None:
             return _expr_str(form)
     name = getattr(d, "name", None)
@@ -1481,6 +1525,105 @@ _seen_vars: dict[str, TypeVarType] = {}
 # process-wide _seen_vars entry (which caused N@first vs N@second in
 # issue #43).
 _expr_constituents: dict[str, dict[str, TypeVarType]] = {}
+
+# Synthetic tvar namespaces the plugin mints (issue #42): implicit dims
+# for undeclared string-spec words, and formula-named expression dims.
+# Anything under these markers in a signature is late-bound by
+# construction, with or without the process-local `_fam_late_bound` set
+# (which a module loaded from mypy's incremental cache never fills).
+_LATE_PREFIXES = ("__numty_implicit__.", "__numty_expr__.")
+_EXPR_PREFIX = "__numty_expr__."
+
+
+def _eval_form(node: ast.AST) -> _LinForm | _DivForm | _MonoForm:
+    """Rebuild a canonical form from its repr AST (issue #42).
+
+    Expr fullnames embed `{form!r}`, a NamedTuple repr, so a type loaded
+    from the incremental cache carries its own form. Only the three
+    canonical shapes with int/str/tuple structure are accepted; anything
+    else raises and the caller falls back to the registry.
+    """
+
+    def num(n: ast.AST) -> int:
+        if type(n) is ast.Constant and type(n.value) is int:
+            return n.value
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+            v = num(n.operand)
+            return v if isinstance(n.op, ast.UAdd) else -v
+        raise ValueError("not an int")
+
+    def strs(n: ast.AST) -> tuple[str, ...]:
+        if not isinstance(n, ast.Tuple):
+            raise ValueError("not a tuple")
+        out = []
+        for e in n.elts:
+            if type(e) is not ast.Constant or type(e.value) is not str:
+                raise ValueError("not a str")
+            out.append(e.value)
+        return tuple(out)
+
+    def coeffs(n: ast.AST) -> tuple[tuple[str, int], ...]:
+        if not isinstance(n, ast.Tuple):
+            raise ValueError("not a tuple")
+        out = []
+        for e in n.elts:
+            if not isinstance(e, ast.Tuple) or len(e.elts) != 2:
+                raise ValueError("not a pair")
+            name, coeff = e.elts
+            if type(name) is not ast.Constant or type(name.value) is not str:
+                raise ValueError("not a name")
+            out.append((name.value, num(coeff)))
+        return tuple(out)
+
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        raise ValueError("not a form")
+    if node.args:
+        raise ValueError("positional args")
+    kw = {k.arg: k.value for k in node.keywords if k.arg is not None}
+    if set(kw) != set() and any(k.arg is None for k in node.keywords):
+        raise ValueError("star kwargs")
+    kind = node.func.id
+    if kind == "_LinForm" and set(kw) == {"coeffs", "const"}:
+        return _LinForm(coeffs(kw["coeffs"]), num(kw["const"]))
+    if kind == "_DivForm" and set(kw) == {"inner", "div", "plus"}:
+        return _DivForm(_eval_form(kw["inner"]), num(kw["div"]), num(kw["plus"]))
+    if kind == "_MonoForm" and set(kw) == {"coeff", "vars"}:
+        return _MonoForm(num(kw["coeff"]), strs(kw["vars"]))
+    raise ValueError("unknown form")
+
+
+def _form_from_fullname(fullname: str) -> _LinForm | _DivForm | _MonoForm | None:
+    """Parse the canonical form embedded in an expr fullname (issue #42).
+
+    A type deserialized from mypy's cache has no entry in the
+    process-local `_expr_forms` registry; its fullname still spells the
+    form, so read it back instead of degrading to Any.
+    """
+    if not fullname.startswith(_EXPR_PREFIX):
+        return None
+    src = fullname[len(_EXPR_PREFIX):]
+    if len(src) > 4000:
+        return None
+    try:
+        tree = ast.parse(src, mode="eval")
+    except (SyntaxError, ValueError):
+        return None
+    try:
+        form = _eval_form(tree.body)
+    except Exception:
+        return None
+    _expr_forms[fullname] = form
+    return form
+
+
+def _form_of(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
+    """Canonical form of a dim var: registry first, fullname fallback."""
+    if not isinstance(d, TypeVarType):
+        return None
+    form = _expr_forms.get(d.fullname)
+    if form is not None:
+        return form
+    return _form_from_fullname(d.fullname)
 
 
 def _current_scope_vars(
@@ -1548,7 +1691,7 @@ def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
     if isinstance(d, int):
         return _LinForm((), d)
     if isinstance(d, TypeVarType):
-        form = _expr_forms.get(d.fullname)
+        form = _form_of(d)
         if form is not None:
             return form
         _seen_vars[d.fullname] = d
@@ -2253,7 +2396,7 @@ def _callsite_expr_bindings(
                 continue
             adim = adims[dim]
             try:
-                form_f = _expr_forms.get(tvar.fullname)
+                form_f = _form_of(tvar)
                 if form_f is None:
                     # Plain formal: direct bind (first wins).
                     if tvar.fullname not in bindings:
@@ -2341,7 +2484,8 @@ def _substitute_return_exprs(
                 continue
             if not isinstance(d, TypeVarType):
                 return None
-            if d.fullname not in _expr_forms:
+            form_early = _form_of(d)
+            if form_early is None:
                 # Plain return var: direct substitution preserves caller id.
                 if d.fullname in bindings:
                     b = bindings[d.fullname]
@@ -2351,7 +2495,7 @@ def _substitute_return_exprs(
                     new_dims.append(d)
                 continue
             # Expr return var.
-            form_r = _expr_forms.get(d.fullname)
+            form_r = form_early
             if not isinstance(form_r, _LinForm):
                 return None
             merged: dict[str, int] = {}
