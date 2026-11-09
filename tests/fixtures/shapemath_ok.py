@@ -1,9 +1,16 @@
 """flip/roll/rot90/gradient/convolve + fft-family shape math."""
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import numpy as np
 
 from numty import F64
+
+if TYPE_CHECKING:
+    from typing import reveal_type
+else:
+    def reveal_type(x):
+        print(x.shape)
+        return x
 
 N = TypeVar("N", bound=int)
 
@@ -47,4 +54,9 @@ def f(a: F64[3, 4], v: F64[8], u: F64[N]) -> None:
     w10: C56 = np.fft.fftn(a, (5, 6), (0, 1))
     w11: C33 = np.fft.rfftn(a)
     w12: C45 = np.fft.rfftn(a, (5, 6), (1, 0))
-    w13: CN = np.fft.rfft(u)
+    # Bare CN means CN[Any]: pin the solver's exact answer as a reveal.
+    w13 = reveal_type(np.fft.rfft(u))  # R: (N//2+1,) complex128
+
+
+if __name__ == "__main__":
+    f(np.zeros((3, 4)), np.zeros(8), np.zeros(11))

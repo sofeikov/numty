@@ -4184,7 +4184,8 @@ def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
     elif len(dims) == 1:
         out = [1, dims[0], 1]
     else:
-        out = [1, *dims]
+        # rank == 3 with 2-D input: numpy appends the new axis.
+        out = [*dims, 1]
     return _ndarray_type(ctx, out, dtype)
 
 
