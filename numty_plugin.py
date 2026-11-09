@@ -6045,13 +6045,41 @@ def _single_axis_value(pair: tuple[Type, Expression | None]) -> int | None | str
     return vals[0]
 
 
-def _dynamic_sequence_element(tp: Type) -> tuple[list[int | Type], Type] | None:
+def _element_expr_type(ctx: FunctionContext, expr: Expression) -> Type | None:
+    """Type of a comprehension's element expression, else None.
+
+    Re-checked without type context first, so every overload candidate
+    reads the same item (the stored type was inferred against that
+    candidate's formal and can differ, e.g. astype's dtype). The
+    stored type is the fallback: it keeps the if-clause narrowing
+    (`a for a in xs if a is not None`) that a re-check loses.
+    """
+    lookup = getattr(ctx.api, "lookup_type_or_none", None)
+    # Read before the re-check, which overwrites the stored type.
+    stored = lookup(expr) if lookup is not None else None
+    try:
+        tp: Type | None = ctx.api.get_expression_type(expr)
+    except Exception:
+        tp = None
+    if tp is not None and _ndarray_parts(tp) is not None:
+        return tp
+    return stored if stored is not None else tp
+
+
+def _dynamic_sequence_element(
+    ctx: FunctionContext, tp: Type, expr: Expression | None
+) -> tuple[list[int | Type], Type] | None:
     """(dims, dtype) of a homogeneous dynamically-built sequence's items.
 
-    A loop-built list[T] has unknowable length but a known element
-    type; anything else (bare lists, generators, unknown elements)
-    stays unprovable.
+    A loop-built list[T] or a list comprehension has unknowable length
+    but one item type. A comprehension arrives joined against the
+    ArrayLike formal, so its item type is re-read from the element
+    expression. Anything else (bare lists, generators, unknown or
+    mixed elements) stays unprovable.
     """
+    if isinstance(expr, ListComprehension):
+        item = _element_expr_type(ctx, expr.generator.left_expr)
+        return _ndarray_parts(item) if item is not None else None
     proper = get_proper_type(tp)
     if not (
         isinstance(proper, Instance)
@@ -6069,7 +6097,7 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
-            elem = _dynamic_sequence_element(pairs[0][0])
+            elem = _dynamic_sequence_element(ctx, pairs[0][0], pairs[0][1])
             if elem is not None:
                 return _concat_dynamic(ctx, pairs, elem)
             ctx.api.fail(
@@ -6138,7 +6166,9 @@ def _stack_promote(dims: list[int | Type], kind: str) -> list[int | Type]:
     if len(dims) == 1:
         return [1, dims[0], 1]
     if len(dims) == 2:
-        return [1, *dims]
+        # dstack appends the new axis: (M, N) -> (M, N, 1), so a dynamic
+        # stack gives (M, N, ?U) (numpy: (2, 3, 2), not (1, 2, 3)).
+        return [*dims, 1]
     return list(dims)
 
 
@@ -6181,7 +6211,7 @@ def _stack_solve(
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
-            elem = _dynamic_sequence_element(pairs[0][0])
+            elem = _dynamic_sequence_element(ctx, pairs[0][0], pairs[0][1])
             if elem is None:
                 ctx.api.fail(
                     f"{kind} needs a sequence of known length "
@@ -6336,7 +6366,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
-            elem = _dynamic_sequence_element(pairs[0][0])
+            elem = _dynamic_sequence_element(ctx, pairs[0][0], pairs[0][1])
             if elem is not None:
                 return _stack_dynamic(ctx, pairs, elem)
             ctx.api.fail(

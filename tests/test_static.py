@@ -1,5 +1,6 @@
 """Static checks: each bad fixture must fail mypy with exactly one error."""
 import os
+import re
 import runpy
 import shutil
 import subprocess
@@ -1149,6 +1150,72 @@ def test_dynamic_concat_axis_oob() -> None:
         run_mypy(FIXTURES / "bad_dynamic_concat_axis.py"),
         "concatenate axis 5 is out of range for 2 dimensions",
     )
+
+
+def test_stack_comprehension_solves() -> None:
+    # #30: a dynamically built sequence whose items share one shape
+    # solves instead of bailing; numpy is the runtime oracle.
+    result = run_mypy(FIXTURES / "stack_comprehension_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [
+        re.sub(r"\?U@\d+[a-z]?", "?U", line.split('Revealed type is "', 1)[1])
+        for line in result.stdout.splitlines()
+        if "Revealed type" in line
+    ]
+    f32 = "numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]"
+    f64 = "numpy.dtype[numpy.float64]"
+    expected = [
+        ("?U, T, n_agents, Literal[2]", f32),
+        ("T, n_agents, Literal[2], ?U", f32),
+        ("T, ?U, n_agents, Literal[2]", f32),
+        ("?U, Literal[3], Literal[2]", f32),
+        ("?U, n_agents, Literal[2]", f32),
+        ("?U, ?U, Literal[3]", f32),
+        ("?U, Literal[3]", f32),
+        ("?U, Literal[3]", f32),
+        ("?U, Literal[3], Literal[2]", f64),
+        ("T, ?U, Literal[2]", f32),
+        ("?U, Literal[3]", f32),
+        ("Literal[3], ?U", f32),
+        ("Literal[3], ?U", f32),
+        ("Literal[3], Literal[2], ?U", f32),
+    ]
+    assert len(notes) == len(expected), result.stdout
+    for note, (dims, dtype) in zip(notes, expected):
+        assert note == f"numpy.ndarray[tuple[{dims}], {dtype}]\"", result.stdout
+    assert _run_fixture("stack_comprehension_ok.py") == [
+        "(3, 5, 4, 2) float32",
+        "(5, 4, 2, 3) float32",
+        "(5, 3, 4, 2) float32",
+        "(7, 3, 2) float32",
+        "(6, 4, 2) float32",
+        "(8, 2, 3) float32",
+        "(16, 3) float32",
+        "(2, 3) float32",
+        "(7, 3, 2) float64",
+        "(5, 12, 2) float32",
+        "(16, 3) float32",
+        "(3, 14) float32",
+        "(3, 16) float32",
+        "(3, 2, 7) float32",
+    ]
+
+
+def test_stack_comprehension_keeps_checking() -> None:
+    # The solved stack keeps rank and item dims, so a provable axis and a
+    # downstream inner-dim clash still fail; numpy raises on both.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_stack_comprehension_matmul.py"),
+        "matmul inner dimensions disagree: 3 vs 4",
+        "[numty-shape]",
+    )
+    assert _run_fixture("bad_stack_comprehension_matmul.py") == ["ValueError"]
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_stack_comprehension_axis.py"),
+        "stack axis 3 is out of range for 2 dimensions",
+        "[numty-axis]",
+    )
+    assert _run_fixture("bad_stack_comprehension_axis.py") == ["AxisError"]
 
 
 def test_unknown_concrete_boundary() -> None:
