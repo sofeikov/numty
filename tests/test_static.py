@@ -1058,6 +1058,42 @@ def test_inplace_grow_does_not_fit() -> None:
     ), result.stdout
 
 
+def test_setitem_ok_stays_clean() -> None:
+    # Issue #51: legal indexed assignments keep their shape and stay clean.
+    result = run_mypy(FIXTURES / "setitem_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [line for line in result.stdout.splitlines() if "Revealed type" in line]
+    assert len(notes) == 1, result.stdout
+    assert "tuple[Literal[5], Literal[3]]" in notes[0], result.stdout
+    assert _run_fixture("setitem_ok.py") == ["ok"]
+
+
+def test_setitem_shape_mismatch() -> None:
+    # Issue #51: values must broadcast one-directionally into the target.
+    result = run_mypy(FIXTURES / "bad_setitem_shape.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 6, result.stdout
+    assert "cannot assign value of shape (4,) into target of shape (5,)" in errors[0]
+    assert "cannot assign value of shape (3, 3) into target of shape (2, 3)" in errors[1]
+    assert "cannot assign value of shape (3,) into target of shape (4,)" in errors[2]
+    assert "cannot assign value of shape (2, 1, 3) into target of shape (2, 3)" in errors[3]
+    assert "cannot assign value of shape (2, 2) into target of shape" in errors[4]
+    assert "cannot assign value of shape (4,) into target of shape (3,)" in errors[5]
+
+
+def test_setitem_oob() -> None:
+    # Issue #51: out-of-range and mask-length errors fire on writes too.
+    result = run_mypy(FIXTURES / "bad_setitem_oob.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 4, result.stdout
+    assert "index 5 is out of range for axis 0 with size 5" in errors[0]
+    assert "index -6 is out of range for axis 0 with size 5" in errors[1]
+    assert "index 3 is out of range for axis 1 with size 3" in errors[2]
+    assert "boolean index did not match indexed array along axis 0" in errors[3]
+
+
 def test_mixed_builders_keep_literals() -> None:
     # #34: one dynamic dim no longer erases the literal ones, so a stored
     # builder result fits a field pinned to 2 / 23. Ops that would move

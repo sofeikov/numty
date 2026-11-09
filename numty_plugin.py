@@ -47,7 +47,8 @@ What it does:
 - getitem solves integer-array (fancy) indices and take_along_axis;
   boolean masks consume n axes for one fresh unknown (?U) with lengths
   checked, and a split advanced block moves to the front; float indices
-  error. Over *Ts, leading items consume the known prefix without an
+  error. setitem reuses the target solving and requires the value to
+  broadcast into it. Over *Ts, leading items consume the known prefix without an
   ellipsis (rank-generic bodies still spell the ellipsis for the middle).
 - dims may be symbolic TypeVars: same name unifies, ranks and counts
   still check, and anything needing values bails instead of erroring.
@@ -1233,6 +1234,8 @@ class NumtyPlugin(Plugin):
             return squeeze_method_hook
         if fullname == "numpy.ndarray.__getitem__":
             return getitem_method_hook
+        if fullname == "numpy.ndarray.__setitem__":
+            return setitem_method_hook
         short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.ndarray.") and short in {
             "__eq__",
@@ -8923,6 +8926,128 @@ def getitem_method_hook(ctx: MethodContext) -> Type:
     if dist is not None:
         return dist
     return _getitem_types(ctx, ctx.type, pairs[0])
+
+
+def setitem_method_hook(ctx: MethodContext) -> Type:
+    """Shape-check `a[idx] = value` (issue #51).
+
+    Solves the target with the read path so out-of-range, too-many and
+    mask-length errors fire on writes too, then requires the value to
+    broadcast one-directionally into the target. Scalars always fit;
+    unpack/unknown/symbolic targets bail. Returns the stub default
+    (None) in every case.
+    """
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 2:
+        return ctx.default_return_type
+    index_pair, value_pair = pairs[0], pairs[1]
+    value_type = value_pair[0]
+    # Union LHS: emit target errors per member, then bail on the value.
+    if _union_members(ctx.type) is not None:
+        _distribute_solve([ctx.type], lambda t: _getitem_types(ctx, t, index_pair))
+        return ctx.default_return_type
+    parts = _ndarray_parts(ctx.type)
+    if parts is None:
+        # Unpack or unknown LHS: still solve for target errors, no value check.
+        _getitem_types(ctx, ctx.type, index_pair)
+        return ctx.default_return_type
+    lhs_dims, lhs_dtype = parts
+    target_type = _solve_getitem(ctx, lhs_dims, lhs_dtype, index_pair)
+    target_parts = _ndarray_parts(target_type)
+    if target_parts is None:
+        # Scalar target (all ints), an error already emitted, or a bail.
+        # Only the scalar case needs a value check here.
+        if _scalar_key(value_type) is not None:
+            return ctx.default_return_type
+        if _is_scalar_target(ctx, ctx.type, index_pair):
+            value_parts = _ndarray_parts(value_type)
+            if value_parts is None or not value_parts[0]:
+                return ctx.default_return_type
+            ctx.api.fail(
+                f"cannot assign value of shape {_dims_str(value_parts[0])} "
+                f"into scalar target (shape {_dims_str(lhs_dims)})",
+                ctx.context,
+                code=NUMTY_BROADCAST,
+            )
+        return ctx.default_return_type
+    target_dims = target_parts[0]
+    if _scalar_key(value_type) is not None:
+        return ctx.default_return_type
+    value_parts = _ndarray_parts(value_type)
+    if value_parts is None:
+        return ctx.default_return_type
+    value_dims = value_parts[0]
+    if len(value_dims) > len(target_dims):
+        ctx.api.fail(
+            f"cannot assign value of shape {_dims_str(value_dims)} "
+            f"into target of shape {_dims_str(target_dims)}",
+            ctx.context,
+            code=NUMTY_BROADCAST,
+        )
+        return ctx.default_return_type
+    offset = len(target_dims) - len(value_dims)
+    for t, v in zip(target_dims[offset:], value_dims):
+        if _dim_eq(t, v):
+            continue
+        if isinstance(v, int) and v == 1:
+            continue
+        if isinstance(t, int) and isinstance(v, int):
+            ctx.api.fail(
+                f"cannot assign value of shape {_dims_str(value_dims)} "
+                f"into target of shape {_dims_str(target_dims)}",
+                ctx.context,
+                code=NUMTY_BROADCAST,
+            )
+            return ctx.default_return_type
+        # Symbolic or unknown: unprovable, bail silently.
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def _is_scalar_target(
+    ctx: MethodContext, tp: Type, pair: tuple[Type, Expression | None]
+) -> bool:
+    """Whether the index consumes every axis (scalar target), else False.
+
+    Only for the fixed-rank path; unpack or unknown bails as non-scalar.
+    """
+    parts = _ndarray_parts(tp)
+    if parts is None:
+        return False
+    dims, _ = parts
+    ndim = len(dims)
+    split = _index_pairs(ctx, pair)
+    if split is None:
+        return False
+    items = _parse_index_items(ctx, split)
+    if items is None:
+        return False
+    if any(item[0] == "ellipsis" for item in items):
+        # Ellipsis keeps span dims unless it spans zero and the rest are ints.
+        consuming = 0
+        for item in items:
+            if item[0] in ("int", "int_any", "slice", "fancy", "fancy0d"):
+                consuming += 1
+            elif item[0] == "mask":
+                consuming += len(item[1])
+        if consuming != ndim:
+            return False
+    else:
+        consuming = 0
+        for item in items:
+            if item[0] in ("int", "int_any", "fancy0d"):
+                consuming += 1
+            elif item[0] in ("slice", "fancy", "newaxis"):
+                return False
+            elif item[0] == "mask":
+                return False
+            elif item[0] == "badindex":
+                return False
+            else:
+                return False
+        if consuming != ndim:
+            return False
+    return True
 
 
 def _getitem_types(

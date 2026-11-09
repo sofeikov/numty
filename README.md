@@ -565,6 +565,12 @@ b[np.zeros(3)]                    # error: integer (or boolean) type required
 np.take_along_axis(a, idx2d, axis=1)  # error: same number of dimensions
 ```
 
+Indexed assignment checks the write: the target solves like a read
+(out-of-range and mask-length errors fire), and the value must
+broadcast one-directionally into it (`m[:, 0] = col` with `(5,) <- (4,)`
+errors; `a[:] = v` with `(5, 3) <- (3,)` stays clean, scalars always
+fit).
+
 ## Unions that check every member
 
 A union-typed array (`(N, K, M) | (N, 1, M)`, or a loop variable over
