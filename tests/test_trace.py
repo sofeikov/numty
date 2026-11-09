@@ -43,7 +43,7 @@ def test_trace_records_bail_and_unhooked(tmp_path: Path) -> None:
         "import numpy as np\n"
         "a = np.zeros((2, 3))\n"
         "b = np.zeros((4, 5))\n"
-        "reveal_type(np.kron(a, b))\n"
+        "reveal_type(np.linalg.qr(a))\n"
         "reveal_type(np.sqrt(8))\n",
         encoding="utf-8",
     )
@@ -55,16 +55,16 @@ def test_trace_records_bail_and_unhooked(tmp_path: Path) -> None:
     events = _load_trace(trace, src.name)
     assert events, f"no trace events for {src.name}: {trace.read_text()[:2000]}"
     by_op = [(e["op"], e["outcome"], e["line"]) for e in events]
-    # kron is unhooked (no solver), sqrt(8) bails (non-array operand).
+    # qr is unhooked (no solver), sqrt(8) bails (non-array operand).
     assert any(
-        "kron" in op and outcome == "unhooked" for op, outcome, _ in by_op
+        "qr" in op and outcome == "unhooked" for op, outcome, _ in by_op
     ), by_op
     assert any(
         outcome == "bail" for _, outcome, _ in by_op
     ), by_op
-    # The unhooked kron line is the reveal line (line 4).
+    # The unhooked qr line is the reveal line (line 4).
     assert any(
-        "kron" in op and outcome == "unhooked" and line == 4
+        "qr" in op and outcome == "unhooked" and line == 4
         for op, outcome, line in by_op
     ), by_op
 

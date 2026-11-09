@@ -524,6 +524,50 @@ def test_norm_axis_mismatch() -> None:
     )
 
 
+def test_issue58_kron_pinv_randn_percentile_ok() -> None:
+    # Issue #58 slice: the four repro calls now solve precise shapes.
+    result = run_mypy(FIXTURES / "issue58_kron_pinv_randn_percentile_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[9] == (
+        '"numpy.ndarray[tuple[Literal[8], Literal[15]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[10] == (
+        '"numpy.ndarray[tuple[Literal[4], Literal[3]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[11] == (
+        '"numpy.ndarray[tuple[Literal[3], Literal[4]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[13] == (
+        '"numpy.ndarray[tuple[Literal[3], Literal[6]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+
+
+def test_kron_broadcast_mismatch() -> None:
+    assert_operator_mismatch(
+        run_mypy(FIXTURES / "bad_kron_broadcast.py"),
+        "broadcast shapes disagree at trailing axis 0",
+        "15 vs 4",
+        "(8, 15)",
+        "(4,)",
+    )
+
+
+def test_pinv_rank_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_pinv_rank.py"),
+        "linalg.pinv requires at least 2 dimensions, got shape (5,)",
+        '"pinv"',
+    )
+
+
+def test_percentile_axis_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_percentile_axis.py"),
+        "percentile axis 5 is out of range for 2 dimensions",
+    )
+
+
 def test_where_broadcast_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_where_broadcast.py"),

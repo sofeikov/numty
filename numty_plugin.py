@@ -1216,6 +1216,11 @@ class NumtyPlugin(Plugin):
             "permutation",
         }:
             return partial(rng_method_hook, op=short)
+        if fullname.startswith("numpy.random.mtrand.RandomState.") and short in {
+            "rand",
+            "randn",
+        }:
+            return legacy_rand_hook
         short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.ndarray.") and short in {
             "sum",
@@ -2967,6 +2972,41 @@ def outer_function_hook(ctx: FunctionContext) -> Type:
     if total_a is None or total_b is None:
         return ctx.default_return_type
     return _matmul_promoted(ctx, [total_a, total_b], dtype_a, dtype_b)
+
+
+def kron_function_hook(ctx: FunctionContext) -> Type:
+    """np.kron: right-aligned dim products, dtype result_type (issue #58).
+
+    (2, 3) kron (4, 5) is (8, 15): shorter inputs pad with 1s on the
+    left, each output dim is the product of the aligned pair. Only
+    int dims solve (symbolic products are nonlinear); anything else
+    bails to the stubs instead of guessing.
+    """
+    pair = _two_arrays(ctx)
+    if pair is None:
+        return ctx.default_return_type
+    parts_a = _ndarray_parts(pair[0])
+    parts_b = _ndarray_parts(pair[1])
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if _has_unpack(dims_a) or _has_unpack(dims_b):
+        return ctx.default_return_type
+    width = max(len(dims_a), len(dims_b))
+    left = [1] * (width - len(dims_a)) + list(dims_a)
+    right = [1] * (width - len(dims_b)) + list(dims_b)
+    out: list[int | Type] = []
+    for x, y in zip(left, right):
+        if isinstance(x, int) and isinstance(y, int):
+            if isinstance(x, bool) or isinstance(y, bool):
+                return ctx.default_return_type
+            out.append(x * y)
+        else:
+            return ctx.default_return_type
+    dtype = _promoted_result_type(ctx, dtype_a, dtype_b)
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out, dtype)
 
 
 def vdot_function_hook(ctx: FunctionContext) -> Type:
@@ -8346,6 +8386,131 @@ def rng_method_hook(ctx: MethodContext, op: str) -> Type:
     return ctx.default_return_type
 
 
+def legacy_rand_hook(ctx: FunctionContext | MethodContext) -> Type:
+    """np.random.rand/randn(*dims): shape is the int dims, float64 (issue #58).
+
+    No args is a scalar (stubs own it). Each positional must fold to a
+    non-negative int; anything dynamic bails instead of guessing.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    dims: list[int | Type] = []
+    for tp, expr in pairs:
+        value = _fold_int(expr) if expr is not None else None
+        if value is None:
+            value = _int_value(tp)
+        if value is None or value < 0:
+            return ctx.default_return_type
+        dims.append(value)
+    if not _dims_fit_intp(ctx, dims):
+        return ctx.default_return_type
+    dtype = _construct_dtype(ctx, "numpy.float64")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def _percentile_q_dims(
+    tp: Type, expr: Expression | None
+) -> list[int | Type] | None:
+    """Shape of a percentile/quantile q argument, else None to bail.
+
+    1-D/2-D list displays give [n]/[n, m]; ndarrays give their dims;
+    Python/numpy scalars give [] (0-d). Anything else (a bare list
+    variable, a dynamic value) stays with the stubs.
+    """
+    if isinstance(expr, (ListExpr, TupleExpr)):
+        if not expr.items:
+            return [0]
+        if all(not isinstance(e, (ListExpr, TupleExpr)) for e in expr.items):
+            return [len(expr.items)]
+        if all(isinstance(e, (ListExpr, TupleExpr)) for e in expr.items):
+            inner = [len(e.items) for e in expr.items]  # type: ignore[union-attr]
+            if len(set(inner)) == 1 and all(
+                not isinstance(sub, (ListExpr, TupleExpr))
+                for e in expr.items
+                for sub in e.items  # type: ignore[union-attr]
+            ):
+                return [len(expr.items), inner[0]]
+        return None
+    parts = _ndarray_parts(tp)
+    if parts is not None:
+        dims, _ = parts
+        if _has_unpack(dims):
+            return None
+        return list(dims)
+    if _weak_name(tp) is not None or _scalar_key(tp) is not None:
+        return []
+    if _int_value(tp) is not None:
+        return []
+    return None
+
+
+def percentile_function_hook(ctx: FunctionContext) -> Type:
+    """np.percentile/quantile (+nan twins): q-shape + reduced shape (issue #58).
+
+    result is shape(q) followed by shape(a) with axis removed (or 1s
+    with keepdims). Float inputs keep dtype, ints become float64;
+    anything unprovable bails to the stubs instead of guessing.
+    """
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = part
+    if _has_unpack(dims_a):
+        return ctx.default_return_type
+    q_dims = _percentile_q_dims(pairs[1][0], pairs[1][1])
+    if q_dims is None:
+        return ctx.default_return_type
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis is None:
+        return ctx.default_return_type
+    keepdims = _fold_flag(_formal_pair(ctx, "keepdims"))
+    if keepdims is None:
+        keepdims = False
+    ndim = len(dims_a)
+    if axis in ("absent", "none"):
+        remaining: list[int | Type] = [1] * ndim if keepdims else []
+    else:
+        assert isinstance(axis, list)
+        normed: list[int] = []
+        for ax in axis:
+            norm = _normalize_axis(ax, ndim)
+            if norm is None:
+                ctx.api.fail(
+                    f"percentile axis {ax} is out of range for {ndim} dimensions "
+                    f"(shape {_dims_str(dims_a)})",
+                    ctx.context,
+                    code=NUMTY_AXIS,
+                )
+                return ctx.default_return_type
+            normed.append(norm)
+        if len(set(normed)) != len(normed):
+            return ctx.default_return_type
+        removed = set(normed)
+        if keepdims:
+            remaining = [1 if i in removed else d for i, d in enumerate(dims_a)]
+        else:
+            remaining = [d for i, d in enumerate(dims_a) if i not in removed]
+    ks = _dtype_kind_size(dtype_a)
+    if ks is None:
+        return ctx.default_return_type
+    kind, _size = ks
+    if kind == "f":
+        out_dtype = dtype_a
+    elif kind in ("i", "u", "b"):
+        out_dtype = _construct_dtype(ctx, "numpy.float64")
+    else:
+        return ctx.default_return_type
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [*q_dims, *remaining], out_dtype)
+
+
 
 def reduction_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
@@ -8882,6 +9047,39 @@ def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
     return _ndarray_type(ctx, dims, out_dtype)
 
 
+def _linalg_pinv(ctx: FunctionContext) -> Type:
+    """linalg.pinv: (..., M, N) -> (..., N, M), ints become float64 (issue #58)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    if len(dims) < 2:
+        ctx.api.fail(
+            f"linalg.pinv requires at least 2 dimensions, got shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, _size = ks
+    if kind in ("i", "u", "b"):
+        out_dtype = _construct_dtype(ctx, "numpy.float64")
+    elif kind in ("f", "c"):
+        out_dtype = dtype
+    else:
+        return ctx.default_return_type
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [*dims[:-2], dims[-1], dims[-2]], out_dtype)
+
+
 def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -9155,6 +9353,8 @@ def linalg_function_hook(ctx: FunctionContext, op: str) -> Type:
         return _linalg_solve(ctx)
     if op in ("inv", "cholesky"):
         return _linalg_same_shape(ctx, op)
+    if op == "pinv":
+        return _linalg_pinv(ctx)
     if op in ("eig", "eigh"):
         return _linalg_eig(ctx, op)
     if op == "svd":
@@ -10191,6 +10391,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "flip": flip_function_hook,
             "gradient": gradient_function_hook,
             "median": reduction_function_hook,
+            "percentile": percentile_function_hook,
+            "quantile": percentile_function_hook,
             "rot90": rot90_function_hook,
             "append": append_function_hook,
             "insert": insert_function_hook,
@@ -10206,7 +10408,9 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "nanmean": reduction_function_hook,
             "nanmedian": reduction_function_hook,
             "nanmin": reduction_function_hook,
+            "nanpercentile": percentile_function_hook,
             "nanprod": reduction_function_hook,
+            "nanquantile": percentile_function_hook,
             "nanstd": reduction_function_hook,
             "nansum": reduction_function_hook,
             "nanvar": reduction_function_hook,
@@ -10215,6 +10419,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "column_stack": column_stack_function_hook,
             "dstack": dstack_function_hook,
             "expand_dims": expand_dims_function_hook,
+            "kron": kron_function_hook,
             "split": split_function_hook,
             "take_along_axis": take_along_axis_function_hook,
             "tile": tile_function_hook,
@@ -10249,10 +10454,15 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
                     "inv",
                     "lstsq",
                     "norm",
+                    "pinv",
                     "solve",
                     "svd",
                 )
             },
+        },
+        "numpy.random.mtrand": {
+            "rand": legacy_rand_hook,
+            "randn": legacy_rand_hook,
         },
         "numpy._core": {
             "moveaxis": moveaxis_function_hook,
