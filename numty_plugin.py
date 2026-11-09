@@ -27,14 +27,14 @@ What it does:
   canonical total (linear and monomial products alike: N*K/N=K,
   B*C*H*W/B=C*H*W); only inexact/inexpressible inferences mint an
   unknown, and same-total renames track as-is (legality stays unchecked,
-  never an error). Over *Ts only block-preserving regroups resolve (the
-  unknown middle stays put; -1 would absorb it, so it bails), with
-  provable int-only total clashes failing loudly. Anything dynamic bails
-  out.
+  never an error). Over *Ts the spelled target is the whole new shape
+  (correct whenever the call succeeds at runtime); a -1 would absorb
+  the unknown product, so it bails, with provable int-only total
+  clashes failing loudly. Anything dynamic bails out.
 - rank-changing ops (transpose, .T, squeeze, expand_dims, sum/prod/mean
-  and friends) track the new shape; transpose reversal over *Ts keeps
-  the unknown block ordered in place (explicit axes bail). No-axis
-  reductions and non-float dtypes bail out to the stubs.
+  and friends) track the new shape; transpose and .T bail out over
+  *Ts (explicit axes bail too). No-axis reductions and non-float
+  dtypes bail out to the stubs.
 - shape builders (*_like from the prototype, full, eye, arange,
   concatenate/stack over tuple or list displays) compute the result shape.
   An explicit, resolvable dtype= is used as-is; unknown dims bail out.
@@ -5580,33 +5580,6 @@ def _reshape_new_dims(
     return dims or None
 
 
-def _regroup_run(
-    run_old: list[int | Type], run_new: list[int | TypeVarType]
-) -> list[int | TypeVarType] | None:
-    """Regroup one known run of dims, else None to bail.
-
-    Mirrors the fixed-rank conservation rule on a slice of the shape:
-    int products must match and the TypeVar multisets must agree. The
-    caller keeps -1 out: an inferred dim would absorb the unknown *Ts
-    product, which no annotation can spell.
-    """
-    old_ints = [d for d in run_old if isinstance(d, int)]
-    old_vars = sorted(d.fullname for d in run_old if isinstance(d, TypeVarType))
-    if len(old_ints) + len(old_vars) != len(run_old):
-        return None
-    new_vars = sorted(d.fullname for d in run_new if isinstance(d, TypeVarType))
-    size_old = 1
-    for d in old_ints:
-        size_old *= d
-    size_new = 1
-    for d in run_new:
-        if isinstance(d, int):
-            size_new *= d
-    if -1 in run_new or size_new != size_old or old_vars != new_vars:
-        return None
-    return list(run_new)
-
-
 _unknown_ids: dict[str, TypeVarId] = {}
 # Display names of unknowns by fullname, and how many distinct unknowns
 # each (module, line) has minted. Names only: identity stays the id.
@@ -5683,39 +5656,24 @@ def _solve_reshape_unpack(
     dtype: Type,
     raw: list[int | TypeVarType],
 ) -> Type:
-    """Reshape a (*prefix, *Ts, *suffix) shape, preserving the middle.
+    """Reshape a (*prefix, *Ts, *suffix) shape (issue #48).
 
-    Only block-preserving regroups are expressible: the target keeps
-    the fixed prefix (suffix regroups) or the fixed suffix (prefix
-    regroups), with the unknown block untouched in place. Anything else
-    is unprovable through *Ts and bails — except a total-size clash on
-    purely int dims, which no *Ts can absorb and which fails loudly.
+    `raw` is the whole new shape: numpy reads the target as exactly
+    that, so the result is `raw` itself (correct whenever the call
+    succeeds at runtime) — `*Ts` is never put back in. Anything else
+    unprovable bails, except a total-size clash on purely int sizes,
+    which no `*Ts` can absorb and which fails loudly.
     """
     old = prefix + [unpack] + suffix
-    suffix_candidate = len(raw) >= len(prefix) and all(
-        _dim_eq(raw[i], prefix[i]) for i in range(len(prefix))
-    )
-    prefix_candidate = len(raw) >= len(suffix) and (
-        not suffix
-        or all(
-            _dim_eq(raw[len(raw) - len(suffix) + i], suffix[i])
-            for i in range(len(suffix))
-        )
-    )
-    if suffix_candidate:
-        regrouped = _regroup_run(suffix, raw[len(prefix):])
-        if regrouped is not None:
-            return _ndarray_type(ctx, [*prefix, unpack, *regrouped], dtype)
-    if prefix_candidate and not suffix_candidate:
-        regrouped = _regroup_run(prefix, raw[: len(raw) - len(suffix)] if suffix else list(raw))
-        if regrouped is not None:
-            return _ndarray_type(ctx, [*regrouped, unpack, *suffix], dtype)
-    if any(not isinstance(d, int) for d in prefix + suffix):
-        return ctx.default_return_type
-    if any(not isinstance(d, int) for d in raw):
-        return ctx.default_return_type
     if -1 in raw:
+        # -1 would absorb the unknown *Ts product.
         return ctx.default_return_type
+    if any(not isinstance(d, int) for d in prefix + suffix):
+        # Symbolic known runs: the target holds by construction when the
+        # call is legal, and legality itself stays unchecked.
+        return _ndarray_type(ctx, list(raw), dtype)
+    if any(not isinstance(d, int) for d in raw):
+        return _ndarray_type(ctx, list(raw), dtype)
     known = 1
     for d in prefix + suffix:
         assert isinstance(d, int)
@@ -5740,7 +5698,7 @@ def _solve_reshape_unpack(
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
-    return ctx.default_return_type
+    return _ndarray_type(ctx, list(raw), dtype)
 
 
 def _reshape_dynamic_dims(
@@ -6200,19 +6158,6 @@ def _apply_permutation(
     return _ndarray_type(ctx, [dims[ax] for ax in normalized], dtype)
 
 
-def _reverse_unpack_dims(
-    prefix: list[int | Type], unpack: UnpackType, suffix: list[int | Type]
-) -> list[int | Type]:
-    """Full reversal with the unknown block kept in place, in order.
-
-    A true reversal would also reverse *Ts itself, which no annotation
-    can spell, so the block stays ordered: (*Ts, 2) reverses to
-    (2, *Ts). Rank and size multiset stay exact; the order inside *Ts
-    is not tracked (see README limitations).
-    """
-    return [*reversed(suffix), unpack, *reversed(prefix)]
-
-
 def _solve_transpose_unpack(
     ctx: FunctionContext | MethodContext,
     prefix: list[int | Type],
@@ -6221,19 +6166,11 @@ def _solve_transpose_unpack(
     dtype: Type,
     rest: list[tuple[Type, Expression | None]],
 ) -> Type:
-    """Transpose a (*prefix, *Ts, *suffix) shape.
+    """Transpose a (*prefix, *Ts, *suffix) shape (issue #48).
 
-    Only the default full reversal is expressible (the unknown block
-    stays in place per _reverse_unpack_dims). Explicit axes would pin
-    the rank through the axis count but cannot order the unknown block,
-    so they bail out instead of guessing.
+    Reversing would also reverse *Ts itself, which no annotation can
+    spell, so every *Ts transpose bails out instead of guessing.
     """
-    if not rest:
-        return _ndarray_type(ctx, _reverse_unpack_dims(prefix, unpack, suffix), dtype)
-    if len(rest) == 1:
-        single = _shape_from_arg(rest[0][0], rest[0][1])
-        if single is None and _is_none_type(rest[0][0]):
-            return _ndarray_type(ctx, _reverse_unpack_dims(prefix, unpack, suffix), dtype)
     return ctx.default_return_type
 
 
@@ -10953,21 +10890,16 @@ def t_attribute_hook(ctx: AttributeContext) -> Type:
 
 
 def _t_type(ctx: AttributeContext, tp: Type) -> Type:
-    """The .T view: full reversal, concrete or over *Ts.
+    """The .T view: full reversal, concrete or mixed shapes only.
 
-    Concrete and mixed shapes reverse exactly; unpack shapes reverse with the
-    unknown block kept in place per _reverse_unpack_dims. Anything else
-    stays on the stubs.
+    Unpack shapes bail: reversing would also reverse *Ts itself, which
+    no annotation can spell (issue #48). Anything else stays on the stubs.
     """
     parts = _ndarray_parts(tp) or _mixed_parts(tp)
     if parts is not None:
         dims, dtype = parts
         return _ndarray_type(ctx, list(reversed(dims)), dtype)
-    split = _unpack_shape(tp)
-    if split is None:
-        return ctx.default_attr_type
-    (prefix, unpack, suffix), dtype = split
-    return _ndarray_type(ctx, _reverse_unpack_dims(prefix, unpack, suffix), dtype)
+    return ctx.default_attr_type
 
 
 def _enum_member_count(info) -> int | None:
