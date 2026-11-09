@@ -1238,6 +1238,8 @@ class NumtyPlugin(Plugin):
             return take_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "swapaxes":
             return swapaxes_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "dot":
+            return dot_method_hook
         return None
 
 
@@ -2925,6 +2927,40 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
     if not matched:
         return ctx.default_return_type
     return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), pair[0], pair[1])
+
+
+def dot_method_hook(ctx: MethodContext) -> Type:
+    """ndarray.dot twin of np.dot: same solver on (self, arg) (issue #58)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    left, right = ctx.type, pairs[0][0]
+    parts_a, parts_b = _operand_parts(left, right)
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if len(dims_a) == 1 and len(dims_b) == 1:
+        matched, message = _contract_pair("dot", dims_a[0], dims_b[0])
+        if message is not None:
+            ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
+            return ctx.default_return_type
+        if not matched:
+            return ctx.default_return_type
+        return _promoted_scalar(ctx, dtype_a, dtype_b)
+    if max(len(dims_a), len(dims_b)) <= 2:
+        return _solve_matmul(ctx, left, right)
+    if len(dims_b) == 1:
+        contracted, out = (dims_a[-1], dims_b[0]), dims_a[:-1]
+    else:
+        contracted = (dims_a[-1], dims_b[-2])
+        out = dims_a[:-1] + dims_b[:-2] + dims_b[-1:]
+    matched, message = _contract_pair("dot", *contracted)
+    if message is not None:
+        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
+        return ctx.default_return_type
+    if not matched:
+        return ctx.default_return_type
+    return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), left, right)
 
 
 def inner_function_hook(ctx: FunctionContext) -> Type:
@@ -6253,6 +6289,124 @@ def eye_function_hook(ctx: FunctionContext) -> Type:
     if n < 0 or m < 0:
         ctx.api.fail(
             f"eye dimensions must be non-negative, got ({n}, {m})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, [n, m], named)
+    dtype = _construct_dtype(ctx, "numpy.float64")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [n, m], dtype)
+
+
+def _builder_single_dim(
+    pair: tuple[Type, Expression | None] | None,
+) -> int | TypeVarType | None:
+    """One builder dim: int literal or symbolic TypeVar, else None to bail."""
+    if pair is None:
+        return None
+    folded = _fold_single(pair)
+    if folded is not None:
+        return folded
+    dim = _dim_value(pair[0])
+    if isinstance(dim, TypeVarType):
+        return dim
+    return None
+
+
+def linspace_function_hook(ctx: FunctionContext) -> Type:
+    """np.linspace: (num,) with explicit dtype or float64 (issue #58).
+
+    Rank-only stubs reject correct Literal annotations, so solve the
+    count exactly. Symbolic counts propagate; anything else bails.
+    """
+    num_pair = _formal_pair(ctx, "num")
+    if num_pair is None:
+        pairs = _all_positionals(ctx)
+        if len(pairs) >= 3:
+            num_pair = pairs[2]
+        else:
+            # Default num=50.
+            num_pair = None
+    if num_pair is None:
+        num: int | TypeVarType | None = 50
+    else:
+        num = _builder_single_dim(num_pair)
+        if num is None:
+            return ctx.default_return_type
+    if isinstance(num, int) and num < 0:
+        ctx.api.fail(
+            f"linspace num must be non-negative, got {num}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, [num], named)
+    dtype = _construct_dtype(ctx, "numpy.float64")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [num], dtype)
+
+
+def identity_function_hook(ctx: FunctionContext) -> Type:
+    """np.identity: (n, n) with explicit dtype or float64 (issue #58)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    n = _builder_single_dim(pairs[0])
+    if n is None:
+        return ctx.default_return_type
+    if isinstance(n, int) and n < 0:
+        ctx.api.fail(
+            f"identity dimensions must be non-negative, got ({n}, {n})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, [n, n], named)
+    dtype = _construct_dtype(ctx, "numpy.float64")
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [n, n], dtype)
+
+
+def tri_function_hook(ctx: FunctionContext) -> Type:
+    """np.tri: (N, M or N) with explicit dtype or float64 (issue #58)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    n = _builder_single_dim(pairs[0])
+    if n is None:
+        return ctx.default_return_type
+    m_pair = _formal_pair(ctx, "M")
+    if m_pair is None or _is_none_type(m_pair[0]):
+        if len(pairs) >= 2:
+            # Positional M.
+            m_pair = pairs[1]
+        else:
+            m: int | TypeVarType | None = n
+            m_pair = None
+    if m_pair is not None:
+        m = _builder_single_dim(m_pair)
+        if m is None:
+            return ctx.default_return_type
+    assert m is not None
+    if isinstance(n, int) and isinstance(m, int) and (n < 0 or m < 0):
+        ctx.api.fail(
+            f"tri dimensions must be non-negative, got ({n}, {m})",
             ctx.context,
             code=NUMTY_SHAPE,
         )
@@ -10354,6 +10508,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "flatnonzero": flatnonzero_function_hook,
             "full": full_function_hook,
             "full_like": like_function_hook,
+            "identity": identity_function_hook,
             "ones": zeros_like_hook,
             "ones_like": like_function_hook,
             "outer": outer_function_hook,
@@ -10364,6 +10519,9 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "matrix_transpose": matrix_transpose_function_hook,
             "tensordot": tensordot_function_hook,
             "zeros_like": like_function_hook,
+        },
+        "numpy._core.function_base": {
+            "linspace": linspace_function_hook,
         },
         "numpy._core.shape_base": {
             "atleast_1d": partial(atleast_function_hook, rank=1),
@@ -10432,6 +10590,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "eye": eye_function_hook,
             "fliplr": fliplr_function_hook,
             "flipud": flipud_function_hook,
+            "tri": tri_function_hook,
         },
         "numpy.lib._type_check_impl": {
             "imag": partial(ufunc_function_hook, group="real"),

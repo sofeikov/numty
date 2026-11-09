@@ -1616,6 +1616,36 @@ def test_dot_nd_mismatch() -> None:
     )
 
 
+def test_issue58_builders_dot_ok() -> None:
+    # Issue #58 slice 2: linspace/identity/tri were rank-only, dot twin Any.
+    result = run_mypy(FIXTURES / "issue58_builders_dot_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[6] == (
+        '"numpy.ndarray[tuple[Literal[7]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[7] == (
+        '"numpy.ndarray[tuple[Literal[4], Literal[4]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[10] == (
+        '"numpy.ndarray[tuple[Literal[2], Literal[4]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+
+
+def test_dot_method_inner_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_dot_method_inner.py"),
+        "matmul inner dimensions disagree: 3 vs 4",
+    )
+
+
+def test_linspace_neg_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_linspace_neg.py"),
+        "linspace num must be non-negative, got -1",
+    )
+
+
 def test_tensordot_size_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_tensordot_size.py"),
