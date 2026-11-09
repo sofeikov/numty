@@ -409,6 +409,25 @@ def test_setitem_shapes_match_numpy() -> None:
     assert a.shape == (5, 3)
 
 
+def test_arith_shapes_match_numpy() -> None:
+    # Issue #54: every bad operator snippet raises at runtime; every ok
+    # one keeps its shape (divmod tuples share it).
+    x = np.ones((2, 3))
+    assert (x // x).shape == (2, 3)
+    assert (x % x).shape == (2, 3)
+    assert divmod(x, x)[0].shape == (2, 3)
+    k = np.zeros((2, 3), dtype=np.int64)
+    assert (k ^ k).shape == (2, 3)
+    assert (k << 1).shape == (2, 3)
+    assert (k & k).shape == (2, 3)
+    m = np.ones((2, 3), dtype=bool)
+    assert (m & True).shape == (2, 3)
+    with pytest.raises(ValueError, match="could not be broadcast"):
+        _ = np.ones((2, 3)) // np.ones(5)
+    with pytest.raises(ValueError, match="could not be broadcast"):
+        _ = np.zeros((2, 3), dtype=np.int64) ^ np.zeros(5, dtype=np.int64)
+
+
 def test_einsum_values() -> None:
     a = np.arange(6, dtype=np.float64).reshape(2, 3)
     b = np.arange(12, dtype=np.float64).reshape(3, 4)
