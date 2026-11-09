@@ -5997,6 +5997,18 @@ def _sequence_parts(
                 return None
             parts = _ndarray_parts(item_tp)
             if parts is None:
+                # Plain Python list-of-ints (e.g. [0] in
+                # concatenate([[0], cumsum(lengths)]), the N+1 offsets
+                # idiom from issue #32): numpy reads it as a 1-D array
+                # of that length. Only flat int lists; nested bails.
+                if isinstance(item_expr, ListExpr) and all(
+                    isinstance(e, IntExpr) for e in item_expr.items
+                ):
+                    dtype = _construct_dtype(ctx, "numpy.int64")
+                    if dtype is None:
+                        return None
+                    items.append(([len(item_expr.items)], dtype))
+                    continue
                 return None
             dims, dtype = parts
             items.append((list(dims), dtype))
@@ -6196,8 +6208,10 @@ def _concat_merge(
         if isinstance(out[norm], int) and isinstance(dims[norm], int):
             out[norm] = out[norm] + dims[norm]
         else:
-            # N + N is not representable: bail out.
-            return ctx.default_return_type
+            # Symbolic lengths add exactly (issue #32): 1+N -> N+1,
+            # N+M -> N+M via linear forms. Unrepresentable (Div/Mono)
+            # mints a fresh unknown, never a bail to Any.
+            out[norm] = _dim_add2(ctx, op, norm, out[norm], dims[norm])
     return _ndarray_type(ctx, out, dtype)
 
 
@@ -7571,18 +7585,24 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
     """cumsum/cumprod keep the input shape; only axis=None flattens.
 
     The flattened size is a products of dims we cannot spell, so
-    axis=None (the default) stays with the stubs. dtype is whatever the
+    axis=None (the default) stays with the stubs, except for 1-D
+    inputs where axis=None keeps the shape (issue #32: np.cumsum
+    without axis on I64[N] is (N,)). dtype is whatever the
     stubs claim: only the shape is solved here.
     """
-    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
-    if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
-        return ctx.default_return_type
     parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
     if _has_unpack(dims):
         return ctx.default_return_type
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
+        # Missing axis (default None): 1-D keeps shape, ND flattens (bail).
+        if axis in ("absent", "none") and len(dims) == 1:
+            axis = [0]
+        else:
+            return ctx.default_return_type
     norm = _normalize_axis(axis[0], len(dims))
     if norm is None:
         ctx.api.fail(

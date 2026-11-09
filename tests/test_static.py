@@ -1390,6 +1390,33 @@ def test_diff_symbolic_mismatch() -> None:
     )
 
 
+def test_concat_symbolic_ok_clean() -> None:
+    # Issue #32 (precision half): symbolic concat lengths stay exact
+    # (N+M, N+1, 2*N) and 1-D cumsum without axis keeps (N,).
+    result = run_mypy(FIXTURES / "concat_symbolic_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    i64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"
+    assert reveals_by_line(result) == {
+        20: f'"{f64.format("M+N")}"',
+        21: f'"{f64.format("N+1")}"',
+        22: f'"{f64.format("2*N")}"',
+        26: f'"{i64.format("N")}"',
+        29: f'"{i64.format("N+1")}"',
+    }, result.stdout
+    assert _run_fixture("concat_symbolic_ok.py") == ["(12,)", "(6,)", "(10,)", "(5,)", "(6,)"]
+
+
+def test_concat_symbolic_mismatch() -> None:
+    # Issue #32: concat of (1,) and (N,) is N+1, not N.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_concat_symbolic.py"),
+        "tuple[N+1]",
+        "tuple[N]",
+    )
+
+
 def test_named_dims_clean_and_runs() -> None:
     result = run_mypy(FIXTURES / "named_dims.py")
     assert result.returncode == 0, result.stdout
