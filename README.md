@@ -414,6 +414,33 @@ The boundary is principled: unknowns flow through bodies but cannot be
 named in signatures — there is no spelling for "somebody else's count".
 Reduce them, or leave the position to inference.
 
+Stacking a list built at runtime works the same way when every item has
+one declared shape: a name typed `list[...]`, or a list comprehension
+(filters, nested loops, and element transforms such as `a * 2` or
+`t.field` all count). `stack` inserts an unknown at the stacked axis.
+`concatenate`, `vstack`, `hstack`, `dstack` and `column_stack` make the
+joined axis unknown. Every other dim and the item dtype carry over, and
+an out-of-range axis is still an error. Items with no declared shape (a
+bare `np.ndarray`) or with different shapes still bail with
+`[numty-bail]` (see [Error codes](#error-codes)).
+
+`assemble.py`:
+
+```python
+import numpy as np
+from numty import F32
+
+
+def assemble(items: list[F32["T n_agents", 2]]) -> None:
+    reveal_type(np.stack([a for a in items]))
+    reveal_type(np.concatenate([a * 2 for a in items], axis=1))
+```
+
+```text
+assemble.py:6: note: Revealed type is "numpy.ndarray[tuple[?U@6, T, n_agents, Literal[2]], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"
+assemble.py:7: note: Revealed type is "numpy.ndarray[tuple[T, ?U@7, Literal[2]], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"
+```
+
 ## Real generic code, checked end to end
 
 Symbolic dimensions ride TypeVars in the shape tuple — same name means same
@@ -577,7 +604,9 @@ promoting `(N,)` to `(1, N)`.
 
 **Joining.** `concatenate` adds dims on the axis, `stack` adds the
 stacked axis, `vstack`/`hstack`/`dstack`/`column_stack` promote then
-concatenate — including enum-driven stacks; mismatches error.
+concatenate — including enum-driven stacks; mismatches error. Lists
+built at runtime whose items share one shape (typed lists, list
+comprehensions) leave only the joined axis unknown.
 
 **Reshape.** Conserves the total with symbolic sizes and infers `-1`
 (`(N, 10, 2)` to `(N, 20)` is fine, `(N, 10, 2)` to `(N, 21)` errors,
@@ -765,7 +794,7 @@ can be silenced or selected on its own:
 | `numty-broadcast` | elementwise operands (arithmetic, comparisons, ufuncs, `where`, `broadcast_*`, index arrays) that do not broadcast | `broadcast shapes disagree at trailing axis 0: 3 vs 4` |
 | `numty-callsite` | one shape variable bound to two sizes by the arguments of a call | `call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)` |
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
-| `numty-bail` | correct code numty cannot check and says so loudly (stacks built dynamically) | `stack needs a sequence of known length (built dynamically; preallocate or ignore)` |
+| `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack needs a sequence of known length (built dynamically; preallocate or ignore)` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
 
 For example, `codes.py`:
@@ -778,7 +807,7 @@ from numty import F64, batch
 def pair(x: F64[batch], y: F64[batch]) -> None: ...
 
 
-def demo(blocks: list[F64[3]], bad: F64[()]) -> None:
+def demo(blocks: list[np.ndarray], bad: F64[()]) -> None:
     a, b = np.zeros((4, 3)), np.zeros((2, 5))
     np.matmul(a, b)                     # numty-shape
     pair(np.zeros(4), np.zeros(5))      # numty-callsite
