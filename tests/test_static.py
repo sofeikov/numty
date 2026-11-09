@@ -1678,6 +1678,28 @@ def test_isclose_broadcast_mismatch() -> None:
     )
 
 
+def test_issue58_fft_keepshape_ok() -> None:
+    result = run_mypy(FIXTURES / "issue58_fft_keepshape_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[7] == (
+        '"numpy.ndarray[tuple[Literal[3], Literal[4]], numpy.dtype[numpy.complex128]]"'
+    ), result.stdout
+    assert notes[10] == (
+        '"numpy.ndarray[tuple[Literal[3], Literal[4]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+
+
+def test_fft2_broadcast_mismatch() -> None:
+    assert_operator_mismatch(
+        run_mypy(FIXTURES / "bad_fft2_broadcast.py"),
+        "broadcast shapes disagree at trailing axis 0",
+        "4 vs 5",
+        "(3, 4)",
+        "(3, 5)",
+    )
+
+
 def test_tensordot_size_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_tensordot_size.py"),

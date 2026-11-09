@@ -3938,6 +3938,43 @@ def fftn_function_hook(ctx: FunctionContext) -> Type:
     return _fftn_solve(ctx, "fftn", pairs[0][0], axes, s, False)
 
 
+def fft2_function_hook(ctx: FunctionContext) -> Type:
+    """np.fft.fft2/ifft2: 2-D fft, same shape when s is absent (issue #58).
+
+    s given resizes (and its default axes differ from fftn), so bail
+    there instead of guessing; the common no-s call keeps the shape
+    with the fft complex dtype, and bad axes still fail.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parsed = _fft_s_axes(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    s, axes = parsed
+    if isinstance(s, str) or isinstance(axes, str):
+        return ctx.default_return_type
+    if s is not None:
+        return ctx.default_return_type
+    return _fftn_solve(ctx, "fft2", pairs[0][0], axes, s, False)
+
+
+def fftshift_function_hook(ctx: FunctionContext) -> Type:
+    """np.fft.fftshift/ifftshift: same shape and dtype (issue #58).
+
+    Axes only select which axes shift; the shape never changes, so no
+    axis parsing is needed for precision. Unranked shapes bail.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    return _ndarray_type(ctx, list(dims), dtype)
+
+
 def rfftn_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -10669,10 +10706,17 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
         },
         "numpy.fft._pocketfft": {
             "fft": fft_function_hook,
+            "fft2": fft2_function_hook,
             "fftn": fftn_function_hook,
             "ifft": fft_function_hook,
+            "ifft2": fft2_function_hook,
+            "ifftn": fftn_function_hook,
             "rfft": rfft_function_hook,
             "rfftn": rfftn_function_hook,
+        },
+        "numpy.fft._helper": {
+            "fftshift": fftshift_function_hook,
+            "ifftshift": fftshift_function_hook,
         },
         "numpy.lib._arraypad_impl": {"pad": pad_function_hook},
         "numpy.lib._arraysetops_impl": {
