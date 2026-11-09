@@ -1563,6 +1563,31 @@ def test_offsets_lengths_mismatch() -> None:
     )
 
 
+def test_offsets_calls_ok_clean_and_runs() -> None:
+    # Issue #32 finish: expression returns infer through calls instead of
+    # going Any. `make_offsets(a: I64[K]) -> I64["M+1"]` reveals K+1 in the
+    # caller, and `take_lengths(K+1)` solves back to K. Distinct TypeVars
+    # per function dodge the #43 `_seen_vars` leak.
+    result = run_mypy(FIXTURES / "offsets_calls_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    i64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"
+    assert reveals_by_line(result) == {
+        37: f'"{i64.format("K+1")}"',
+        39: f'"{i64.format("K")}"',
+    }, result.stdout
+    assert _run_fixture("offsets_calls_ok.py") == ["(6,)", "(5,)", "(6,)", "(5,)"]
+
+
+def test_offsets_calls_mismatch() -> None:
+    # Issue #32 finish: K+1 from a call does not fit a K annotation.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_offsets_calls.py"),
+        "tuple[K+1]",
+        "tuple[K]",
+    )
+
+
 def test_expr_dims_rejected() -> None:
     # Expression dims stay linear: name*name and division fail loudly
     # instead of going quietly Any.
