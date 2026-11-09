@@ -895,13 +895,14 @@ class NumtyPlugin(Plugin):
         self._fam_late_bound.add(fullname)
         # Remember constituent vars so later simplifications (e.g.
         # diff(N+1) -> N) return the scope's own object, not a stale one.
+        # Last-wins (issue #43): each scope's binding refreshes this.
         for name in names:
             v = resolved[name]
             if isinstance(v, TypeVarType):
-                _seen_vars.setdefault(v.fullname, v)
+                _seen_vars[v.fullname] = v
         # Per-scope constituents for #32 finish: diff(M+1)->M looks up M
         # in the defining scope via the expr's fullname, dodging the
-        # global _seen_vars first-wins leak (#43).
+        # global _seen_vars leak (#43).
         try:
             _expr_constituents[fullname] = {
                 v.fullname: v
@@ -1430,7 +1431,8 @@ _seen_vars: dict[str, TypeVarType] = {}
 # Per-expr constituent objects by scope (issue #32 finish): expr fullname
 # -> {constituent fullname -> TypeVarType object from the defining scope}.
 # Lets diff(M+1) -> M return the *current* function's M instead of the
-# first-seen global in _seen_vars (which causes N@first vs N@second).
+# process-wide _seen_vars entry (which caused N@first vs N@second in
+# issue #43).
 _expr_constituents: dict[str, dict[str, TypeVarType]] = {}
 
 
@@ -1491,7 +1493,10 @@ def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
 
     Plain TypeVars read as single-term linears, so N and N*1 compare
     equal; anything else is unresolvable. Seen variables are remembered
-    by fullname so materialization can return the real object.
+    by fullname so materialization can return the real object. Last-wins,
+    not first-wins (issue #43): sequential checking refreshes this to the
+    current function's object (its inner call resolves before any outer
+    call in the same body materializes).
     """
     if isinstance(d, int):
         return _LinForm((), d)
@@ -1499,7 +1504,7 @@ def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
         form = _expr_forms.get(d.fullname)
         if form is not None:
             return form
-        _seen_vars.setdefault(d.fullname, d)
+        _seen_vars[d.fullname] = d
         return _LinForm(((d.fullname, 1),), 0)
     return None
 
@@ -1710,11 +1715,22 @@ def _materialize_dim(
             if consts is not None and want in consts:
                 return consts[want]
         # 2) Current call's own object (reshape/split second-function
-        # leak): prefer it over the process-wide first-wins registry.
+        # leak): prefer it over the process-wide registry.
         try:
             current = _current_scope_vars(ctx)
             if want in current:
                 return current[want]
+            # 2b) Transitive (issue #43): the current call's args hold an
+            # expr (e.g. repeat's N*2 feeding reshape's -1), not the bare
+            # var. That expr's constituents were just recorded by the
+            # inner call in this same body, so they are the current
+            # function's objects; the global registry below still holds
+            # whichever function was checked first.
+            for tv in current.values():
+                if isinstance(tv, TypeVarType):
+                    consts = _expr_constituents.get(tv.fullname)
+                    if consts is not None and want in consts:
+                        return consts[want]
         except Exception:
             pass
         seen = _seen_vars.get(want)
