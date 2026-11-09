@@ -668,7 +668,13 @@ infers `(B, C*H*W)`, `(N, K)` reshaped to `(N, -1)` infers `(N, K)`,
 and the round-trip back proves clean by commutativity.
 `sliding_window_view` appends the window
 after the shrunken dims (`N-w+1`, symbolic included — the conv-output
-formula falls out).
+formula falls out). Linear forms also spell in annotations: `I64["N+1"]`
+denotes one more than `N`, so the offsets/lengths duality checks both
+ways — `np.diff` of `I64["N+1"]` is `I64[N]`, and
+`np.concatenate([[0], np.cumsum(lengths)])` of `I64[N]` is `I64["N+1"]`
+(no `type: ignore`). Supported per dim: `N+1`, `N-1`, `2*N`, `N+M`,
+plain constants (`"5"` is `Literal[5]`); anything non-linear
+(`N*M`, `N//2`) fails loudly instead of going quietly `Any`.
 
 What that unlocks — code that failed before, exact now:
 

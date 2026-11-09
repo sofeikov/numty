@@ -62,6 +62,7 @@ What it does:
 """
 from __future__ import annotations
 
+import ast
 import keyword
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -544,32 +545,216 @@ class NumtyPlugin(Plugin):
         A lone single-word spec is a forward reference, which mypy resolves
         before any hook runs, so it still needs a declared name. The rest
         of the lookup path is `_fam_bare`.
+
+        A word may also be a linear expression over names (`"N+1"`,
+        `"N-1"`, `"2*N"`, `"N+M"`), spelled without spaces so it stays one
+        dim (issue #32: offsets/lengths duality). Each name inside resolves
+        like a bare name (declared or implicit); the whole word denotes the
+        linear form, so `I64["N+1"]` unifies with the `N+1` that
+        `concatenate([[0], cumsum(x)])` infers, and `np.diff` of it is `N`.
+        Only linear forms are supported; anything else fails loudly.
         """
         words = text.split()
         if not words:
             raise _FamFail(
                 f'{head} string dims must name at least one dim, e.g. "batch features"'
             )
-        for word in words:
-            if not word.isidentifier() or keyword.iskeyword(word):
-                raise _FamFail(
-                    f'{head} string dim "{word}" is not a name;'
-                    ' write space-separated names like "batch features"'
-                )
-        minted = self._fam_bind_words(ctx, words, node)
+        bare = [w for w in words if w.isidentifier() and not keyword.iskeyword(w)]
+        minted = self._fam_bind_words(ctx, bare, node)
         dims: list[int | Type] = []
         for word in words:
-            if word in minted:
-                dims.append(minted[word])
-            else:
-                dims.append(
-                    self._fam_bare(
-                        ctx,
-                        head,
-                        UnboundType(word, [], line=node.line, column=node.column),
+            if word.isidentifier() and not keyword.iskeyword(word):
+                if word in minted:
+                    dims.append(minted[word])
+                else:
+                    dims.append(
+                        self._fam_bare(
+                            ctx,
+                            head,
+                            UnboundType(word, [], line=node.line, column=node.column),
+                        )
                     )
-                )
+            else:
+                dims.append(self._fam_expr(ctx, head, word, node))
         return dims
+
+    def _fam_expr(
+        self,
+        ctx: AnalyzeTypeContext,
+        head: str,
+        word: str,
+        node: RawExpressionType | UnboundType,
+    ) -> int | Type:
+        """A linear expression dim (`N+1`, `N-1`, `2*N`, `N+M`) for issue #32.
+
+        Parses the word with `ast` (names, int constants, `+`/`-`/`*`
+        only), resolves each name like a bare dim (declared TypeVar or
+        implicit mint), and returns the dim for the canonical linear form:
+        a plain int for const-only, otherwise a scope-bound variable whose
+        registry form is the linear combination. Non-linear or unparsable
+        words fail loudly so unsupported shapes never go quietly Any.
+        """
+        try:
+            tree = ast.parse(word, mode="eval")
+        except SyntaxError:
+            raise _FamFail(
+                f'{head} string dim "{word}" is not a name or linear expression;'
+                ' write space-separated names like "batch features"'
+                ' or linear forms like "N+1"'
+            ) from None
+        names: list[str] = []
+        seen: set[str] = set()
+
+        def collect(e: ast.expr) -> None:
+            if isinstance(e, ast.Name):
+                if e.id not in seen:
+                    seen.add(e.id)
+                    names.append(e.id)
+            elif isinstance(e, ast.Constant):
+                return
+            elif isinstance(e, ast.BinOp) and isinstance(
+                e.op, (ast.Add, ast.Sub, ast.Mult)
+            ):
+                collect(e.left)
+                collect(e.right)
+            elif isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.UAdd, ast.USub)):
+                collect(e.operand)
+            else:
+                raise _FamFail(
+                    f'{head} string dim "{word}" is not linear;'
+                    ' only names, integers, "+", "-", "*" (e.g. "N+1", "2*N")'
+                )
+
+        try:
+            collect(tree.body)
+        except _FamFail:
+            raise
+        for name in names:
+            if not name.isidentifier() or keyword.iskeyword(name):
+                raise _FamFail(
+                    f'{head} string dim "{word}" is not linear;'
+                    ' only names, integers, "+", "-", "*" (e.g. "N+1", "2*N")'
+                )
+        # Bind constituent names exactly like bare dims (declared lookup or
+        # implicit mint), then resolve each to its TypeVar or int value.
+        minted = self._fam_bind_words(ctx, names, node)
+        resolved: dict[str, int | Type] = {}
+        for name in names:
+            if name in minted:
+                resolved[name] = minted[name]
+            else:
+                resolved[name] = self._fam_bare(
+                    ctx, head, UnboundType(name, [], line=node.line, column=node.column)
+                )
+        coeffs: dict[str, int] = {}
+        const = 0
+
+        def add_scaled(fullname: str, c: int) -> None:
+            if c:
+                coeffs[fullname] = coeffs.get(fullname, 0) + c
+
+        def walk(e: ast.expr) -> tuple[dict[str, int], int]:
+            if isinstance(e, ast.Name):
+                v = resolved[e.id]
+                if isinstance(v, int):
+                    return {}, v
+                if isinstance(v, TypeVarType):
+                    return {v.fullname: 1}, 0
+                raise _FamFail(
+                    f'{head} dim "{e.id}" must be a TypeVar, an integer,'
+                    " Unpack[Ts], or Literal[...]"
+                )
+            if isinstance(e, ast.Constant):
+                if isinstance(e.value, bool) or not isinstance(e.value, int):
+                    raise _FamFail(
+                        f'{head} string dim "{word}" is not linear;'
+                        ' only names, integers, "+", "-", "*" (e.g. "N+1", "2*N")'
+                    )
+                return {}, e.value
+            if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.UAdd, ast.USub)):
+                sub_c, sub_k = walk(e.operand)
+                if isinstance(e.op, ast.USub):
+                    return ({k: -v for k, v in sub_c.items()}, -sub_k)
+                return sub_c, sub_k
+            if isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Sub)):
+                lc, lk = walk(e.left)
+                rc, rk = walk(e.right)
+                if isinstance(e.op, ast.Sub):
+                    rc = {k: -v for k, v in rc.items()}
+                    rk = -rk
+                merged = dict(lc)
+                for k, v in rc.items():
+                    merged[k] = merged.get(k, 0) + v
+                return ({k: v for k, v in merged.items() if v}, lk + rk)
+            if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Mult):
+                lc, lk = walk(e.left)
+                rc, rk = walk(e.right)
+                if lc and rc:
+                    raise _FamFail(
+                        f'{head} string dim "{word}" is not linear'
+                        ' (name * name); use "+", "-", or a single "*"'
+                        ' with a constant (e.g. "N+1", "2*N")'
+                    )
+                if lc:
+                    if rk == 0:
+                        return {}, 0
+                    return ({k: v * rk for k, v in lc.items()}, lk * rk)
+                if rc:
+                    if lk == 0:
+                        return {}, 0
+                    return ({k: v * lk for k, v in rc.items()}, rk * lk)
+                return {}, lk * rk
+            raise _FamFail(
+                f'{head} string dim "{word}" is not linear;'
+                ' only names, integers, "+", "-", "*" (e.g. "N+1", "2*N")'
+            )
+
+        part_c, part_k = walk(tree.body)
+        for fullname, c in part_c.items():
+            add_scaled(fullname, c)
+        const = part_k
+        coeffs = {k: v for k, v in coeffs.items() if v}
+        if not coeffs:
+            return const
+        form = _LinForm(tuple(sorted(coeffs.items())), const)
+        # Form-keyed identity shared with inferred expressions (_expr_var):
+        # the same canonical form is the same variable everywhere, so an
+        # inferred `N+1` is identical to an annotated `I64["N+1"]` and
+        # native subtype checking accepts it. The fullname embeds the
+        # canonical form (with fullnames), so different expressions never
+        # collide; `?U`-containing forms stay per-site via the unknown key.
+        fullname = f"__numty_expr__.{form!r}"
+        analyzer = cast(TypeAnalyser, ctx.api)
+        scope = analyzer.tvar_scope
+        existing = scope.get_binding(fullname)
+        if existing is not None:
+            return existing
+        vid = _expr_ids.get(fullname)
+        if vid is None:
+            vid = TypeVarId.new(0)
+            _expr_ids[fullname] = vid
+        _expr_forms[fullname] = form
+        display = _expr_str(form)
+        upper = ctx.api.named_type("builtins.int", [], node.line, node.column)
+        obj = TypeVarType(
+            name=display,
+            fullname=fullname,
+            id=vid,
+            values=[],
+            upper_bound=upper,
+            default=AnyType(TypeOfAny.from_omitted_generics),
+            line=node.line,
+            column=node.column,
+        )
+        scope.bind_existing(obj)
+        self._fam_late_bound.add(fullname)
+        # Remember constituent vars so later simplifications (e.g.
+        # diff(N+1) -> N) return the scope's own object, not a stale one.
+        for name in names:
+            v = resolved[name]
+            if isinstance(v, TypeVarType):
+                _seen_vars.setdefault(v.fullname, v)
+        return obj
 
     def _fam_bind_words(
         self,
@@ -1109,21 +1294,28 @@ def _expr_str(form: _LinForm | _DivForm | _MonoForm) -> str:
 def _expr_var(
     ctx: FunctionContext | MethodContext, op: str, index: int, form: _LinForm | _DivForm | _MonoForm
 ) -> TypeVarType:
-    """Mint (or reuse) the site-keyed variable denoting a dim expression.
+    """Mint (or reuse) the variable denoting a dim expression (issue #32).
 
-    Same site keying as _fresh_unknown, so overload candidates mint the
-    identical variable; the registry maps it back to the canonical form.
+    Form-keyed (not site-keyed): the same canonical form reuses one
+    variable id everywhere, so an inferred `N+1` is the same variable as
+    an annotated `I64["N+1"]` with the same form and native subtype
+    checking accepts it. Different forms never collide. Re-checks and
+    overload candidates with the same form still mint identically, and
+    `?U`-containing forms stay per-site via the unknown's own site key.
+    The registry maps the fullname back to the canonical form.
     """
+    # `op`/`index` only disambiguate the call site for debugging; identity
+    # comes from the form itself.
+    _ = op, index
     tree = getattr(ctx.api, "tree", None)
-    module = getattr(tree, "fullname", "") or ""
+    _ = getattr(tree, "fullname", "") or ""
     line = ctx.context.line
     column = ctx.context.column
-    key = f"{module}_{line}_{column}_{op}_{index}"
-    fullname = f"__numty_expr__.{key}"
-    vid = _expr_ids.get(key)
+    fullname = f"__numty_expr__.{form!r}"
+    vid = _expr_ids.get(fullname)
     if vid is None:
         vid = TypeVarId.new(0)
-        _expr_ids[key] = vid
+        _expr_ids[fullname] = vid
     _expr_forms[fullname] = form
     upper = ctx.api.named_generic_type("builtins.int", [])
     return TypeVarType(

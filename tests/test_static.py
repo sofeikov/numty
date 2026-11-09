@@ -1312,7 +1312,7 @@ def test_sklearn_ridge_clean_and_runs() -> None:
 def test_f64_str_bad_token_rejected() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_str_token.py"),
-        'F64 string dim "3" is not a name',
+        'F64 string dim "foo!" is not a name or linear expression',
         'space-separated names like "batch features"',
     )
 
@@ -1415,6 +1415,49 @@ def test_concat_symbolic_mismatch() -> None:
         "tuple[N+1]",
         "tuple[N]",
     )
+
+
+def test_offsets_lengths_ok_clean_and_runs() -> None:
+    # Issue #32 precision half: linear expression dims (`I64["N+1"]`)
+    # spell the offsets/lengths duality, so `np.diff` of `N+1` is `N`
+    # and `concatenate([[0], cumsum])` of `N` is `N+1` with no ignore.
+    # Distinct TypeVars per function dodge the #43 `_seen_vars` leak
+    # (same-name bare simplifications otherwise bind to the first scope).
+    result = run_mypy(FIXTURES / "offsets_lengths_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    i64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"
+    assert reveals_by_line(result) == {
+        35: f'"{i64.format("K+1")}"',
+        36: f'"{i64.format("K")}"',
+    }, result.stdout
+    assert _run_fixture("offsets_lengths_ok.py") == ["(6,)", "(5,)", "(5,)", "(6,)"]
+
+
+def test_offsets_lengths_mismatch() -> None:
+    # Issue #32: N+1 offsets do not fit an N annotation.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_offsets_lengths.py"),
+        "tuple[N+1]",
+        "tuple[N]",
+    )
+
+
+def test_expr_dims_rejected() -> None:
+    # Expression dims stay linear: name*name and division fail loudly
+    # instead of going quietly Any.
+    for bad, fragment in (
+        ('F64["N*M"]', "is not linear"),
+        ('F64["N//2"]', "is not linear"),
+    ):
+        fixture = FIXTURES / "_tmp_expr_bad.py"
+        fixture.write_text(
+            "from numty import F64\ndef f(x: " + bad + ") -> None: ...\n"
+        )
+        try:
+            assert_single_error(run_mypy(fixture), fragment)
+        finally:
+            fixture.unlink(missing_ok=True)
 
 
 def test_named_dims_clean_and_runs() -> None:
