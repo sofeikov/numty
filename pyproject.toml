@@ -5,7 +5,7 @@ description = "Static shape checking for NumPy"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "numpy>=2",
+    "numpy>=2.5",
 ]
 
 [dependency-groups]
