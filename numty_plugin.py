@@ -7548,9 +7548,15 @@ def _parse_index_item(
         begin = _fold_index_bound(ctx, expr.begin_index)
         end = _fold_index_bound(ctx, expr.end_index)
         stride = _fold_index_bound(ctx, expr.stride)
-        if begin is None or end is None or stride is None:
-            return None
-        return ("slice", begin, end, stride)
+        # Unprovable bounds no longer bail the whole getitem (issue #57):
+        # they become "unknown" and the consumer mints a fresh unknown
+        # for that axis while keeping the sibling dims.
+        return (
+            "slice",
+            "unknown" if begin is None else begin,
+            "unknown" if end is None else end,
+            "unknown" if stride is None else stride,
+        )
     if expr is not None:
         init = _final_slice_call(ctx, expr)
         if init is not None and all(k == ARG_POS for k in init.arg_kinds):
@@ -7562,11 +7568,18 @@ def _parse_index_item(
                 raw = (init.args[0], init.args[1], init.args[2])
             else:
                 return None
-            bounds = tuple(
-                "missing" if b is None else _fold_int(b) for b in raw
-            )
-            if any(b is None for b in bounds):
-                return None
+            # An explicit None inside slice(...) means missing, exactly
+            # like an omitted bound; an unprovable bound is "unknown"
+            # (issue #57) rather than a whole-getitem bail.
+            bounds: list[int | str] = []
+            for b in raw:
+                if b is None:
+                    bounds.append("missing")
+                elif isinstance(b, NameExpr) and b.name == "None":
+                    bounds.append("missing")
+                else:
+                    value = _fold_int(b)
+                    bounds.append(value if value is not None else "unknown")
             begin, end, stride = bounds
             return ("slice", begin, end, stride)
     if isinstance(expr, StarExpr):
@@ -7623,13 +7636,22 @@ def _parse_index_items(
 
 
 def _consume_one(
-    ctx: MethodContext, item: tuple, size: int | Type, axis: str, shape_repr: str
+    ctx: MethodContext,
+    item: tuple,
+    size: int | Type,
+    axis: str,
+    shape_repr: str,
+    pos: int = 0,
+    role: str = "slice",
 ) -> list[int | Type] | None:
     """Apply one parsed index item to a known dim: kept dims, or None.
 
     None means bail out silently, except provable errors (out-of-range
     int, zero step, bad index type), which fail inside and also yield
-    None. Dropped dims contribute nothing.
+    None. Dropped dims contribute nothing. A slice bound the parser
+    could not prove ("unknown", issue #57) mints a fresh unknown for a
+    concrete axis instead of bailing the whole shape; over a symbolic
+    axis only a full-range unit-stride slice keeps the dim.
     """
     kind = item[0]
     if kind in ("int", "int_any"):
@@ -7656,16 +7678,22 @@ def _consume_one(
         )
         return None
     _, begin, end, stride = item
-    if not isinstance(size, int):
-        if begin == "missing" and end == "missing" and stride == "missing":
+    if isinstance(size, int):
+        if "unknown" in (begin, end, stride):
+            return [_fresh_unknown(ctx, role, pos)]
+        bounds = tuple(None if b == "missing" else b for b in (begin, end, stride))
+        try:
+            return [len(range(*slice(*bounds).indices(size)))]
+        except ValueError:
+            ctx.api.fail("slice step is zero", ctx.context, code=NUMTY_AXIS)
+            return None
+    if begin == "missing" and end == "missing":
+        if stride == "missing" or stride in (1, -1):
             return [size]
-        return None
-    bounds = tuple(None if b == "missing" else b for b in (begin, end, stride))
-    try:
-        return [len(range(*slice(*bounds).indices(size)))]
-    except ValueError:
-        ctx.api.fail("slice step is zero", ctx.context, code=NUMTY_AXIS)
-        return None
+        if stride == 0:
+            ctx.api.fail("slice step is zero", ctx.context, code=NUMTY_AXIS)
+            return None
+    return [_fresh_unknown(ctx, role, pos)]
 
 
 def _consume_prefix(
@@ -7700,7 +7728,7 @@ def _consume_prefix(
             out.append(_fresh_unknown(ctx, "mask", i))
             i += rank
             continue
-        frag = _consume_one(ctx, item, prefix[i], str(i), shape_repr)
+        frag = _consume_one(ctx, item, prefix[i], str(i), shape_repr, i, "slice")
         if frag is None:
             return None
         out.extend(frag)
@@ -7723,7 +7751,9 @@ def _consume_suffix(
             continue
         if p < 0:
             return None
-        frag = _consume_one(ctx, item, suffix[p], f"-{len(suffix) - p}", shape_repr)
+        frag = _consume_one(
+            ctx, item, suffix[p], f"-{len(suffix) - p}", shape_repr, p, "slicesuf"
+        )
         if frag is None:
             return None
         slot[idx] = frag
@@ -7904,21 +7934,40 @@ def _solve_getitem(
             )
             return ctx.default_return_type
         else:
+            # Slice: an unprovable bound ("unknown", issue #57) mints a
+            # fresh unknown for a concrete axis instead of bailing the
+            # whole shape; over a symbolic axis only a full-range
+            # unit-stride slice keeps the dim.
             _, begin, end, stride = item
             size = dims[dim]
-            if not isinstance(size, int):
-                if begin == "missing" and end == "missing" and stride == "missing":
-                    out.append(size)
+            if isinstance(size, int):
+                if "unknown" in (begin, end, stride):
+                    out.append(_fresh_unknown(ctx, "slice", dim))
                 else:
-                    return ctx.default_return_type
+                    bounds = tuple(
+                        None if b == "missing" else b for b in (begin, end, stride)
+                    )
+                    try:
+                        out.append(len(range(*slice(*bounds).indices(size))))
+                    except ValueError:
+                        ctx.api.fail(
+                            "slice step is zero", ctx.context, code=NUMTY_AXIS
+                        )
+                        return ctx.default_return_type
                 dim += 1
                 continue
-            bounds = tuple(None if b == "missing" else b for b in (begin, end, stride))
-            try:
-                out.append(len(range(*slice(*bounds).indices(size))))
-            except ValueError:
-                ctx.api.fail("slice step is zero", ctx.context, code=NUMTY_AXIS)
-                return ctx.default_return_type
+            if begin == "missing" and end == "missing":
+                if stride == "missing" or stride in (1, -1):
+                    out.append(size)
+                elif stride == 0:
+                    ctx.api.fail(
+                        "slice step is zero", ctx.context, code=NUMTY_AXIS
+                    )
+                    return ctx.default_return_type
+                else:
+                    out.append(_fresh_unknown(ctx, "slice", dim))
+            else:
+                out.append(_fresh_unknown(ctx, "slice", dim))
             dim += 1
     out.extend(dims[dim:])
     if not out:

@@ -253,6 +253,46 @@ def test_unknown_broadcast_downstream_error() -> None:
     )
 
 
+def test_unknown_slice_keeps_sibling_dims() -> None:
+    # Issue #57: a variable slice bound used to bail the whole getitem
+    # to Any; now the sliced axis is a fresh unknown and the rest keeps
+    # checking (a full-range reversal keeps the symbolic dim exactly).
+    result = run_mypy(FIXTURES / "unknown_slice_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [
+        re.sub(r"\?U@\d+[a-z]?", "?U", line.split('Revealed type is "', 1)[1])
+        for line in result.stdout.splitlines()
+        if "Revealed type" in line
+    ]
+    f64 = "numpy.dtype[numpy.float64]"
+    assert notes == [
+        f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
+        f'numpy.ndarray[tuple[?U, Literal[7]], {f64}]"',
+        f'numpy.ndarray[tuple[Literal[5], ?U], {f64}]"',
+        f'numpy.ndarray[tuple[Literal[5], Literal[3]], {f64}]"',
+        f'numpy.ndarray[tuple[N, Literal[3]], {f64}]"',
+        f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
+    ], result.stdout
+    assert _run_fixture("unknown_slice_ok.py") == [
+        "(32, 3)",
+        "(4, 7)",
+        "(5, 3)",
+        "(5, 3)",
+        "(6, 3)",
+        "(5, 3)",
+    ]
+
+
+def test_unknown_slice_downstream_error() -> None:
+    # Issue #57: the minibatch slice keeps the feature width, so the
+    # 3-vs-7 matmul bug is caught instead of passing silently.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_unknown_slice_downstream.py"),
+        "matmul inner dimensions disagree: 3 vs 7",
+        line=10,
+    )
+
+
 def test_good_path_precision_visible() -> None:
     result = run_mypy(FIXTURES / "static_ok.py")
     assert result.returncode == 0, result.stdout
