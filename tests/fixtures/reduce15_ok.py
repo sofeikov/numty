@@ -36,9 +36,8 @@ def g(y: F64[129, 4]) -> None:
 
 
 def h(a: F64[N, M], c: I32[N]) -> None:
-    # TODO(#32): numpy returns (N-1, M) but the solver keeps N. Pinned as
-    # a reveal rather than an annotation so the #32 fix flips this red.
-    ds = reveal_type(np.diff(a, axis=0))  # R: (N, M), want (N-1, M)
+    # Issue #32 (soundness half): diff subtracts n from the axis.
+    ds = reveal_type(np.diff(a, axis=0))  # R: (N-1, M)
     di: I32[3] = reveal_type(np.diff(np.zeros(4, dtype=np.int32)))  # R: (3,)
     r: I64[N] = reveal_type(np.cumsum(c, axis=0))  # R: (N,)
 
