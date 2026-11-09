@@ -1240,6 +1240,8 @@ class NumtyPlugin(Plugin):
             return swapaxes_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "dot":
             return dot_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "repeat":
+            return repeat_method_hook
         return None
 
 
@@ -4174,6 +4176,85 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, dtype)
 
 
+def repeat_method_hook(ctx: MethodContext) -> Type:
+    """ndarray.repeat twin of np.repeat (issue #58).
+
+    Self is the array; repeats/axis come from formals or positionals.
+    Only the common scalar-repeats path solves precisely (like the
+    function hook); displays and dynamic counts use the same helpers,
+    anything else bails to the stubs.
+    """
+    parts = _ndarray_parts(ctx.type)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    repeats_pair = _formal_pair(ctx, "repeats")
+    axis_pair = _formal_pair(ctx, "axis")
+    pairs = _all_positionals(ctx)
+    if repeats_pair is None:
+        # repeats is positional-only (def repeat(self, repeats, /, ...)):
+        # callee_arg_names holds None there, so the formal lookup misses
+        # even though the positional is visible. Fall back to it.
+        repeats_pair = pairs[0] if pairs else None
+    if repeats_pair is None:
+        return ctx.default_return_type
+    if axis_pair is None and _positionals_only(ctx):
+        axis_pair = pairs[1] if len(pairs) > 1 else None
+    axis: int | None = None
+    if axis_pair is not None:
+        parsed = _parse_axis_arg(axis_pair)
+        if parsed is None:
+            return ctx.default_return_type
+        if isinstance(parsed, str):
+            axis = None
+        elif len(parsed) == 1:
+            axis = parsed[0]
+        else:
+            return ctx.default_return_type
+    count = _repeat_count(repeats_pair)
+    if count is None:
+        return ctx.default_return_type
+    if isinstance(count, int) and count < 0:
+        ctx.api.fail(
+            f"repeat repeats must be non-negative, got {count}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    size: int | str = "bail"
+    entries = _repeat_display(repeats_pair)
+    if entries is not None and len(entries) != 1:
+        checked = _repeat_display_size(ctx, dims, axis, entries)
+        if checked is None:
+            return ctx.default_return_type
+        size = checked
+    if axis is None:
+        if isinstance(size, int):
+            return _ndarray_type(ctx, [size], dtype)
+        if isinstance(count, int):
+            return _ndarray_type(
+                ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
+            )
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
+    target = _normalize_axis(axis, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"repeat axis {axis} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    if isinstance(size, int):
+        out[target] = size
+    elif isinstance(count, int):
+        out[target] = _dim_mul_const(ctx, "repeat", target, out[target], count)
+    else:
+        out[target] = _fresh_unknown(ctx, "repeat", target)
+    return _ndarray_type(ctx, out, dtype)
+
+
 def _pad_side(expr: Expression, tp: Type | None) -> int | None | str:
     """A pad width side: int, None when unknown, 'bad' when garbage."""
     value = _fold_int(expr)
@@ -6247,6 +6328,39 @@ def _like_types(ctx: FunctionContext, tp: Type) -> Type:
     return _ndarray_type(ctx, dims, dtype)
 
 
+def copy_function_hook(ctx: FunctionContext) -> Type:
+    """np.copy: same shape and dtype (issue #58).
+
+    Trivial keep-shape twin of the hooked method (m.copy() already
+    solved); previously fell back to Any and accepted any annotation.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _parts_or_unpack(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    return _ndarray_type(ctx, list(dims), dtype)
+
+
+def ascontiguousarray_function_hook(ctx: FunctionContext) -> Type:
+    """np.ascontiguousarray: same shape, explicit dtype or kept (issue #58)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _parts_or_unpack(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, list(dims), named)
+    return _ndarray_type(ctx, list(dims), dtype)
+
+
 def full_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     shape_pair = _formal_pair(ctx, "shape") or (pairs[0] if pairs else None)
@@ -8312,6 +8426,26 @@ def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, dims, dtype)
+
+
+def isclose_function_hook(ctx: FunctionContext) -> Type:
+    """np.isclose: broadcast bool like ==, mismatch fails (issue #58).
+
+    rtol/atol/equal_nan are scalars and never affect the shape; only
+    the first two array operands solve. allclose returns a Python bool
+    and stays with the stubs.
+    """
+    pair = _two_arrays(ctx)
+    if pair is None:
+        a_pair = _formal_pair(ctx, "a")
+        b_pair = _formal_pair(ctx, "b")
+        if a_pair is None or b_pair is None:
+            return ctx.default_return_type
+        pair = (a_pair[0], b_pair[0])
+    dist = _distribute_solve([pair[0], pair[1]], lambda l, r: _compare_types(ctx, l, r))
+    if dist is not None:
+        return dist
+    return _compare_types(ctx, pair[0], pair[1])
 
 
 def _solve_argdrop(
@@ -10492,6 +10626,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "array": asarray_function_hook,
             "asanyarray": asarray_function_hook,
             "asarray": asarray_function_hook,
+            "ascontiguousarray": ascontiguousarray_function_hook,
             "concatenate": concatenate_function_hook,
             "dot": dot_function_hook,
             "empty": zeros_like_hook,
@@ -10509,6 +10644,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "full": full_function_hook,
             "full_like": like_function_hook,
             "identity": identity_function_hook,
+            "isclose": isclose_function_hook,
             "ones": zeros_like_hook,
             "ones_like": like_function_hook,
             "outer": outer_function_hook,
@@ -10545,6 +10681,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
         },
         "numpy.lib._function_base_impl": {
             "average": average_function_hook,
+            "copy": copy_function_hook,
             "diff": diff_function_hook,
             "flip": flip_function_hook,
             "gradient": gradient_function_hook,
