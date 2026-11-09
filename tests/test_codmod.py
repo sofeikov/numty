@@ -14,7 +14,8 @@ import pytest
 from numty_codmod import codemod_source
 
 ROOT = Path(__file__).resolve().parent.parent
-CACHE = ROOT / ".mypy-codmod-cache"
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "")
+CACHE = ROOT / (".mypy-codmod-cache" if not _WORKER else f".mypy-codmod-cache-{_WORKER}")
 
 
 
@@ -150,6 +151,16 @@ def _run_python(src: str, tmp_path: Path, name: str) -> str:
     return result.stdout
 
 
+def _run_pair(before_src: str, after_src: str, tmp_path: Path) -> tuple[str, str]:
+    """Run before/after snippets concurrently (independent subprocesses)."""
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fb = pool.submit(_run_python, before_src, tmp_path, "before.py")
+        fa = pool.submit(_run_python, after_src, tmp_path, "after.py")
+        return fb.result(), fa.result()
+
+
 def test_self_op_skips_non_arrays(tmp_path: Path) -> None:
     out, warnings = codemod_source(NON_ARRAYS, self_ops=True)
     assert out == NON_ARRAYS
@@ -158,9 +169,8 @@ def test_self_op_skips_non_arrays(tmp_path: Path) -> None:
         f"self-ops skipped: {name} is not known to be an array"
         for name in ["n", "lst", "t", "words", "s", "flag", "k", "m", "p", "lst", "z"]
     ]
-    assert _run_python(out, tmp_path, "after.py") == _run_python(
-        NON_ARRAYS, tmp_path, "before.py"
-    )
+    before, after = _run_pair(NON_ARRAYS, out, tmp_path)
+    assert after == before
 
 
 def test_self_op_array_bindings_still_rewrite(tmp_path: Path) -> None:
@@ -198,18 +208,21 @@ def test_self_op_array_bindings_still_rewrite(tmp_path: Path) -> None:
     ]:
         assert rewritten in out
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
-    runs = []
-    for name, text in (("before.py", src), ("after.py", out)):
+    import concurrent.futures
+
+    def _run_named(args: tuple[str, str]) -> "subprocess.CompletedProcess[str]":
+        name, text = args
         (tmp_path / name).write_text(text)
-        runs.append(
-            subprocess.run(
-                [sys.executable, str(tmp_path / name)],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
+        return subprocess.run(
+            [sys.executable, str(tmp_path / name)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        runs = list(pool.map(_run_named, [("before.py", src), ("after.py", out)]))
     assert runs[0].returncode == 0, runs[0].stderr
     assert runs[1].stdout == runs[0].stdout
 
@@ -667,9 +680,9 @@ def test_self_op_matrix_annotation_keeps_matmul(tmp_path: Path) -> None:
         " a matrix product)",
         "line 9: self-ops rewrote to np.add(x, x) (trusting the annotation of x)",
     ]
-    before = _run_python(MATRIX_REPRO, tmp_path, "before.py")
+    before, after = _run_pair(MATRIX_REPRO, out, tmp_path)
     assert before.splitlines()[0] == "[[7, 10], [15, 22]] matrix"
-    assert _run_python(out, tmp_path, "after.py") == before
+    assert after == before
 
 
 _ANNOTATION_HEADER = (
@@ -801,9 +814,9 @@ def test_self_op_constructor_bindings_rewrite_every_op(tmp_path: Path) -> None:
         "print((np.divide(b, b)).tolist(), type(np.multiply(b, b)).__name__",
     ]:
         assert rewritten in out
-    before = _run_python(src, tmp_path, "before.py")
+    before, after = _run_pair(src, out, tmp_path)
     assert before.startswith("[[1.0, 4.0], [9.0, 16.0]]")
-    assert _run_python(out, tmp_path, "after.py") == before
+    assert after == before
 
 
 # Every _NP_CONSTRUCTORS entry fed np.matrix, a MaskedArray and a user
@@ -877,8 +890,8 @@ def test_self_op_base_class_constructors_rewrite(tmp_path: Path, expr: str) -> N
     assert warnings == [
         f"line 19: self-ops rewrote to {call}" for call in _SELF_OP_CALLS
     ]
-    before = _run_python(src, tmp_path, "before.py")
-    assert _run_python(out, tmp_path, "after.py") == before
+    before, after = _run_pair(src, out, tmp_path)
+    assert after == before
 
 
 @pytest.mark.parametrize(
@@ -909,8 +922,8 @@ def test_self_op_spaced_keep_subclass(tmp_path: Path, expr: str) -> None:
         f"line 19: self-ops rewrote to {call} {trusted}"
         for call in _SELF_OP_CALLS[3:]
     ]
-    before = _run_python(src, tmp_path, "before.py")
-    assert _run_python(out, tmp_path, "after.py") == before
+    before, after = _run_pair(src, out, tmp_path)
+    assert after == before
     # The skips are what keep it: rewriting every site changes the output.
     naive = src
     for site, call in zip(_SELF_OP_SITES, _SELF_OP_CALLS):

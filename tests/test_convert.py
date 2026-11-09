@@ -18,6 +18,25 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
 
 
+def _convert_cache_dir() -> Path:
+    _worker = os.environ.get("PYTEST_XDIST_WORKER", "")
+    return ROOT / (".mypy-convert-cache" if not _worker else f".mypy-convert-cache-{_worker}")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fresh_convert_cache() -> None:
+    # Fresh per session (like test_static): mypy does not reliably
+    # invalidate plugin results, but within one run the plugin is fixed
+    # so incremental reuse across the 3 e2e checks stays fast.
+    import shutil
+
+    shutil.rmtree(_convert_cache_dir(), ignore_errors=True)
+    yield
+    # Keep the cache for the next run's warmth? No: clear at start is
+    # enough; leave the warmed cache on disk for the next invocation.
+    pass
+
+
 def convert(src: str) -> tuple[str, list[str]]:
     return convert_source(src)
 
@@ -564,14 +583,17 @@ def _check_converted(name: str, tmp_path: Path) -> tuple[Path, list[str]]:
 
 
 def _run_mypy(*paths: Path, tmp_path: Path) -> "subprocess.CompletedProcess[str]":
+    # Shared incremental cache (per xdist worker): converted files differ
+    # per test but numpy/plugin parsing is cached, so the 2nd/3rd e2e run
+    # is warm instead of cold with --no-incremental.
+    cache_dir = _convert_cache_dir()
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     return subprocess.run(
         [
             sys.executable,
             "-m",
             "mypy",
-            "--no-incremental",
-            f"--cache-dir={tmp_path / 'mypy-cache'}",
+            f"--cache-dir={cache_dir}",
             *map(str, paths),
         ],
         cwd=ROOT,
@@ -697,6 +719,8 @@ def test_e2e_converted_runs_and_checks(tmp_path: Path) -> None:
     Covers the lost-comment cases (README `squared_norm`; `*batch c`,
     which needs its ignore), `_n`, case, return-only `_` and late imports.
     """
+    import concurrent.futures
+
     stub = tmp_path / "stub"
     stub.mkdir()
     (stub / "jaxtyping.py").write_text(JAXTYPING_STUB)
@@ -711,7 +735,8 @@ def test_e2e_converted_runs_and_checks(tmp_path: Path) -> None:
         converted.append(path)
     result = _run_mypy(*converted, tmp_path=tmp_path)
     assert result.returncode == 0, result.stdout
-    for name in E2E:
+
+    def _run_pair(name: str) -> tuple[str, int, str, int, str, str, str]:
         before = subprocess.run(
             [sys.executable, str(tmp_path / f"orig_{name}.py")],
             env={**os.environ, "PYTHONPATH": f"{ROOT}{os.pathsep}{stub}"},
@@ -727,6 +752,11 @@ def test_e2e_converted_runs_and_checks(tmp_path: Path) -> None:
             text=True,
             timeout=120,
         )
-        assert before.returncode == 0, (name, before.stderr)
-        assert after.returncode == 0, (name, after.stderr)
-        assert after.stdout == before.stdout, name
+        return (name, before.returncode, before.stderr, after.returncode, after.stderr,
+                before.stdout, after.stdout)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(E2E))) as pool:
+        for name, bc, berr, ac, aerr, bout, aout in pool.map(_run_pair, list(E2E)):
+            assert bc == 0, (name, berr)
+            assert ac == 0, (name, aerr)
+            assert aout == bout, name

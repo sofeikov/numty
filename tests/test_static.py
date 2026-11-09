@@ -14,21 +14,110 @@ FIXTURES = ROOT / "tests" / "fixtures"
 # invalidate plugin results across plugin edits, so never reuse the default
 # cache (or a previous run's) here. Within one run the plugin is fixed, so
 # incremental caching across fixtures stays fast.
-CACHE = ROOT / ".mypy-test-cache"
+# Under pytest-xdist each worker gets its own cache dir (via
+# PYTEST_XDIST_WORKER) so parallel mypy runs do not thrash each other.
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER", "")
+CACHE = ROOT / (".mypy-test-cache" if not _WORKER else f".mypy-test-cache-{_WORKER}")
+
+# Session batch: one mypy run over every fixture serves all default-flag
+# single-file checks from memory. Per-file subprocesses cost ~0.1s of
+# startup each (≈20s for the suite); one batched run is ~2-3s cold and
+# ~0.08s warm. Flagged / multi-file runs still use subprocesses (with a
+# per-flag cache dir so option changes do not invalidate the default cache).
+_BATCH_RESULTS: dict[str, tuple[int, str]] = {}
+_BATCH_READY = False
+
+
+def _ensure_batch() -> None:
+    global _BATCH_READY
+    if _BATCH_READY:
+        return
+    _BATCH_READY = True
+    files = sorted(FIXTURES.glob("*.py"))
+    if not files:
+        return
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    result = subprocess.run(
+        [sys.executable, "-m", "mypy", "--cache-dir", str(CACHE), *map(str, files)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    per_file: dict[str, list[str]] = {f.name: [] for f in files}
+    for line in result.stdout.splitlines():
+        # mypy prints paths relative to cwd (tests/fixtures/<name>:...).
+        # Match by prefix to avoid false positives from message text.
+        for f in files:
+            if line.startswith(f"tests/fixtures/{f.name}:") or line.startswith(f"{f}:"):
+                per_file[f.name].append(line)
+                break
+            # Absolute-path fallback (cwd variations).
+            if line.startswith(f"{str(f)}:"):
+                per_file[f.name].append(line)
+                break
+    for f in files:
+        lines = per_file[f.name]
+        n_errors = sum(1 for line in lines if ": error:" in line)
+        if n_errors == 0:
+            stdout = ("".join(line + "\n" for line in lines)
+                      + "Success: no issues found in 1 source file\n")
+            _BATCH_RESULTS[f.name] = (0, stdout)
+        else:
+            stdout = ("".join(line + "\n" for line in lines)
+                      + f"Found {n_errors} error{'s' if n_errors != 1 else ''}"
+                        f" in 1 file (checked 1 source file)\n")
+            _BATCH_RESULTS[f.name] = (1, stdout)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _fresh_mypy_cache() -> None:
+    global _BATCH_READY
+    _BATCH_RESULTS.clear()
+    _BATCH_READY = False
     shutil.rmtree(CACHE, ignore_errors=True)
+    # Flag-specific caches (see run_mypy) live beside CACHE.
+    for extra in CACHE.parent.glob(CACHE.name + "-flags-*"):
+        shutil.rmtree(extra, ignore_errors=True)
     yield
     shutil.rmtree(CACHE, ignore_errors=True)
+    for extra in CACHE.parent.glob(CACHE.name + "-flags-*"):
+        shutil.rmtree(extra, ignore_errors=True)
+    _BATCH_RESULTS.clear()
+    _BATCH_READY = False
+
+
+def _cache_for_flags(flags: tuple[str, ...]) -> Path:
+    if not flags:
+        return CACHE
+    import hashlib
+
+    digest = hashlib.md5(" ".join(flags).encode()).hexdigest()[:12]
+    return CACHE.parent / f"{CACHE.name}-flags-{digest}"
 
 
 def run_mypy(*paths: Path, flags: tuple[str, ...] = ()) -> "subprocess.CompletedProcess[str]":
+    # Fast path: default-flag single-fixture checks are served from the
+    # session batch (no new subprocess, no cache thrashing).
+    if not flags and len(paths) == 1:
+        try:
+            single = Path(paths[0])
+        except Exception:
+            single = None  # type: ignore[assignment]
+        if single is not None and single.parent == FIXTURES and single.suffix == ".py":
+            _ensure_batch()
+            hit = _BATCH_RESULTS.get(single.name)
+            if hit is not None:
+                returncode, stdout = hit
+                return subprocess.CompletedProcess(
+                    args=[], returncode=returncode, stdout=stdout, stderr=""
+                )
     # PYTHONPATH (not MYPYPATH) is what lets mypy import the local plugin.
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    cache_dir = _cache_for_flags(flags)
     return subprocess.run(
-        [sys.executable, "-m", "mypy", "--cache-dir", str(CACHE), *flags, *map(str, paths)],
+        [sys.executable, "-m", "mypy", "--cache-dir", str(cache_dir), *flags, *map(str, paths)],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -1018,7 +1107,13 @@ def test_unknown_concrete_boundary() -> None:
     )
 
 
+_FIXTURE_RUN_CACHE: dict[str, list[str]] = {}
+
+
 def _run_fixture(name: str) -> list[str]:
+    hit = _FIXTURE_RUN_CACHE.get(name)
+    if hit is not None:
+        return list(hit)
     run = subprocess.run(
         [sys.executable, str(FIXTURES / name)],
         capture_output=True,
@@ -1026,7 +1121,9 @@ def _run_fixture(name: str) -> list[str]:
         timeout=120,
     )
     assert run.returncode == 0, run.stderr
-    return run.stdout.strip().splitlines()
+    out = run.stdout.strip().splitlines()
+    _FIXTURE_RUN_CACHE[name] = out
+    return list(out)
 
 
 def test_unknown_names_distinct_and_readable() -> None:
