@@ -2339,6 +2339,20 @@ def _mul_dims(
     return _materialize_dim(ctx, op, index, acc)
 
 
+def _is_bare_name_dim(d: int | Type) -> bool:
+    """An int, or one declared size name: no formula and no unknown."""
+    if isinstance(d, int):
+        return True
+    form = _resolve_dim(d)
+    return (
+        isinstance(form, _LinForm)
+        and form.const == 0
+        and len(form.coeffs) == 1
+        and form.coeffs[0][1] == 1
+        and not _form_has_unknown(form)
+    )
+
+
 def _linear_product(dims: list[int | Type]) -> _LinForm | _MonoForm | None:
     """Canonical total product: linear or single monomial, else None."""
     acc: _LinForm | _MonoForm | None = _LinForm((), 1)
@@ -3667,6 +3681,60 @@ def _has_mixed_operand(*types: Type) -> bool:
         isinstance(p, Instance) and p.type.fullname == NDARRAY_FULLNAME and _is_mixed_shape(p)
         for p in map(get_proper_type, types)
     )
+
+
+def _movable_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
+    """(dims, dtype) for ops that only move axes around (transposes).
+
+    Those never read a size, so an axis of unknown size (`Any`, as a
+    dynamic reshape leaves) moves like any other. Without this the
+    stubs answer: `.T` and `transpose` return Self there, the shape
+    unreversed.
+    """
+    parts = _ndarray_parts(tp) or _mixed_parts(tp)
+    if parts is not None:
+        return parts
+    proper = get_proper_type(tp)
+    if not (
+        isinstance(proper, Instance)
+        and proper.type.fullname == NDARRAY_FULLNAME
+        and len(proper.args) == 2
+    ):
+        return None
+    shape = get_proper_type(proper.args[0])
+    if not isinstance(shape, TupleType):
+        return None
+    dims: list[int | Type] = []
+    for item in shape.items:
+        value = _dim_value(item)
+        plain = get_proper_type(item)
+        if value is not None:
+            dims.append(value)
+        elif isinstance(plain, Instance) and plain.type.fullname == INT_FULLNAME:
+            dims.append(plain.copy_modified(last_known_value=None))
+        elif isinstance(plain, AnyType):
+            dims.append(plain)
+        else:
+            return None
+    return dims, proper.args[1]
+
+
+def _unknown_axis_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
+    """(dims, dtype) of a shape with an axis of unknown size (`Any`).
+
+    For ops that drop or move axes without reading a size. The stubs'
+    answer there is wrong: Self for swapaxes and moveaxis (the shape
+    unmoved), a signed dtype for `sum` of uint8. Mixed shapes (a
+    literal next to a plain `int`) keep their own rule, see #34.
+    """
+    if _mixed_parts(tp) is not None:
+        return None
+    parts = _movable_parts(tp)
+    if parts is None or any(_is_plain_int(d) for d in parts[0]):
+        # A widened mixed shape, (int, Any): moving its axes would stop
+        # `x = np.moveaxis(x, 0, 1)` from fitting x again.
+        return None
+    return parts
 
 
 def _mixed_parts(tp: Type, partner: bool = False) -> tuple[list[int | Type], Type] | None:
@@ -7248,6 +7316,106 @@ def _solve_reshape_unpack(
     return _ndarray_type(ctx, list(raw), dtype)
 
 
+def _fold_dim_expr(
+    ctx: FunctionContext | MethodContext, expr: Expression, index: int
+) -> int | Type | None:
+    """A size written as arithmetic over known sizes, else None.
+
+    `a.shape[0] * a.shape[1]`, `n + 1`, `2 * a.shape[0]`, `n // 2`:
+    mypy types all of these `int`, which loses the size. The operands
+    are read from their own types (a literal, or a shape variable) and
+    combined with the dim algebra; what the algebra cannot spell (a
+    sum times a sum) is a fresh unknown, which is still a size.
+    """
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+    if isinstance(expr, OpExpr) and expr.op in ("+", "-", "*", "//"):
+        left = _fold_dim_expr(ctx, expr.left, index)
+        right = _fold_dim_expr(ctx, expr.right, index)
+        if left is None or right is None:
+            return None
+        op = "shape-arith"
+        if expr.op == "+":
+            return _dim_add2(ctx, op, index, left, right)
+        if expr.op == "-":
+            if isinstance(right, int):
+                return _dim_add_const(ctx, op, index, left, -right)
+            return _dim_add2(ctx, op, index, left, _dim_mul_const(ctx, op, index, right, -1))
+        if expr.op == "*":
+            if isinstance(right, int):
+                return _dim_mul_const(ctx, op, index, left, right)
+            if isinstance(left, int):
+                return _dim_mul_const(ctx, op, index, right, left)
+            fa, fb = _resolve_dim(left), _resolve_dim(right)
+            if isinstance(fa, (_LinForm, _MonoForm)) and isinstance(fb, (_LinForm, _MonoForm)):
+                product = _form_mul(fa, fb)
+                if product is not None:
+                    return _materialize_dim(ctx, op, index, product)
+            return _fresh_unknown(ctx, op, index)
+        if not isinstance(right, int) or right <= 0:
+            return None
+        if isinstance(left, int):
+            return left // right
+        return _dim_div(ctx, op, index, left, right, 0)
+    lookup = getattr(ctx.api, "lookup_type_or_none", None)
+    tp = lookup(expr) if lookup is not None else None
+    if tp is None:
+        return None
+    dim = _dim_value(tp)
+    return dim if isinstance(dim, (int, TypeVarType)) else None
+
+
+def _reshape_fold_arithmetic(
+    ctx: FunctionContext | MethodContext, pairs: list[tuple[Type, Expression | None]]
+) -> list[tuple[Type, Expression | None]]:
+    """`pairs` with arithmetic target sizes replaced by the dim they spell.
+
+    `x.reshape(x.shape[0] * x.shape[1], -1)` names its first size
+    exactly; read as the plain `int` mypy gives it, the size is lost.
+    """
+    if not pairs:
+        return pairs
+    int_instance = ctx.api.named_generic_type(INT_FULLNAME, [])
+
+    def folded(expr: Expression | None, index: int) -> Type | None:
+        if not isinstance(expr, OpExpr) or _fold_int(expr) is not None:
+            return None
+        dim = _fold_dim_expr(ctx, expr, index)
+        if dim is None:
+            return None
+        return LiteralType(dim, fallback=int_instance) if isinstance(dim, int) else dim
+
+    first_tp, first_expr = pairs[0]
+    first = get_proper_type(first_tp)
+    if isinstance(first_expr, TupleExpr):
+        if not isinstance(first, TupleType) or len(first.items) != len(first_expr.items):
+            return pairs
+        if any(isinstance(item, StarExpr) for item in first_expr.items):
+            return pairs
+        items: list[Type] = []
+        changed = False
+        for index, (item_tp, item_expr) in enumerate(zip(first.items, first_expr.items)):
+            new = folded(item_expr, index)
+            if new is None:
+                # The expression is dropped below, so keep what it folds to.
+                literal = _fold_int(item_expr)
+                if literal is not None:
+                    new = LiteralType(literal, fallback=int_instance)
+            else:
+                changed = True
+            items.append(new if new is not None else item_tp)
+        if not changed:
+            return pairs
+        return [(first.copy_modified(items=items), None), *pairs[1:]]
+    out = list(pairs)
+    for index, (_, expr) in enumerate(pairs):
+        new = folded(expr, index)
+        if new is not None:
+            out[index] = (new, None)
+    return out
+
+
 def _reshape_dynamic_dims(
     pairs: list[tuple[Type, Expression | None]],
 ) -> list[int | Type] | None:
@@ -7344,6 +7512,10 @@ def _solve_reshape_dynamic(
 def _solve_reshape(
     ctx: FunctionContext | MethodContext, old: Type, pairs: list[tuple[Type, Expression | None]]
 ) -> Type:
+    try:
+        pairs = _reshape_fold_arithmetic(ctx, pairs)
+    except Exception:
+        _swallowed(ctx, "_reshape_fold_arithmetic")
     # A plain `int` target size, or an input whose shape the exact paths
     # below cannot read (mixed, all-int): keep the requested literals.
     dynamic = _reshape_dynamic_dims(pairs)
@@ -7470,7 +7642,12 @@ def _solve_reshape(
         )
         # Canonical equality only ever silences: N*2 vs 2*N is proven, and
         # every loud below also fired before (or shows the same numbers).
-        if size_new != size_old and not forms_equal:
+        # Comparing the literal factors alone only means something when
+        # every other dim is a bare name: `2*N+2` carries a factor of 2
+        # that (N+1, 2) spells as a literal, and an unknown may hide any.
+        both_formed = old_form is not None and new_form is not None
+        literal_only = all(_is_bare_name_dim(d) for d in [*dims_old, *raw])
+        if size_new != size_old and not forms_equal and (both_formed or literal_only):
             if old_form is not None and new_form is not None:
                 ctx.api.fail(
                     f"reshape changes total size: {_expr_str(old_form)} -> "
@@ -8245,7 +8422,7 @@ def _reduction_bool_types(
     dtype: Type,
     op: str = "any",
 ) -> Type:
-    parts = _parts_or_unpack(array)
+    parts = _parts_or_unpack(array) or _unknown_axis_parts(array)
     if parts is None:
         return ctx.default_return_type
     dims, _ = parts
@@ -9548,7 +9725,7 @@ def transpose_method_hook(ctx: MethodContext) -> Type:
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
         return ctx.default_return_type
-    parts = _ndarray_parts(ctx.type) or _mixed_parts(ctx.type)
+    parts = _movable_parts(ctx.type)
     if parts is not None:
         dims, dtype = parts
         return _solve_transpose(ctx, dims, dtype, pairs)
@@ -9587,7 +9764,7 @@ def transpose_function_hook(ctx: FunctionContext) -> Type:
         if first is None:
             return ctx.default_return_type
         pairs = [first]
-    parts = _ndarray_parts(pairs[0][0]) or _mixed_parts(pairs[0][0])
+    parts = _movable_parts(pairs[0][0])
     if parts is None:
         split = _unpack_shape(pairs[0][0])
         if split is None:
@@ -9680,7 +9857,7 @@ def swapaxes_function_hook(ctx: FunctionContext) -> Type:
             a2_pair = pairs[2]
         if arr_pair is None:
             return ctx.default_return_type
-        parts = _ndarray_parts(arr_pair[0])
+        parts = _ndarray_parts(arr_pair[0]) or _unknown_axis_parts(arr_pair[0])
         if parts is None:
             return ctx.default_return_type
         dims, dtype = parts
@@ -9703,7 +9880,7 @@ def swapaxes_function_hook(ctx: FunctionContext) -> Type:
 
 
 def swapaxes_method_hook(ctx: MethodContext) -> Type:
-    parts = _ndarray_parts(ctx.type)
+    parts = _ndarray_parts(ctx.type) or _unknown_axis_parts(ctx.type)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -9762,7 +9939,7 @@ def moveaxis_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
+    parts = _ndarray_parts(pairs[0][0]) or _unknown_axis_parts(pairs[0][0])
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -9820,7 +9997,7 @@ def rollaxis_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
+    parts = _ndarray_parts(pairs[0][0]) or _unknown_axis_parts(pairs[0][0])
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -9901,7 +10078,7 @@ def matrix_transpose_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
+    parts = _ndarray_parts(pairs[0][0]) or _unknown_axis_parts(pairs[0][0])
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -9909,7 +10086,7 @@ def matrix_transpose_function_hook(ctx: FunctionContext) -> Type:
 
 
 def mt_attribute_hook(ctx: AttributeContext) -> Type:
-    parts = _ndarray_parts(ctx.type) or _mixed_parts(ctx.type)
+    parts = _movable_parts(ctx.type)
     if parts is None:
         return ctx.default_attr_type
     dims, dtype = parts
@@ -9921,7 +10098,7 @@ def permute_dims_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0]) or _mixed_parts(pairs[0][0])
+    parts = _movable_parts(pairs[0][0])
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -10174,6 +10351,33 @@ def _reduction_inputs(
     return _apply_out_dtype(ctx, _reduction_types(ctx, array, axis, keepdims, has_dtype, op))
 
 
+def _reduction_dtype_only(
+    ctx: FunctionContext | MethodContext, array: Type, has_dtype: bool, op: str
+) -> Type:
+    """The stubs' answer for a shape numty cannot read, with numty's dtype.
+
+    The dtype of a reduction does not depend on the shape, and the stubs
+    get it wrong for an array result: `sum` of uint8 along an axis comes
+    back signed where numpy gives uint64.
+    """
+    default = get_proper_type(ctx.default_return_type)
+    source = get_proper_type(array)
+    if has_dtype or not all(
+        isinstance(t, Instance) and t.type.fullname == NDARRAY_FULLNAME and len(t.args) == 2
+        for t in (default, source)
+    ):
+        return ctx.default_return_type
+    assert isinstance(default, Instance) and isinstance(source, Instance)
+    if isinstance(get_proper_type(default.args[0]), TupleType):
+        # A fixed-rank answer (keepdims on a mixed shape) is widened by
+        # the caller's guard, which has to see the stubs' own object.
+        return ctx.default_return_type
+    out_dtype = _reduction_out_dtype(ctx, op, source.args[1])
+    if out_dtype is None:
+        return ctx.default_return_type
+    return default.copy_modified(args=[default.args[0], out_dtype])
+
+
 def _reduction_types(
     ctx: FunctionContext | MethodContext,
     array: Type,
@@ -10182,9 +10386,9 @@ def _reduction_types(
     has_dtype: bool,
     op: str = "sum",
 ) -> Type:
-    parts = _parts_or_unpack(array)
+    parts = _parts_or_unpack(array) or _unknown_axis_parts(array)
     if parts is None:
-        return ctx.default_return_type
+        return _reduction_dtype_only(ctx, array, has_dtype, op)
     dims, dtype = parts
     if _has_unpack(dims):
         split = _split_flat(dims)
@@ -14975,7 +15179,7 @@ def _t_type(ctx: AttributeContext, tp: Type) -> Type:
     Unpack shapes bail: reversing would also reverse *Ts itself, which
     no annotation can spell (issue #48). Anything else stays on the stubs.
     """
-    parts = _ndarray_parts(tp) or _mixed_parts(tp)
+    parts = _movable_parts(tp)
     if parts is not None:
         dims, dtype = parts
         return _ndarray_type(ctx, list(reversed(dims)), dtype)

@@ -1114,6 +1114,41 @@ def test_permutation_of_a_0d_array() -> None:
     assert len(reveals_by_line(result)) == 2, result.stdout
 
 
+def test_reshape_targets_written_as_arithmetic() -> None:
+    # Found by the oracle's symbolic reshape family.
+    # - `x.reshape(x.shape[0] * x.shape[1])` was read as a plain `int`
+    #   and the size lost; arithmetic over sizes is now folded.
+    # - `.T`, swapaxes and moveaxis on a shape with an axis of unknown
+    #   size took the stubs' Self: the shape came back unmoved.
+    # - `sum` along an axis of such an array took the stubs' dtype,
+    #   signed for a uint8 input where numpy gives uint64.
+    # - (N+1, 2) to (2*N+2,) was "reshape changes total size: 2 -> 1":
+    #   only the literal factors were compared, and 2*N+2 hides one.
+    result = run_mypy(FIXTURES / "reshape_arithmetic_ok.py")
+    assert result.returncode == 0, result.stdout
+    nd = "numpy.ndarray[tuple[{}], numpy.dtype[{}]]"
+    bits = "numpy._typing._nbit_base._{}Bit"
+    f64 = "numpy.float64"
+    u8, u64 = (f"numpy.unsignedinteger[{bits.format(n)}]" for n in (8, 64))
+    assert reveals_by_line(result) == {
+        19: f'"{nd.format("M*N", u8)}"',
+        20: f'"{nd.format("Literal[1], 3*M", f64)}"',
+        21: f'"{nd.format("2*M, ?U@21", u8)}"',
+        22: f'"{nd.format("Literal[1], M*N", u8)}"',
+        24: f'"{nd.format("Literal[3], Any, Literal[1]", f64)}"',
+        25: f'"{nd.format("Literal[3], Any, Literal[1]", f64)}"',
+        26: f'"{nd.format("Any, Literal[3], Literal[1]", f64)}"',
+        27: f'"{nd.format("Any", u64)}"',
+        29: f'"{nd.format("int", f64)}"',
+        30: f'"{nd.format("Literal[2]", f64)}"',
+    }, result.stdout
+    assert _run_fixture("reshape_arithmetic_ok.py") == [
+        "(24,) uint8", "(1, 12) float64", "(8, 3) uint8", "(1, 24) uint8",
+        "(3, 4, 1) float64", "(3, 4, 1) float64", "(4, 3, 1) float64", "(24,) uint64",
+        "(14,) float64", "(2,) float64",
+    ]
+
+
 def test_callsite_conflict() -> None:
     result = run_mypy(FIXTURES / "bad_callsite_conflict.py")
     assert result.returncode == 1, result.stdout
