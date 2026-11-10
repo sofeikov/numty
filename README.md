@@ -112,9 +112,9 @@ error: Incompatible return value type (got "ndarray[tuple[batch, heads, seq, seq
   latest long run (42,000 expressions, seeds 101-130, NumPy 2.5.4,
   mypy 2.4.1) had **no disagreements**. Each symbolic expression is
   run at four sets of sizes, empty axes included, which makes 105,000
-  comparisons: 60,709 exact shapes matched NumPy's, and of the 27,632
-  NumPy rejects, 17,484 were reported before running. Three cases hit
-  documented gaps in NumPy's own stubs and 144 hit the empty-axis
+  comparisons: 59,023 exact shapes matched NumPy's, and of the 27,853
+  NumPy rejects, 17,160 were reported before running. Three cases hit
+  documented gaps in NumPy's own stubs and 137 hit the empty-axis
   limit on symbolic subtraction (see
   [Checked against numpy](#checked-against-numpy)).
 - **It finds seeded bugs.** [bench/](bench) hides 18 realistic
@@ -817,7 +817,10 @@ and reshape proves `N*2` vs `2*N` (dividing `-1` exactly); mismatches
 error with readable formulas. Products of distinct symbolic dims track
 as monomials (`H*D`, `C*H*W`): flattening `(B, C, H, W)` with `-1`
 infers `(B, C*H*W)`, `(N, K)` reshaped to `(N, -1)` infers `(N, K)`,
-and the round-trip back proves clean by commutativity.
+and the round-trip back proves clean by commutativity. A reshape
+target may spell its sizes as arithmetic over known ones:
+`x.reshape(x.shape[0] * x.shape[1], -1)` on `(N, M, K)` is `(M*N, K)`,
+and `2 * n`, `n + 1` and `n // 2` are read the same way.
 `sliding_window_view` appends the window
 after the shrunken dims (`N-w+1`, symbolic included — the conv-output
 formula falls out). Linear forms also spell in annotations: `I64["N+1"]`

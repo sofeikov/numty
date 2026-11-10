@@ -694,6 +694,71 @@ class SymGen(Gen):
         target = self.rng.choice(("-1", "(-1,)", "(1, -1)", "(-1, 1)", f"{a.text}.shape[::-1]", "(2, -1)"))
         return f"{a.text}.reshape({target})"
 
+    def reshape_symbolic(self) -> str:
+        """Reshape to a target spelled from the operands' own sizes.
+
+        The total has to be conserved as a product of symbolic dims,
+        which is the one place numty compares factors (`2*N` against
+        `N`). Some targets conserve it, some cannot, and some only do
+        for another operand's sizes.
+        """
+        r = self.rng
+        a = self.operand(self.shape(r.choice((1, 2, 2, 3, 3))))
+        rank = len(a.shape)
+        x = a.text
+
+        def dim(i: int) -> str:
+            return f"{x}.shape[{i}]"
+
+        every = [dim(i) for i in range(rank)]
+        product = " * ".join(every)
+        targets = [
+            f"({product},)",
+            f"({product}, 1)",
+            f"(1, {product})",
+            f"({', '.join(reversed(every))},)",
+            f"({', '.join(r.sample(every, rank))},)",
+            f"({dim(0)}, -1)",
+            f"(-1, {dim(-1)})",
+            f"(-1, {dim(0)})",
+            f"(*{x}.shape, 1)",
+            f"(1, *{x}.shape)",
+            f"{x}.shape + (1,)",
+            f"(-1, *{x}.shape[1:])",
+            f"(*{x}.shape[:-1], -1)",
+            f"(2, {product})",  # twice the total
+            f"(2 * {dim(0)}, -1)",
+            f"({dim(0)} + 1, -1)",
+            f"({dim(0)}, {dim(0)})",
+            f"({dim(0)} // 2, -1)",
+            f"(2, -1, {dim(-1)})",
+            f"(-1, 2, 3)",
+            f"({dim(0)}, 2, -1)",
+        ]
+        if rank >= 2:
+            targets += [
+                f"({dim(0)} * {dim(1)}, -1)",
+                f"({dim(0)}, {' * '.join(every[1:])})",
+                f"(-1, {dim(0)} * {dim(1)})",
+                f"({dim(1)}, -1, {dim(0)})",
+                f"({dim(0)} * {dim(1)},)",
+            ]
+        if r.random() < 0.3:
+            b = self.near(a.shape)
+            targets = [
+                f"{b.text}.shape",
+                f"({b.text}.shape[0], -1)",
+                f"(-1, {b.text}.shape[-1])",
+                f"(*{b.text}.shape, -1)",
+                f"({b.text}.size,)",
+                f"({x}.size // {b.text}.shape[0], {b.text}.shape[0])",
+            ]
+        target = r.choice(targets)
+        tail = r.choice(("", "", "", ".T", ".sum(axis=0)", ".reshape(-1)", f".reshape({x}.shape)"))
+        if target.startswith("(") and r.random() < 0.25:
+            return f"{x}.reshape(*{target}){tail}"
+        return r.choice(("{}.reshape({}){}", "np.reshape({}, {}){}")).format(x, target, tail)
+
     def getitem(self) -> str:
         a = self.operand(self.shape(self.rng.choice((1, 2, 2, 3))))
         items = [
@@ -825,6 +890,7 @@ class SymGen(Gen):
         Gen.einsum, Gen.window, chain, Gen.split, Gen.edit,
         Gen.all_any, Gen.rounding, Gen.divmod_builtin, Gen.linalg_cross,
         Gen.array_method, Gen.array_method, Gen.rng_method,
+        reshape_symbolic, reshape_symbolic, reshape_symbolic,
         call, call, call, call,
     )
 
