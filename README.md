@@ -958,7 +958,7 @@ under it (see `tests/fixtures/rebind_allow_ok.py`).
 
 ### Installing elsewhere
 
-`numty` ships as regular packages (`numty` plus the plugin and the two
+`numty` ships as regular packages (`numty` plus the plugin and the three
 tools, each with its own PEP 561 `py.typed` marker), so an out-of-tree
 install just works — no `PYTHONPATH` or `mypy_path` needed:
 
@@ -1061,9 +1061,10 @@ cat /tmp/numty.jsonl
 
 writes one JSON object per hook call that needed attention:
 `{file, line, col, op, outcome, reason}` with `outcome` one of
-`solved`, `bail` (a hooked call kept the stubs' type) or `unhooked`
+`solved`, `bail` (a hooked call kept the stubs' type), `unhooked`
 (a `numpy.*` call with no hook where a known shape flowed in
-unchecked, e.g. `np.kron`). Only modules that are actually re-checked
+unchecked, e.g. `np.kron`) or `crash` (the hook itself failed; see
+below). Only modules that are actually re-checked
 emit events, so use a fresh `--cache-dir` when collecting a trace.
 
 ```bash
@@ -1080,6 +1081,55 @@ with `# type: ignore[numty-unsolved]`. Unhooked overloaded functions
 diagnostic inside the hook aborts mypy's overload search and turns a
 correct call into `arg-type` noise, so strict leaves those to the
 trace.
+
+`python -m numty_report` measures the give-ups instead of erroring on
+them: it runs mypy with tracing on a fresh cache and prints per-file
+`solved` / `bailed` / `unhooked` / `crashed` counts plus the top bail
+reasons (the same idea as mypy's `--any-exprs-report`):
+
+```bash
+PYTHONPATH=. python -m numty_report --top 5 repro.py
+```
+
+```text
+repro.py:4: note: Revealed type is "numpy.ndarray[Any, Any]"
+Success: no issues found in 1 source file
+numty report: 23 traced call(s) in 1 file(s) (694 stub/site-packages event(s) hidden; --all-files to show)
+file             solved  bailed  unhooked  crashed  total
+repro.py             11       6         6        0     23
+top bail reasons (top 5):
+  6x typing.SupportsIndex.__index__: unsolved (default stub type kept)
+top unhooked ops (top 5):
+  6x numpy.linalg._linalg.eigvals
+```
+
+mypy's own output passes through and its exit code is kept, so the
+report can replace a bare `mypy` invocation. Third-party stub and
+site-packages events are hidden by default (`--all-files` shows
+them); `--cache-dir` and `--trace-file` override the fresh temporary
+ones. Bails stay silent by default — erroring on them punishes
+correct code, which is what strict is for.
+
+### Supported versions and startup warnings
+
+numty hooks key on private numpy module paths (e.g.
+`numpy._core.einsumfunc.einsum`) and on mypy internals, so a version
+drift can silently unhook everything — on numpy 2.2–2.4 the
+constructor hooks never fired (#67). Two gates warn loudly instead:
+
+- `plugin(version)` compares the running mypy against the tested
+  range (2.4.x) and prints one `numty: warning:` to stderr outside it.
+- On first use, the installed numpy is compared against the minimum
+  supported (2.5, the `numpy>=2.5` floor), and a canary resolves a
+  short list of hooked fullnames (`numpy._core.multiarray.zeros`,
+  `numpy._core.fromnumeric.reshape`, `numpy.linalg._linalg.norm`,
+  `numpy.ndarray.__matmul__`, …) in the loaded stubs, warning once
+  naming any that is missing. Only modules the checked code actually
+  loads are judged, so unrelated renames elsewhere stay silent.
+
+CI runs the suite against both the oldest supported numpy and the
+latest release, so a stub rename that unhooks everything fails there
+first.
 
 ### When numty itself fails
 

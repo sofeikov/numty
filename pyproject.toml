@@ -36,7 +36,7 @@ build-backend = "hatchling.build"
 # top-level import names (`plugins = numty_plugin` is unchanged). As a
 # side effect the editable install is a single `.pth` to the checkout, so
 # `numty` and the tools all import live from one place.
-packages = ["numty", "numty_plugin", "numty_convert", "numty_codmod"]
+packages = ["numty", "numty_plugin", "numty_convert", "numty_codmod", "numty_report"]
 
 [tool.pytest.ini_options]
 # Parallel by default: mypy/python subprocesses dominate runtime and the

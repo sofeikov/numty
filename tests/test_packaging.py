@@ -9,7 +9,8 @@ top-level `py.typed` next to them nor a co-located `.pyi` is honored for
 an installed top-level `.py`). Editable installs additionally
 split-brained: `numty` imported live from the checkout while the tools
 resolved to stale site-packages copies. The fix is one regular package
-per tool (`numty_plugin/`, `numty_convert/`, `numty_codmod/`), each with
+per tool (`numty_plugin/`, `numty_convert/`, `numty_codmod/`,
+`numty_report/`), each with
 its own `py.typed`, keeping the same top-level import names — so the
 editable install is a single `.pth` and everything imports live.
 
@@ -28,7 +29,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
-TOOLS = ("numty_plugin", "numty_convert", "numty_codmod")
+TOOLS = ("numty_plugin", "numty_convert", "numty_codmod", "numty_report")
 
 uv = shutil.which("uv")
 pytestmark = pytest.mark.skipif(uv is None, reason="uv is required (see README quickstart)")
@@ -126,7 +127,7 @@ def test_editable_install_imports_live_from_one_place(tmp_path: Path) -> None:
 
     probe = (
         "import importlib.util\n"
-        "for name in ['numty', 'numty_plugin', 'numty_convert', 'numty_codmod']:\n"
+        "for name in ['numty', 'numty_plugin', 'numty_convert', 'numty_codmod', 'numty_report']:\n"
         "    spec = importlib.util.find_spec(name)\n"
         "    print(name, spec.origin)\n"
     )
@@ -140,7 +141,7 @@ def test_editable_install_imports_live_from_one_place(tmp_path: Path) -> None:
         line.split(" ", 1) for line in result.stdout.strip().splitlines()
     )
     assert set(origins) == {
-        "numty", "numty_plugin", "numty_convert", "numty_codmod",
+        "numty", "numty_plugin", "numty_convert", "numty_codmod", "numty_report",
     }, result.stdout
     root = str(ROOT)
     stale = {
