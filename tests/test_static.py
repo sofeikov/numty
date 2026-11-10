@@ -2450,6 +2450,26 @@ def test_vdot_size_mismatch() -> None:
     )
 
 
+def test_contract_pair_symbolic_mismatch() -> None:
+    # Issue #139: dot/inner/tensordot/vdot missed N+1 vs N that
+    # matmul/broadcast already flag; distinct ?U bails (Any) not scalar.
+    result = run_mypy(FIXTURES / "bad_contract_pair_symbolic.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    solver = [
+        line
+        for line in errors
+        if "contracted dimensions disagree" in line or "different sizes" in line
+    ]
+    assert len(solver) == 6, result.stdout
+    assert "dot contracted dimensions disagree: N+1 vs N" in solver[0], result.stdout
+    assert "dot contracted dimensions disagree: N+1 vs N" in solver[1], result.stdout
+    assert "inner contracted dimensions disagree: N+1 vs N" in solver[2], result.stdout
+    assert "tensordot contracted dimensions disagree: N+1 vs N" in solver[3], result.stdout
+    assert "dot contracted dimensions disagree: N+1 vs N" in solver[4], result.stdout
+    assert "vdot operands have different sizes: N+1 vs N" in solver[5], result.stdout
+
+
 def test_take_oob_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_take_oob.py"),
