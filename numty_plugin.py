@@ -330,6 +330,10 @@ class NumtyPlugin(Plugin):
         # shape TypeVars in its formals gets the call-site conflict
         # check. Overloads are skipped: the hook runs per candidate and
         # a non-matching item would false-positive.
+        if fullname == "numpy.linalg._linalg.norm":
+            return _norm_signature_hook
+        if fullname == "numpy._core.einsumfunc.einsum":
+            return _einsum_signature_hook
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
         return self.callsite_signature_hook
@@ -348,6 +352,46 @@ class NumtyPlugin(Plugin):
         # Instance/class/static methods and __call__ get the call-site
         # conflict check plus rank notes; anything else the checker
         # resolves without shape generics stays unhooked.
+        if fullname == "numpy.ndarray.reshape":
+            return _reshape_signature_hook
+        # Broadcast operators: suppress mechanical [operator] duplicate
+        # when our hook already reports the mismatch (issue #148). Only
+        # for dunders that broadcast; clean calls keep default.
+        if fullname in {
+            "numpy.ndarray.__add__",
+            "numpy.ndarray.__radd__",
+            "numpy.ndarray.__sub__",
+            "numpy.ndarray.__rsub__",
+            "numpy.ndarray.__mul__",
+            "numpy.ndarray.__rmul__",
+            "numpy.ndarray.__truediv__",
+            "numpy.ndarray.__rtruediv__",
+            "numpy.ndarray.__floordiv__",
+            "numpy.ndarray.__rfloordiv__",
+            "numpy.ndarray.__mod__",
+            "numpy.ndarray.__rmod__",
+            "numpy.ndarray.__pow__",
+            "numpy.ndarray.__rpow__",
+            "numpy.ndarray.__xor__",
+            "numpy.ndarray.__rxor__",
+            "numpy.ndarray.__lshift__",
+            "numpy.ndarray.__rlshift__",
+            "numpy.ndarray.__rshift__",
+            "numpy.ndarray.__rrshift__",
+            "numpy.ndarray.__divmod__",
+            "numpy.ndarray.__rdivmod__",
+            "numpy.ndarray.__eq__",
+            "numpy.ndarray.__ne__",
+            "numpy.ndarray.__lt__",
+            "numpy.ndarray.__le__",
+            "numpy.ndarray.__gt__",
+            "numpy.ndarray.__ge__",
+            "numpy.ndarray.__and__",
+            "numpy.ndarray.__rand__",
+            "numpy.ndarray.__or__",
+            "numpy.ndarray.__ror__",
+        }:
+            return _broadcast_signature_hook
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
         # A hook here would make every method call in the program (list,
@@ -1404,7 +1448,7 @@ class NumtyPlugin(Plugin):
         }:
             return logical_method_hook
         if fullname.startswith("numpy.ndarray.") and short in {"any", "all"}:
-            return allany_method_hook
+            return partial(allany_method_hook, op=short)
         if fullname.startswith("numpy.ndarray.") and short in {
             "argmax",
             "argmin",
@@ -1449,7 +1493,7 @@ class NumtyPlugin(Plugin):
         }:
             return partial(reduction_method_hook, op=short)
         if fullname.startswith("numpy.ndarray.") and short in {"cumsum", "cumprod"}:
-            return cumsum_method_hook
+            return partial(cumsum_method_hook, op=short)
         if fullname.startswith("numpy.ndarray.") and short == "ravel":
             return ravel_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "flatten":
@@ -4243,7 +4287,8 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
             if na in seen_a or nb in seen_b:
                 bad = ia if na in seen_a else ib
                 ctx.api.fail(
-                    f"duplicate axis {bad} in tensordot axes",
+                    f"tensordot has duplicate axis {bad} in {tuple(axes_a + axes_b)} "
+                    f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
                     ctx.context,
                     code=NUMTY_AXIS,
                 )
@@ -4374,7 +4419,7 @@ def _take_solve(
     norm = _normalize_axis_0d(axis[0], len(dims))
     if norm is None:
         ctx.api.fail(
-            f"axis {axis[0]} is out of range for {len(dims)} dimensions "
+            f"take axis {axis[0]} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
             code=NUMTY_AXIS,
@@ -4698,6 +4743,8 @@ def _string_value(tp: Type) -> str | None:
     proper = get_proper_type(tp)
     if isinstance(proper, LiteralType) and isinstance(proper.value, str):
         return proper.value
+    if isinstance(proper, Instance) and proper.last_known_value is not None:
+        return _string_value(proper.last_known_value)
     return None
 
 
@@ -7400,13 +7447,18 @@ def _solve_expand_dims(
         if not 0 <= norm < total:
             ctx.api.fail(
                 f"expand_dims axis {ax} is out of range for {ndim} dimensions "
-                f"with {len(axis)} new axes",
+                f"with {len(axis)} new axes (shape {_dims_str(dims)})",
                 ctx.context,
                 code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         if norm in normalized:
-            ctx.api.fail(f"expand_dims has duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
+            ctx.api.fail(
+                f"expand_dims has duplicate axis {ax} in {tuple(axis)} "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
             return ctx.default_return_type
         normalized.append(norm)
     out = list(dims)
@@ -7468,6 +7520,7 @@ def _solve_reduction(
     keepdims: bool | None,
     has_dtype: bool,
     force_dtype: Type | None = None,
+    op: str = "sum",
 ) -> Type:
     if not isinstance(axis, list) or keepdims is None or has_dtype:
         return ctx.default_return_type
@@ -7480,14 +7533,19 @@ def _solve_reduction(
         norm = _normalize_axis_0d(ax, ndim)
         if norm is None:
             ctx.api.fail(
-                f"axis {ax} is out of range for {ndim} dimensions "
+                f"{op} axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
                 code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         if norm in normalized:
-            ctx.api.fail(f"duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
+            ctx.api.fail(
+                f"{op} has duplicate axis {ax} in {tuple(axis)} "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
             return ctx.default_return_type
         normalized.append(norm)
     chosen = set(normalized)
@@ -7496,7 +7554,9 @@ def _solve_reduction(
     return _maybe_scalar(ctx, [d for i, d in enumerate(dims) if i not in chosen], out_dtype)
 
 
-def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) -> Type:
+def _reduction_inputs_bool(
+    ctx: FunctionContext | MethodContext, array: Type, op: str = "any"
+) -> Type:
     """any/all: same axis rules as reductions, but the output is bool."""
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     keep_pair = _formal_pair(ctx, "keepdims")
@@ -7507,11 +7567,11 @@ def _reduction_inputs_bool(ctx: FunctionContext | MethodContext, array: Type) ->
     if dtype is None:
         return ctx.default_return_type
     dist = _distribute_solve(
-        [array], lambda t: _reduction_bool_types(ctx, t, axis, keepdims, has_dtype, dtype)
+        [array], lambda t: _reduction_bool_types(ctx, t, axis, keepdims, has_dtype, dtype, op)
     )
     if dist is not None:
         return dist
-    return _reduction_bool_types(ctx, array, axis, keepdims, has_dtype, dtype)
+    return _reduction_bool_types(ctx, array, axis, keepdims, has_dtype, dtype, op)
 
 
 def _reduction_bool_types(
@@ -7521,6 +7581,7 @@ def _reduction_bool_types(
     keepdims: bool | None,
     has_dtype: bool,
     dtype: Type,
+    op: str = "any",
 ) -> Type:
     parts = _parts_or_unpack(array)
     if parts is None:
@@ -7530,7 +7591,7 @@ def _reduction_bool_types(
         split = _split_flat(dims)
         if split is None:
             return ctx.default_return_type
-        return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype, dtype)
+        return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype, dtype, op)
     if axis == "absent":
         # An omitted axis reduces every axis, exactly like axis=None.
         axis = "none"
@@ -7541,18 +7602,18 @@ def _reduction_bool_types(
             return _ndarray_type(ctx, [1] * len(dims), dtype)
         scalar = _scalar_of_dtype(dtype)
         return scalar if scalar is not None else ctx.default_return_type
-    return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, dtype)
+    return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, dtype, op)
 
 
-def allany_method_hook(ctx: MethodContext) -> Type:
-    return _reduction_inputs_bool(ctx, ctx.type)
+def allany_method_hook(ctx: MethodContext, op: str) -> Type:
+    return _reduction_inputs_bool(ctx, ctx.type, op)
 
 
-def allany_function_hook(ctx: FunctionContext) -> Type:
+def allany_function_hook(ctx: FunctionContext, op: str) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    return _reduction_inputs_bool(ctx, pairs[0][0])
+    return _reduction_inputs_bool(ctx, pairs[0][0], op)
 
 
 _DTYPE_BASE = {
@@ -8434,7 +8495,8 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     norm = _normalize_axis(axis, ndim)
     if norm is None:
         ctx.api.fail(
-            f"concatenate axis {axis} is out of range for {ndim} dimensions",
+            f"concatenate axis {axis} is out of range for {ndim} dimensions "
+            f"(shape {_dims_str(items[0][0])})",
             ctx.context,
             code=NUMTY_AXIS,
         )
@@ -8623,7 +8685,8 @@ def _concat_dynamic(
     norm = _normalize_axis(axis, len(dims_e))
     if norm is None:
         ctx.api.fail(
-            f"concatenate axis {axis} is out of range for {len(dims_e)} dimensions",
+            f"concatenate axis {axis} is out of range for {len(dims_e)} dimensions "
+            f"(shape {_dims_str(dims_e)})",
             ctx.context,
             code=NUMTY_AXIS,
         )
@@ -8651,7 +8714,8 @@ def _stack_dynamic(
     norm = axis + ndim + 1 if axis < 0 else axis
     if not 0 <= norm <= ndim:
         ctx.api.fail(
-            f"stack axis {axis} is out of range for {ndim} dimensions",
+            f"stack axis {axis} is out of range for {ndim} dimensions "
+            f"(shape {_dims_str(dims_e)})",
             ctx.context,
             code=NUMTY_AXIS,
         )
@@ -8705,20 +8769,39 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
             provable = len(dims) != len(first) or any(
                 _dims_provably_ne(x, y) for x, y in zip(first, dims)
             )
-            if all(isinstance(d, int) for d in dims) and all(
-                isinstance(d, int) for d in first
-            ):
+            if len(dims) != len(first):
                 ctx.api.fail(
-                    "stack shapes differ: "
-                    + ", ".join(_dims_str(dims) for dims, _ in items),
+                    f"stack ranks differ: "
+                    + ", ".join(_dims_str(dims) for dims, _ in items)
+                    + f" (axis {axis})",
                     ctx.context,
                     code=NUMTY_SHAPE,
                 )
                 return ctx.default_return_type
-            if provable:
+            # Same rank: name the first differing dimension and its values,
+            # like concatenate does, plus the stack axis.
+            diff_at: int | None = None
+            for i, (x, y) in enumerate(zip(first, dims)):
+                if not _dim_eq(x, y):
+                    diff_at = i
+                    break
+            if diff_at is not None and (
+                all(isinstance(d, int) for d in dims)
+                and all(isinstance(d, int) for d in first)
+            ):
+                x, y = first[diff_at], dims[diff_at]
                 ctx.api.fail(
-                    "stack shapes differ: "
-                    + ", ".join(_dims_str(dims) for dims, _ in items),
+                    f"stack dimension {diff_at} differs: {_dim_str(x)} vs {_dim_str(y)} "
+                    f"(shapes {_dims_str(first)} vs {_dims_str(dims)}; axis {axis})",
+                    ctx.context,
+                    code=NUMTY_SHAPE,
+                )
+                return ctx.default_return_type
+            if provable and diff_at is not None:
+                x, y = first[diff_at], dims[diff_at]
+                ctx.api.fail(
+                    f"stack dimension {diff_at} differs: {_dim_str(x)} vs {_dim_str(y)} "
+                    f"(shapes {_dims_str(first)} vs {_dims_str(dims)}; axis {axis})",
                     ctx.context,
                     code=NUMTY_SHAPE,
                 )
@@ -8728,7 +8811,8 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     norm = axis + ndim + 1 if axis < 0 else axis
     if not 0 <= norm <= ndim:
         ctx.api.fail(
-            f"stack axis {axis} is out of range for {ndim} dimensions",
+            f"stack axis {axis} is out of range for {ndim} dimensions "
+            f"(shape {_dims_str(first)})",
             ctx.context,
             code=NUMTY_AXIS,
         )
@@ -9338,6 +9422,7 @@ def _solve_reduction_unpack(
     keepdims: bool | None,
     has_dtype: bool,
     force_dtype: Type | None = None,
+    op: str = "sum",
 ) -> Type:
     """Reduce a (*prefix, *Ts, *suffix) shape along provable axes.
 
@@ -9365,7 +9450,12 @@ def _solve_reduction_unpack(
                 return ctx.default_return_type
             pos = ax
         if pos in chosen:
-            ctx.api.fail(f"duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
+            ctx.api.fail(
+                f"{op} has duplicate axis {ax} in {tuple(axis)} "
+                f"(shape {_dims_str(prefix + [unpack] + suffix)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
             return ctx.default_return_type
         chosen.add(pos)
     if keepdims:
@@ -9407,7 +9497,7 @@ def _reduction_types(
         split = _split_flat(dims)
         if split is None:
             return ctx.default_return_type
-        return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype)
+        return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype, op=op)
     out_dtype = _reduction_out_dtype(ctx, op, dtype)
     if out_dtype is None:
         return ctx.default_return_type
@@ -9422,11 +9512,11 @@ def _reduction_types(
             return ctx.default_return_type
         if keepdims:
             return _solve_reduction(
-                ctx, dims, dtype, list(range(len(dims))), True, has_dtype, out_dtype
+                ctx, dims, dtype, list(range(len(dims))), True, has_dtype, out_dtype, op
             )
         scalar = _scalar_of_dtype(out_dtype)
         return scalar if scalar is not None else ctx.default_return_type
-    return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, out_dtype)
+    return _solve_reduction(ctx, dims, dtype, axis, keepdims, has_dtype, out_dtype, op)
 
 
 def reduction_method_hook(ctx: MethodContext, op: str) -> Type:
@@ -10416,7 +10506,10 @@ def isclose_function_hook(ctx: FunctionContext) -> Type:
 
 
 def _solve_argdrop(
-    ctx: FunctionContext | MethodContext, dims: list[int], axis: list[int] | None | str
+    ctx: FunctionContext | MethodContext,
+    dims: list[int],
+    axis: list[int] | None | str,
+    op: str = "argmax",
 ) -> Type:
     """argmax/argmin: drop the axis, integer positions out (issue #47).
 
@@ -10442,14 +10535,19 @@ def _solve_argdrop(
         norm = _normalize_axis_0d(ax, ndim)
         if norm is None:
             ctx.api.fail(
-                f"axis {ax} is out of range for {ndim} dimensions "
+                f"{op} axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
                 code=NUMTY_AXIS,
             )
             return ctx.default_return_type
         if norm in normalized:
-            ctx.api.fail(f"duplicate axis {ax}", ctx.context, code=NUMTY_AXIS)
+            ctx.api.fail(
+                f"{op} has duplicate axis {ax} in {tuple(axis)} "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
             return ctx.default_return_type
         normalized.append(norm)
     chosen = set(normalized)
@@ -10466,6 +10564,7 @@ def _solve_same_or_flat(
     dtype: Type,
     axis: list[int] | None | str,
     int_out: bool,
+    op: str = "sort",
 ) -> Type:
     """sort/partition (same shape) and argsort/argpartition (integer out)."""
     if axis == "absent":
@@ -10480,7 +10579,7 @@ def _solve_same_or_flat(
     for ax in axis:
         if _normalize_axis(ax, ndim) is None:
             ctx.api.fail(
-                f"axis {ax} is out of range for {ndim} dimensions "
+                f"{op} axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
                 ctx.context,
                 code=NUMTY_AXIS,
@@ -10565,8 +10664,8 @@ def _arg_inputs(ctx: FunctionContext | MethodContext, array: Type, op: str) -> T
     if op in ("partition", "argpartition") and not _kth_in_bounds(ctx, dims, axis, op):
         return ctx.default_return_type
     if op in ARG_DROP:
-        return _solve_argdrop(ctx, dims, axis)
-    return _solve_same_or_flat(ctx, dims, dtype, axis, int_out=op in ARG_SAME_INT)
+        return _solve_argdrop(ctx, dims, axis, op)
+    return _solve_same_or_flat(ctx, dims, dtype, axis, int_out=op in ARG_SAME_INT, op=op)
 
 
 def arg_method_hook(ctx: MethodContext, op: str) -> Type:
@@ -10956,7 +11055,9 @@ def _flatten_total_dim(
         return None
 
 
-def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
+def _cumsum_solve(
+    ctx: FunctionContext | MethodContext, array: Type, op: str = "cumsum"
+) -> Type:
     """cumsum/cumprod keep the input shape; only axis=None flattens.
 
     axis=None flattens to the literal total like reshape(-1) (issue
@@ -11013,7 +11114,7 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
     norm = _normalize_axis_0d(axis[0], len(dims))
     if norm is None:
         ctx.api.fail(
-            f"axis {axis[0]} is out of range for {len(dims)} dimensions "
+            f"{op} axis {axis[0]} is out of range for {len(dims)} dimensions "
             f"(shape {_dims_str(dims)})",
             ctx.context,
             code=NUMTY_AXIS,
@@ -11045,15 +11146,15 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
     return _ndarray_type(ctx, out_dims, dtype)
 
 
-def cumsum_function_hook(ctx: FunctionContext) -> Type:
+def cumsum_function_hook(ctx: FunctionContext, op: str = "cumsum") -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    return _cumsum_solve(ctx, pairs[0][0])
+    return _cumsum_solve(ctx, pairs[0][0], op)
 
 
-def cumsum_method_hook(ctx: MethodContext) -> Type:
-    return _cumsum_solve(ctx, ctx.type)
+def cumsum_method_hook(ctx: MethodContext, op: str = "cumsum") -> Type:
+    return _cumsum_solve(ctx, ctx.type, op)
 
 
 def _ravel_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
@@ -11230,6 +11331,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     label_size: dict[str, int | Type] = {}
     label_first_operand: dict[str, int] = {}
+    label_first_dims: dict[str, list[int | Type]] = {}
     counts: dict[str, int] = {}
     ell_inputs: list[list[int | Type]] = []
     for oi, ((dims, _), term) in enumerate(zip(parts, terms)):
@@ -11268,6 +11370,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
             if known is None:
                 label_size[label] = size
                 label_first_operand[label] = oi
+                label_first_dims[label] = list(dims)
             elif not _dim_eq(known, size):
                 if (
                     isinstance(known, int)
@@ -11282,17 +11385,19 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                     # still conflicts, as it does in numpy.
                     label_size[label] = max(known, size)
                 elif isinstance(known, int) and isinstance(size, int):
+                    first_dims = label_first_dims.get(label, [])
                     ctx.api.fail(
                         f"einsum label '{label}' has conflicting sizes: "
-                        f"{known} vs {size} (shape {_dims_str(dims)})",
+                        f"{known} vs {size} (shapes {_dims_str(first_dims)} vs {_dims_str(dims)})",
                         ctx.context,
                         code=NUMTY_SHAPE,
                     )
                     return ctx.default_return_type
                 elif _dims_provably_ne(known, size):
+                    first_dims = label_first_dims.get(label, [])
                     ctx.api.fail(
                         f"einsum label '{label}' has conflicting sizes: "
-                        f"{_dim_str(known)} vs {_dim_str(size)} (shape {_dims_str(dims)})",
+                        f"{_dim_str(known)} vs {_dim_str(size)} (shapes {_dims_str(first_dims)} vs {_dims_str(dims)})",
                         ctx.context,
                         code=NUMTY_SHAPE,
                     )
@@ -11808,6 +11913,320 @@ def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -
         )
         return False
     return True
+
+
+def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
+    """Widen ord/axis to Any when the call would fail _norm_ord_fits (issue #148).
+
+    The function hook rejects every overload candidate for fro/nuc with a
+    single axis (filtered errors), mypy finds no erased target for inline
+    "fro" (plain str), and reports `No overload...` + 20 notes instead of
+    our targeted message. When the actuals show an explicit ord that would
+    reduce 1 dim with a string ord, or reduce >2 dims, return a copy with
+    ord/axis as Any so one overload approximately matches; the fallback
+    then runs the function hook unfiltered, which reports the single
+    [numty-axis] error. All other calls keep the default signature.
+    """
+    try:
+        sig = ctx.default_signature
+        if not isinstance(sig, CallableType):
+            return ctx.default_signature
+        if len(ctx.args) != len(sig.arg_types):
+            return ctx.default_signature
+        names = list(sig.arg_names)
+        try:
+            x_idx = names.index("x")
+            ord_idx = names.index("ord")
+            axis_idx = names.index("axis")
+        except ValueError:
+            return ctx.default_signature
+        if len(ctx.args[x_idx]) != 1:
+            return ctx.default_signature
+        x_expr = ctx.args[x_idx][0]
+        try:
+            x_tp = ctx.api.get_expression_type(x_expr)
+        except Exception:
+            return ctx.default_signature
+        part = _ndarray_parts(x_tp)
+        if part is None:
+            return ctx.default_signature
+        dims, _ = part
+        # ord: absent or None passes; otherwise need explicit value.
+        ord_exprs = ctx.args[ord_idx]
+        if not ord_exprs:
+            return ctx.default_signature
+        if len(ord_exprs) != 1:
+            return ctx.default_signature
+        ord_expr = ord_exprs[0]
+        try:
+            ord_tp = ctx.api.get_expression_type(ord_expr)
+        except Exception:
+            return ctx.default_signature
+        if _is_none_type(ord_tp):
+            return ctx.default_signature
+        order = _string_value(ord_tp)
+        if order is None and _weak_name(ord_tp) not in ("builtins.int", "builtins.float"):
+            return ctx.default_signature
+        number = _int_value(ord_tp)
+        # axis: absent/none reduces all dims; otherwise parse the list.
+        axis_exprs = ctx.args[axis_idx]
+        if not axis_exprs:
+            reduced = len(dims)
+        else:
+            if len(axis_exprs) != 1:
+                return ctx.default_signature
+            # _parse_axis_arg needs (type, expr); get type for the axis expr.
+            try:
+                axis_tp = ctx.api.get_expression_type(axis_exprs[0])
+            except Exception:
+                return ctx.default_signature
+            parsed = _parse_axis_arg((axis_tp, axis_exprs[0]))
+            if parsed is None:
+                return ctx.default_signature
+            if parsed in ("absent", "none"):
+                reduced = len(dims)
+            else:
+                assert isinstance(parsed, list)
+                # Duplicate axes bail in the function hook (no error), so
+                # leave the signature alone.
+                if len(set(parsed)) != len(parsed):
+                    return ctx.default_signature
+                reduced = len(parsed)
+        would_fail = False
+        if reduced > 2:
+            # Explicit ord (we already know ord is explicit here).
+            would_fail = True
+        elif order is not None and reduced == 1:
+            would_fail = True
+        if not would_fail:
+            return ctx.default_signature
+        new_arg_types = list(sig.arg_types)
+        new_arg_types[ord_idx] = AnyType(TypeOfAny.explicit)
+        new_arg_types[axis_idx] = AnyType(TypeOfAny.explicit)
+        return sig.copy_modified(arg_types=new_arg_types)
+    except Exception:
+        return ctx.default_signature
+
+
+def _reshape_signature_hook(ctx: MethodSigContext) -> Type:
+    """Widen reshape formals to Any on provable int total mismatch (issue #148).
+
+    The function hook reports `reshape changes total size` then mypy's
+    fallback (empty_sequence overload with Sequence[Never]) reports a
+    mechanical arg-type second error. When old and new are all ints with
+    different totals (no -1), return Any formals so the fallback's arg
+    check succeeds and only the single [numty-shape] error remains.
+    All other calls keep the default signature.
+    """
+    try:
+        sig = ctx.default_signature
+        if not isinstance(sig, CallableType):
+            return ctx.default_signature
+        part = _ndarray_parts(ctx.type)
+        if part is None:
+            return ctx.default_signature
+        dims_old, _ = part
+        if not dims_old or not all(isinstance(d, int) for d in dims_old):
+            return ctx.default_signature
+        call = ctx.context
+        if not isinstance(call, CallExpr):
+            return ctx.default_signature
+        pairs: list[tuple[Type, Expression | None]] = []
+        for expr, kind in zip(call.args, call.arg_kinds):
+            if kind != ARG_POS:
+                continue
+            try:
+                tp = ctx.api.get_expression_type(expr)
+            except Exception:
+                return ctx.default_signature
+            pairs.append((tp, expr))
+        if not pairs:
+            return ctx.default_signature
+        raw = _reshape_new_dims(pairs)
+        if raw is None:
+            return ctx.default_signature
+        if not raw or not all(isinstance(d, int) for d in raw):
+            return ctx.default_signature
+        if any(d == -1 for d in raw):  # type: ignore[comparison-overlap]
+            return ctx.default_signature
+        size_old = 1
+        for d in dims_old:
+            assert isinstance(d, int)
+            size_old *= d
+        size_new = 1
+        for d in raw:
+            assert isinstance(d, int)
+            size_new *= d
+        if size_new == size_old:
+            return ctx.default_signature
+        return sig.copy_modified(
+            arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+        )
+    except Exception:
+        return ctx.default_signature
+
+
+def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
+    """Widen other to Any on provable broadcast mismatch (issue #148).
+
+    The method hook reports `broadcast shapes disagree` then mypy reports
+    a mechanical [operator] duplicate. When both operands have known
+    shapes that provably cannot broadcast (ints or N vs N-1 linear
+    forms), return Any formals so the fallback's arg check succeeds and
+    only the single [numty-broadcast] error remains. All other calls
+    keep the default signature.
+    """
+    try:
+        sig = ctx.default_signature
+        if not isinstance(sig, CallableType):
+            return ctx.default_signature
+        part_a = _ndarray_parts(ctx.type)
+        if part_a is None:
+            return ctx.default_signature
+        dims_a, _ = part_a
+        if not dims_a:
+            return ctx.default_signature
+        # Other operand: OpExpr (a+b) has left/right; explicit
+        # a.__add__(b) is a CallExpr with one arg.
+        from mypy.nodes import CallExpr as _CallExpr
+        from mypy.nodes import OpExpr as _OpExpr
+
+        other_expr = None
+        call = ctx.context
+        if isinstance(call, _OpExpr):
+            # a + b: left is self, right is other (or vice versa for __radd__?).
+            # For __radd__, self is right operand (b in a+b where b.__radd__(a))?
+            # To be safe, try both sides: if left matches self type, other is right, else vice versa.
+            # Simpler: use right for __add__ etc., left for __radd__? Actually for `a+b`,
+            # mypy tries both `a.__add__(b)` (self=a, other=b) and `b.__radd__(a)` (self=b, other=a).
+            # In the first, ctx.type is a, other is b (right). In the second, ctx.type is b, other is a (left).
+            # We don't know which hook invocation this is (fullname tells: __add__ vs __radd__).
+            # For __add__ etc. (normal), other is right; for __radd__ etc. (reflected), other is left.
+            # Detect via fullname? We don't have fullname here (hook doesn't receive it).
+            # Instead, try right first: if right type has known dims and mismatches, use it;
+            # otherwise try left. Simplest: check both, if either mismatches with self, trigger.
+            try:
+                right_tp = ctx.api.get_expression_type(call.right)
+                right_part = _ndarray_parts(right_tp)
+                if right_part is not None:
+                    dims_b, _ = right_part
+                    if dims_b:
+                        _, msg = _broadcast_result(list(dims_a), list(dims_b), None)
+                        if msg is not None:
+                            return sig.copy_modified(
+                                arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                            )
+            except Exception:
+                pass
+            try:
+                left_tp = ctx.api.get_expression_type(call.left)
+                left_part = _ndarray_parts(left_tp)
+                if left_part is not None:
+                    dims_b, _ = left_part
+                    if dims_b:
+                        _, msg = _broadcast_result(list(dims_a), list(dims_b), None)
+                        if msg is not None:
+                            return sig.copy_modified(
+                                arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                            )
+            except Exception:
+                pass
+            return ctx.default_signature
+        elif isinstance(call, _CallExpr) and call.args:
+            # Explicit a.__add__(b): first arg is other.
+            other_expr = call.args[0]
+        else:
+            return ctx.default_signature
+        if other_expr is None:
+            return ctx.default_signature
+        try:
+            other_tp = ctx.api.get_expression_type(other_expr)
+        except Exception:
+            return ctx.default_signature
+        part_b = _ndarray_parts(other_tp)
+        if part_b is None:
+            return ctx.default_signature
+        dims_b, _ = part_b
+        if not dims_b:
+            return ctx.default_signature
+        _, msg = _broadcast_result(list(dims_a), list(dims_b), None)
+        if msg is None:
+            return ctx.default_signature
+        return sig.copy_modified(
+            arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+        )
+    except Exception:
+        return ctx.default_signature
+
+
+def _einsum_signature_hook(ctx: FunctionSigContext) -> Type:
+    """Widen *operands to Any on provable int label clash (issue #148).
+
+    The function hook reports the clash then mypy's fallback (bool
+    overload) reports two mechanical arg-type follow-ons. When labels
+    conflict on ints, return Any for *operands so the fallback's arg
+    check succeeds and only the single [numty-shape] error remains.
+    All other calls keep the default signature.
+    """
+    try:
+        sig = ctx.default_signature
+        if not isinstance(sig, CallableType):
+            return ctx.default_signature
+        call = ctx.context
+        if not isinstance(call, CallExpr) or not call.args:
+            return ctx.default_signature
+        eq_expr = call.args[0]
+        if not isinstance(eq_expr, StrExpr):
+            return ctx.default_signature
+        equation = "".join(eq_expr.value.split())
+        if equation.count("->") != 1:
+            return ctx.default_signature
+        lhs, _ = equation.split("->")
+        terms = lhs.split(",")
+        operand_exprs = [a for a, k in zip(call.args[1:], call.arg_kinds[1:]) if k == ARG_POS]
+        # *operands could also be passed as *args? Bail then (function hook bails too).
+        if len(operand_exprs) != len(terms):
+            return ctx.default_signature
+        dims_list: list[list[int | Type]] = []
+        for expr in operand_exprs:
+            try:
+                tp = ctx.api.get_expression_type(expr)
+            except Exception:
+                return ctx.default_signature
+            part = _ndarray_parts(tp)
+            if part is None:
+                return ctx.default_signature
+            dims, _ = part
+            # Only all-int dims for the targeted suppression; symbolic
+            # bails in the function hook (no error, no follow-on).
+            if not all(isinstance(d, int) for d in dims):
+                return ctx.default_signature
+            dims_list.append(list(dims))  # type: ignore[arg-type]
+        label_size: dict[str, int] = {}
+        for dims, term in zip(dims_list, terms):
+            parsed = _parse_einsum_term(term)
+            if parsed is None:
+                return ctx.default_signature
+            pre, post, has_ell = parsed
+            if has_ell:
+                return ctx.default_signature
+            if len(pre) != len(dims):
+                return ctx.default_signature
+            for label, size in zip(pre, dims):
+                assert isinstance(size, int)
+                if label not in label_size:
+                    label_size[label] = size
+                elif label_size[label] != size:
+                    # Provable int clash: widen *operands.
+                    for i, kind in enumerate(sig.arg_kinds):
+                        if kind == ARG_STAR:
+                            new_arg_types = list(sig.arg_types)
+                            new_arg_types[i] = AnyType(TypeOfAny.explicit)
+                            return sig.copy_modified(arg_types=new_arg_types)
+                    return ctx.default_signature
+        return ctx.default_signature
+    except Exception:
+        return ctx.default_signature
 
 
 def _linalg_norm(ctx: FunctionContext) -> Type:
@@ -13716,11 +14135,11 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
     by_module: dict[str, dict[str, Callable[[FunctionContext], Type]]] = {
         "numpy._core.einsumfunc": {"einsum": einsum_function_hook},
         "numpy._core.fromnumeric": {
-            "all": allany_function_hook,
-            "any": allany_function_hook,
+            "all": partial(allany_function_hook, op="all"),
+            "any": partial(allany_function_hook, op="any"),
             "clip": clip_function_hook,
-            "cumprod": cumsum_function_hook,
-            "cumsum": cumsum_function_hook,
+            "cumprod": partial(cumsum_function_hook, op="cumprod"),
+            "cumsum": partial(cumsum_function_hook, op="cumsum"),
             "max": partial(reduction_function_hook, op="max"),
             "mean": partial(reduction_function_hook, op="mean"),
             "min": partial(reduction_function_hook, op="min"),
@@ -13834,8 +14253,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
         "numpy.lib._nanfunctions_impl": {
             "nanargmax": partial(arg_function_hook, op="nanargmax"),
             "nanargmin": partial(arg_function_hook, op="nanargmin"),
-            "nancumprod": cumsum_function_hook,
-            "nancumsum": cumsum_function_hook,
+            "nancumprod": partial(cumsum_function_hook, op="nancumprod"),
+            "nancumsum": partial(cumsum_function_hook, op="nancumsum"),
             "nanmax": partial(reduction_function_hook, op="nanmax"),
             "nanmean": partial(reduction_function_hook, op="nanmean"),
             "nanmedian": partial(reduction_function_hook, op="nanmedian"),

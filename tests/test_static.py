@@ -208,7 +208,8 @@ def assert_operator_mismatch(result: "subprocess.CompletedProcess[str]", *fragme
 
 
 def test_broadcast_mismatch() -> None:
-    assert_operator_mismatch(
+    # Issue #148: single targeted error, no mechanical [operator] duplicate.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_broadcast.py"),
         "broadcast shapes disagree at trailing axis 0",
         "3 vs 4",
@@ -416,7 +417,10 @@ def test_concat_dim_mismatch() -> None:
 def test_stack_shape_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_stack_shape.py"),
-        "stack shapes differ: (2, 3), (3, 2)",
+        "stack dimension 0 differs: 2 vs 3",
+        "(2, 3)",
+        "(3, 2)",
+        "axis 0",
     )
 
 
@@ -451,9 +455,11 @@ def test_eye_neg_mismatch() -> None:
 
 
 def test_concat_axis_mismatch() -> None:
+    # Issue #148: OOB names shape (take/split/squeeze form).
     assert_single_error(
         run_mypy(FIXTURES / "bad_concat_axis.py"),
         "concatenate axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
     )
 
 
@@ -536,10 +542,12 @@ def test_argmax_axis_mismatch() -> None:
 
 
 def test_einsum_label_conflict() -> None:
-    assert_rank_mismatch(
+    # Issue #148: single targeted error with both shapes, no bool follow-ons.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_einsum_labels.py"),
         "einsum label 'j' has conflicting sizes: 3 vs 5",
-        '"einsum"',
+        "(2, 3)",
+        "(5, 4)",
     )
 
 
@@ -661,7 +669,8 @@ def test_issue58_kron_pinv_randn_percentile_ok() -> None:
 
 
 def test_kron_broadcast_mismatch() -> None:
-    assert_operator_mismatch(
+    # Issue #148: single targeted error, no operator duplicate.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_kron_broadcast.py"),
         "broadcast shapes disagree at trailing axis 0",
         "15 vs 4",
@@ -833,22 +842,14 @@ def test_arith_ok_stays_clean() -> None:
 
 def test_arith_broadcast_mismatch() -> None:
     # Issue #54: the newly hooked operators fail with the binary wording.
+    # Issue #148: single targeted error per line, no operator duplicates.
     result = run_mypy(FIXTURES / "bad_arith_broadcast.py")
     assert result.returncode == 1, result.stdout
-    ours = [
-        line
-        for line in result.stdout.splitlines()
-        if "broadcast shapes disagree at trailing axis 0" in line
-    ]
-    assert len(ours) == 4, result.stdout
-    for line in ours:
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 4, result.stdout
+    for line in errors:
+        assert "broadcast shapes disagree at trailing axis 0" in line, result.stdout
         assert "3 vs 5" in line and "(2, 3)" in line and "(5,)" in line, result.stdout
-    rest = [
-        line
-        for line in result.stdout.splitlines()
-        if ": error:" in line and line not in ours
-    ]
-    assert rest and all("Unsupported operand" in line for line in rest), result.stdout
 
 
 def test_dtype_ok_stays_clean() -> None:
@@ -882,9 +883,11 @@ def test_dtype_wrong_fails() -> None:
 
 
 def test_any_axis_out_of_range() -> None:
+    # Issue #148: OOB names op and shape.
     assert_single_error(
         run_mypy(FIXTURES / "bad_any_axis.py"),
-        "axis 5 is out of range for 2 dimensions",
+        "any axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
     )
 
 
@@ -907,9 +910,11 @@ def test_reshape_symbolic_minus1() -> None:
 
 
 def test_min_axis_out_of_range() -> None:
+    # Issue #148: OOB names op and shape.
     assert_single_error(
         run_mypy(FIXTURES / "bad_min_axis.py"),
-        "axis 5 is out of range for 2 dimensions",
+        "min axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
     )
 
 
@@ -1049,17 +1054,21 @@ def test_squeeze_size_mismatch() -> None:
 
 
 def test_sum_axis_mismatch() -> None:
+    # Issue #148: OOB names op and shape (take/split/squeeze form).
     assert_single_error(
         run_mypy(FIXTURES / "bad_sum_axis.py"),
-        "axis 5 is out of range for 2 dimensions",
+        "sum axis 5 is out of range for 2 dimensions",
+        "(2, 3)",
     )
 
 
 def test_expand_axis_mismatch() -> None:
+    # Issue #148: OOB names shape alongside the new-axes count.
     assert_rank_mismatch(
         run_mypy(FIXTURES / "bad_expand_axis.py"),
         "expand_dims axis 5 is out of range",
         '"expand_dims"',
+        "(3,)",
     )
 
 
@@ -1072,7 +1081,8 @@ def test_folded_size_mismatch() -> None:
 
 
 def test_folded_reshape_mismatch() -> None:
-    assert_reshape_mismatch(
+    # Issue #148: single targeted error, no Sequence[Never] follow-on.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_fold_reshape.py"),
         "reshape changes total size: 6 -> 12",
     )
@@ -1090,7 +1100,8 @@ def assert_reshape_mismatch(result: "subprocess.CompletedProcess[str]", *fragmen
 
 
 def test_reshape_size_mismatch() -> None:
-    assert_reshape_mismatch(
+    # Issue #148: single targeted error, no Sequence[Never] follow-on.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_reshape_size.py"),
         "reshape changes total size: 6 -> 8",
         "(2, 3)",
@@ -1820,6 +1831,7 @@ def test_stack_comprehension_keeps_checking() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_stack_comprehension_axis.py"),
         "stack axis 3 is out of range for 2 dimensions",
+        "(2, 3)",
         "[numty-axis]",
     )
     assert _run_fixture("bad_stack_comprehension_axis.py") == ["AxisError"]
@@ -2124,16 +2136,18 @@ def test_offsets_lengths_mismatch() -> None:
 def test_provable_linear_mismatch() -> None:
     # Issue #32: same-var different-const dims (N vs N-1 from np.diff,
     # N vs N+2 from np.pad) are provably unequal, so broadcast/matmul/
-    # stack fail instead of bailing to a silent ?U/Any.
+    # stack fail instead of bailing to a silent ?U/Any. Each is a single
+    # targeted error (issue #148: no mechanical operator/stack follow-on).
     result = run_mypy(FIXTURES / "bad_provable_linear.py")
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    assert len(errors) == 4, result.stdout
+    assert len(errors) == 3, result.stdout
     assert "broadcast shapes disagree at trailing axis 0" in errors[0], result.stdout
     assert "N vs N-1" in errors[0], result.stdout
-    assert "Unsupported operand types for -" in errors[1], result.stdout
-    assert "matmul inner dimensions disagree: N vs N+2" in errors[2], result.stdout
-    assert "stack shapes differ: (N+2,), (N,)" in errors[3], result.stdout
+    assert "matmul inner dimensions disagree: N vs N+2" in errors[1], result.stdout
+    assert "stack dimension 0 differs: N+2 vs N" in errors[2], result.stdout
+    assert "(N+2,)" in errors[2] and "(N,)" in errors[2], result.stdout
+    assert "axis 0" in errors[2], result.stdout
 
 
 def test_comprehension_unknown_bails_not_false_proof() -> None:
@@ -2250,7 +2264,8 @@ def test_class_attr_substitution() -> None:
     assert reveals_by_line(result) == {
         17: '"numpy.ndarray[tuple[Literal[6]], numpy.dtype[numpy.float64]]"',
     }, result.stdout
-    assert_operator_mismatch(
+    # Issue #148: single targeted error, no operator duplicate.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_class_attr.py"),
         "broadcast shapes disagree at trailing axis 0",
         "6 vs 9",
@@ -2292,7 +2307,8 @@ def test_inline_generic_call_ok_clean_and_runs() -> None:
 def test_inline_generic_call_mismatch() -> None:
     # Issue #55: the nested shape survives, so the (4, 5) vs (4, 6)
     # mismatch is flagged instead of passing silently through Any.
-    assert_operator_mismatch(
+    # Issue #148: single targeted error, no operator duplicate.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_inline_generic_call.py"),
         "broadcast shapes disagree at trailing axis 0",
         "5 vs 6",
@@ -2551,7 +2567,8 @@ def test_issue58_fft_keepshape_ok() -> None:
 
 
 def test_fft2_broadcast_mismatch() -> None:
-    assert_operator_mismatch(
+    # Issue #148: single targeted error, no operator duplicate.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_fft2_broadcast.py"),
         "broadcast shapes disagree at trailing axis 0",
         "4 vs 5",
@@ -3178,13 +3195,13 @@ def test_norm_fro_on_one_axis() -> None:
 
 
 def test_norm_fro_display_on_one_axis() -> None:
-    # Spelled inline, "fro" is only a literal inside each overload
-    # candidate. Once the hook rejects them all, mypy's fallback infers
-    # plain str, finds no erased target, and reports its own overload
-    # error instead of ours. The call still fails, as numpy's does.
+    # Inline "fro" with a single axis is a matrix-norm misuse (issue #148):
+    # the signature hook widens ord/axis so the function hook's targeted
+    # [numty-axis] error survives instead of overload spam.
     assert_single_error(
         run_mypy(FIXTURES / "bad_norm_fro_display.py"),
-        'No overload variant of "norm" matches argument types',
+        "linalg.norm ord='fro' is a matrix norm and needs 2 axes, got 1",
+        "(2, 3, 4)",
     )
 
 
@@ -3255,9 +3272,11 @@ def test_huge_dim_rejected() -> None:
 
 
 def test_sum_duplicate_axis() -> None:
+    # Issue #148: duplicate-axis names op, tuple and shape (take/split/squeeze form).
     assert_single_error(
         run_mypy(FIXTURES / "bad_sum_dup_axis.py"),
-        "duplicate axis -2",
+        "sum has duplicate axis -2 in (0, -2)",
+        "(3, 4)",
     )
 
 
@@ -3282,8 +3301,8 @@ def test_error_code_tagged(fixture: str, code: str) -> None:
 
 
 def test_broadcast_operator_error_code() -> None:
-    # The operator form adds mypy's own [operator] error; ours is tagged.
-    assert_operator_mismatch(
+    # Issue #148: single [numty-broadcast] error, no [operator] duplicate.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_broadcast.py"),
         "broadcast shapes disagree",
         "  [numty-broadcast]",
