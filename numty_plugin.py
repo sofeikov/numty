@@ -1513,6 +1513,13 @@ class NumtyPlugin(Plugin):
             "var",
         }:
             return partial(reduction_method_hook, op=short)
+        # ufunc methods (np.add.reduce, .accumulate, .outer, .reduceat):
+        # axis-checked shape solves; .at keeps the stubs (issue #142).
+        if short in {"reduce", "accumulate", "outer", "reduceat"} and (
+            fullname.startswith("numpy.ufunc.")
+            or fullname.startswith("numpy._typing._ufunc.")
+        ):
+            return partial(ufunc_method_hook, op=short)
         if fullname.startswith("numpy.ndarray.") and short in {"cumsum", "cumprod"}:
             return partial(cumsum_method_hook, op=short)
         if fullname.startswith("numpy.ndarray.") and short == "ravel":
@@ -9661,6 +9668,240 @@ def _reduction_types(
 
 def reduction_method_hook(ctx: MethodContext, op: str) -> Type:
     return _reduction_inputs(ctx, ctx.type, op)
+
+
+def _ufunc_reduce_types(
+    ctx: FunctionContext | MethodContext,
+    array: Type,
+    axis: list[int] | None | str,
+    keepdims: bool | None,
+    op: str = "reduce",
+) -> Type:
+    """ufunc reduce: like sum, but a missing axis reduces axis 0 (issue #142).
+
+    Only the shape is solved here; the dtype stays unknown (see
+    _ufunc_any_dtype).
+    """
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    dtype = _ufunc_any_dtype()
+    if _has_unpack(dims):
+        if axis == "none":
+            return ctx.default_return_type
+        split = _split_flat(dims)
+        if split is None:
+            return ctx.default_return_type
+        return _solve_reduction_unpack(
+            ctx, *split, dtype, axis, keepdims, False, dtype, op=op
+        )
+    if axis == "none":
+        if keepdims is None:
+            return ctx.default_return_type
+        if keepdims:
+            return _ndarray_type(ctx, [1] * len(dims), dtype)
+        return _maybe_scalar(ctx, [], dtype)
+    return _solve_reduction(ctx, dims, dtype, axis, keepdims, False, dtype, op=op)
+
+
+def _ufunc_reduce_inputs(ctx: MethodContext, array: Type, op: str = "reduce") -> Type:
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis == "absent":
+        # Unlike ndarray.sum (axis=None), ufunc reduce defaults to axis 0.
+        axis = [0]
+    keep_pair = _formal_pair(ctx, "keepdims")
+    keepdims = False if keep_pair is None else _fold_flag(keep_pair)
+    dist = _distribute_solve(
+        [array], lambda t: _ufunc_reduce_types(ctx, t, axis, keepdims, op)
+    )
+    if dist is not None:
+        return _apply_out_dtype(ctx, dist)
+    return _apply_out_dtype(ctx, _ufunc_reduce_types(ctx, array, axis, keepdims, op))
+
+
+def _ufunc_accumulate_types(
+    ctx: FunctionContext | MethodContext, array: Type, op: str = "accumulate"
+) -> Type:
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if _has_unpack(dims) or not dims:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, list(dims), _ufunc_any_dtype())
+
+
+def _ufunc_accumulate_inputs(
+    ctx: MethodContext, array: Type, op: str = "accumulate"
+) -> Type:
+    """ufunc accumulate keeps the input shape (issue #142).
+
+    axis=None is a runtime ValueError and a 0-d input has no loop
+    ("cannot accumulate on a scalar"), so both stay with the stubs.
+    """
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if _has_unpack(dims) or not dims:
+        return ctx.default_return_type
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis == "absent":
+        axis = [0]
+    if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
+        return ctx.default_return_type
+    norm = _normalize_axis_0d(axis[0], len(dims))
+    if norm is None:
+        ctx.api.fail(
+            f"{op} axis {axis[0]} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    dist = _distribute_solve([array], lambda t: _ufunc_accumulate_types(ctx, t, op))
+    if dist is not None:
+        return _apply_out_dtype(ctx, dist)
+    return _apply_out_dtype(ctx, _ufunc_accumulate_types(ctx, array, op))
+
+
+def _ufunc_outer_shape(tp: Type) -> list[int | Type] | None:
+    """Operand dims for outer: arrays contribute their shape, scalars []."""
+    part = _parts_or_unpack(tp)
+    if part is not None:
+        dims, _ = part
+        if _has_unpack(dims):
+            return None
+        return list(dims)
+    if _scalar_key(tp) is not None or _scalar_ret_name(tp) is not None:
+        return []
+    return None
+
+
+def _ufunc_outer_types(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type
+) -> Type:
+    """ufunc outer concatenates the operand shapes (issue #142)."""
+    first = _ufunc_outer_shape(left)
+    second = _ufunc_outer_shape(right)
+    if first is None or second is None:
+        return ctx.default_return_type
+    return _maybe_scalar(ctx, first + second, _ufunc_any_dtype())
+
+
+def _ufunc_outer_inputs(ctx: MethodContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 2:
+        return ctx.default_return_type
+    dist = _distribute_solve(
+        [pairs[0][0], pairs[1][0]], lambda l, r: _ufunc_outer_types(ctx, l, r)
+    )
+    if dist is not None:
+        return _apply_out_dtype(ctx, dist)
+    return _apply_out_dtype(ctx, _ufunc_outer_types(ctx, pairs[0][0], pairs[1][0]))
+
+
+def _ufunc_any_dtype() -> Type:
+    """Canonical unknown dtype for ufunc-method solves (issue #142).
+
+    Bare Any, never a candidate's stub dtype: overload candidates carry
+    different defaults (Incomplete vs NDArray[Incomplete]), and hook
+    returns that differ across matching candidates trip mypy's
+    overload-ambiguity erasure. Only the shape is solved here.
+    """
+    return AnyType(TypeOfAny.explicit)
+
+
+def _reduceat_length(pair: tuple[Type, Expression | None] | None) -> int | Type | None:
+    """Length of a reduceat indices argument, else None to bail.
+
+    A display's length is its item count; a 1-D array's is its dim
+    (concrete or symbolic). Anything else (scalars, which fail at
+    runtime, 0-d/2-d arrays, dynamic sequences) stays with the stubs.
+    """
+    if pair is None:
+        return None
+    tp, expr = pair
+    if isinstance(expr, (ListExpr, TupleExpr)):
+        if any(isinstance(e, (ListExpr, TupleExpr, StarExpr)) for e in expr.items):
+            return None
+        return len(expr.items)
+    parts = _ndarray_parts(tp)
+    if parts is not None:
+        dims, _ = parts
+        if len(dims) == 1 and isinstance(dims[0], (int, TypeVarType)):
+            return dims[0]
+    return None
+
+
+def _ufunc_reduceat_types(
+    ctx: FunctionContext | MethodContext,
+    array: Type,
+    length: int | Type | None,
+    axis: list[int] | None | str,
+    op: str = "reduceat",
+) -> Type:
+    """ufunc reduceat: the axis dim becomes the indices length (issue #142)."""
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if _has_unpack(dims) or not dims or length is None:
+        # *Ts shapes stay with the stubs, and numpy refuses 0-d input
+        # ("cannot reduceat on a scalar") while the stubs accept it.
+        return ctx.default_return_type
+    if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
+        return ctx.default_return_type
+    norm = _normalize_axis_0d(axis[0], len(dims))
+    if norm is None:
+        ctx.api.fail(
+            f"{op} axis {axis[0]} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    out[norm] = length
+    return _ndarray_type(ctx, out, _ufunc_any_dtype())
+
+
+def _ufunc_reduceat_inputs(
+    ctx: MethodContext, array: Type, op: str = "reduceat"
+) -> Type:
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis == "absent":
+        axis = [0]
+    length = _reduceat_length(_formal_pair(ctx, "indices"))
+    dist = _distribute_solve(
+        [array], lambda t: _ufunc_reduceat_types(ctx, t, length, axis, op)
+    )
+    if dist is not None:
+        return _apply_out_dtype(ctx, dist)
+    return _apply_out_dtype(ctx, _ufunc_reduceat_types(ctx, array, length, axis, op))
+
+
+def ufunc_method_hook(ctx: MethodContext, op: str) -> Type:
+    """np.add.reduce/.accumulate/.outer/.reduceat: axis checks + shapes.
+
+    reduce drops the axis (axis 0 by default), accumulate keeps the
+    shape, outer concatenates the operand shapes, and reduceat sizes
+    the axis by the indices length. Only the shape is solved here; the
+    dtype stays unknown. add.at is unhooked (returns None).
+    """
+    if op == "outer":
+        return _ufunc_outer_inputs(ctx)
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    if op == "reduce":
+        return _ufunc_reduce_inputs(ctx, pairs[0][0], op)
+    if op == "accumulate":
+        return _ufunc_accumulate_inputs(ctx, pairs[0][0], op)
+    if op == "reduceat":
+        return _ufunc_reduceat_inputs(ctx, pairs[0][0], op)
+    return ctx.default_return_type
 
 
 def _enum_member_value(modules: dict, tp: Type) -> int | None:
