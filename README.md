@@ -827,7 +827,7 @@ your `mypy.ini`) to have the solver check them too.
 
 ## Error codes
 
-Every numty diagnostic carries one of seven mypy error codes, so each kind
+Every numty diagnostic carries one of eight mypy error codes, so each kind
 can be silenced or selected on its own:
 
 | Code | Covers | Example message |
@@ -839,6 +839,7 @@ can be silenced or selected on its own:
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack needs a sequence of known length (built dynamically; preallocate or ignore)` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
+| `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
 
 For example, `codes.py`:
 
@@ -878,7 +879,7 @@ disable_error_code = numty-bail
 ```
 
 or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
-reports a shape error on that line. All seven are sub-codes of `misc`, so
+reports a shape error on that line. All eight are sub-codes of `misc`, so
 an existing `# type: ignore[misc]` or `disable_error_code = misc` keeps
 covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
 then asks for the narrower code (`Unused "type: ignore" comment, use
@@ -918,6 +919,30 @@ with `# type: ignore[numty-unsolved]`. Unhooked overloaded functions
 diagnostic inside the hook aborts mypy's overload search and turns a
 correct call into `arg-type` noise, so strict leaves those to the
 trace.
+
+### When numty itself fails
+
+A bug inside the plugin never aborts the mypy run, and never passes for
+a clean result either. The exception is caught, the call keeps the
+stubs' type, and the line gets
+
+```text
+error: numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)  [numty-internal]
+```
+
+The same failure is written to `NUMTY_TRACE` with outcome `crash`.
+mypy may add a follow-on error of its own on that line (for an
+operator, `Unsupported operand types`), because any diagnostic raised
+while it matches overloads ends the match. Turn the report off with
+`disable_error_code = numty-internal`; the line then goes unchecked
+silently, as it did before this code existed. A few internal helpers
+have no source position to report against, and their failures are
+trace-only.
+
+For a traceback, set `NUMTY_DEBUG=1`: the exception then propagates
+and mypy stops with `INTERNAL ERROR` (add `--show-traceback`). The test
+suite runs this way (`tests/conftest.py`), so an exception the plugin
+would have swallowed fails the tests.
 
 An argument of the wrong rank is rejected by mypy itself, with its own
 `arg-type` error. The parameter's dim TypeVars cannot be solved from a

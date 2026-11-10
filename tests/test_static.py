@@ -1759,6 +1759,16 @@ def test_f64_str_callsite_conflict() -> None:
     )
 
 
+def test_recursive_alias_formal_keeps_callsite_check() -> None:
+    # Issue #164: walking a recursive alias hit RecursionError, which the
+    # call-site hook swallowed, silently skipping the whole call.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_recursive_alias_callsite.py"),
+        "call-site shape conflict for 'batch'",
+        "4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)",
+    )
+
+
 def test_f64_str_matmul_dim_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_str_matmul.py"),
