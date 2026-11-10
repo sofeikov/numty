@@ -1349,6 +1349,9 @@ class NumtyPlugin(Plugin):
         if fullname in {
             "numpy.ndarray.__add__",
             "numpy.ndarray.__radd__",
+        }:
+            return partial(broadcast_method_hook, op="add")
+        if fullname in {
             "numpy.ndarray.__mul__",
             "numpy.ndarray.__rmul__",
             "numpy.ndarray.__xor__",
@@ -6226,9 +6229,13 @@ def _solve_broadcast_unpack(
     sa = _unpack_shape(left) if a is None else None
     sb = _unpack_shape(right) if b is None else None
     if sa is None and sb is None:
-        if a is None:
-            return ctx.default_return_type
-        return _solve_broadcast_scalar(ctx, a[0], a[1], right)
+        # Either side may be the array (issue #144): np.power(2, i32)
+        # arrives scalar-left, while operators arrive array-left.
+        if a is not None:
+            return _solve_broadcast_scalar(ctx, a[0], a[1], right)
+        if b is not None:
+            return _solve_broadcast_scalar(ctx, b[0], b[1], left)
+        return ctx.default_return_type
     if sa is not None and sb is not None:
         (p1, u1, s1), dtype_a = sa
         (p2, u2, s2), dtype_b = sb
@@ -6270,14 +6277,18 @@ def _solve_broadcast_unpack(
     return ctx.default_return_type
 
 
-def _solve_broadcast(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
-    dist = _distribute_solve([left, right], lambda l, r: _broadcast_types(ctx, l, r))
+def _solve_broadcast(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type, op: str | None = None
+) -> Type:
+    dist = _distribute_solve([left, right], lambda l, r: _broadcast_types(ctx, l, r, op))
     if dist is not None:
         return dist
-    return _broadcast_types(ctx, left, right)
+    return _broadcast_types(ctx, left, right, op)
 
 
-def _broadcast_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+def _broadcast_types(
+    ctx: FunctionContext | MethodContext, left: Type, right: Type, op: str | None = None
+) -> Type:
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
     if a is None or b is None:
@@ -6287,6 +6298,42 @@ def _broadcast_types(ctx: FunctionContext | MethodContext, left: Type, right: Ty
     dims_b, dtype_b = b
     name = _promote_dtypes(dtype_a, dtype_b)
     if name is None:
+        # Datetime family add/subtract (issue #144): promotion has no
+        # entry, but the stubs already carry the right dtype
+        # (datetime/timedelta). Keep the solved broadcast shape with the
+        # stub dtype instead of dropping both to Any. Only add/subtract
+        # are valid (M+m, m+M, m+m, M-m, M-M, m-m); anything else
+        # (M+M, m-M, *, /) bails so invalid loops stay errors. The op
+        # rides in from the method/ufunc caller; unknown callers bail.
+        if op in ("add", "subtract") and (
+            _datetime_kind(dtype_a) is not None or _datetime_kind(dtype_b) is not None
+        ):
+            # Valid combos only: M+m, m+M, m+m, M-m, M-M, m-m. Anything
+            # else (M+M, m-M, datetime with a numeric dtype) bails so
+            # invalid loops stay errors.
+            ka, kb = _datetime_kind(dtype_a), _datetime_kind(dtype_b)
+            if (ka, kb, op) not in {
+                ("M", "m", "add"),
+                ("m", "M", "add"),
+                ("m", "m", "add"),
+                ("M", "m", "subtract"),
+                ("M", "M", "subtract"),
+                ("m", "m", "subtract"),
+            }:
+                return ctx.default_return_type
+            if isinstance(
+                get_proper_type(ctx.default_return_type), UninhabitedType
+            ):
+                return ctx.default_return_type
+            default_dtype = _default_dtype(ctx)
+            if not isinstance(get_proper_type(default_dtype), AnyType):
+                dims, message = _broadcast_result(dims_a, dims_b, ctx)
+                if message is not None:
+                    ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
+                    return ctx.default_return_type
+                if dims is None:
+                    return ctx.default_return_type
+                return _ndarray_type(ctx, dims, default_dtype)
         return ctx.default_return_type
     dims, message = _broadcast_result(dims_a, dims_b, ctx)
     if message is not None:
@@ -6304,14 +6351,14 @@ def _broadcast_types(ctx: FunctionContext | MethodContext, left: Type, right: Ty
     return _ndarray_type(ctx, dims, dtype)
 
 
-def broadcast_method_hook(ctx: MethodContext) -> Type:
+def broadcast_method_hook(ctx: MethodContext, op: str | None = None) -> Type:
     # Never replace a stub Never (no loop) with a valid array (issue #61).
     if isinstance(get_proper_type(ctx.default_return_type), UninhabitedType):
         return ctx.default_return_type
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
-    return _solve_broadcast(ctx, ctx.type, args[0])
+    return _solve_broadcast(ctx, ctx.type, args[0], op)
 
 
 def _is_bool_operand(tp: Type) -> bool:
@@ -6333,7 +6380,7 @@ def subtract_method_hook(ctx: MethodContext) -> Type:
             code=NUMTY_BROADCAST,
         )
         return ctx.default_return_type
-    return _solve_broadcast(ctx, ctx.type, args[0])
+    return _solve_broadcast(ctx, ctx.type, args[0], "subtract")
 
 
 def floordiv_mod_pow_method_hook(ctx: MethodContext) -> Type:
@@ -7265,6 +7312,52 @@ _DTYPE_INFO: dict[str, tuple[str, int]] = {
 
 _NAME_OF_KIND_SIZE = {v: k for k, v in _DTYPE_INFO.items()}
 
+_DATETIME_FULLNAMES = frozenset({"numpy.datetime64", "numpy.timedelta64"})
+
+
+def _datetime_string_kind(value: str) -> str | None:
+    """'M'/'m' for datetime64/timedelta64 strings with any unit, else None."""
+    text = value.strip()
+    if text in ("datetime64", "timedelta64"):
+        return "M" if text == "datetime64" else "m"
+    for base, kind in (("datetime64", "M"), ("timedelta64", "m")):
+        if text.startswith(base + "[") and text.endswith("]"):
+            return kind
+    return None
+
+
+def _datetime_kind(dtype: Type) -> str | None:
+    """'M' for datetime64, 'm' for timedelta64, else None (issue #144).
+
+    Units are erased in the stubs (datetime64[Any]), so only the base
+    matters; anything else bails like before.
+    """
+    proper = get_proper_type(dtype)
+    if not isinstance(proper, Instance) or not proper.args:
+        return None
+    element = get_proper_type(proper.args[0])
+    if not isinstance(element, Instance):
+        return None
+    if element.type.fullname == "numpy.datetime64":
+        return "M"
+    if element.type.fullname == "numpy.timedelta64":
+        return "m"
+    return None
+
+
+def _construct_datetime_dtype(
+    ctx: FunctionContext | MethodContext, kind: str
+) -> Type | None:
+    """dtype[datetime64] / dtype[timedelta64] with an Any unit, else None."""
+    try:
+        name = "numpy.datetime64" if kind == "M" else "numpy.timedelta64"
+        element: Type = ctx.api.named_generic_type(
+            name, [AnyType(TypeOfAny.explicit)]
+        )
+        return ctx.api.named_generic_type(DTYPE_FULLNAME, [element])
+    except Exception:
+        return None
+
 _WEAK_SCALARS = frozenset(
     {"builtins.int", "builtins.float", "builtins.complex", "builtins.bool"}
 )
@@ -7813,7 +7906,14 @@ def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
     proper = get_proper_type(tp)
     if isinstance(proper, LiteralType) and isinstance(proper.value, str):
         name = _DTYPE_STRINGS.get(proper.value)
-        return _construct_dtype(ctx, name) if name is not None else None
+        if name is not None:
+            return _construct_dtype(ctx, name)
+        # Datetime units erase to Any in the stubs (issue #144):
+        # "datetime64[D]", "datetime64[ns]", "timedelta64[D]", ...
+        kind = _datetime_string_kind(proper.value)
+        if kind is not None:
+            return _construct_datetime_dtype(ctx, kind)
+        return None
     if (
         isinstance(proper, Instance)
         and proper.type.fullname == "builtins.type"
@@ -7827,11 +7927,17 @@ def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
             fullname = _BUILTIN_DTYPE.get(fullname, fullname)
             if fullname in _DTYPE_INFO:
                 return _construct_dtype(ctx, fullname)
+            if fullname in ("numpy.datetime64", "numpy.timedelta64"):
+                kind = "M" if fullname == "numpy.datetime64" else "m"
+                return _construct_datetime_dtype(ctx, kind)
     if isinstance(proper, Instance) and proper.type.fullname == DTYPE_FULLNAME:
         if len(proper.args) == 1:
             element = get_proper_type(proper.args[0])
             if isinstance(element, Instance) and element.type.fullname in _DTYPE_INFO:
                 return _construct_dtype(ctx, element.type.fullname)
+            if isinstance(element, Instance) and element.type.fullname in _DATETIME_FULLNAMES:
+                kind = "M" if element.type.fullname == "numpy.datetime64" else "m"
+                return _construct_datetime_dtype(ctx, kind)
         return None
     if isinstance(proper, CallableType):
         name = _scalar_ret_name(proper.ret_type)
@@ -7854,7 +7960,12 @@ def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
         return _construct_dtype(ctx, names.pop())
     if isinstance(expr, StrExpr):
         name = _DTYPE_STRINGS.get(expr.value)
-        return _construct_dtype(ctx, name) if name is not None else None
+        if name is not None:
+            return _construct_dtype(ctx, name)
+        kind = _datetime_string_kind(expr.value)
+        if kind is not None:
+            return _construct_datetime_dtype(ctx, kind)
+        return None
     return None
 
 
@@ -9500,6 +9611,11 @@ def _reduction_types(
         return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype, op=op)
     out_dtype = _reduction_out_dtype(ctx, op, dtype)
     if out_dtype is None:
+        # mean(datetime) always raises (UFuncTypeError, issue #144):
+        # bail to Any so no float64 (or other) dtype is claimed. The
+        # stubs already emit the arg-type error.
+        if _datetime_kind(dtype) == "M" and op.removeprefix("nan") == "mean":
+            return AnyType(TypeOfAny.explicit)
         return ctx.default_return_type
     if axis == "absent":
         # An omitted axis reduces every axis, exactly like axis=None.
@@ -11235,10 +11351,19 @@ def diff_function_hook(ctx: FunctionContext) -> Type:
         pair = _formal_pair(ctx, name)
         if pair is not None and not _is_none_type(pair[0]):
             return ctx.default_return_type
-    if _dtype_fullname(dtype) == "numpy.datetime64":
-        # Datetime diffs change dtype (datetime64 -> timedelta64), which
-        # only the stubs' dedicated overload tracks.
-        return ctx.default_return_type
+    if _datetime_kind(dtype) == "M":
+        # Datetime diffs change dtype (datetime64 -> timedelta64, issue
+        # #144): same shape logic, timedelta result.
+        out_dtype = _construct_datetime_dtype(ctx, "m")
+        if out_dtype is None:
+            return ctx.default_return_type
+        size = dims[ax]
+        out = list(dims)
+        if isinstance(size, int):
+            out[ax] = max(0, size - n)
+        else:
+            out[ax] = _dim_add_const(ctx, "diff", ax, size, -n)
+        return _ndarray_type(ctx, out, out_dtype)
     size = dims[ax]
     out = list(dims)
     if isinstance(size, int):
@@ -12808,6 +12933,7 @@ def linalg_cross_function_hook(ctx: FunctionContext) -> Type:
 _UFUNC_KEEP = frozenset(
     {
         "square",
+        "reciprocal",
         "floor",
         "ceil",
         "trunc",
@@ -13947,8 +14073,8 @@ def _ufunc_call_solve(ctx: MethodContext) -> Type:
     if name is None:
         return ctx.default_return_type
     if name in _UFUNC_KEEP:
-        # Per-loop tables (issue #61): bool square -> int8; bool
-        # sign/negative and float/complex invert have no loop -> fail.
+        # Per-loop tables (issue #61): bool square/reciprocal/conj ->
+        # int8; bool sign/negative and float/complex invert have no loop.
         pairs = _all_positionals_expanded(ctx)
         if pairs is None:
             return ctx.default_return_type
@@ -13957,7 +14083,7 @@ def _ufunc_call_solve(ctx: MethodContext) -> Type:
             part = _parts_or_unpack(tp)
             if part is not None:
                 base = _dtype_base(part[1])
-                if name == "square" and base == "b":
+                if name in ("square", "reciprocal", "conj", "conjugate") and base == "b":
                     dims = _broadcast_dims(ctx, tp, tp)
                     if dims is None:
                         return ctx.default_return_type
@@ -14029,7 +14155,7 @@ def _ufunc_call_solve(ctx: MethodContext) -> Type:
             if dtype is None:
                 return ctx.default_return_type
             return _ndarray_type(ctx, dims, dtype)
-        return _solve_broadcast(ctx, pairs[0][0], pairs[1][0])
+        return _solve_broadcast(ctx, pairs[0][0], pairs[1][0], name)
     if name in _UFUNC_BINARY_FLOAT:
         pairs = _all_positionals_expanded(ctx)
         if pairs is None:
