@@ -2091,6 +2091,17 @@ def test_take_convolve_0d_ok_clean() -> None:
     }, result.stdout
 
 
+def test_matrix_transpose_rank_mismatch() -> None:
+    # Issue #129: matrix_transpose/.mT require rank >= 2.
+    result = run_mypy(FIXTURES / "bad_matrix_transpose_rank.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 3, result.stdout
+    assert "matrix_transpose requires rank >= 2, got shape (3,)" in errors[0], result.stdout
+    assert "matrix_transpose requires rank >= 2, got shape (3,)" in errors[1], result.stdout
+    assert "matrix_transpose requires rank >= 2, got shape ()" in errors[2], result.stdout
+
+
 def test_inline_generic_call_ok_clean_and_runs() -> None:
     # Issue #55: nested generic calls keep shapes inline (1 level from
     # the issue plus 2-4 level ML nesting), concrete and symbolic.

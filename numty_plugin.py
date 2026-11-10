@@ -8939,7 +8939,14 @@ def _matrix_transpose_solve(
 ) -> Type:
     ndim = len(dims)
     if ndim < 2:
-        return _ndarray_type(ctx, list(dims), dtype)
+        ctx.api.fail(
+            f"matrix_transpose requires rank >= 2, got shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        if isinstance(ctx, AttributeContext):
+            return ctx.default_attr_type
+        return ctx.default_return_type
     out = list(dims)
     out[-2], out[-1] = out[-1], out[-2]
     return _ndarray_type(ctx, out, dtype)
