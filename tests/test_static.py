@@ -1000,6 +1000,42 @@ def test_min_axis_out_of_range() -> None:
     )
 
 
+def test_callsite_formula_no_size() -> None:
+    # A fixed size no value of the name can produce: `n+2` is never 1,
+    # `2*n` is never 5. Sizes that do fit are solved, not flagged.
+    result = run_mypy(FIXTURES / "bad_callsite_no_size.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line.split(": error: ")[1] for line in result.stdout.splitlines() if ": error:" in line]
+    assert errors == [
+        "call-site shape conflict: no size 'n' makes n+2 equal 1"
+        " (argument 'x', axis 1)  [numty-callsite]",
+        "call-site shape conflict: no size 'n' makes 2*n equal 5"
+        " (argument 'x', axis 1)  [numty-callsite]",
+    ], result.stdout
+
+
+def test_callsite_formula_returns() -> None:
+    # Found by the oracle's generic-call family. A formal `N+1` given
+    # `2*M+2` solves N = 2*M+1; before, N stayed unbound and the
+    # callee's `N` leaked into the result as the caller's own `N`
+    # (`N+M+1` came back as `M+2*N+1`), or as `Never`. What cannot be
+    # solved, or cannot be told from the callee's own dim, is unknown.
+    result = run_mypy(FIXTURES / "callsite_formula_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        36: f'"{f64.format("2*M+1, 3*M+N+2")}"',
+        37: f'"{f64.format("N+2, N+3")}"',
+        38: f'"{f64.format("N+1, N+2")}"',
+        39: f'"{f64.format("?U@39, Literal[2]")}"',
+        40: f'"{f64.format("?U@40, ?U@40b")}"',
+        41: f'"{f64.format("Literal[3], Literal[7]")}"',
+    }, result.stdout
+    assert _run_fixture("callsite_formula_ok.py") == [
+        "(7, 13)", "(4, 5)", "(3, 4)", "(3, 2)", "(3, 4)", "(3, 7)",
+    ]
+
+
 def test_callsite_conflict() -> None:
     result = run_mypy(FIXTURES / "bad_callsite_conflict.py")
     assert result.returncode == 1, result.stdout
