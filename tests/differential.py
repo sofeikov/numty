@@ -790,6 +790,65 @@ class SymGen(Gen):
         form = self.rng.choice(("np.matmul({}, {})", "{} @ {}", "np.dot({}, {})"))
         return form.format(a.text, b.text)
 
+    def builder_symbolic(self) -> str:
+        """Builders with sizes spelled as arithmetic (issue #186).
+
+        `np.zeros((a.shape[0] * a.shape[1], a.shape[0] + 1))` names
+        exact sizes; mypy types them `int`, so the plugin folds them
+        with the dim algebra. A product the algebra cannot spell (a sum
+        times a sum) is an unknown size, which still matches.
+        """
+        r = self.rng
+        a = self.operand(self.shape(r.choice((1, 2, 2, 3, 3))))
+        rank = len(a.shape)
+        x = a.text
+
+        def dim(i: int) -> str:
+            return f"{x}.shape[{i}]"
+
+        every = [dim(i) for i in range(rank)]
+        product = " * ".join(every)
+        shapes = [
+            f"({product},)",
+            f"({dim(0)},)",
+            f"(2 * {dim(0)},)",
+            f"({dim(0)} + 1,)",
+            f"({dim(0)} * {dim(0)},)",
+            f"({dim(0)} // 2 + 1,)",
+            f"({dim(0)}, {dim(-1)})",
+            f"({dim(0)} * {dim(-1)}, {dim(0)} + 1)",
+            f"({dim(0)} + 1, {dim(-1)} * 2)",
+        ]
+        if rank >= 2:
+            shapes += [
+                f"({dim(0)} * {dim(1)},)",
+                f"({dim(0)} * {dim(1)}, {dim(0)} + 1)",
+                f"({dim(0)}, {' * '.join(every[1:])})",
+                f"(({dim(0)} + 1) * ({dim(1)} + 1),)",
+            ]
+        singles = [
+            f"2 * {dim(0)}",
+            f"{dim(0)} + 1",
+            product,
+        ]
+        if rank >= 2:
+            singles.append(f"{dim(0)} * {dim(1)}")
+        kind = r.choice(("zeros", "ones", "empty", "full", "rng", "rng"))
+        if kind in ("zeros", "ones", "empty"):
+            shape = r.choice(singles if r.random() < 0.3 else shapes)
+            return f"np.{kind}({shape})"
+        if kind == "full":
+            shape = r.choice(shapes + singles)
+            return f"np.full({shape}, 1.5)"
+        shape = r.choice(shapes + singles)
+        src = "np.random.default_rng(0)"
+        op = r.choice(("standard_normal", "random", "normal", "integers"))
+        if op == "integers":
+            return f"{src}.integers(0, 5, size={shape})"
+        if op == "normal":
+            return f"{src}.normal(size={shape})"
+        return f"{src}.{op}(size={shape})"
+
     def chain(self) -> str:
         a = self.operand()
         b = self.operand(a.shape)
@@ -1150,6 +1209,7 @@ class SymGen(Gen):
         Gen.all_any, Gen.rounding, Gen.divmod_builtin, Gen.linalg_cross,
         Gen.array_method, Gen.array_method, Gen.rng_method,
         reshape_symbolic, reshape_symbolic, reshape_symbolic,
+        builder_symbolic, builder_symbolic, builder_symbolic,
         call, call, call, call,
         ts_binary, ts_binary, ts_matmul, ts_matmul, ts_reshape, ts_reshape,
         ts_reduction, ts_reduction, ts_call, ts_call,

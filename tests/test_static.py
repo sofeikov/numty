@@ -1149,6 +1149,37 @@ def test_reshape_targets_written_as_arithmetic() -> None:
     ]
 
 
+def test_builders_keep_arithmetic_sizes() -> None:
+    # Issue #186: a size written as arithmetic was typed `int` by mypy,
+    # so builders lost it where reshape (#184) already folded it.
+    result = run_mypy(FIXTURES / "builders_arithmetic_ok.py")
+    assert result.returncode == 0, result.stdout
+    nd = "numpy.ndarray[tuple[{}], numpy.dtype[{}]]"
+    bits = "numpy._typing._nbit_base._{}Bit"
+    f64 = "numpy.float64"
+    i64 = f"numpy.signedinteger[{bits.format(64)}]"
+    assert reveals_by_line(result) == {
+        20: f'"{nd.format("M*N, M+1", f64)}"',
+        21: f'"{nd.format("2*M", f64)}"',
+        22: f'"{nd.format("M+1, 2*N", f64)}"',
+        23: f'"{nd.format("M*N", f64)}"',
+        24: f'"{nd.format("M*N", f64)}"',
+        25: f'"{nd.format("M-1, N//2", f64)}"',
+        27: f'"{nd.format("?U@27", f64)}"',
+        29: f'"{nd.format("M*N, M+1", f64)}"',
+        30: f'"{nd.format("2*M", f64)}"',
+        31: f'"{nd.format("M+1, 2*N", i64)}"',
+        35: f'"{nd.format("M*N, M+1", f64)}"',
+        36: f'"{nd.format("2*M", f64)}"',
+    }, result.stdout
+    assert _run_fixture("builders_arithmetic_ok.py") == [
+        "(24, 5) float64", "(8,) float64", "(5, 12) float64", "(24,) float64",
+        "(24,) float64", "(3, 3) float64", "(35,) float64",
+        "(24, 5) float64", "(8,) float64", "(5, 12) int64",
+        "(24, 5) float64", "(8,) float64",
+    ]
+
+
 def test_callsite_conflict() -> None:
     result = run_mypy(FIXTURES / "bad_callsite_conflict.py")
     assert result.returncode == 1, result.stdout
