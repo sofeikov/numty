@@ -469,7 +469,11 @@ Two arguments sharing one shape TypeVar are checked at the call site,
 where the actual shapes are still visible: `f(x_5, y_6)` against `(A[N],
 A[N])` errors with the two sizes named. Different TypeVars (`N` vs `M`)
 stay silent by design — their equality is unprovable, and unknown is not
-an error. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
+an error. The same holds for `matmul` inner dims between distinct free
+symbolics (`(S,F)@(S,T)` keeps `(S,T)` "if legal", issue #127): a generic
+function whose body needs `F == S` but declares them independent cannot
+be proven wrong inside the body, so the check stays at the call site,
+where concrete sizes are visible. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
 `A` — a bare generic alias silently means unknown sizes). The same holds
 for a dataclass holding shapes: `list[Box]` with `Box(Generic[N])`
 holding `F64[N, 3]` is an error (`Box used bare ... [numty-annotation]`,
