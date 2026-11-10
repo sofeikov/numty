@@ -2043,6 +2043,33 @@ def test_reshape_symbolic_total_mismatch() -> None:
     assert "reshape changes total size: N+2 -> N" in errors[1], result.stdout
 
 
+def test_no_crash_ok_clean() -> None:
+    # Issue #41: sort(axis=None) and 0-d dot/inner must never crash.
+    result = run_mypy(FIXTURES / "no_crash_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "INTERNAL ERROR" not in result.stdout, result.stdout
+    assert "internal error" not in result.stdout.lower(), result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    i32 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]"
+    assert reveals_by_line(result) == {
+        12: f'"numpy.ndarray[tuple[3*N], {f64}]"',
+        13: f'"numpy.ndarray[tuple[3*N], {i32}]"',
+        17: f'"numpy.ndarray[tuple[Literal[4], Literal[3]], {f64}]"',
+        18: f'"numpy.ndarray[tuple[Literal[2], Literal[4], Literal[3]], {f64}]"',
+        19: f'"numpy.ndarray[tuple[Literal[4], Literal[3]], {f64}]"',
+    }, result.stdout
+
+
+def test_solve_0d_mismatch() -> None:
+    # Issue #41: 0-d b in linalg.solve is a normal error, not a crash.
+    result = run_mypy(FIXTURES / "bad_solve_0d.py")
+    assert result.returncode == 1, result.stdout
+    assert "INTERNAL ERROR" not in result.stdout, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 1, result.stdout
+    assert "linalg.solve: b has 0 dimensions" in errors[0], result.stdout
+
+
 def test_offsets_calls_ok_clean_and_runs() -> None:
     # Issue #32 finish: expression returns infer through calls instead of
     # going Any. `make_offsets(a: I64[K]) -> I64["M+1"]` reveals K+1 in the
