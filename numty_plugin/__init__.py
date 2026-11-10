@@ -391,6 +391,8 @@ class NumtyPlugin(Plugin):
             return _norm_signature_hook
         if fullname == "numpy._core.einsumfunc.einsum":
             return _einsum_signature_hook
+        if fullname == "numpy.linalg._linalg.cross":
+            return _linalg_cross_signature_hook
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
         return self.callsite_signature_hook
@@ -9917,15 +9919,13 @@ def permute_dims_function_hook(ctx: FunctionContext) -> Type:
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
-    if len(pairs) == 1:
-        # No axes: reverse
-        return _ndarray_type(ctx, list(reversed(dims)), dtype)
-    # axes as second positional or formal "axes"
+    # axes as second positional or as the keyword
     axes_pair = _formal_pair(ctx, "axes")
     if axes_pair is None and len(pairs) > 1:
         axes_pair = pairs[1]
-    if axes_pair is None:
-        return ctx.default_return_type
+    if axes_pair is None or _is_none_type(axes_pair[0]):
+        # No axes: reverse
+        return _ndarray_type(ctx, list(reversed(dims)), dtype)
     axes = _shape_from_arg(axes_pair[0], axes_pair[1])
     if axes is None:
         return ctx.default_return_type
@@ -13027,6 +13027,38 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
         return ctx.default_signature
 
 
+def _linalg_cross_signature_hook(ctx: FunctionSigContext) -> Type:
+    """Let `np.linalg.cross` take arrays of rank 3 and up.
+
+    The stubs type both operands as 1-D or 2-D, so a batch of vectors
+    (`F64[N, M, 3]`) is an [arg-type] error although numpy accepts any
+    rank. When an operand is a numeric array of rank above 2, the two
+    array formals become Any; the function hook then solves the shape
+    and dtype and still reports a vector axis that is not 3.
+    """
+    try:
+        sig = ctx.default_signature
+        if not isinstance(sig, CallableType) or len(sig.arg_types) < 2:
+            return ctx.default_signature
+        if len(ctx.args) < 2 or len(ctx.args[0]) != 1 or len(ctx.args[1]) != 1:
+            return ctx.default_signature
+        ranks = []
+        for exprs in ctx.args[:2]:
+            parts = _ndarray_parts(ctx.api.get_expression_type(exprs[0]))
+            if parts is None or _dtype_base(parts[1]) not in ("i", "u", "f", "c"):
+                return ctx.default_signature
+            ranks.append(len(parts[0]))
+        if max(ranks) <= 2:
+            return ctx.default_signature
+        new_arg_types = list(sig.arg_types)
+        new_arg_types[0] = AnyType(TypeOfAny.explicit)
+        new_arg_types[1] = AnyType(TypeOfAny.explicit)
+        return sig.copy_modified(arg_types=new_arg_types)
+    except Exception:
+        _swallowed(ctx, "_linalg_cross_signature_hook")
+        return ctx.default_signature
+
+
 def _reshape_signature_hook(ctx: MethodSigContext) -> Type:
     """Widen reshape formals to Any on provable int total mismatch (issue #148).
 
@@ -13893,11 +13925,12 @@ def linalg_cross_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     vec_a, vec_b = dims_a[norm_a], dims_b[norm_b]
-    if not isinstance(vec_a, int) or not isinstance(vec_b, int):
-        return ctx.default_return_type
-    if vec_a != 3 or vec_b != 3:
+    # A symbolic vector axis is taken to be 3: the call fails otherwise,
+    # and the stubs (written for 1-D and 2-D) would answer int8 here.
+    if any(isinstance(v, int) and v != 3 for v in (vec_a, vec_b)):
         ctx.api.fail(
-            f"linalg.cross requires 3-dimensional vectors, got {vec_a} and {vec_b} "
+            f"linalg.cross requires 3-dimensional vectors, got "
+            f"{_dim_str(vec_a)} and {_dim_str(vec_b)} "
             f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
             ctx.context,
             code=NUMTY_SHAPE,
@@ -14567,25 +14600,39 @@ def ufunc_function_hook(ctx: FunctionContext, group: str) -> Type:
     return _solve_ufunc(ctx, group)
 
 
-def _bool_round(
-    ctx: FunctionContext | MethodContext, array: Type, plain: bool
+def _solve_round(
+    ctx: FunctionContext | MethodContext, array: Type, function: bool
 ) -> Type:
-    """round on a bool array, the one input whose dtype it changes.
+    """round: the input's shape and dtype, except on a bool array.
 
-    The stubs keep the dtype, which is right for every numeric input.
-    A bool array comes back float16 from a plain `round()`; with
-    `decimals` numpy takes another path (and can refuse outright), so
-    only the shape is kept there.
+    Every numeric dtype is kept. A bool array comes back float16 from
+    `round()` and `round(0)`; with any other `decimals` numpy refuses
+    (it cannot cast the scaled values back to bool), so nothing is
+    claimed there. numty has no error code for a dtype failure.
     """
     part = _parts_or_unpack(array)
-    if part is None or _dtype_base(part[1]) != "b":
+    if part is None:
         return ctx.default_return_type
-    dims, _ = part
-    if not plain:
-        any_dtype = ctx.api.named_generic_type(
-            DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)]
-        )
-        return _ndarray_type(ctx, dims, any_dtype)
+    out = _formal_pair(ctx, "out")
+    if out is not None and not _is_none_type(out[0]):
+        return ctx.default_return_type
+    dims, dtype = part
+    base = _dtype_base(dtype)
+    if base != "b":
+        # The method's stub already returns Self; np.round's loses the shape.
+        if function and base is not None:
+            return _ndarray_type(ctx, dims, dtype)
+        return ctx.default_return_type
+    pair = _formal_pair(ctx, "decimals")
+    if pair is not None:
+        decimals = _fold_single(pair)
+        if decimals is None:
+            any_dtype = ctx.api.named_generic_type(
+                DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)]
+            )
+            return _ndarray_type(ctx, dims, any_dtype)
+        if decimals != 0:
+            return AnyType(TypeOfAny.special_form)
     f16 = _construct_dtype(ctx, "numpy.float16")
     if f16 is None:
         return ctx.default_return_type
@@ -14593,15 +14640,14 @@ def _bool_round(
 
 
 def round_method_hook(ctx: MethodContext) -> Type:
-    return _bool_round(ctx, ctx.type, plain=not any(ctx.arg_types))
+    return _solve_round(ctx, ctx.type, function=False)
 
 
 def round_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    plain = sum(len(types) for types in ctx.arg_types) == 1
-    return _bool_round(ctx, pairs[0][0], plain)
+    return _solve_round(ctx, pairs[0][0], function=True)
 
 
 def angle_function_hook(ctx: FunctionContext) -> Type:
@@ -15342,6 +15388,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
         "numpy._core.einsumfunc": {"einsum": einsum_function_hook},
         "numpy._core.fromnumeric": {
             "round": round_function_hook,
+            "around": round_function_hook,
             "all": partial(allany_function_hook, op="all"),
             "any": partial(allany_function_hook, op="any"),
             "clip": clip_function_hook,

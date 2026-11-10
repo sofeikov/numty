@@ -251,6 +251,9 @@ REGRESSIONS: list[tuple[str, bool]] = [
     ("np.correlate(np.zeros(()), np.ones((2,)))", True),
     ("np.zeros(()).mean(axis=0, keepdims=True)", True),
     ("np.zeros(()).sum(axis=0, keepdims=True)", False),
+    # permute_dims took `axes=` by keyword as no axes, and reversed.
+    ("np.permute_dims(np.ones((5, 4, 2, 2), dtype=np.float16), axes=(1, 2, 0, 3))", False),
+    ("np.permute_dims(np.ones((3, 3, 4), dtype=np.int32), axes=(0, 2, 1))", False),
 ]
 
 

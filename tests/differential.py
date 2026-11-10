@@ -285,6 +285,10 @@ class Gen:
                 f"np.transpose({a.text})",
                 f"{a.text}.transpose({perm!r})",
                 f"np.transpose({a.text}, {perm!r})",
+                f"np.transpose({a.text}, axes={perm!r})",
+                f"np.permute_dims({a.text})",
+                f"np.permute_dims({a.text}, {perm!r})",
+                f"np.permute_dims({a.text}, axes={perm!r})",
                 f"np.swapaxes({a.text}, {self.axis(rank)}, {self.axis(rank)})",
                 f"np.moveaxis({a.text}, {self.axis(rank)}, {self.axis(rank)})",
                 f"{a.text}.mT",
@@ -502,6 +506,51 @@ class Gen:
             )
         )
 
+    def all_any(self) -> str:
+        a = self.operand()
+        rank = len(a.shape)
+        name = self.rng.choice(("all", "any"))
+        axis = self.rng.choice(
+            ("", f", axis={self.axis(rank)}", f", {self.axis(rank)}", ", axis=None", ", axis=(0, -1)")
+        )
+        keep = ", keepdims=True" if self.rng.random() < 0.3 else ""
+        return f"np.{name}({a.text}{axis}{keep})"
+
+    def rounding(self) -> str:
+        a = self.operand()
+        return self.rng.choice(
+            (
+                "np.round({})", "np.round({}, 2)", "np.round({}, decimals=1)", "np.around({})",
+                "np.around({}, 1)", "{}.round()", "{}.round(2)", "{}.round(decimals=1)",
+            )
+        ).format(a.text)
+
+    def divmod_builtin(self) -> str:
+        a = self.operand()
+        other = self.rng.choice((self.near(a.shape).text, "2", "2.5", "np.int8(3)"))
+        return self.rng.choice((f"divmod({a.text}, {other})", f"divmod({other}, {a.text})"))
+
+    def linalg_cross(self) -> str:
+        r = self.rng
+
+        def vectors(shape: tuple[int, ...]) -> tuple[int, ...]:
+            # Mostly a 3 somewhere, since that is what cross needs.
+            if shape and r.random() < 0.8:
+                at = r.randrange(len(shape))
+                return shape[:at] + (3,) + shape[at + 1 :]
+            return shape
+
+        a = self.operand(vectors(self.shape(r.choice((1, 1, 2, 2, 3)))))
+        roll = r.random()
+        if roll < 0.5:
+            b = self.operand(a.shape)
+        elif roll < 0.8:
+            b = self.operand(vectors(self.shape(r.choice((1, 2)))))
+        else:
+            b = self.operand()
+        axis = f", axis={self.axis(len(a.shape))}" if r.random() < 0.5 else ""
+        return f"np.linalg.cross({a.text}, {b.text}{axis})"
+
     def chain(self) -> str:
         a = self.operand()
         b = self.operand(a.shape)
@@ -517,6 +566,7 @@ class Gen:
         where, clip, shape_helper, shape_helper, tile_repeat, pad, linalg, linalg_solve,
         einsum, take, take_along_axis, expand_squeeze, broadcast_to, fft, split,
         roll_rot, builder, average, edit, window, lookup, ufunc_method, chain,
+        all_any, rounding, divmod_builtin, linalg_cross,
     )
 
     def expression(self) -> str:
@@ -702,6 +752,7 @@ class SymGen(Gen):
         Gen.where, Gen.clip, Gen.shape_helper, Gen.tile_repeat, pad,
         Gen.expand_squeeze, Gen.fft, Gen.roll_rot, Gen.take, Gen.products,
         Gen.einsum, Gen.window, chain, Gen.split, Gen.edit,
+        Gen.all_any, Gen.rounding, Gen.divmod_builtin, Gen.linalg_cross,
         call, call, call, call,
     )
 

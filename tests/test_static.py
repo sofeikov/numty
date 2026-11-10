@@ -1036,6 +1036,51 @@ def test_callsite_formula_returns() -> None:
     ]
 
 
+def test_hooks_the_oracle_reached_first() -> None:
+    # permute_dims, np.round, linalg.cross, np.all/np.any and builtin
+    # divmod had no test until the oracle generated them. It found:
+    # `permute_dims(a, axes=...)` by keyword reversed the axes instead of
+    # applying them; `np.round` of a non-bool array lost the shape and
+    # `np.around` was not hooked at all; `linalg.cross` with a symbolic
+    # vector axis fell back to the stubs, which answer int8 for rank 3
+    # and reject the call.
+    result = run_mypy(FIXTURES / "oracle_hooks_ok.py")
+    nd = "numpy.ndarray[tuple[{}], numpy.dtype[{}]]"
+    f64, boolean = "numpy.float64", "numpy.bool[bool]"
+    bits = "numpy._typing._nbit_base._{}Bit"
+    f16 = f"numpy.floating[{bits.format(16)}]"
+    i64 = f"numpy.signedinteger[{bits.format(64)}]"
+    lit = lambda *dims: ", ".join(f"Literal[{d}]" for d in dims)  # noqa: E731
+    assert reveals_by_line(result) == {
+        26: f'"{nd.format(lit(4, 2, 3), f64)}"',
+        27: f'"{nd.format(lit(3, 2, 4), f64)}"',
+        28: f'"{nd.format("M, N", f64)}"',
+        29: f'"{nd.format("N, M", f64)}"',
+        30: f'"{nd.format(lit(2, 3, 4), f64)}"',
+        31: f'"{nd.format(lit(2, 3), f16)}"',
+        32: f'"{nd.format(lit(2, 3), f16)}"',
+        33: f'"{nd.format("K, Literal[3], Literal[3]", i64)}"',
+        34: f'"{nd.format("M", boolean)}"',
+        35: f'"{nd.format(lit(1, 3, 1), boolean)}"',
+        36: f'"{nd.format("N, M", f64)}"',
+    }, result.stdout
+    # Line 33 is rank 3: the stubs type linalg.cross for 1-D and 2-D
+    # only, and used to add two [arg-type] errors to a call numpy accepts.
+    assert result.returncode == 0, result.stdout
+    assert _run_fixture("oracle_hooks_ok.py") == [
+        "(4, 2, 3) float64", "(3, 2, 4) float64", "(6, 5) float64", "(5, 6) float64",
+        "(2, 3, 4) float64", "(2, 3) float16", "(2, 3) float16", "(3, 3, 3) int64",
+        "(6,) bool", "(1, 3, 1) bool", "(5, 6) float64",
+    ]
+
+
+def test_round_bool_with_decimals_claims_nothing() -> None:
+    # numpy cannot cast the scaled values back to bool and raises; numty
+    # used to reveal the input's shape for a call that never returns.
+    result = run_mypy(FIXTURES / "round_bool_decimals.py")
+    assert reveals_by_line(result) == {8: '"Any"', 9: '"Any"', 10: '"Any"'}, result.stdout
+
+
 def test_callsite_conflict() -> None:
     result = run_mypy(FIXTURES / "bad_callsite_conflict.py")
     assert result.returncode == 1, result.stdout
