@@ -769,6 +769,18 @@ class NumtyPlugin(Plugin):
                     dims.extend(parsed)
                 else:
                     dims.append(parsed)
+            # A size is never below 0. A bare `-1` is refused where it
+            # is parsed; this covers every other spelling: `"2-3"`,
+            # `"-1"`, `Literal[-1]`, `"-N-1"`.
+            for d in dims:
+                if isinstance(d, int) and d < 0:
+                    raise _FamFail(f"{head} dim {d} is negative; a size cannot be below 0")
+                form = _form_of(d)
+                if form is not None and _form_never_size(form):
+                    raise _FamFail(
+                        f"{head} dim {_expr_str(form)} is negative for every size;"
+                        " a size cannot be below 0"
+                    )
         except _FamFail as bad:
             ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
             return AnyType(TypeOfAny.from_error)
@@ -1743,6 +1755,18 @@ def _forms_provably_ne(fa: object, fb: object, nonzero: bool = False) -> bool:
     return False
 
 
+def _form_never_size(form: object) -> bool:
+    """A form below 0 whatever its variables are: no array has that size.
+
+    Variables are sizes, so never negative: a linear form with no
+    positive coefficient is at most its constant. `-N-1` and `-3`
+    qualify; `-N` (0 on an empty axis) and `N-1` do not.
+    """
+    if isinstance(form, _LinForm):
+        return form.const < 0 and all(c < 0 for _, c in form.coeffs)
+    return False
+
+
 def _dim_str(d: int | Type) -> str:
     if isinstance(d, int):
         return str(d)
@@ -1990,7 +2014,7 @@ def _expr_str(form: _LinForm | _DivForm | _MonoForm) -> str:
         out = f"({inner})" if compound else inner
         out += f"//{form.div}"
         if form.plus:
-            out += f"+{form.plus}"
+            out += f"{form.plus:+d}"
         return out
     parts = []
     for fullname, coeff in form.coeffs:
@@ -2295,12 +2319,18 @@ def _dim_div(
         return _fresh_unknown(ctx, op, index)
     if isinstance(fa, _LinForm) and not fa.coeffs:
         return fa.const // div + plus
-    if all(c % div == 0 for _, c in fa.coeffs) and fa.const % div == 0:
+    if div < 0:
+        return _fresh_unknown(ctx, op, index)
+    # Whole multiples of div leave the floor: (2*N+1)//2 is N and
+    # (N+3)//2 is (N+1)//2+1. Taking them out gives one spelling per
+    # function, so equal dims built in different orders compare equal.
+    if all(c % div == 0 for _, c in fa.coeffs):
         base = _LinForm(tuple((n, c // div) for n, c in fa.coeffs), fa.const // div)
         if plus:
             base = _lin_add(base, _LinForm((), plus))
         return _materialize_dim(ctx, op, index, base, prefer=a)
-    return _materialize_dim(ctx, op, index, _DivForm(fa, div, plus))
+    inner = _LinForm(fa.coeffs, fa.const % div)
+    return _materialize_dim(ctx, op, index, _DivForm(inner, div, plus + fa.const // div))
 
 
 def _mul_dims(

@@ -3448,6 +3448,23 @@ def test_sum_duplicate_axis() -> None:
     )
 
 
+def test_negative_dims_are_refused_in_every_spelling() -> None:
+    # `F64[-1]` was refused, but the same size spelled `"2-3"`, `"-1"`
+    # or `Literal[-1]` went through as a dim of -1 (found by fuzzing
+    # the string-dim parser against Python's own arithmetic).
+    result = run_mypy(FIXTURES / "bad_f64_negative.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert [line.split(": error: ")[1] for line in errors] == [
+        "F64 dim -1 is negative; a size cannot be below 0  [numty-annotation]",
+        "F64 dim -1 is negative; a size cannot be below 0  [numty-annotation]",
+        "F64 dim -1 is negative; a size cannot be below 0  [numty-annotation]",
+        "F64 dim -time-1 is negative for every size; a size cannot be below 0"
+        "  [numty-annotation]",
+    ], result.stdout
+    assert [int(line.split(":")[1]) for line in errors] == [8, 11, 14, 17]
+
+
 # Error codes (#66): each kind of numty diagnostic carries its own code, a
 # sub-code of misc, so it can be silenced or selected on its own while old
 # `ignore[misc]` / `disable_error_code = misc` setups keep working.

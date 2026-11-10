@@ -1419,6 +1419,14 @@ subtraction below.
   [tests/differential.py](tests/differential.py) — the differential
   oracle: generated numpy expressions, numty's type against numpy's
   result (see "Checked against numpy").
+- [tests/test_dim_algebra.py](tests/test_dim_algebra.py) — properties
+  of the symbolic dim algebra, generated with Hypothesis and checked
+  at every assignment of small sizes, 0 and 1 included: form
+  arithmetic matches integer arithmetic, a size has one spelling
+  however it was built, "provably unequal" is never claimed for forms
+  some sizes make equal, forms survive the cache round trip, and a
+  printed formula evaluates to its form. String dims are checked
+  through mypy against Python's own arithmetic.
 - [tests/test_ty.py](tests/test_ty.py) — runs the pinned ty over
   `numty/__init__.py demo.py` (exactly the 2 demo errors) and over
   [flex_portable.py](tests/fixtures/flex_portable.py) (`FlexArray`
