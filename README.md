@@ -110,10 +110,13 @@ error: Incompatible return value type (got "ndarray[tuple[batch, heads, seq, seq
   generates NumPy expressions, compares numty's inferred shape and
   dtype with what NumPy returns, and fails on any disagreement. The
   latest long run (42,000 expressions, seeds 101-130, NumPy 2.5.4,
-  mypy 2.4.1) had **no disagreements**: 24,601 exact shapes matched
-  NumPy's, and of the 11,195 expressions NumPy rejects, 8,398 were
-  reported before running. Three cases hit documented gaps in NumPy's
-  own stubs (see [Checked against numpy](#checked-against-numpy)).
+  mypy 2.4.1) had **no disagreements**. Each symbolic expression is
+  run at four sets of sizes, empty axes included, which makes 105,000
+  comparisons: 62,138 exact shapes matched NumPy's, and of the 28,135
+  NumPy rejects, 17,403 were reported before running. Three cases hit
+  documented gaps in NumPy's own stubs and 159 hit the empty-axis
+  limit on symbolic subtraction (see
+  [Checked against numpy](#checked-against-numpy)).
 - **It finds seeded bugs.** [bench/](bench) hides 18 realistic
   mistakes in MLP-training and math-library code; 17 are reported
   before anything runs. The 18th passes a bare `np.ndarray`, so there
@@ -1185,7 +1188,10 @@ wrong answer does. Two modes share the machinery. Concrete mode builds
 operands with literal shapes across twelve dtypes. Symbolic mode wraps
 the expression in a function with `F64[N, M]`-style parameters, calls
 it with fixed sizes, and substitutes them into the revealed dims, so
-`N+1`, `N*M` and `N//2+1` are checked as arithmetic.
+`N+1`, `N*M` and `N//2+1` are checked as arithmetic. A symbolic answer
+is a claim about every size, so each case is evaluated under four
+assignments from one mypy run: odd sizes, even sizes, and two with an
+empty axis.
 
 The suite runs a small fixed-seed sample of both modes plus every
 expression the oracle has caught so far, pinned by hand. For a longer
@@ -1213,7 +1219,10 @@ on calls numty does not hook are listed in `KNOWN_GAPS` in
 `tests/differential.py` rather than failed (two entries today:
 `cov`/`corrcoef` and `digitize` on complex input), and in symbolic
 mode an expression numpy rejects is never counted against numty,
-since distinct dims are unprovable by design.
+since distinct dims are unprovable by design. A symbolic dim that
+comes out negative at the sizes used (`N-1` on an empty axis) is
+counted as a known gap too; see the limitation on symbolic
+subtraction below.
 
 ## Limitations, stated plainly
 
@@ -1249,6 +1258,16 @@ since distinct dims are unprovable by design.
   themselves rank-check without the plugin is still open in
   [#5](https://github.com/sofeikov/numty/issues/5).
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
+- A symbolic subtraction assumes the axis is long enough. `a[1:]` is
+  `(N-1,)` and `np.diff(a)` is `(N-1,)`, but numpy stops at zero: on an
+  empty axis both are `(0,)`, not `(-1,)`. So `signal[:, 1:] - signal`
+  is reported as `time-1` vs `time` although numpy accepts it when
+  `time` is 0 (both sides empty) or 1 (the empty side broadcasts).
+  The oracle counts these as a known gap instead of failing. Sizes
+  that differ only by a factor are not assumed non-empty: `2*M` and
+  `M` are equal at `M == 0`, so `np.vdot` of `(2, M)` and `(M,)` is
+  not an error. `reshape` is the exception and reads totals up to a
+  zero factor (`(2*N,)` to `(3, N)` is an error).
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
   `full`, `*_like(shape=...)`) keeps the literal dims of a tuple

@@ -101,6 +101,38 @@ def test_comparison_rules(revealed: str, value: object, expected: str | None) ->
     assert d._compare(d.parse_type(revealed), value) == expected
 
 
+def test_symbolic_claims_are_checked_at_every_size(tmp_path: Path) -> None:
+    # `N+1` is right for every N; `N-1` for `a[1:]` is right until the
+    # axis is empty, where numpy returns 0 and the formula says -1.
+    sizes = d.SIZE_ASSIGNMENTS
+    assert any(0 in s.values() for s in sizes)
+    assert {s["N"] % 2 for s in sizes if s["N"]} == {0, 1}
+    revealed = d.parse_type(ARRAY.format("N//2+1", "numpy.float64"))
+    assert d._compare(revealed, np.zeros(2), {"N": 3}) is None
+    assert d._compare(revealed, np.zeros(2), {"N": 4}) == "WRONG_SHAPE"
+    assert d._compare(revealed, np.zeros(3), {"N": 4}) is None
+
+    grow = d.Case("np.pad(a0, 1)", [("a0", "F64", ("N",))])
+    shrink = d.Case("a0[1:]", [("a0", "F64", ("N",))])
+    # Off by one for every N >= 2, but (0,) + (0,) at N=0: the error
+    # names `N-1`, which is -1 there, so it is the same known gap.
+    off = d.Case("a0[1:] + a0", [("a0", "F64", ("N",))])
+    findings, stats = d.check([grow, shrink, off], tmp_path)
+    assert not findings, "\n".join(str(f) for f in findings)
+    assert stats["agree: exact shape"] == 2 * len(sizes) - 1, stats
+    assert stats[d.BELOW_DOMAIN] == 2, stats
+    assert stats["numpy raises, flagged"] == len(sizes) - 1, stats
+    assert d._negative_dim("shapes (N-1,) vs (N,)", {"N": 0})
+    assert not d._negative_dim("shapes (N-1,) vs (N,)", {"N": 3})
+    assert not d._negative_dim("different sizes: 2*M vs M", {"M": 0})
+    assert not d._negative_dim("axis -1 is out of range (shape (N,))", {"N": 0})
+
+    # A claim that is wrong without going negative is a finding, and
+    # says which sizes exposed it.
+    wrong = d.Finding("WRONG_SHAPE", shrink, "N", "shape (0,)", {"N": 0})
+    assert "numpy with N=0" in str(wrong)
+
+
 def test_known_gaps_are_narrow() -> None:
     # A known gap excuses one finding kind on one call shape, nothing else.
     import re
@@ -155,6 +187,28 @@ REGRESSIONS: list[tuple[str, bool]] = [
     ("np.zeros(()).mean(axis=0, keepdims=True)", True),
     ("np.zeros(()).sum(axis=0, keepdims=True)", False),
 ]
+
+
+def test_empty_axis_is_not_a_size_mismatch(tmp_path: Path) -> None:
+    # Found by the zero-size assignments: `2*M` and `M` are the same
+    # size when M is 0, so numpy accepts these and numty must not call
+    # them a mismatch. `M+1` vs `M` differ for every M and still error.
+    params = [("a0", "F64", (2, "M")), ("a1", "F64", ("M",))]
+    mono = [("a0", "F64", ("N", "M", 2)), ("a1", "I64", ("M", "N"))]
+    cases = [
+        d.Case("np.vdot(a0, a1)", params),
+        d.Case("np.vdot(a0, a1)", mono),
+        d.Case("a0.ravel() + a1", params),
+        d.Case("np.vdot(np.pad(a1, (0, 1)), a1)", params),
+    ]
+    empty = {"N": 3, "M": 0, "K": 7, "P": 4}
+    for case in cases[:3]:
+        assert not isinstance(d.evaluate(case, empty), Exception), case.expr
+    assert isinstance(d.evaluate(cases[3], empty), Exception)
+    findings, stats = d.check(cases, tmp_path)
+    assert not findings, "\n".join(str(f) for f in findings)
+    # Only the pad case is flagged, under all four assignments.
+    assert stats["numpy raises, flagged"] == len(d.SIZE_ASSIGNMENTS), stats
 
 
 def test_regressions_stay_fixed(tmp_path: Path) -> None:
