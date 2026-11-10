@@ -80,6 +80,13 @@ KNOWN_GAPS: tuple[tuple[str, str, str], ...] = (
 # large as what it subtracts. A wrong answer whose dims all stay
 # non-negative still fails.
 BELOW_DOMAIN = "known gap: size below the formula's domain"
+# A shape error on a symbolic case says the code is wrong for sizes in
+# general, not for every size: `N+1` against `N` does not broadcast,
+# except that at N=0 it is 1 against 0, which does. So an error is a
+# false positive only when numpy accepts the expression under every
+# assignment; where numpy raises under some and accepts under others,
+# the accepting ones are counted under this key.
+SPECIAL_SIZES = "error stands: numpy accepts only at special sizes"
 
 DIMS = (1, 2, 3, 4, 5, 6)
 DTYPES = (
@@ -110,6 +117,10 @@ SIZE_ASSIGNMENTS: tuple[dict[str, int], ...] = (
     {"N": 0, "M": 5, "K": 7, "P": 4},
     {"N": 3, "M": 0, "K": 7, "P": 4},
 )
+# Dims that are formulas over the names, so rules are also tested on
+# inputs that are already expressions (`F64[N, "N+1"]`). None can be
+# negative, whatever the sizes: the operand has to exist at runtime.
+SYMBOL_FORMULAS = ("N+1", "N+2", "2*N", "2*M+1", "N+M", "M+K")
 SYMBOL_HEADS = {
     "F64": "float64",
     "F32": "float32",
@@ -522,12 +533,16 @@ class SymGen(Gen):
     def __init__(self, rng: random.Random) -> None:
         super().__init__(rng)
         self.params: list[tuple[str, str, tuple[object, ...]]] = []
+        self.helpers: list[Helper] = []
+        self.helper_count = 0
 
     def shape(self, rank: int | None = None) -> tuple[int, ...]:  # type: ignore[override]
         r = self.rng
         if rank is None:
             rank = r.choice((1, 1, 2, 2, 2, 3))
         pool: tuple[object, ...] = ("N", "N", "M", "M", "K", "P", 2, 3)
+        if r.random() < 0.3:
+            pool += SYMBOL_FORMULAS
         return cast("tuple[int, ...]", tuple(r.choice(pool) for _ in range(rank)))
 
     def operand(self, shape=None, dtype=None) -> Operand:  # type: ignore[override]
@@ -586,6 +601,99 @@ class SymGen(Gen):
         a = self.operand()
         return f"np.pad({a.text}, {self.rng.choice(('1', '(1, 2)'))})"
 
+    def call(self) -> str:
+        """A call to a generic function whose signature carries formulas.
+
+        `def g(x0: F64[N, "N+1"]) -> F64["2*N"]` is a contract: bind the
+        names from the argument shapes, then the result has the shape
+        the return spells. numty has to work that out at the call site
+        in the caller's own names; `Helper.__call__` does it on the
+        actual arrays.
+        """
+        r = self.rng
+        words = r.random() < 0.3
+        names = r.sample(("N", "M", "K"), r.choice((1, 2, 2, 3)))
+
+        def formula(pool: tuple[str, ...]) -> str:
+            a = r.choice(names)
+            return r.choice(pool).format(a=a, b=r.choice(names))
+
+        def formal() -> object:
+            roll = r.random()
+            if roll < 0.65:
+                return r.choice(names)
+            if roll < 0.8:
+                return r.choice((2, 3))
+            return formula(("{a}+1", "{a}+2", "2*{a}"))
+
+        formals = [
+            (r.choice(tuple(SYMBOL_HEADS)), tuple(formal() for _ in range(r.choice((1, 2, 2, 3)))))
+            for _ in range(r.choice((1, 1, 2)))
+        ]
+        bound = sorted({n for _, dims in formals for d in dims for n in _names_in(d)})
+        if not bound:
+            head, dims = formals[0]
+            formals[0] = (head, (names[0],) + dims[1:])
+            bound = [names[0]]
+        names = bound
+
+        def returned() -> object:
+            roll = r.random()
+            if roll < 0.4:
+                return r.choice(names)
+            if roll < 0.5:
+                return r.choice((2, 3))
+            return formula(("{a}+1", "{a}+2", "2*{a}", "{a}+{b}", "2*{a}+1", "{a}+{b}+1"))
+
+        ret = (r.choice(tuple(SYMBOL_HEADS)), tuple(returned() for _ in range(r.choice((1, 2, 2, 3)))))
+        # Undeclared words only where every spec can be one string: a
+        # lone `F64["rows"]` is a forward reference to a declared name.
+        specs = [dims for _, dims in formals] + [ret[1]]
+        if words and not any(len(dims) == 1 and str(dims[0]).isidentifier() for dims in specs):
+            word = {"N": "rows", "M": "cols", "K": "depth"}
+
+            def reword(dims: tuple[object, ...]) -> tuple[object, ...]:
+                return tuple(
+                    re.sub(r"[A-Z]", lambda m: word[m[0]], d) if isinstance(d, str) else d
+                    for d in dims
+                )
+
+            formals = [(head, reword(dims)) for head, dims in formals]
+            ret = (ret[0], reword(ret[1]))
+            names = [word[n] for n in names]
+        else:
+            words = False
+        helper = Helper(f"g{self.helper_count}", formals, ret, words)
+        self.helper_count += 1
+        self.helpers.append(helper)
+
+        # What each of the helper's names stands for in the caller.
+        pool: tuple[object, ...] = ("N", "N", "M", "M", "K", "P", 2, 3) + SYMBOL_FORMULAS
+        binding = {n: r.choice(pool) for n in names}
+        args = []
+        for head, dims in formals:
+            shape = [_substitute(d, binding) for d in dims]
+            roll = r.random()
+            if roll < 0.1:
+                shape[r.randrange(len(shape))] = r.choice(pool)  # a conflict, or a wrong literal
+            elif roll < 0.15:
+                shape = shape[1:] or shape + shape  # wrong rank
+            if r.random() < 0.08:
+                head = r.choice(tuple(SYMBOL_HEADS))  # maybe the wrong dtype
+            name = f"a{len(self.params)}"
+            self.params.append((name, head, tuple(shape)))
+            roll = r.random()
+            if roll < 0.7:
+                args.append(name)
+            elif roll < 0.8:
+                args.append(f"np.concatenate([{name}, {name}])")
+            elif roll < 0.9:
+                args.append(f"np.pad({name}, 1)")
+            else:
+                args.append(f"{name}.T")
+        tail = r.choice(("", "", "", ".T", ".sum(axis=0)", "[::-1]"))
+        return f"{helper.name}({', '.join(args)}){tail}"
+
     FAMILIES = (
         Gen.binary_operator, Gen.binary_operator, Gen.scalar_operator, Gen.unary,
         matmul, matmul, Gen.method_reduction, Gen.method_reduction,
@@ -594,18 +702,98 @@ class SymGen(Gen):
         Gen.where, Gen.clip, Gen.shape_helper, Gen.tile_repeat, pad,
         Gen.expand_squeeze, Gen.fft, Gen.roll_rot, Gen.take, Gen.products,
         Gen.einsum, Gen.window, chain, Gen.split, Gen.edit,
+        call, call, call, call,
     )
 
     def case(self) -> "Case":
         self.params = []
+        self.helpers = []
         expr = self.expression()
-        return Case(expr, list(self.params))
+        return Case(expr, list(self.params), list(self.helpers))
+
+
+def _names_in(dim: object) -> list[str]:
+    return re.findall(r"[A-Za-z_]\w*", dim) if isinstance(dim, str) else []
+
+
+def _substitute(dim: object, binding: dict[str, object]) -> object:
+    """A helper's dim with the caller's dims put in for its names."""
+    if not isinstance(dim, str):
+        return dim
+    if dim in binding:
+        return binding[dim]
+    text = re.sub(r"[A-Za-z_]\w*", lambda m: f"({binding[m[0]]})", dim)
+    return text if _names_in(text) else cast(int, eval(text, {"__builtins__": {}}))
+
+
+def _value(dim: object, env: dict[str, int]) -> int:
+    if isinstance(dim, int):
+        return dim
+    return cast(int, eval(cast(str, dim), {"__builtins__": {}}, dict(env)))
+
+
+@dataclass
+class Helper:
+    """A generic function known only by its signature, and what it means.
+
+    `words` spells the dims jaxtyping-style in one string of undeclared
+    names (`F64["rows cols+1"]`); otherwise they are declared TypeVars
+    and quoted formulas (`F64[N, "N+1"]`).
+    """
+
+    name: str
+    formals: list[tuple[str, tuple[object, ...]]]
+    ret: tuple[str, tuple[object, ...]]
+    words: bool = False
+
+    def _spec(self, head: str, dims: tuple[object, ...]) -> str:
+        if self.words:
+            return f'{head}["{" ".join(str(d) for d in dims)}"]'
+        return f"{head}[{_spell_dims(dims)}]"
+
+    def signature(self) -> str:
+        params = ", ".join(f"x{i}: {self._spec(h, d)}" for i, (h, d) in enumerate(self.formals))
+        return f"def {self.name}({params}) -> {self._spec(*self.ret)}:"
+
+    def __call__(self, *arrays: object) -> np.ndarray:
+        if len(arrays) != len(self.formals):
+            raise TypeError("wrong number of arguments")
+        env: dict[str, int] = {}
+        formulas: list[tuple[str, int]] = []
+        for (head, dims), array in zip(self.formals, arrays):
+            if not isinstance(array, np.ndarray) or str(array.dtype) != SYMBOL_HEADS[head]:
+                raise TypeError(f"expected a {SYMBOL_HEADS[head]} array")
+            if array.ndim != len(dims):
+                raise ValueError(f"expected rank {len(dims)}, got {array.ndim}")
+            for dim, size in zip(dims, array.shape):
+                if isinstance(dim, int):
+                    if dim != size:
+                        raise ValueError(f"expected {dim}, got {size}")
+                elif dim.isidentifier():  # type: ignore[attr-defined]
+                    if env.setdefault(cast(str, dim), size) != size:
+                        raise ValueError(f"{dim} is both {env[cast(str, dim)]} and {size}")
+                else:
+                    formulas.append((cast(str, dim), size))
+        for dim, size in formulas:
+            free = sorted(set(_names_in(dim)) - set(env))
+            if free:
+                # One name, increasing in it: solve by search.
+                (name,) = free
+                fits = [n for n in range(size + 1) if _value(dim, {**env, name: n}) == size]
+                if not fits:
+                    raise ValueError(f"no {name} makes {dim} equal {size}")
+                env[name] = fits[0]
+            elif _value(dim, env) != size:
+                raise ValueError(f"{dim} is {_value(dim, env)}, got {size}")
+        head, dims = self.ret
+        return np.ones(tuple(_value(d, env) for d in dims), dtype=SYMBOL_HEADS[head])
 
 
 @dataclass
 class Case:
     expr: str
     params: list[tuple[str, str, tuple[object, ...]]] = field(default_factory=list)
+    helpers: list["Helper"] = field(default_factory=list)
 
     @property
     def symbolic(self) -> bool:
@@ -614,16 +802,32 @@ class Case:
     def signature(self) -> str:
         parts = []
         for name, head, shape in self.params:
-            dims = ", ".join(str(d) for d in shape)
-            parts.append(f"{name}: {head}[{dims}]")
+            parts.append(f"{name}: {head}[{_spell_dims(shape)}]")
         return ", ".join(parts)
 
     def runtime_namespace(self, sizes: dict[str, int] = SYMBOL_SIZES) -> dict[str, object]:
         ns: dict[str, object] = {"np": np}
         for name, head, shape in self.params:
-            concrete = tuple(sizes[d] if isinstance(d, str) else cast(int, d) for d in shape)
+            concrete = tuple(_dim_size(d, sizes) for d in shape)
             ns[name] = np.ones(concrete, dtype=SYMBOL_HEADS[head])
+        for helper in self.helpers:
+            ns[helper.name] = helper
         return ns
+
+
+def _spell_dims(shape: tuple[object, ...]) -> str:
+    """Dims as written inside `F64[...]`: a formula has to be quoted."""
+    return ", ".join(
+        f'"{d}"' if isinstance(d, str) and not d.isidentifier() else str(d) for d in shape
+    )
+
+
+def _dim_size(dim: object, sizes: dict[str, int]) -> int:
+    if isinstance(dim, int):
+        return dim
+    value = _eval_dim(cast(str, dim), sizes)
+    assert value is not None and value >= 0, dim
+    return value
 
 
 def generate(seed: int, count: int, symbolic: bool) -> list[Case]:
@@ -636,7 +840,11 @@ def generate(seed: int, count: int, symbolic: bool) -> list[Case]:
 
 
 def render(cases: list[Case]) -> tuple[str, list[int]]:
-    """mypy source for the cases, and the line each `reveal_type` is on."""
+    """mypy source for the cases, and the line each `reveal_type` is on.
+
+    Every other line is scaffolding that must type-check: `check`
+    refuses a run with an error anywhere else.
+    """
     out = [
         "from typing import TypeVar",
         "import numpy as np",
@@ -645,6 +853,9 @@ def render(cases: list[Case]) -> tuple[str, list[int]]:
     ]
     lines: list[int] = []
     for i, case in enumerate(cases):
+        for helper in case.helpers:
+            out.append(helper.signature())
+            out.append("    raise NotImplementedError")
         if case.symbolic:
             out.append(f"def f{i}({case.signature()}) -> None:")
             out.append(f"    reveal_type({case.expr})")
@@ -827,6 +1038,7 @@ class Finding:
 
     def __str__(self) -> str:
         where = f"def f({self.case.signature()}): " if self.case.symbolic else ""
+        where = "".join(f"{h.signature()} ...\n    " for h in self.case.helpers) + where
         at = ""
         if self.sizes is not None:
             at = " with " + ", ".join(f"{k}={v}" for k, v in self.sizes.items())
@@ -941,6 +1153,14 @@ def check(
     reveals, errors, raw = run_mypy(source, workdir)
     if "INTERNAL ERROR" in raw or "Traceback (most recent call last)" in raw:
         raise AssertionError("mypy crashed on generated cases:\n" + raw[-4000:])
+    stray = sorted(set(errors) - set(lines))
+    if stray:
+        # A helper signature or a `def` line: the generator's mistake,
+        # and the reveal below it would be compared against nonsense.
+        shown = "\n".join(
+            f"{source.splitlines()[n - 1]}\n    {errors[n][0]}" for n in stray[:5]
+        )
+        raise AssertionError("generated scaffolding does not type-check:\n" + shown)
     findings: list[Finding] = []
     stats: dict[str, int] = {}
 
@@ -958,8 +1178,7 @@ def check(
         findings.append(Finding(kind, case, static, _describe(value), shown))
         count(kind)
 
-    def judge(case: Case, line: int, sizes: dict[str, int]) -> None:
-        value = evaluate(case, sizes)
+    def judge(case: Case, line: int, sizes: dict[str, int], value: object, raises: bool) -> None:
         static = reveals.get(line, "<no reveal>")
         errs = errors.get(line, [])
         asserting = [e for e in errs if any(f"[{c}]" in e for c in _ASSERTING_CODES)]
@@ -978,11 +1197,14 @@ def check(
                     return
             count("numpy raises, not flagged (allowed)")
             return
-        if asserting and case.symbolic and _negative_dim(asserting[0], sizes):
-            count(BELOW_DOMAIN)
+        # A call to a generated function has no stubs to blame: any
+        # error on a call the signature allows is numty's.
+        blamed = errs if case.helpers else asserting
+        if blamed and raises:
+            count(SPECIAL_SIZES)
             return
-        if asserting:
-            report("FALSE_POSITIVE", case, asserting[0], value, sizes)
+        if blamed:
+            report("FALSE_POSITIVE", case, blamed[0], value, sizes)
             return
         if static == "<no reveal>":
             count("no reveal")
@@ -1001,8 +1223,13 @@ def check(
             count("agree: partial or no claim")
 
     for case, line in zip(cases, lines):
-        for sizes in assignments if case.symbolic else assignments[:1]:
-            judge(case, line, sizes)
+        used = assignments if case.symbolic else assignments[:1]
+        values = [evaluate(case, sizes) for sizes in used]
+        raises = any(
+            isinstance(v, BaseException) and not isinstance(v, _DATA_ERRORS) for v in values
+        )
+        for sizes, value in zip(used, values):
+            judge(case, line, sizes, value, raises)
     return findings, stats
 
 

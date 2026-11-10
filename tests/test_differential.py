@@ -115,13 +115,19 @@ def test_symbolic_claims_are_checked_at_every_size(tmp_path: Path) -> None:
     grow = d.Case("np.pad(a0, 1)", [("a0", "F64", ("N",))])
     shrink = d.Case("a0[1:]", [("a0", "F64", ("N",))])
     # Off by one for every N >= 2, but (0,) + (0,) at N=0: the error
-    # names `N-1`, which is -1 there, so it is the same known gap.
+    # is about sizes in general and stands, since numpy raises at the
+    # other three assignments.
     off = d.Case("a0[1:] + a0", [("a0", "F64", ("N",))])
     findings, stats = d.check([grow, shrink, off], tmp_path)
     assert not findings, "\n".join(str(f) for f in findings)
     assert stats["agree: exact shape"] == 2 * len(sizes) - 1, stats
-    assert stats[d.BELOW_DOMAIN] == 2, stats
+    assert stats[d.BELOW_DOMAIN] == 1, stats
+    assert stats[d.SPECIAL_SIZES] == 1, stats
     assert stats["numpy raises, flagged"] == len(sizes) - 1, stats
+    # An error on code numpy accepts at every size is still a finding.
+    fine = d.Case("a0 + a0", [("a0", "F64", ("N",))])
+    source, lines = d.render([fine])
+    assert "reveal_type(a0 + a0)" in source
     assert d._negative_dim("shapes (N-1,) vs (N,)", {"N": 0})
     assert not d._negative_dim("shapes (N-1,) vs (N,)", {"N": 3})
     assert not d._negative_dim("different sizes: 2*M vs M", {"M": 0})
@@ -131,6 +137,65 @@ def test_symbolic_claims_are_checked_at_every_size(tmp_path: Path) -> None:
     # says which sizes exposed it.
     wrong = d.Finding("WRONG_SHAPE", shrink, "N", "shape (0,)", {"N": 0})
     assert "numpy with N=0" in str(wrong)
+
+
+def test_generic_call_reference() -> None:
+    # The oracle's own reading of a signature with formula dims: bind
+    # the names from the argument shapes, then build what the return
+    # spells. It has to be right for the comparison to mean anything.
+    g = d.Helper("g", [("F64", ("N", "N+1")), ("I64", ("2*M", 3))], ("F32", ("N+M", "2*N+1")))
+    assert g.signature() == 'def g(x0: F64[N, "N+1"], x1: I64["2*M", 3]) -> F32["N+M", "2*N+1"]:'
+    out = g(np.ones((4, 5)), np.ones((6, 3), dtype=np.int64))
+    assert out.shape == (7, 9) and out.dtype == np.float32
+    with pytest.raises(ValueError):  # N+1 is 5, not 6
+        g(np.ones((4, 6)), np.ones((6, 3), dtype=np.int64))
+    with pytest.raises(ValueError):  # no M makes 2*M equal 5
+        g(np.ones((4, 5)), np.ones((5, 3), dtype=np.int64))
+    with pytest.raises(ValueError):  # the literal 3
+        g(np.ones((4, 5)), np.ones((6, 2), dtype=np.int64))
+    with pytest.raises(ValueError):  # rank
+        g(np.ones(4), np.ones((6, 3), dtype=np.int64))
+    with pytest.raises(TypeError):  # dtype
+        g(np.ones((4, 5)), np.ones((6, 3)))
+    words = d.Helper("h", [("F64", ("rows", "cols+1"))], ("F64", ("rows",)), words=True)
+    assert words.signature() == 'def h(x0: F64["rows cols+1"]) -> F64["rows"]:'
+    solved = d.Helper("s", [("F64", ("N+2",))], ("F64", ("N",)))
+    assert solved(np.ones(2)).shape == (0,)
+    with pytest.raises(ValueError):
+        solved(np.ones(1))
+
+
+def test_generic_calls_agree_with_the_signature(tmp_path: Path) -> None:
+    # Pinned from the generic-call family's first run, where each of
+    # these came back with a wrong dim or `Never`.
+    def case(helper: d.Helper, *shapes: tuple[object, ...], tail: str = "") -> d.Case:
+        params = [(f"a{i}", helper.formals[i][0], shape) for i, shape in enumerate(shapes)]
+        args = ", ".join(name for name, _, _ in params)
+        return d.Case(f"{helper.name}({args}){tail}", params, [helper])
+
+    leak = d.Helper("g0", [("Bool", ("N+1", "M"))], ("U8", ("2*M+1", "M+2", "N+M+1")))
+    unsolved = d.Helper("g1", [("F32", ("2*M", "K", "K"))], ("I64", (3, "K+M")))
+    never = d.Helper("g2", [("I64", ("N+1", "M"))], ("F64", ("N", "M+1")))
+    capture = d.Helper("g3", [("F64", ("N",)), ("F64", ("N+1",))], ("F64", ("N", 2)))
+    own = d.Helper("g4", [("Bool", ("M", 2))], ("F32", ("M", "2*M+1")))
+    spelled = d.Helper("g5", [("F32", ("rows", "depth+1"))], ("U8", ("rows", "depth")), words=True)
+    cases = [
+        case(leak, ("(2*M+1)+1", "N+M")),
+        case(unsolved, ("P", "M+K", "M+K")),
+        case(never, ("N+3", "N+3"), tail=".T"),
+        case(capture, ("N+1",), ("N+2",)),
+        case(own, ("2*M+1", 2), tail=".T"),
+        case(spelled, ("N+M", "M+3")),
+    ]
+    findings, stats = d.check(cases, tmp_path)
+    assert not findings, "\n".join(str(f) for f in findings)
+    sizes = len(d.SIZE_ASSIGNMENTS)
+    # Four are solved exactly; `unsolved` (P need not be even) and
+    # `capture` (the caller's N+1 is also the callee's dim) are unknown.
+    assert stats["agree: exact shape"] == 4 * sizes, stats
+    assert stats["agree: partial or no claim"] + stats.get(
+        "numpy raises, not flagged (allowed)", 0
+    ) == 2 * sizes, stats
 
 
 def test_known_gaps_are_narrow() -> None:

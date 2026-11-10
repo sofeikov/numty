@@ -112,9 +112,9 @@ error: Incompatible return value type (got "ndarray[tuple[batch, heads, seq, seq
   latest long run (42,000 expressions, seeds 101-130, NumPy 2.5.4,
   mypy 2.4.1) had **no disagreements**. Each symbolic expression is
   run at four sets of sizes, empty axes included, which makes 105,000
-  comparisons: 62,138 exact shapes matched NumPy's, and of the 28,135
-  NumPy rejects, 17,403 were reported before running. Three cases hit
-  documented gaps in NumPy's own stubs and 159 hit the empty-axis
+  comparisons: 60,958 exact shapes matched NumPy's, and of the 29,252
+  NumPy rejects, 18,242 were reported before running. Three cases hit
+  documented gaps in NumPy's own stubs and 172 hit the empty-axis
   limit on symbolic subtraction (see
   [Checked against numpy](#checked-against-numpy)).
 - **It finds seeded bugs.** [bench/](bench) hides 18 realistic
@@ -1181,7 +1181,10 @@ and compares. A run fails when
 - numty claims a shape or dtype numpy does not produce,
 - numpy rejects an expression that numty gave a fully concrete type
   with no diagnostic, or
-- numty reports a shape error on an expression numpy accepts.
+- numty reports a shape error on an expression numpy accepts. For a
+  symbolic expression that means accepts at every set of sizes tried:
+  an error there is about sizes in general (see the limitation on
+  symbolic errors below).
 
 Losing precision (an unknown dim, `Any`, a bail) never fails: only a
 wrong answer does. Two modes share the machinery. Concrete mode builds
@@ -1191,7 +1194,15 @@ it with fixed sizes, and substitutes them into the revealed dims, so
 `N+1`, `N*M` and `N//2+1` are checked as arithmetic. A symbolic answer
 is a claim about every size, so each case is evaluated under four
 assignments from one mypy run: odd sizes, even sizes, and two with an
-empty axis.
+empty axis. Parameters may carry formulas themselves (`F64[N, "N+1"]`),
+so rules also meet inputs that are already expressions.
+
+Symbolic mode also calls generic functions it writes itself, such as
+`def g(x0: F64[N, "N+1"]) -> F64["2*N", M]`, with arguments in the
+caller's own names. There is no numpy answer for those, so the oracle
+carries its own reading of a signature: bind the names from the
+argument shapes, then build what the return spells. numty's answer at
+the call site has to match it.
 
 The suite runs a small fixed-seed sample of both modes plus every
 expression the oracle has caught so far, pinned by hand. For a longer
@@ -1258,16 +1269,29 @@ subtraction below.
   themselves rank-check without the plugin is still open in
   [#5](https://github.com/sofeikov/numty/issues/5).
 - Without the plugin, `matmul` returns a loose type: usable but unchecked.
+- A shape error on symbolic dims is about sizes in general, not about
+  every size. `signal[:, 1:] - signal` is reported as `time-1` vs
+  `time`, and that is wrong code for any `time` above 2, but numpy
+  accepts it when `time` is 0 (both sides empty), 1 (the empty side
+  broadcasts) or 2 (a length-1 axis broadcasts). The same holds for
+  `N+1` against `N`. The oracle counts an error as false only when
+  numpy accepts the expression at every set of sizes it tries.
 - A symbolic subtraction assumes the axis is long enough. `a[1:]` is
   `(N-1,)` and `np.diff(a)` is `(N-1,)`, but numpy stops at zero: on an
-  empty axis both are `(0,)`, not `(-1,)`. So `signal[:, 1:] - signal`
-  is reported as `time-1` vs `time` although numpy accepts it when
-  `time` is 0 (both sides empty) or 1 (the empty side broadcasts).
-  The oracle counts these as a known gap instead of failing. Sizes
-  that differ only by a factor are not assumed non-empty: `2*M` and
-  `M` are equal at `M == 0`, so `np.vdot` of `(2, M)` and `(M,)` is
-  not an error. `reshape` is the exception and reads totals up to a
+  empty axis both are `(0,)`, not `(-1,)`. The oracle counts a dim
+  that comes out negative as a known gap.
+- Sizes that differ only by a factor are not reported outside
+  `reshape`: `2*M` and `M` are equal at `M == 0`, so `np.vdot` of
+  `(2, M)` and `(M,)` is not an error. `reshape` reads totals up to a
   zero factor (`(2*N,)` to `(3, N)` is an error).
+- At a call, a formula parameter is solved when the argument gives a
+  whole linear answer: `"N+1"` given `M+3` binds `N` to `M+2`, and
+  `"2*N"` given `2*M+4` binds it to `M+2`. `"2*N"` given `M` does
+  not (M need not be even), and the return dims that need `N` are
+  unknown. So is a result dim that would be spelled exactly like one
+  of the callee's own formula parameters over the same module-level
+  name: `def g(x: F64[N], y: F64["N+1"]) -> F64[N]` called with an
+  `N+1`-sized `x` returns an unknown size, not `N+1`.
 - Dynamic shapes (`np.zeros((n, 3))`) cannot be proven wrong, so they are
   left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
   `full`, `*_like(shape=...)`) keeps the literal dims of a tuple

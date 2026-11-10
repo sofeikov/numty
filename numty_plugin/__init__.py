@@ -675,7 +675,20 @@ class NumtyPlugin(Plugin):
             bindings = _callsite_expr_bindings(sig, formals, ctx)
             new_ret = _substitute_return_exprs(sig, bindings, ctx)
             if new_ret is not None:
-                sig = sig.copy_modified(ret_type=new_ret)
+                # Formula variables only the old return mentioned are
+                # no longer the callee's to bind (see the note in
+                # `_substitute_return_exprs`).
+                formal_ids = {
+                    tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)
+                }
+                sig = sig.copy_modified(
+                    ret_type=new_ret,
+                    variables=[
+                        v
+                        for v in sig.variables
+                        if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
+                    ],
+                )
         except Exception:
             _swallowed(ctx, "_callsite_check")
             pass
@@ -2911,16 +2924,18 @@ def _callsite_expr_bindings(
     sig: CallableType,
     formals: list[tuple[int, list[tuple[int, TypeVarType]]]],
     ctx: FunctionSigContext,
-) -> dict[str, int | Type]:
+) -> dict[str, int | Type | _LinForm]:
     """Callee var fullname -> actual dim for expression returns (issue #32).
 
     Plain formal dims bind directly to the actual dim object (preserving the
     caller's TypeVar id, which also dodges the #43 stale-object leak).
-    Expr formal dims of the form M+const solve M from the actual's linear
-    form when it is const or a single var with matching const (M+1 vs K+1,
-    M+1 vs 6); anything fancier bails for that dim.
+    Expr formal dims in one name, c*M + k, solve M from the actual's linear
+    form: an int, one of the caller's variables, or a linear form in them
+    (M+1 vs N+3 gives M = N+2). A name no formal dim can solve stays out
+    of the result, and `_substitute_return_exprs` makes the return dims
+    that need it unknown.
     """
-    bindings: dict[str, int | Type] = {}
+    bindings: dict[str, int | Type | _LinForm] = {}
     for i, positions in formals:
         if i >= len(ctx.args):
             continue
@@ -2947,43 +2962,52 @@ def _callsite_expr_bindings(
                     if tvar.fullname not in bindings:
                         bindings[tvar.fullname] = adim
                     continue
-                # Expr formal: only single-var linear M+const for now.
-                if not isinstance(form_f, _LinForm):
+                # Expr formal in one name, c*M + k: the actual A gives
+                # M = (A - k) / c whenever that is a whole linear form
+                # (M+1 vs K+1, M+1 vs 6, M+1 vs N+3, 2*M vs 2*N+4).
+                # Anything else leaves M unbound, and the return dims
+                # that need it become unknown.
+                if not isinstance(form_f, _LinForm) or len(form_f.coeffs) != 1:
                     continue
-                if len(form_f.coeffs) != 1 or form_f.coeffs[0][1] != 1:
+                m_full, scale = form_f.coeffs[0]
+                if scale <= 0 or m_full in bindings:
                     continue
-                m_full, const_f = form_f.coeffs[0][0], form_f.const
                 fa = _resolve_dim(adim)
-                if fa is None or not isinstance(fa, _LinForm):
+                if fa is None or not isinstance(fa, _LinForm) or _form_has_unknown(fa):
                     continue
+                rest = fa.const - form_f.const
+                whole = rest % scale == 0 and all(c % scale == 0 for _, c in fa.coeffs)
                 if not fa.coeffs:
-                    # Actual const: M = const_a - const_f.
-                    if tvar.fullname not in bindings and m_full not in bindings:
-                        bindings[m_full] = fa.const - const_f
-                    continue
-                if len(fa.coeffs) == 1 and fa.coeffs[0][1] == 1:
-                    a_full, const_a = fa.coeffs[0][0], fa.const
-                    if const_a != const_f:
-                        continue  # M = A + diff needs new expr; skip.
-                    if m_full in bindings:
+                    if not whole or rest < 0:
+                        # A fixed size no value of M can produce.
+                        ctx.api.fail(
+                            f"call-site shape conflict: no size '{_short_var(m_full)}' "
+                            f"makes {_expr_str(form_f)} equal {fa.const} "
+                            f"(argument '{sig.arg_names[i]}', axis {dim})",
+                            ctx.context,
+                            code=NUMTY_CALLSITE,
+                        )
                         continue
-                    if isinstance(adim, TypeVarType) and not (
-                        adim.fullname.startswith("__numty_expr__.")
-                    ):
-                        # Actual plain A: M = A (caller's object).
-                        bindings[m_full] = adim
+                    bindings[m_full] = rest // scale
+                    continue
+                if not whole:
+                    continue
+                solved = _LinForm(tuple((n, c // scale) for n, c in fa.coeffs), rest // scale)
+                if solved != _LinForm(((solved.coeffs[0][0], 1),), 0):
+                    bindings[m_full] = solved
+                    continue
+                # M is one of the caller's own names: bind its object,
+                # so the result is that variable and not a lookalike.
+                a_full = solved.coeffs[0][0]
+                found: Type | None = None
+                if isinstance(adim, TypeVarType):
+                    if adim.fullname == a_full:
+                        found = adim
                     else:
-                        # Actual expr K+1 with same const: M = K via
-                        # the actual's own constituents (caller's scope).
-                        consts = None
-                        if isinstance(adim, TypeVarType):
-                            consts = _expr_constituents.get(adim.fullname)
-                        if consts is not None and a_full in consts:
-                            bindings[m_full] = consts[a_full]
-                        else:
-                            found = _seen_vars.get(a_full)
-                            if found is not None:
-                                bindings[m_full] = found
+                        found = _expr_constituents.get(adim.fullname, {}).get(a_full)
+                if found is None:
+                    found = _seen_vars.get(a_full)
+                bindings[m_full] = found if found is not None else solved
             except Exception:
                 _swallowed(ctx, "_callsite_expr_bindings")
                 continue
@@ -3015,7 +3039,7 @@ def _callsite_expr_bindings(
 
 def _substitute_return_exprs(
     sig: CallableType,
-    bindings: dict[str, int | Type],
+    bindings: dict[str, int | Type | _LinForm],
     ctx: FunctionSigContext,
 ) -> Type | None:
     """Return type with callee expr vars substituted by call bindings.
@@ -3024,9 +3048,25 @@ def _substitute_return_exprs(
     Plain vars use the actual object directly (caller's id); new expr forms
     reuse the form-keyed global id so an inferred N+1 is the same variable
     as an annotated I64["N+1"].
+
+    A return dim that needs a callee name the call did not bind is
+    unknown. Left alone, a plain one is `Never` to mypy, and one inside
+    a formula would read as the caller's variable of the same name:
+    `-> F64["N+M"]` with only M bound is not the caller's `N` plus
+    anything. The exception is a dim that is itself a formal dim
+    (`x: F64["N+1"]) -> F64["N+1"]`), which mypy infers on its own.
     """
-    if not bindings:
-        return None
+    # Dims mypy infers by itself: every variable a formal mentions,
+    # wherever it sits (`x: F64["N+1"]`, `xs: dict[str, F64[N, M]]`).
+    inferred: set[str] = set()
+    for formal in sig.arg_types:
+        try:
+            inferred.update(
+                tv.fullname for tv in _iter_tvarlikes(formal) if isinstance(tv, TypeVarType)
+            )
+        except Exception:
+            _swallowed(ctx, "_substitute_return_exprs")
+            return None
     try:
         ret_parts = _ndarray_parts(sig.ret_type)
     except Exception:
@@ -3047,7 +3087,7 @@ def _substitute_return_exprs(
             obj_by_fullname.setdefault(k, v)
     for k, v in _seen_vars.items():
         obj_by_fullname.setdefault(k, v)
-    for d in rdims:
+    for index, d in enumerate(rdims):
         try:
             if isinstance(d, int):
                 new_dims.append(d)
@@ -3056,43 +3096,56 @@ def _substitute_return_exprs(
                 return None
             form_early = _form_of(d)
             if form_early is None:
-                # Plain return var: direct substitution preserves caller id.
-                if d.fullname in bindings:
-                    b = bindings[d.fullname]
-                    new_dims.append(b)
+                bound = bindings.get(d.fullname)
+                if bound is None:
+                    if d.fullname in inferred:
+                        new_dims.append(d)
+                    else:
+                        new_dims.append(_fresh_unknown(ctx, "callsite-return", index))
+                        changed = True
+                    continue
+                if not isinstance(bound, _LinForm):
+                    # Plain return var: direct substitution preserves caller id.
+                    new_dims.append(bound)
                     changed = True
-                else:
-                    new_dims.append(d)
+                    continue
+                form_r = _LinForm(((d.fullname, 1),), 0)
+            elif d.fullname in inferred:
+                # The dim is a formal dim as it stands (`x: F64["N+1"])
+                # -> F64["N+1"]`): mypy binds it from the argument.
+                new_dims.append(d)
                 continue
-            # Expr return var.
-            form_r = form_early
-            if not isinstance(form_r, _LinForm):
+            elif isinstance(form_early, _LinForm):
+                form_r = form_early
+            else:
                 return None
+            if any(cfull not in bindings for cfull, _ in form_r.coeffs):
+                # A name the call did not bind: mypy's own answer if
+                # the whole dim is a formal dim, else nothing is known.
+                if d.fullname in inferred:
+                    new_dims.append(d)
+                else:
+                    new_dims.append(_fresh_unknown(ctx, "callsite-return", index))
+                    changed = True
+                continue
             merged: dict[str, int] = {}
             const = form_r.const
-            substituted = False
             abort = False
             for cfull, coeff in form_r.coeffs:
-                if cfull in bindings:
-                    b = bindings[cfull]
-                    if isinstance(b, int):
-                        const += coeff * b
-                        substituted = True
-                    else:
-                        fb = _resolve_dim(b)
-                        if not isinstance(fb, _LinForm):
-                            abort = True
-                            break
-                        for bfull, bcoeff in fb.coeffs:
-                            merged[bfull] = merged.get(bfull, 0) + coeff * bcoeff
-                        const += coeff * fb.const
-                        substituted = True
-                else:
-                    merged[cfull] = merged.get(cfull, 0) + coeff
+                b = bindings[cfull]
+                if isinstance(b, int):
+                    const += coeff * b
+                    continue
+                fb = b if isinstance(b, _LinForm) else _resolve_dim(b)
+                if not isinstance(fb, _LinForm):
+                    abort = True
+                    break
+                for bfull, bcoeff in fb.coeffs:
+                    merged[bfull] = merged.get(bfull, 0) + coeff * bcoeff
+                const += coeff * fb.const
             if abort:
-                return None
-            if not substituted:
-                new_dims.append(d)
+                new_dims.append(_fresh_unknown(ctx, "callsite-return", index))
+                changed = True
                 continue
             merged = {k: v for k, v in merged.items() if v != 0}
             if not merged:
@@ -3102,13 +3155,11 @@ def _substitute_return_exprs(
             if len(merged) == 1:
                 (only_full, only_coeff) = next(iter(merged.items()))
                 if only_coeff == 1 and const == 0:
-                    # Single var: reuse the caller's object when known.
+                    # Single var: the caller's object, or nothing.
                     obj = obj_by_fullname.get(only_full)
-                    if obj is not None:
-                        new_dims.append(obj)
-                    else:
-                        new_dims.append(d)
-                        continue
+                    if obj is None:
+                        obj = _fresh_unknown(ctx, "callsite-return", index)
+                    new_dims.append(obj)
                     changed = True
                     continue
             new_form = _LinForm(tuple(sorted(merged.items())), const)
@@ -3152,6 +3203,23 @@ def _substitute_return_exprs(
             return None
     if not changed:
         return None
+    # A formula's variable is keyed by its form, so the caller's `N+1`
+    # and a `"N+1"` in this signature are one TypeVar when both are
+    # written over the same module-level `N`. mypy binds the callee's
+    # variables after this hook, and would read a caller's dim put into
+    # the return as the callee's own: rebound to whatever that formal
+    # received, or `Never`. `_callsite_check` drops the ones no formal
+    # mentions; one a formal does mention cannot be told apart, so the
+    # dim is unknown.
+    formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
+    for index, (old_d, new_d) in enumerate(zip(rdims, new_dims)):
+        if (
+            new_d is not old_d
+            and isinstance(new_d, TypeVarType)
+            and new_d.fullname.startswith(_EXPR_PREFIX)
+            and new_d.id in formal_ids
+        ):
+            new_dims[index] = _fresh_unknown(ctx, "callsite-return", index)
     # Rebuild the ndarray return with the new dims.
     try:
         proper = get_proper_type(sig.ret_type)
