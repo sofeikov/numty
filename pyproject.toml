@@ -21,14 +21,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# Real package layout (issue #31): mypy honors `numty/py.typed` inside a
-# package, but not a top-level `py.typed` next to single-file modules —
-# wheel installs used to report `Skipping analyzing "numty"`.
-packages = ["numty"]
-[tool.hatch.build.targets.wheel.force-include]
-"numty_plugin.py" = "numty_plugin.py"
-"numty_convert.py" = "numty_convert.py"
-"numty_codmod.py" = "numty_codmod.py"
+# Regular package layout (issues #31, #147): mypy only honors `py.typed`
+# inside a package directory — not a top-level marker next to single-file
+# modules, and not a co-located `.pyi` (an installed top-level `.py` is
+# never a candidate without its own package dir). So the plugin and the
+# two tools are real packages (`numty_plugin/`, `numty_convert/`,
+# `numty_codmod/`), each with its own `py.typed`, keeping the same
+# top-level import names (`plugins = numty_plugin` is unchanged). As a
+# side effect the editable install is a single `.pth` to the checkout, so
+# `numty` and the tools all import live from one place.
+packages = ["numty", "numty_plugin", "numty_convert", "numty_codmod"]
 
 [tool.pytest.ini_options]
 # Parallel by default: mypy/python subprocesses dominate runtime and the
