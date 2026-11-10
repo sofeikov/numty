@@ -7,11 +7,17 @@ two must agree:
 
 - a shape or dtype numty claims must be the one numpy produces;
 - an expression numpy rejects must not get a fully concrete type with
-  no diagnostic;
+  no diagnostic (concrete mode, `CLAIM_ON_ERROR`);
+- a symbolic expression numpy rejects under *every* small size
+  assignment (1-3 for each name, including equal names) must not pass
+  silently either (issue #183, `MISSED_ERROR`);
 - an expression numpy accepts must not draw a numty shape error.
 
-Losing precision (an unknown dim, `Any`, a bail) is always allowed:
-only a *wrong* answer fails.
+Losing precision (an unknown dim, `Any`, a bail) is allowed only when
+the rejection is unprovable: some size assignment would make the
+expression work (`F64[N] + F64[M]` with `N == M`). An assignment-proof
+rejection is a miss, not prudence. `SIZE_ASSIGNMENTS` keeps names
+distinct by design, so it cannot make this distinction on its own.
 
 Two modes share the machinery. Concrete mode builds every operand with
 a literal shape. Symbolic mode wraps the expression in a function whose
@@ -36,6 +42,7 @@ Used by tests/test_differential.py; run it by hand for a longer hunt:
 from __future__ import annotations
 
 import ast
+import itertools
 import os
 import random
 import re
@@ -142,6 +149,115 @@ SYMBOL_HEADS = {
 # spelled `Unpack[Ts]` in annotations and `*Ts` in reveals.
 TS_DIM: object = "*Ts"
 TS_PREFIXES: tuple[tuple[int, ...], ...] = ((), (2,), (2, 6))
+
+
+def _distinct_names(case: "Case") -> list[str]:
+    """Sorted TypeVar names appearing in a symbolic case's shapes.
+
+    Issue #183: includes names inside formulas (`N+1` contains `N`)
+    and inside helpers, so exhaustive probing varies every size that
+    could make the expression work.
+    """
+    names: set[str] = set()
+    for _, _, shape in case.params:
+        for dim in shape:
+            if dim == TS_DIM:
+                continue
+            if isinstance(dim, int):
+                continue
+            for cand in ("N", "M", "K", "P"):
+                if cand in str(dim):
+                    # Single-letter names cannot hide inside other
+                    # identifiers here (dims are `N`, `N+1`, ...).
+                    names.add(cand)
+    for helper in case.helpers:
+        for _, dims in helper.formals:
+            for dim in dims:
+                if dim == TS_DIM or isinstance(dim, int):
+                    continue
+                for cand in ("N", "M", "K", "P"):
+                    if cand in str(dim):
+                        names.add(cand)
+        _, ret_dims = helper.ret
+        for dim in ret_dims:
+            if dim == TS_DIM or isinstance(dim, int):
+                continue
+            for cand in ("N", "M", "K", "P"):
+                if cand in str(dim):
+                    names.add(cand)
+    return sorted(names)
+
+
+def _always_raises(case: "Case") -> bool:
+    """True when numpy rejects `case` under every small size assignment.
+
+    Issue #183: symbolic mode counted every silent rejection as
+    allowed, mixing correct silence (`F64[N] + F64[M]`, where `N` could
+    equal `M`) with genuine misses (a literal axis out of range for a
+    known rank). Trying every combination of sizes 1-3 for each
+    distinct name separates them: if any assignment succeeds (or raises
+    a data-dependent error, which the oracle skips), the miss is
+    unprovable by design and stays allowed. Only an assignment-proof
+    rejection becomes a `MISSED_ERROR` failure. `SIZE_ASSIGNMENTS`
+    keeps names distinct (and never 1) by design, so it cannot make
+    this distinction on its own.
+
+    TypeError (dtype loops like float `bitwise_and`) is excluded by the
+    caller: this only probes, it does not classify. Cases with `*Ts`
+    need prefix reasoning as follow-up and stay unprovable for now.
+
+    `cross` is excluded for now: its provability can hinge on the same
+    TypeVar appearing both as the vector dim (which must be 3) and in
+    the broadcast leading dims (e.g. `[P, N, N]` vs `[2, N]`, where N
+    must be both 3 and 2). `repeat`, `vdot` and stacking (`stack`,
+    including `dstack`) with a single repeated name are excluded for
+    the same cross-position / number-theoretic reason.
+
+    Helpers and formulas (`N+1`, `2*N`, ...) are excluded for now:
+    they come from newer generator families (#182 methods with formula
+    returns, #184 reshape targets, #185 helpers/*Ts) whose
+    assignment-proof misses need formula reasoning as follow-up. This
+    keeps #183's fix to the original families (literal axes/ranks and
+    simple `N`/`M`/`K`/`P`/`2`/`3` shapes) that sampling found.
+    """
+    if case.has_ts:
+        return False
+    if case.helpers:
+        return False
+    for _, _, shape in case.params:
+        for dim in shape:
+            if dim == TS_DIM or isinstance(dim, int):
+                continue
+            if dim not in ("N", "M", "K", "P"):
+                # A formula (e.g. "N+1", "2*N"): needs follow-up.
+                return False
+    if "cross" in case.expr:
+        return False
+    if any(op in case.expr for op in ("repeat", "vdot", "stack")):
+        return False
+    names = _distinct_names(case)
+    if not names:
+        return True
+    for combo in itertools.product((1, 2, 3), repeat=len(names)):
+        mapping = dict(zip(names, combo))
+        try:
+            ns = case.runtime_namespace(mapping, ())
+        except Exception:
+            # A size that cannot form an operand (e.g. negative from a
+            # formula) is not a shape rejection: treat as unprovable.
+            return False
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with np.errstate(all="ignore"):
+                try:
+                    eval(case.expr, ns)
+                except Exception as exc:  # noqa: BLE001 - the exception is the answer
+                    if isinstance(exc, _SHAPE_ERRORS):
+                        continue
+                    return False
+                else:
+                    return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1683,7 +1799,7 @@ def array_claim(
 
 @dataclass
 class Finding:
-    kind: str  # WRONG_SHAPE, WRONG_DTYPE, CLAIM_ON_ERROR, FALSE_POSITIVE
+    kind: str  # WRONG_SHAPE, WRONG_DTYPE, CLAIM_ON_ERROR, MISSED_ERROR, FALSE_POSITIVE
     case: Case
     static: str
     runtime: str
@@ -1871,13 +1987,28 @@ def check(
             if errs:
                 count("numpy raises, flagged")
                 return
-            if isinstance(value, _SHAPE_ERRORS) and static != "<no reveal>":
-                node = parse_type(static)
-                claim = array_claim(node, sizes, ts_prefix)
-                if claim is not None and claim.concrete and not case.symbolic:
-                    report("CLAIM_ON_ERROR", case, static, value, sizes, ts_prefix)
-                    return
-            count("numpy raises, not flagged (allowed)")
+            # Issue #183: symbolic mode counted every silent rejection
+            # as allowed. A rejection that survives every small size
+            # assignment (1-3 for each name, including equal names) is
+            # provable: no choice of N/M/K/P would make it work, so
+            # silence is a miss, not prudence. TypeError (dtype loops)
+            # is excluded; ValueError/IndexError cover shapes, axes,
+            # ranks. Concrete keeps its rule (only a concrete claim
+            # fails); *Ts, cross and repeat/vdot/stack cross-position
+            # need follow-up and stay unprovable for now.
+            if isinstance(value, (ValueError, IndexError)):
+                if static != "<no reveal>":
+                    if not case.symbolic:
+                        node = parse_type(static)
+                        claim = array_claim(node, sizes, ts_prefix)
+                        if claim is not None and claim.concrete:
+                            report("CLAIM_ON_ERROR", case, static, value, sizes, ts_prefix)
+                            return
+                    elif not case.has_ts:
+                        if _always_raises(case):
+                            report("MISSED_ERROR", case, static, value, sizes, ts_prefix)
+                            return
+            count("numpy raises, not flagged (unprovable)")
             return
         # A call to a generated function has no stubs to blame: any
         # error on a call the signature allows is numty's.
