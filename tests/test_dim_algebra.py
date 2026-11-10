@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import functools
 import itertools
+import os
 import random
 import re
 from pathlib import Path
@@ -50,7 +51,15 @@ SHORT = tuple(v.rsplit(".", 1)[-1] for v in VARS)
 SIZES = [dict(zip(VARS, vals)) for vals in itertools.product(range(5), repeat=len(VARS))]
 POSITIVE = [env for env in SIZES if all(env.values())]
 
-settings.register_profile("numty", max_examples=300, deadline=None)
+# Fixed examples by default, like the oracle's fixed seeds: a red suite
+# should mean the change under test broke something. For a longer hunt
+# with fresh examples every run:
+#
+#     NUMTY_PROPERTY_EXAMPLES=5000 uv run pytest tests/test_dim_algebra.py
+_HUNT = os.environ.get("NUMTY_PROPERTY_EXAMPLES")
+settings.register_profile(
+    "numty", max_examples=int(_HUNT or 300), derandomize=_HUNT is None, deadline=None
+)
 settings.load_profile("numty")
 
 
@@ -279,7 +288,10 @@ def test_never_a_size_means_negative_everywhere(form: Form) -> None:
     if p._form_never_size(form):
         assert all(value(form, env) < 0 for env in SIZES)
     elif isinstance(form, _LinForm):
-        assert any(value(form, env) >= 0 for env in SIZES + [{v: 99 for v in VARS}])
+        # Not refused, so some sizes make it a size: grow the variables
+        # that add, leave the ones that subtract at 0.
+        grown = {v: 0 for v in VARS} | {v: 99 for v, c in form.coeffs if c > 0}
+        assert value(form, grown) >= 0
 
 
 # --------------------------------------------------------------------------
