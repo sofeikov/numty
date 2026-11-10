@@ -2701,7 +2701,7 @@ def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, Ty
     for i, (tp, kind) in enumerate(zip(sig.arg_types, sig.arg_kinds)):
         if kind not in (ARG_POS, ARG_OPT):
             continue
-        parts = _ndarray_parts(tp)
+        parts = _parts_or_unpack(tp)
         if parts is None:
             continue
         positions = [(d, t) for d, t in enumerate(parts[0]) if isinstance(t, TypeVarType)]
@@ -2969,14 +2969,20 @@ def _callsite_expr_bindings(
         except Exception:
             _swallowed(ctx, "_callsite_expr_bindings")
             continue
-        parts = _ndarray_parts(actual_tp)
+        parts = _parts_or_unpack(actual_tp)
         if parts is None:
             continue
         adims, _ = parts
         for dim, tvar in positions:
             if dim >= len(adims):
                 continue
+            # For *Ts formals the unpack itself sits in the dims list;
+            # a formal Ts never binds like a sized dim (issue #185).
             adim = adims[dim]
+            if not isinstance(adim, int) and isinstance(
+                get_proper_type(adim), UnpackType
+            ):
+                continue
             try:
                 form_f = _form_of(tvar)
                 if form_f is None:
@@ -3047,7 +3053,20 @@ def _callsite_expr_bindings(
         except Exception:
             _swallowed(ctx, "_callsite_expr_bindings")
             continue
-        if not _has_unknown_shape(actual_tp):
+        proper_actual = get_proper_type(actual_tp)
+        if not (
+            _has_unknown_shape(actual_tp)
+            or isinstance(proper_actual, AnyType)
+            # A *Ts transpose bails to bare Any (issue #185): like an
+            # unknown rank, it must not leave the return as the caller's
+            # own names (which would read as exact and wrong).
+            or (
+                isinstance(proper_actual, Instance)
+                and proper_actual.type.fullname == NDARRAY_FULLNAME
+                and len(proper_actual.args) == 2
+                and isinstance(get_proper_type(proper_actual.args[0]), AnyType)
+            )
+        ):
             continue
         for dim, tvar in positions:
             if tvar.fullname not in bindings:
@@ -3090,7 +3109,7 @@ def _substitute_return_exprs(
             _swallowed(ctx, "_substitute_return_exprs")
             return None
     try:
-        ret_parts = _ndarray_parts(sig.ret_type)
+        ret_parts = _parts_or_unpack(sig.ret_type)
     except Exception:
         _swallowed(ctx, "_substitute_return_exprs")
         return None
@@ -3112,6 +3131,10 @@ def _substitute_return_exprs(
     for index, d in enumerate(rdims):
         try:
             if isinstance(d, int):
+                new_dims.append(d)
+                continue
+            if isinstance(get_proper_type(d), UnpackType):
+                # A *Ts segment passes through untouched (issue #185).
                 new_dims.append(d)
                 continue
             if not isinstance(d, TypeVarType):
@@ -8031,7 +8054,9 @@ def _solve_transpose_unpack(
     Reversing would also reverse *Ts itself, which no annotation can
     spell, so every *Ts transpose bails out instead of guessing.
     """
-    return ctx.default_return_type
+    # The stubs preserve the input shape, which is a wrong exact claim
+    # once reversed (issue #185): bail to Any instead of the default.
+    return AnyType(TypeOfAny.from_omitted_generics)
 
 
 _DTYPE_INFO: dict[str, tuple[str, int]] = {
@@ -10301,23 +10326,27 @@ def _solve_reduction_unpack(
     into *Ts bails out, as do absent/None axes, exactly like the
     fixed-rank path.
     """
+    # Bailing here must not return the stubs' answer: for *Ts shapes the
+    # stubs preserve the input shape (e.g. `var` keeps (*Ts, P)), which
+    # is a wrong exact claim when an axis actually reduces. Return Any
+    # so the shape stays unchecked instead of wrong (issue #185).
     if not isinstance(axis, list) or keepdims is None or has_dtype:
-        return ctx.default_return_type
+        return AnyType(TypeOfAny.from_omitted_generics)
     if force_dtype is None and _dtype_fullname(dtype) not in REDUCTION_DTYPES:
-        return ctx.default_return_type
+        return AnyType(TypeOfAny.from_omitted_generics)
     out_dtype = force_dtype if force_dtype is not None else dtype
     flat = prefix + [unpack] + suffix
     chosen: set[int] = set()
     for ax in axis:
         if isinstance(ax, bool) or not isinstance(ax, int):
-            return ctx.default_return_type
+            return AnyType(TypeOfAny.from_omitted_generics)
         if ax < 0:
             if -ax > len(suffix):
-                return ctx.default_return_type
+                return AnyType(TypeOfAny.from_omitted_generics)
             pos = len(flat) + ax
         else:
             if ax >= len(prefix):
-                return ctx.default_return_type
+                return AnyType(TypeOfAny.from_omitted_generics)
             pos = ax
         if pos in chosen:
             ctx.api.fail(
@@ -10394,7 +10423,14 @@ def _reduction_types(
         split = _split_flat(dims)
         if split is None:
             return ctx.default_return_type
-        return _solve_reduction_unpack(ctx, *split, dtype, axis, keepdims, has_dtype, op=op)
+        out_dtype = _reduction_out_dtype(ctx, op, dtype)
+        if out_dtype is None:
+            if _datetime_kind(dtype) == "M" and op.removeprefix("nan") == "mean":
+                return AnyType(TypeOfAny.explicit)
+            return AnyType(TypeOfAny.from_omitted_generics)
+        return _solve_reduction_unpack(
+            ctx, *split, dtype, axis, keepdims, has_dtype, out_dtype, op=op
+        )
     out_dtype = _reduction_out_dtype(ctx, op, dtype)
     if out_dtype is None:
         # mean(datetime) always raises (UFuncTypeError, issue #144):

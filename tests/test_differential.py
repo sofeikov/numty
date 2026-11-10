@@ -224,6 +224,98 @@ def test_generic_calls_agree_with_the_signature(tmp_path: Path) -> None:
     ) == 2 * sizes, stats
 
 
+def test_ts_helper_binds_variadic_segment() -> None:
+    # The oracle's reading of a signature carrying *Ts: the shared prefix
+    # binds from the actual arrays and the suffix solves like before.
+    ts = d.TS_DIM
+    g = d.Helper("g", [("F64", (ts, "N", "M"))], ("F64", (ts, "N", "M+1")))
+    assert g.signature() == 'def g(x0: F64[Unpack[Ts], N, M]) -> F64[Unpack[Ts], N, "M+1"]:'
+    assert g(np.ones((2, 3, 5))).shape == (2, 3, 6)
+    # Shared prefix must agree.
+    h = d.Helper(
+        "h", [("F64", (ts, "N")), ("F64", (ts, "N"))], ("F64", (ts, "N"))
+    )
+    h(np.ones((2, 3)), np.ones((2, 3)))
+    with pytest.raises(ValueError):  # Ts is (2,) vs (3,)
+        h(np.ones((2, 3)), np.ones((3, 3)))
+    with pytest.raises(ValueError):  # rank: suffix needs one dim
+        g(np.ones((2,)))
+    with pytest.raises(TypeError):  # dtype
+        bad = d.Helper("b", [("F64", (ts, "N"))], ("F64", (ts, "N")))
+        bad(np.ones((2, 3), dtype=np.float32))
+    # Formulas over the suffix solve; leading dims before *Ts align too.
+    f = d.Helper("f", [("F64", (ts, "M"))], ("F32", (ts, "M+M", "2*M")))
+    assert f(np.ones((2, 3))).shape == (2, 6, 6)
+    lead = d.Helper("l", [("F64", (2, ts, "N"))], ("F64", (2, ts, "N")))
+    assert lead(np.ones((2, 2, 3))).shape == (2, 2, 3)
+    with pytest.raises(ValueError):  # leading 2 vs 3
+        lead(np.ones((3, 2, 3)))
+
+
+def test_ts_comparison_substitutes_prefix() -> None:
+    # A revealed *Ts has to be substituted with the case's prefix rank
+    # before the shape is compared (issue #185).
+    f64 = "numpy.dtype[numpy.float64]"
+    revealed = f'numpy.ndarray[tuple[*Ts, Literal[4], Literal[6]], {f64}]'
+    node = d.parse_type(revealed)
+    assert d.array_claim(node, {"N": 3}, ()) is not None
+    assert d.array_claim(node, {"N": 3}, ()).dims == [4, 6]
+    assert d.array_claim(node, {"N": 3}, (2,)).dims == [2, 4, 6]
+    assert d.array_claim(node, {"N": 3}, (2, 6)).dims == [2, 6, 4, 6]
+    assert d._compare(node, np.zeros((4, 6)), {"N": 3}, ()) is None
+    assert d._compare(node, np.zeros((2, 4, 6)), {"N": 3}, (2,)) is None
+    assert (
+        d._compare(node, np.zeros((2, 4, 6)), {"N": 3}, (2, 6)) == "WRONG_SHAPE"
+    )
+    # Unpack[Ts] spells the same segment.
+    unpacked = revealed.replace("*Ts", "Unpack[Ts]")
+    assert d._compare(d.parse_type(unpacked), np.zeros((2, 4, 6)), {"N": 3}, (2,)) is None
+
+
+def test_ts_families_agree_with_the_signature(tmp_path: Path) -> None:
+    # Pinned from the *Ts family's first run (issue #185): reductions
+    # over the prefix claimed the input shape, and formula returns over
+    # *Ts came back as Never. Each of these now solves or bails safely.
+    ts = d.TS_DIM
+
+    def case(expr: str, params: list[tuple[str, str, tuple[object, ...]]], helpers: list[d.Helper] | None = None) -> d.Case:
+        return d.Case(expr, params, helpers or [])
+
+    # Same-shape threading, matmul over (*Ts, N, M), and a suffix-axis
+    # reduction: exact at every prefix rank.
+    add = case("a0 + a1", [("a0", "F64", (ts, "N")), ("a1", "F64", (ts, "N"))])
+    matmul = case(
+        "np.matmul(a0, a1)",
+        [("a0", "F64", (ts, "N", "M")), ("a1", "F64", (ts, "M", "K"))],
+    )
+    reduce = case(
+        "a0.sum(axis=-1, keepdims=True)", [("a0", "F64", (ts, "N", "M"))]
+    )
+    # Provable total-size clash over *Ts: flagged at every prefix rank.
+    bad_reshape = case("a0.reshape((2, 4))", [("a0", "I64", (ts, 2, 3))])
+    # Generic helpers carrying *Ts, with formulas over the suffix.
+    g = d.Helper("g0", [("F64", (ts, "M"))], ("F32", (ts, "M+1",)))
+    call = d.Case("g0(a0)", [("a0", "F64", (ts, "N"))], [g])
+    h = d.Helper(
+        "h1", [("F64", (ts, "N")), ("F64", (ts, "N"))], ("F64", (ts, "N"))
+    )
+    conflict = d.Case(
+        "h1(a0, a1)",
+        [("a0", "F64", (ts, "N")), ("a1", "F64", (ts, "M"))],
+        [h],
+    )
+    cases = [add, matmul, reduce, bad_reshape, call, conflict]
+    findings, stats = d.check(cases, tmp_path)
+    assert not findings, "\n".join(str(f) for f in findings)
+    n_sizes = len(d.SIZE_ASSIGNMENTS)
+    n_prefix = len(d.TS_PREFIXES)
+    # Three exact families plus the generic call are exact at every
+    # (size, prefix) combination; the reshape clash is flagged and the
+    # prefix conflict is allowed (numpy raises, not flagged) or special.
+    assert stats["agree: exact shape"] == 4 * n_sizes * n_prefix, stats
+    assert stats["numpy raises, flagged"] == 1 * n_sizes * n_prefix, stats
+
+
 def test_known_gaps_are_narrow() -> None:
     # A known gap excuses one finding kind on one call shape, nothing else.
     import re
