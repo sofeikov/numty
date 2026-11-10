@@ -1,0 +1,971 @@
+"""Differential oracle: numty's static answer against what numpy returns.
+
+Issue #165. The fixtures pin behaviours someone thought of; this
+generates numpy expressions nobody wrote down, asks mypy+numty for
+their type (`reveal_type`) and evaluates the same text with numpy. The
+two must agree:
+
+- a shape or dtype numty claims must be the one numpy produces;
+- an expression numpy rejects must not get a fully concrete type with
+  no diagnostic;
+- an expression numpy accepts must not draw a numty shape error.
+
+Losing precision (an unknown dim, `Any`, a bail) is always allowed:
+only a *wrong* answer fails.
+
+Two modes share the machinery. Concrete mode builds every operand with
+a literal shape. Symbolic mode wraps the expression in a function whose
+parameters carry TypeVar dims (`F64[N, M]`), then calls it with fixed
+sizes and substitutes them into the revealed dims (`N+1`, `N*M`, ...).
+
+Used by tests/test_differential.py; run it by hand for a longer hunt:
+
+    PYTHONPATH=. python -m tests.differential --seeds 1-20 --count 800
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import random
+import re
+import subprocess
+import sys
+import warnings
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import cast
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Exceptions that mean "these shapes/axes/dtypes do not fit": the cases
+# numty exists to catch. Data-dependent failures (singular matrices,
+# non-convergence) say nothing about shapes and are ignored.
+_SHAPE_ERRORS = (ValueError, IndexError, TypeError)
+_DATA_ERRORS = (np.linalg.LinAlgError, ZeroDivisionError, OverflowError, FloatingPointError)
+
+# numty codes that assert the code is wrong. `numty-bail` and
+# `numty-unsolved` say "cannot check", so they are not counted as
+# false positives on working code.
+_ASSERTING_CODES = ("numty-shape", "numty-broadcast", "numty-axis", "numty-callsite")
+
+# Wrong answers that are known and not numty's to give: the call is not
+# hooked, so the type comes from numpy's own stubs. Each entry is
+# (finding kind, pattern on the expression, why). Matching findings are
+# counted, not failed, so a new case of the same kind still stands out.
+KNOWN_GAPS: tuple[tuple[str, str, str], ...] = (
+    (
+        "WRONG_DTYPE",
+        r"^np\.(cov|corrcoef)\(np\.\w+\(\(.*\), dtype=np\.complex\d+\)\)$",
+        "numpy's stubs type cov/corrcoef of a complex array as float64",
+    ),
+    (
+        "CLAIM_ON_ERROR",
+        r"^np\.digitize\(np\.\w+\(\(.*?\), dtype=np\.complex\d+\), ",
+        "numpy's stubs accept a complex x for digitize, numpy raises",
+    ),
+)
+
+DIMS = (1, 2, 3, 4, 5, 6)
+DTYPES = (
+    "",
+    "",
+    "",
+    "np.float32",
+    "np.float16",
+    "np.int64",
+    "np.int32",
+    "np.int8",
+    "np.uint8",
+    "bool",
+    "np.complex64",
+    "np.complex128",
+)
+# Symbolic mode: sizes are distinct and never 1, so two different names
+# can neither broadcast nor coincide by accident.
+SYMBOL_SIZES = {"N": 3, "M": 5, "K": 7, "P": 4}
+SYMBOL_HEADS = {
+    "F64": "float64",
+    "F32": "float32",
+    "I64": "int64",
+    "U8": "uint8",
+    "Bool": "bool",
+}
+
+
+# --------------------------------------------------------------------------
+# Expression generation
+
+
+@dataclass
+class Operand:
+    """One array operand: the text to write and the shape it has."""
+
+    text: str
+    shape: tuple[int, ...]
+
+
+class Gen:
+    """Random numpy expressions over operands from `self.operand`."""
+
+    def __init__(self, rng: random.Random) -> None:
+        self.rng = rng
+
+    # -- operands ---------------------------------------------------------
+
+    def shape(self, rank: int | None = None) -> tuple[int, ...]:
+        r = self.rng
+        if rank is None:
+            rank = r.choice((0, 1, 1, 2, 2, 2, 3, 3, 4))
+        return tuple(r.choice(DIMS) for _ in range(rank))
+
+    def operand(
+        self, shape: tuple[int, ...] | None = None, dtype: str | None = None
+    ) -> Operand:
+        r = self.rng
+        if shape is None:
+            shape = self.shape()
+        if dtype is None:
+            dtype = r.choice(DTYPES)
+        builder = r.choice(("zeros", "ones"))
+        suffix = f", dtype={dtype}" if dtype else ""
+        return Operand(f"np.{builder}({shape!r}{suffix})", shape)
+
+    def near(self, shape: tuple[int, ...]) -> Operand:
+        """An operand that often, but not always, fits next to `shape`."""
+        r = self.rng
+        roll = r.random()
+        if roll < 0.45:
+            return self.operand(shape)
+        if roll < 0.6 and shape:
+            return self.operand(shape[r.randrange(len(shape)) :])
+        if roll < 0.75 and shape:
+            mixed = tuple(1 if r.random() < 0.4 else d for d in shape)
+            return self.operand(mixed)
+        return self.operand()
+
+    def index(self, shape: tuple[int, ...]) -> Operand:
+        """An integer index array (all zeros, so always in range)."""
+        return Operand(f"np.zeros({shape!r}, dtype=np.int64)", shape)
+
+    def axis(self, rank: int) -> int | None:
+        r = self.rng
+        if rank == 0:
+            return r.choice((0, -1, None))
+        return r.randint(-rank - 1, rank)
+
+    # -- expression families ---------------------------------------------
+
+    def binary_operator(self) -> str:
+        a = self.operand()
+        op = self.rng.choice(("+", "-", "*", "/", "//", "%", "**", "<", "<=", "==", "!=", ">=", ">"))
+        return f"{a.text} {op} {self.near(a.shape).text}"
+
+    def bool_operator(self) -> str:
+        a = self.operand(dtype=self.rng.choice(("bool", "np.int64", "np.uint8")))
+        b = self.near(a.shape)
+        dt = self.rng.choice(("bool", "np.int64"))
+        return f"{a.text} {self.rng.choice('&|^')} np.zeros({b.shape!r}, dtype={dt})"
+
+    def scalar_operator(self) -> str:
+        a = self.operand()
+        s = self.rng.choice(("2", "2.5", "True", "1j", "np.float32(2)", "np.int8(3)"))
+        op = self.rng.choice(("+", "-", "*", "/", "**", "//"))
+        return self.rng.choice((f"{a.text} {op} {s}", f"{s} {op} {a.text}"))
+
+    def unary(self) -> str:
+        a = self.operand()
+        return self.rng.choice((f"-{a.text}", f"+{a.text}", f"abs({a.text})", f"~{a.text}"))
+
+    def matmul(self) -> str:
+        a = self.operand(self.shape(self.rng.choice((1, 2, 2, 3))))
+        r = self.rng
+        if r.random() < 0.6 and a.shape:
+            b = self.operand((a.shape[-1],) + self.shape(r.choice((0, 1))))
+        else:
+            b = self.operand()
+        form = r.choice(("np.matmul({}, {})", "{} @ {}", "np.dot({}, {})", "{}.dot({})"))
+        return form.format(a.text, b.text)
+
+    def products(self) -> str:
+        a, b = self.operand(), self.operand()
+        fn = self.rng.choice(("tensordot", "inner", "outer", "vdot", "kron", "cross", "convolve", "correlate"))
+        return f"np.{fn}({a.text}, {b.text})"
+
+    def tensordot_axes(self) -> str:
+        a, b = self.operand(), self.operand()
+        axes = self.rng.choice(("0", "1", "2", "([0], [0])", "([-1], [0])", "([0, 1], [1, 0])"))
+        return f"np.tensordot({a.text}, {b.text}, axes={axes})"
+
+    def method_reduction(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(
+            ("sum", "mean", "max", "min", "prod", "std", "var", "argmax", "argmin", "any", "all", "cumsum", "cumprod")
+        )
+        keep = ", keepdims=True" if self.rng.random() < 0.3 and not name.startswith("cum") else ""
+        return f"{a.text}.{name}(axis={self.axis(len(a.shape))}{keep})"
+
+    def function_reduction(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(
+            (
+                "sum", "mean", "median", "nansum", "nanmean", "nanmax", "argmax", "argsort",
+                "sort", "diff", "flip", "cumsum", "squeeze", "expand_dims", "gradient",
+                "count_nonzero", "linalg.norm", "unique", "ptp", "amax", "nanargmin",
+            )
+        )
+        return f"np.{name}({a.text}, axis={self.axis(len(a.shape))})"
+
+    def no_axis(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(
+            (
+                "sum()", "mean()", "max()", "argmax()", "ravel()", "flatten()", "copy()",
+                "astype(np.float32)", "astype(int)", "squeeze()", "conj()", "round()",
+                "clip(0, 1)", "nonzero()", "diagonal()", "trace()", "swapaxes(0, -1)",
+                "cumsum()", "argsort()", "T", "real", "imag", "tolist()",
+            )
+        )
+        return f"{a.text}.{name}"
+
+    def reshape(self) -> str:
+        a = self.operand()
+        total = int(np.prod(a.shape, dtype=int))
+        target = self.rng.choice(
+            ((-1,), (total,), (1, -1), (-1, 1), (2, -1), (-1, 3), (total, 1, 1), a.shape[::-1], (2, 2, -1), (-1, 2, 3))
+        )
+        form = self.rng.choice(("{}.reshape({!r})", "{}.reshape{!r}", "np.reshape({}, {!r})"))
+        return form.format(a.text, target)
+
+    def transpose(self) -> str:
+        a = self.operand()
+        rank = len(a.shape)
+        perm = tuple(self.rng.sample(range(rank), rank))
+        return self.rng.choice(
+            (
+                f"{a.text}.T",
+                f"{a.text}.transpose()",
+                f"np.transpose({a.text})",
+                f"{a.text}.transpose({perm!r})",
+                f"np.transpose({a.text}, {perm!r})",
+                f"np.swapaxes({a.text}, {self.axis(rank)}, {self.axis(rank)})",
+                f"np.moveaxis({a.text}, {self.axis(rank)}, {self.axis(rank)})",
+                f"{a.text}.mT",
+                f"np.rollaxis({a.text}, {self.axis(rank)})",
+            )
+        )
+
+    def getitem(self) -> str:
+        r = self.rng
+        a = self.operand(self.shape(r.choice((1, 2, 2, 3, 3))))
+        items = []
+        for d in a.shape[: r.randint(0, len(a.shape))]:
+            if r.random() < 0.12:
+                items.append("None")  # a new axis: consumes no dim
+            items.append(
+                r.choice(
+                    (
+                        str(r.randint(-d - 1, d)),
+                        ":",
+                        f"{r.randint(-d, d)}:",
+                        f":{r.randint(-d - 1, d + 1)}",
+                        f"::{r.choice((1, 2, -1, 3))}",
+                        f"{r.randint(0, d)}:{r.randint(0, d + 2)}",
+                        "...",
+                        f"[0, {d - 1}]",
+                        f"np.arange({r.randint(1, d)})",
+                        f"np.ones({d}, dtype=bool)",
+                        f"np.zeros(({r.choice(DIMS)}, 2), dtype=np.int64)",
+                    )
+                )
+            )
+        return f"{a.text}[{', '.join(items) or '...'}]"
+
+    def join(self) -> str:
+        a = self.operand()
+        b = self.near(a.shape)
+        name = self.rng.choice(("concatenate", "stack", "vstack", "hstack", "dstack", "column_stack"))
+        axis = ""
+        if name in ("concatenate", "stack") and self.rng.random() < 0.6:
+            axis = f", axis={self.axis(len(a.shape))}"
+        seq = self.rng.choice(("[{}, {}]", "({}, {})")).format(a.text, b.text)
+        return f"np.{name}({seq}{axis})"
+
+    def unary_ufunc(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(
+            (
+                "sqrt", "exp", "abs", "sin", "negative", "floor", "isnan", "sign", "square",
+                "log1p", "conj", "real", "imag", "angle", "reciprocal", "logical_not",
+                "rint", "isfinite", "absolute", "tanh", "ceil", "cbrt",
+            )
+        )
+        return f"np.{name}({a.text})"
+
+    def binary_ufunc(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(
+            (
+                "add", "maximum", "minimum", "hypot", "arctan2", "power", "logical_and",
+                "equal", "subtract", "multiply", "true_divide", "floor_divide", "fmod",
+                "less", "bitwise_and", "copysign",
+            )
+        )
+        return f"np.{name}({a.text}, {self.near(a.shape).text})"
+
+    def where(self) -> str:
+        a = self.operand()
+        cond = self.operand(self.near(a.shape).shape, "bool")
+        return f"np.where({cond.text}, {a.text}, {self.near(a.shape).text})"
+
+    def clip(self) -> str:
+        a = self.operand()
+        lo = self.rng.choice(("0", self.near(a.shape).text))
+        hi = self.rng.choice(("1", self.near(a.shape).text))
+        return f"np.clip({a.text}, {lo}, {hi})"
+
+    def shape_helper(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(
+            (
+                "atleast_1d", "atleast_2d", "atleast_3d", "ravel", "flatnonzero", "zeros_like",
+                "ones_like", "copy", "ascontiguousarray", "asfortranarray", "asarray", "fliplr",
+                "flipud", "trace", "diag", "tril", "triu", "diagonal", "argwhere", "nonzero",
+                "squeeze", "transpose", "isnan", "array", "empty_like", "cov", "corrcoef",
+            )
+        )
+        return f"np.{name}({a.text})"
+
+    def tile_repeat(self) -> str:
+        a = self.operand()
+        if self.rng.random() < 0.5:
+            reps = self.rng.choice(("2", "3", "(2,)", "(2, 3)", "(1, 2, 2)"))
+            return f"np.{self.rng.choice(('tile', 'repeat'))}({a.text}, {reps})"
+        return f"np.repeat({a.text}, {self.rng.randint(1, 3)}, axis={self.axis(len(a.shape))})"
+
+    def pad(self) -> str:
+        a = self.operand()
+        rank = max(len(a.shape), 1)
+        width = self.rng.choice(("1", "(1, 2)", repr(((1, 2),) * rank), "((0, 1), (2, 0))"))
+        return f"np.pad({a.text}, {width})"
+
+    def linalg(self) -> str:
+        r = self.rng
+        n = r.choice(DIMS)
+        a = self.operand(r.choice(((n, n), (n, n), self.shape(2), self.shape(3), self.shape(1))), r.choice(("", "", "np.float32", "np.int64", "np.complex128")))
+        name = r.choice(
+            ("inv", "det", "cholesky", "eigvals", "pinv", "svd", "qr", "eigh", "slogdet", "matrix_rank", "eig", "eigvalsh", "norm", "cond", "matrix_transpose")
+        )
+        return f"np.linalg.{name}({a.text})"
+
+    def linalg_solve(self) -> str:
+        r = self.rng
+        n = r.choice(DIMS)
+        a = self.operand(r.choice(((n, n), (n, n), self.shape(2))), "")
+        b = self.operand(r.choice(((n,), (n, r.choice(DIMS)), self.shape())), "")
+        return f"np.linalg.{r.choice(('solve', 'lstsq'))}({a.text}, {b.text})"
+
+    def einsum(self) -> str:
+        sub = self.rng.choice(
+            (
+                "ij,jk->ik", "ij->ji", "ii->i", "ij,ij->", "i,j->ij", "...ij,...jk->...ik",
+                "ijk->kji", "ij,j", "bij,bjk->bik", "ii", "ij->", "i,i", "ij,kj->ik", "...i->...",
+            )
+        )
+        count = sub.split("->")[0].count(",") + 1
+        ops = ", ".join(self.operand(dtype="").text for _ in range(count))
+        return f"np.einsum({sub!r}, {ops})"
+
+    def take(self) -> str:
+        a = self.operand()
+        idx = self.rng.choice(("0", "[0, 0]", "np.zeros(2, dtype=np.int64)", "[[0], [0]]"))
+        axis = "" if self.rng.random() < 0.4 else f", axis={self.axis(len(a.shape))}"
+        return f"np.take({a.text}, {idx}{axis})"
+
+    def take_along_axis(self) -> str:
+        a = self.operand()
+        idx = self.index(self.near(a.shape).shape)
+        return f"np.take_along_axis({a.text}, {idx.text}, axis={self.axis(len(a.shape))})"
+
+    def expand_squeeze(self) -> str:
+        a = self.operand()
+        rank = len(a.shape)
+        if self.rng.random() < 0.5:
+            where = self.rng.choice((str(self.axis(rank)), "(0, 1)", "(0, -1)"))
+            return f"np.expand_dims({a.text}, {where})"
+        axis = "" if self.rng.random() < 0.4 else f", axis={self.axis(rank)}"
+        return f"np.squeeze({a.text}{axis})"
+
+    def broadcast_to(self) -> str:
+        a = self.operand()
+        target = self.rng.choice((self.shape(), self.shape(1) + a.shape, a.shape))
+        return f"np.broadcast_to({a.text}, {target!r})"
+
+    def fft(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(("fft", "rfft", "ifft", "fft2", "rfft2", "fftn", "irfft", "ifft2", "rfftn"))
+        extra = self.rng.choice(("", f", n={self.rng.randint(1, 7)}", f", axis={self.axis(len(a.shape))}"))
+        if name.endswith(("2", "n")):
+            extra = ""
+        return f"np.fft.{name}({a.text}{extra})"
+
+    def split(self) -> str:
+        a = self.operand()
+        axis = "" if self.rng.random() < 0.4 else f", axis={self.axis(len(a.shape))}"
+        return f"np.{self.rng.choice(('split', 'array_split'))}({a.text}, {self.rng.choice((1, 2, 3))}{axis})"
+
+    def roll_rot(self) -> str:
+        a = self.operand()
+        if self.rng.random() < 0.5:
+            axis = self.rng.choice(("", f", axis={self.axis(len(a.shape))}"))
+            return f"np.roll({a.text}, {self.rng.choice((1, 2, -1))}{axis})"
+        axes = self.rng.choice(("", ", axes=(0, 1)", ", axes=(1, 0)", ", axes=(0, 0)"))
+        return f"np.rot90({a.text}, {self.rng.choice((1, 2, 3))}{axes})"
+
+    def builder(self) -> str:
+        name = self.rng.choice(("eye", "identity", "arange", "linspace", "zeros", "ones", "full", "empty"))
+        args = self.rng.choice(("3", "(2, 3)", "4, 5", "(3,), 1.5", "0", "5, dtype=np.float32", "(2, 2), 7", "3, 4, dtype=int"))
+        return f"np.{name}({args})"
+
+    def average(self) -> str:
+        a = self.operand()
+        w = self.operand(self.shape(1), "")
+        return f"np.average({a.text}, axis={self.axis(len(a.shape))}, weights={w.text})"
+
+    def edit(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(("insert", "append", "delete"))
+        where = self.rng.choice(("0", "[0, 1]"))
+        value = "" if name == "delete" else ", 1.0"
+        if name == "append":
+            where, value = "1.0", ""
+        axis = "" if self.rng.random() < 0.5 or name == "append" else f", axis={self.axis(len(a.shape))}"
+        return f"np.{name}({a.text}, {where}{value}{axis})"
+
+    def window(self) -> str:
+        a = self.operand()
+        win = self.rng.choice(("1", "2", "3", "(2, 2)"))
+        axis = "" if self.rng.random() < 0.5 else f", axis={self.axis(len(a.shape))}"
+        return f"np.lib.stride_tricks.sliding_window_view({a.text}, {win}{axis})"
+
+    def lookup(self) -> str:
+        a, b = self.operand(), self.operand()
+        name = self.rng.choice(("searchsorted", "isin", "digitize", "percentile", "quantile", "trapezoid", "meshgrid"))
+        return f"np.{name}({a.text}, {b.text})"
+
+    def ufunc_method(self) -> str:
+        a = self.operand()
+        name = self.rng.choice(("add", "multiply", "maximum", "logical_and"))
+        rank = len(a.shape)
+        return self.rng.choice(
+            (
+                f"np.{name}.reduce({a.text}, axis={self.axis(rank)})",
+                f"np.{name}.accumulate({a.text}, axis={self.axis(rank)})",
+                f"np.{name}.outer({a.text}, {self.operand().text})",
+            )
+        )
+
+    def chain(self) -> str:
+        a = self.operand()
+        b = self.operand(a.shape)
+        tail = self.rng.choice(("", "[::2]", "[None]", ".mean()", ".T", ".sum(axis=0)", ".reshape(-1, 1)"))
+        op = self.rng.choice("+-*")
+        return f"({a.text} {op} {b.text}).reshape(-1){tail}"
+
+    FAMILIES: tuple[Callable[..., str], ...] = (
+        binary_operator, binary_operator, bool_operator, scalar_operator, unary,
+        matmul, matmul, products, tensordot_axes, method_reduction, method_reduction,
+        function_reduction, function_reduction, no_axis, reshape, reshape, transpose,
+        transpose, getitem, getitem, getitem, join, join, unary_ufunc, binary_ufunc,
+        where, clip, shape_helper, shape_helper, tile_repeat, pad, linalg, linalg_solve,
+        einsum, take, take_along_axis, expand_squeeze, broadcast_to, fft, split,
+        roll_rot, builder, average, edit, window, lookup, ufunc_method, chain,
+    )
+
+    def expression(self) -> str:
+        return self.rng.choice(self.FAMILIES)(self)
+
+
+class SymGen(Gen):
+    """Expressions over the parameters of a generic function.
+
+    Operands are parameter names with symbolic shapes; `self.params`
+    collects the ones the current expression used.
+    """
+
+    def __init__(self, rng: random.Random) -> None:
+        super().__init__(rng)
+        self.params: list[tuple[str, str, tuple[object, ...]]] = []
+
+    def shape(self, rank: int | None = None) -> tuple[int, ...]:  # type: ignore[override]
+        r = self.rng
+        if rank is None:
+            rank = r.choice((1, 1, 2, 2, 2, 3))
+        pool: tuple[object, ...] = ("N", "N", "M", "M", "K", "P", 2, 3)
+        return cast("tuple[int, ...]", tuple(r.choice(pool) for _ in range(rank)))
+
+    def operand(self, shape=None, dtype=None) -> Operand:  # type: ignore[override]
+        if shape is None:
+            shape = self.shape()
+        head = {
+            None: self.rng.choice(("F64", "F64", "F64", "F32", "I64", "U8")),
+            "": "F64",
+            "bool": "Bool",
+            "np.int64": "I64",
+        }.get(dtype, "F64")
+        name = f"a{len(self.params)}"
+        self.params.append((name, head, tuple(shape)))
+        return Operand(name, tuple(shape))  # type: ignore[arg-type]
+
+    def near(self, shape) -> Operand:  # type: ignore[override]
+        r = self.rng
+        roll = r.random()
+        if roll < 0.5:
+            return self.operand(shape)
+        if roll < 0.7 and shape:
+            return self.operand(shape[r.randrange(len(shape)) :])
+        return self.operand()
+
+    # Families whose text depends on concrete sizes are rebuilt here.
+
+    def reshape(self) -> str:
+        a = self.operand()
+        target = self.rng.choice(("-1", "(-1,)", "(1, -1)", "(-1, 1)", f"{a.text}.shape[::-1]", "(2, -1)"))
+        return f"{a.text}.reshape({target})"
+
+    def getitem(self) -> str:
+        a = self.operand(self.shape(self.rng.choice((1, 2, 2, 3))))
+        items = [
+            self.rng.choice(("0", ":", "1:", ":-1", "::2", "None", "...", "-1", "::-1", "1:-1"))
+            for _ in a.shape[: self.rng.randint(0, len(a.shape))]
+        ]
+        return f"{a.text}[{', '.join(items) or '...'}]"
+
+    def matmul(self) -> str:
+        a = self.operand(self.shape(self.rng.choice((1, 2, 2, 3))))
+        if self.rng.random() < 0.6:
+            b = self.operand((a.shape[-1],) + self.shape(self.rng.choice((0, 1))))
+        else:
+            b = self.operand()
+        form = self.rng.choice(("np.matmul({}, {})", "{} @ {}", "np.dot({}, {})"))
+        return form.format(a.text, b.text)
+
+    def chain(self) -> str:
+        a = self.operand()
+        b = self.operand(a.shape)
+        tail = self.rng.choice(("", "[::2]", "[None]", ".T", ".reshape(-1, 1)"))
+        return f"({a.text} + {b.text}).reshape(-1){tail}"
+
+    def pad(self) -> str:
+        a = self.operand()
+        return f"np.pad({a.text}, {self.rng.choice(('1', '(1, 2)'))})"
+
+    FAMILIES = (
+        Gen.binary_operator, Gen.binary_operator, Gen.scalar_operator, Gen.unary,
+        matmul, matmul, Gen.method_reduction, Gen.method_reduction,
+        Gen.function_reduction, Gen.no_axis, reshape, reshape, Gen.transpose,
+        getitem, getitem, Gen.join, Gen.join, Gen.unary_ufunc, Gen.binary_ufunc,
+        Gen.where, Gen.clip, Gen.shape_helper, Gen.tile_repeat, pad,
+        Gen.expand_squeeze, Gen.fft, Gen.roll_rot, Gen.take, Gen.products,
+        Gen.einsum, Gen.window, chain, Gen.split, Gen.edit,
+    )
+
+    def case(self) -> "Case":
+        self.params = []
+        expr = self.expression()
+        return Case(expr, list(self.params))
+
+
+@dataclass
+class Case:
+    expr: str
+    params: list[tuple[str, str, tuple[object, ...]]] = field(default_factory=list)
+
+    @property
+    def symbolic(self) -> bool:
+        return bool(self.params)
+
+    def signature(self) -> str:
+        parts = []
+        for name, head, shape in self.params:
+            dims = ", ".join(str(d) for d in shape)
+            parts.append(f"{name}: {head}[{dims}]")
+        return ", ".join(parts)
+
+    def runtime_namespace(self) -> dict[str, object]:
+        ns: dict[str, object] = {"np": np}
+        for name, head, shape in self.params:
+            sizes = tuple(SYMBOL_SIZES[d] if isinstance(d, str) else cast(int, d) for d in shape)
+            ns[name] = np.ones(sizes, dtype=SYMBOL_HEADS[head])
+        return ns
+
+
+def generate(seed: int, count: int, symbolic: bool) -> list[Case]:
+    rng = random.Random(seed)
+    if symbolic:
+        gen = SymGen(rng)
+        return [gen.case() for _ in range(count)]
+    plain = Gen(rng)
+    return [Case(plain.expression()) for _ in range(count)]
+
+
+def render(cases: list[Case]) -> tuple[str, list[int]]:
+    """mypy source for the cases, and the line each `reveal_type` is on."""
+    out = [
+        "from typing import TypeVar",
+        "import numpy as np",
+        "from numty import F64, F32, I64, U8, Bool",
+        *(f'{name} = TypeVar("{name}", bound=int)' for name in SYMBOL_SIZES),
+    ]
+    lines: list[int] = []
+    for i, case in enumerate(cases):
+        if case.symbolic:
+            out.append(f"def f{i}({case.signature()}) -> None:")
+            out.append(f"    reveal_type({case.expr})")
+        else:
+            out.append(f"reveal_type({case.expr})")
+        lines.append(len(out))
+    return "\n".join(out) + "\n", lines
+
+
+# --------------------------------------------------------------------------
+# Reading mypy's answer
+
+
+@dataclass
+class Node:
+    """A parsed type: `name[args]`, or a `|` union (name == "|")."""
+
+    name: str
+    args: list["Node"] = field(default_factory=list)
+
+
+def _split_top(text: str, sep: str) -> list[str]:
+    parts, depth, start = [], 0, 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif depth == 0 and text.startswith(sep, i):
+            parts.append(text[start:i])
+            i += len(sep)
+            start = i
+            continue
+        i += 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts]
+
+
+def parse_type(text: str) -> Node:
+    text = text.strip()
+    union = _split_top(text, " | ")
+    if len(union) > 1:
+        return Node("|", [parse_type(p) for p in union])
+    if text.endswith("]") and "[" in text:
+        name, inner = text.split("[", 1)
+        inner = inner[:-1]
+        if name == "Literal":
+            return Node("Literal", [Node(inner)])
+        return Node(name, [parse_type(p) for p in _split_top(inner, ", ")])
+    return Node(text)
+
+
+_BITS = {"_8Bit": 8, "_16Bit": 16, "_32Bit": 32, "_64Bit": 64}
+_DIRECT = {
+    "float16", "float32", "float64", "int8", "int16", "int32", "int64", "uint8",
+    "uint16", "uint32", "uint64", "complex64", "complex128", "bool",
+}
+
+
+def dtype_names(node: Node) -> set[str] | None:
+    """The numpy dtype names a `dtype[...]` argument allows, or None if open."""
+    short = node.name.rsplit(".", 1)[-1]
+    if node.name == "|":
+        names: set[str] = set()
+        for arg in node.args:
+            got = dtype_names(arg)
+            if got is None:
+                return None
+            names |= got
+        return names
+    if short in _DIRECT:
+        return {short}
+    if short == "bool_":
+        return {"bool"}
+    if short == "intp":
+        return {"int64", "int32"}
+    if short == "uintp":
+        return {"uint64", "uint32"}
+    kinds = {"floating": "float", "signedinteger": "int", "unsignedinteger": "uint"}
+    if short in kinds and len(node.args) == 1:
+        widths = node.args[0].args if node.args[0].name == "|" else [node.args[0]]
+        out = set()
+        for w in widths:
+            bits = _BITS.get(w.name.rsplit(".", 1)[-1])
+            if bits is None:
+                return None
+            out.add(f"{kinds[short]}{bits}")
+        return out
+    if short == "complexfloating" and node.args:
+        bits = _BITS.get(node.args[0].name.rsplit(".", 1)[-1])
+        return {f"complex{bits * 2}"} if bits else None
+    return None
+
+
+def _eval_dim(text: str) -> int | None:
+    """A revealed dim (`N`, `N+1`, `N*M`, `N//2+1`) under SYMBOL_SIZES."""
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        return None
+    allowed = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Name, ast.Constant, ast.Load,
+        ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.USub,
+    )
+    for sub in ast.walk(tree):
+        if not isinstance(sub, allowed):
+            return None
+        if isinstance(sub, ast.Name) and sub.id not in SYMBOL_SIZES:
+            return None
+    value = eval(compile(tree, "<dim>", "eval"), {"__builtins__": {}}, dict(SYMBOL_SIZES))
+    return value if isinstance(value, int) else None
+
+
+@dataclass
+class ArrayClaim:
+    """What a revealed ndarray type asserts. None means "not claimed"."""
+
+    dims: list[int | None] | None  # None: rank unknown
+    dtypes: set[str] | None
+
+    @property
+    def concrete(self) -> bool:
+        return self.dims is not None and all(d is not None for d in self.dims)
+
+
+def array_claim(node: Node) -> ArrayClaim | None:
+    if node.name != "numpy.ndarray" or len(node.args) != 2:
+        return None
+    shape, dtype = node.args
+    dims: list[int | None] | None
+    if shape.name in ("tuple", "builtins.tuple"):
+        if len(shape.args) == 1 and shape.args[0].name == "()":
+            dims = []
+        elif any(a.name == "..." for a in shape.args) or any(
+            a.name.startswith(("Unpack", "*")) for a in shape.args
+        ):
+            dims = None
+        else:
+            dims = []
+            for a in shape.args:
+                if a.name == "Literal" and a.args and a.args[0].name.lstrip("-").isdigit():
+                    dims.append(int(a.args[0].name))
+                elif not a.args:
+                    dims.append(_eval_dim(a.name))
+                else:
+                    dims.append(None)
+    else:
+        dims = None
+    names = None
+    if dtype.name == "numpy.dtype" and len(dtype.args) == 1:
+        names = dtype_names(dtype.args[0])
+    return ArrayClaim(dims, names)
+
+
+# --------------------------------------------------------------------------
+# Comparison
+
+
+@dataclass
+class Finding:
+    kind: str  # WRONG_SHAPE, WRONG_DTYPE, CLAIM_ON_ERROR, FALSE_POSITIVE
+    case: Case
+    static: str
+    runtime: str
+
+    def __str__(self) -> str:
+        where = f"def f({self.case.signature()}): " if self.case.symbolic else ""
+        return f"{self.kind}: {where}{self.case.expr}\n    numty: {self.static}\n    numpy: {self.runtime}"
+
+
+def _check_array(claim: ArrayClaim, value: np.ndarray | np.generic) -> str | None:
+    shape = tuple(np.shape(value))
+    if claim.dims is not None:
+        if isinstance(value, np.generic) and not claim.dims:
+            pass
+        elif len(claim.dims) != len(shape) or any(
+            d is not None and d != s for d, s in zip(claim.dims, shape)
+        ):
+            return "WRONG_SHAPE"
+    if claim.dtypes is not None and str(value.dtype) not in claim.dtypes:
+        return "WRONG_DTYPE"
+    return None
+
+
+def _compare(node: Node, value: object) -> str | None:
+    """Kind of mismatch between a revealed type and a runtime value."""
+    claim = array_claim(node)
+    if claim is not None:
+        if isinstance(value, (np.ndarray, np.generic)):
+            return _check_array(claim, value)
+        return None
+    if isinstance(value, (tuple, list)) and value and all(isinstance(v, np.ndarray) for v in value):
+        if node.name in ("tuple", "builtins.tuple") and len(node.args) == len(value):
+            if not any(a.name == "..." for a in node.args):
+                for sub, item in zip(node.args, value):
+                    bad = _compare(sub, item)
+                    if bad:
+                        return bad
+        elif node.name in ("list", "builtins.list") and len(node.args) == 1:
+            for item in value:
+                bad = _compare(node.args[0], item)
+                if bad:
+                    return bad
+    return None
+
+
+def _describe(value: object) -> str:
+    if isinstance(value, BaseException):
+        return f"raises {type(value).__name__}: {str(value)[:120]}"
+    if isinstance(value, (np.ndarray, np.generic)):
+        return f"shape {tuple(np.shape(value))}, dtype {value.dtype}"
+    if isinstance(value, (tuple, list)):
+        return f"{type(value).__name__} of " + ", ".join(_describe(v) for v in value[:4])
+    return type(value).__name__
+
+
+def evaluate(case: Case) -> object:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with np.errstate(all="ignore"):
+            try:
+                return eval(case.expr, case.runtime_namespace())
+            except Exception as exc:  # the exception is the answer
+                return exc
+
+
+def run_mypy(source: str, workdir: Path) -> tuple[dict[int, str], dict[int, list[str]], str]:
+    """Reveals and errors by line for `source`, plus the raw output."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    path = workdir / "cases.py"
+    path.write_text(source, encoding="utf-8")
+    (workdir / "mypy.ini").write_text("[mypy]\nplugins = numty_plugin\n", encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "mypy", "--config-file", "mypy.ini",
+            "--cache-dir", str(workdir / "cache"), "--no-error-summary",
+            "--show-traceback", "cases.py",
+        ],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    raw = result.stdout + result.stderr
+    reveals: dict[int, str] = {}
+    errors: dict[int, list[str]] = {}
+    for line in result.stdout.splitlines():
+        m = re.match(r"cases\.py:(\d+): (note|error): (.*)", line)
+        if not m:
+            continue
+        number, level, text = int(m[1]), m[2], m[3]
+        if level == "note" and text.startswith('Revealed type is "'):
+            reveals[number] = text[len('Revealed type is "') : -1]
+        elif level == "error":
+            errors.setdefault(number, []).append(text)
+    return reveals, errors, raw
+
+
+def check(cases: list[Case], workdir: Path) -> tuple[list[Finding], dict[str, int]]:
+    source, lines = render(cases)
+    reveals, errors, raw = run_mypy(source, workdir)
+    if "INTERNAL ERROR" in raw or "Traceback (most recent call last)" in raw:
+        raise AssertionError("mypy crashed on generated cases:\n" + raw[-4000:])
+    findings: list[Finding] = []
+    stats: dict[str, int] = {}
+
+    def count(key: str) -> None:
+        stats[key] = stats.get(key, 0) + 1
+
+    def report(kind: str, case: Case, static: str, value: object) -> None:
+        for known_kind, pattern, _why in KNOWN_GAPS:
+            if kind == known_kind and re.search(pattern, case.expr):
+                count(f"known gap: {kind}")
+                return
+        findings.append(Finding(kind, case, static, _describe(value)))
+        count(kind)
+
+    for case, line in zip(cases, lines):
+        value = evaluate(case)
+        static = reveals.get(line, "<no reveal>")
+        errs = errors.get(line, [])
+        asserting = [e for e in errs if any(f"[{c}]" in e for c in _ASSERTING_CODES)]
+        if isinstance(value, _DATA_ERRORS):
+            count("skipped: data-dependent runtime error")
+            continue
+        if isinstance(value, BaseException):
+            if errs:
+                count("numpy raises, flagged")
+                continue
+            if isinstance(value, _SHAPE_ERRORS) and static != "<no reveal>":
+                node = parse_type(static)
+                claim = array_claim(node)
+                if claim is not None and claim.concrete and not case.symbolic:
+                    report("CLAIM_ON_ERROR", case, static, value)
+                    continue
+            count("numpy raises, not flagged (allowed)")
+            continue
+        if asserting:
+            report("FALSE_POSITIVE", case, asserting[0], value)
+            continue
+        if static == "<no reveal>":
+            count("no reveal")
+            continue
+        bad = _compare(parse_type(static), value)
+        if bad:
+            report(bad, case, static, value)
+            continue
+        claim = array_claim(parse_type(static))
+        if claim is not None and claim.concrete and isinstance(value, np.ndarray):
+            count("agree: exact shape")
+        else:
+            count("agree: partial or no claim")
+    return findings, stats
+
+
+def main(argv: list[str]) -> int:
+    import argparse
+    import tempfile
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--seeds", default="1-4", help="e.g. 7 or 1-20")
+    parser.add_argument("--count", type=int, default=600)
+    parser.add_argument("--mode", choices=("concrete", "symbolic", "both"), default="both")
+    args = parser.parse_args(argv)
+    lo, _, hi = args.seeds.partition("-")
+    seeds = range(int(lo), int(hi or lo) + 1)
+    modes = ("concrete", "symbolic") if args.mode == "both" else (args.mode,)
+    total = 0
+    for mode in modes:
+        for seed in seeds:
+            cases = generate(seed, args.count, symbolic=mode == "symbolic")
+            with tempfile.TemporaryDirectory() as tmp:
+                findings, stats = check(cases, Path(tmp))
+            print(f"== {mode} seed {seed}: " + ", ".join(f"{k}={v}" for k, v in sorted(stats.items())))
+            for finding in findings:
+                print(finding)
+            total += len(findings)
+    print(f"{total} finding(s)")
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

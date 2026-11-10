@@ -1499,6 +1499,8 @@ class NumtyPlugin(Plugin):
             return inplace_method_hook
         if fullname == "numpy.ndarray.clip":
             return clip_method_hook
+        if fullname == "numpy.ndarray.round":
+            return round_method_hook
         # Bare ufunc objects (np.sqrt, np.add, ...) are stub variables, not
         # functions, so get_function_hook never sees them. Their generic
         # type carries the ufunc name as a Literal, which this hook reads.
@@ -3673,6 +3675,83 @@ _SHAPE_KEEPERS = frozenset({
 })
 
 
+_recheck_depth = 0
+
+
+def _is_degraded_operand(tp: Type) -> bool:
+    """An argument type that lost what its expression would show alone.
+
+    Any, or an ndarray whose shape is not a fixed tuple or whose dtype
+    is unknown: what an inline numpy call collapses to when mypy infers
+    it against one overload's formal (see _undegraded_args).
+    """
+    proper = get_proper_type(tp)
+    if isinstance(proper, AnyType):
+        return True
+    if not isinstance(proper, Instance) or proper.type.fullname != NDARRAY_FULLNAME:
+        return False
+    if len(proper.args) != 2:
+        return True
+    shape = get_proper_type(proper.args[0])
+    if not isinstance(shape, TupleType):
+        return True
+    dtype = get_proper_type(proper.args[1])
+    if isinstance(dtype, AnyType):
+        return True
+    return isinstance(dtype, Instance) and any(
+        isinstance(get_proper_type(arg), AnyType) for arg in dtype.args
+    )
+
+
+def _undegraded_args(
+    ctx: FunctionContext | MethodContext,
+) -> FunctionContext | MethodContext:
+    """Give a hook the operands as written, not as one overload saw them.
+
+    mypy infers each argument against the formal of the overload it is
+    trying. An inline builder with a dtype the first overload does not
+    take (`f64 + np.ones((7, 7), dtype=np.complex64)` against the
+    float64 overload of `__add__`) then falls through to the builder's
+    catch-all overload and arrives here as `ndarray[Any, ...]`. The
+    float64 overload accepts that, and the hook saw an operand with no
+    shape and no dtype: mismatched shapes passed, and the result kept
+    the float64 dtype of an overload that should never have matched
+    (issue #166).
+
+    So an inline call or operator whose type arrived degraded is
+    re-inferred on its own, with no type context, and the hook gets
+    that answer when it is a known array. Names and attributes are
+    left alone (their type does not depend on context), which also
+    keeps the cost off ordinary code: a precise operand is never
+    re-inferred. Nested re-inference is capped, since each level
+    re-checks the subexpression.
+    """
+    global _recheck_depth
+    if _recheck_depth >= 2:
+        return ctx
+    new_types: list[list[Type]] | None = None
+    for i, (exprs, types) in enumerate(zip(ctx.args, ctx.arg_types)):
+        for j, (expr, tp) in enumerate(zip(exprs, types)):
+            if not isinstance(expr, (CallExpr, OpExpr)) or not _is_degraded_operand(tp):
+                continue
+            _recheck_depth += 1
+            try:
+                fresh = ctx.api.get_expression_type(expr)
+            except Exception:
+                _swallowed(ctx, "_undegraded_args")
+                continue
+            finally:
+                _recheck_depth -= 1
+            if _is_degraded_operand(fresh) or _ndarray_parts(fresh) is None:
+                continue
+            if new_types is None:
+                new_types = [list(ts) for ts in ctx.arg_types]
+            new_types[i][j] = fresh
+    if new_types is None:
+        return ctx
+    return ctx._replace(arg_types=new_types)
+
+
 def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..., Type] | None:
     """Wrap a numpy hook so a mixed-shape operand cannot leak misplaced dims.
 
@@ -3732,6 +3811,11 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
             result = default
         else:
             try:
+                if not isinstance(ctx, AttributeContext):
+                    ctx = _undegraded_args(ctx)
+                    operands = [t for ts in ctx.arg_types for t in ts]
+                    if isinstance(ctx, MethodContext):
+                        operands.append(ctx.type)
                 result = hook(ctx)
             except Exception:
                 _swallowed(ctx, fullname)
@@ -4853,7 +4937,7 @@ def gradient_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if isinstance(axis, str):
         if len(dims) == 1:
-            return pairs[0][0]
+            return _gradient_result(ctx, pairs[0][0], dims, 0)
         return ctx.default_return_type
     if not _check_each_axis(ctx, dims, axis, "gradient") or not _check_unique_axes(
         ctx, dims, axis, "gradient"
@@ -4861,7 +4945,45 @@ def gradient_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if len(axis) != 1:
         return ctx.default_return_type
-    return pairs[0][0]
+    norm = _normalize_axis(axis[0], len(dims))
+    if norm is None:
+        return ctx.default_return_type
+    return _gradient_result(ctx, pairs[0][0], dims, norm)
+
+
+def _gradient_result(
+    ctx: FunctionContext, operand: Type, dims: list[int | Type], axis: int
+) -> Type:
+    """gradient along one axis: the operand's shape, in a floating dtype.
+
+    Central differences need two points, so a known size below 2 on
+    the axis is numpy's "Shape of array too small" error. Integers
+    come back float64, floats and complex keep their dtype, and bool
+    is rejected by numpy (bail).
+    """
+    size = dims[axis]
+    if isinstance(size, int) and size < 2:
+        ctx.api.fail(
+            f"gradient needs at least 2 elements along axis {axis}, got {size} "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    proper = get_proper_type(operand)
+    if not isinstance(proper, Instance) or len(proper.args) != 2:
+        return ctx.default_return_type
+    ks = _dtype_kind_size(proper.args[1])
+    if ks is None:
+        return ctx.default_return_type
+    if ks[0] in ("f", "c"):
+        return operand
+    if ks[0] in ("i", "u"):
+        f64 = _construct_dtype(ctx, "numpy.float64")
+        if f64 is None:
+            return ctx.default_return_type
+        return proper.copy_modified(args=[proper.args[0], f64])
+    return ctx.default_return_type
 
 
 def _parse_int_pair(
@@ -4951,11 +5073,13 @@ def _convolve_solve(
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
-    if len(dims_a) == 0:
-        # 0-d arrays flatten to one element (issue #131).
-        dims_a = [1]
-    if len(dims_b) == 0:
-        dims_b = [1]
+    if op == "convolve":
+        # convolve flattens 0-d arrays to one element (issue #131);
+        # correlate rejects them ("object of too small depth").
+        if len(dims_a) == 0:
+            dims_a = [1]
+        if len(dims_b) == 0:
+            dims_b = [1]
     if len(dims_a) != 1 or len(dims_b) != 1:
         ctx.api.fail(
             f"{op} only supports 1-dimensional arrays "
@@ -5058,7 +5182,8 @@ def _complex_dtype(ctx: FunctionContext, dtype: Type) -> Type:
     name = _dtype_fullname(dtype)
     if name is None:
         return _default_dtype(ctx)
-    out = "numpy.complex64" if name in ("numpy.float16", "numpy.float32") else "numpy.complex128"
+    single = ("numpy.float16", "numpy.float32", "numpy.complex64")
+    out = "numpy.complex64" if name in single else "numpy.complex128"
     built = _construct_dtype(ctx, out)
     return built if built is not None else _default_dtype(ctx)
 
@@ -5090,10 +5215,79 @@ def fft_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, _complex_dtype(ctx, dtype))
 
 
+def irfft_function_hook(ctx: FunctionContext) -> Type:
+    """np.fft.irfft: n points on the axis (default 2*(m-1)), real dtype.
+
+    The stubs keep the input's shape and answer float64 whatever comes
+    in. numpy returns float32 for float32/complex64 input and float16
+    for float16; everything else is float64. A symbolic axis without n
+    stays with the stubs.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    parsed = _fft_axis_n(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    n, axis = parsed
+    target = _normalize_axis(axis, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"irfft axis {axis} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    if isinstance(n, int):
+        out[target] = n
+    else:
+        m = out[target]
+        if not isinstance(m, int):
+            return ctx.default_return_type
+        if m < 2:
+            ctx.api.fail(
+                f"irfft of {m} point{'s' if m != 1 else ''} along axis {target} has no "
+                f"output points (2*(m-1) = 0); pass n= (shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
+        out[target] = 2 * (m - 1)
+    name = _dtype_fullname(dtype)
+    if name is None:
+        return ctx.default_return_type
+    if name == "numpy.float16":
+        real = "numpy.float16"
+    elif name in ("numpy.float32", "numpy.complex64"):
+        real = "numpy.float32"
+    else:
+        real = "numpy.float64"
+    built = _construct_dtype(ctx, real)
+    if built is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out, built)
+
+
 def _rfft_size(
     ctx: FunctionContext, op: str, index: int, dim: int | Type
 ) -> int | Type:
     return _dim_div(ctx, op, index, dim, 2, 1)
+
+
+def _rfft_complex_input(ctx: FunctionContext, op: str) -> Type:
+    """The real transforms take real input only (numpy: TypeError)."""
+    ctx.api.fail(
+        f"{op} needs real input, got a complex array (use fft instead)",
+        ctx.context,
+        code=NUMTY_BROADCAST,
+    )
+    return ctx.default_return_type
 
 
 def _rfft_solve(
@@ -5103,6 +5297,8 @@ def _rfft_solve(
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
+    if _dtype_base(dtype) == "c":
+        return _rfft_complex_input(ctx, op)
     target = _normalize_axis(axis, len(dims))
     if target is None:
         ctx.api.fail(
@@ -5231,7 +5427,22 @@ def _fftn_solve(
         return ctx.default_return_type
     dims, dtype = parts
     ndim = len(dims)
+    if rfft and _dtype_base(dtype) == "c":
+        return _rfft_complex_input(ctx, op)
     if s is None and axes is None:
+        # Default axes: the last two for fft2/ifft2, every axis otherwise.
+        need = 2 if op in ("fft2", "rfft2") else 1 if rfft else 0
+        if ndim < need:
+            ctx.api.fail(
+                f"{op} needs at least {need} dimension{'s' if need > 1 else ''}, "
+                f"got {ndim} (shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
+            return ctx.default_return_type
+        if ndim == 0:
+            # fftn over no axes hands the 0-d input back untouched.
+            return arg
         out = list(dims)
         if rfft and out:
             out[-1] = _rfft_size(ctx, op, len(out) - 1, out[-1])
@@ -5342,6 +5553,23 @@ def fft2_function_hook(ctx: FunctionContext) -> Type:
     if s is not None:
         return ctx.default_return_type
     return _fftn_solve(ctx, "fft2", pairs[0][0], axes, s, False)
+
+
+def rfft2_function_hook(ctx: FunctionContext) -> Type:
+    """np.fft.rfft2: real 2-D fft over the last two axes, no s.
+
+    Same contract as fft2_function_hook; the last axis halves.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parsed = _fft_s_axes(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    s, axes = parsed
+    if isinstance(s, str) or isinstance(axes, str) or s is not None:
+        return ctx.default_return_type
+    return _fftn_solve(ctx, "rfft2", pairs[0][0], axes, s, True)
 
 
 def fftshift_function_hook(ctx: FunctionContext) -> Type:
@@ -6102,6 +6330,18 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
+    # numpy only searches a 1-D array ("object too deep for desired
+    # array" otherwise): a known other rank is an error, not a shape.
+    sorted_parts = _ndarray_parts(pairs[0][0])
+    if sorted_parts is not None and not _has_unpack(sorted_parts[0]):
+        if len(sorted_parts[0]) != 1:
+            ctx.api.fail(
+                "searchsorted needs a 1-D sorted array, got "
+                f"{len(sorted_parts[0])} dimensions (shape {_dims_str(sorted_parts[0])})",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
     values_dims = _search_values_dims(pairs[1][0], pairs[1][1])
     if values_dims is None:
         return ctx.default_return_type
@@ -6581,7 +6821,28 @@ def floordiv_mod_pow_method_hook(ctx: MethodContext) -> Type:
     if not pairs:
         return ctx.default_return_type
     arg = pairs[0][0]
-    if _is_bool_operand(ctx.type) and _is_bool_operand(arg):
+    # `bool_array ** 2` is numpy's square fast path, which answers int8
+    # like bool ** bool; any other Python int exponent lifts to int64.
+    if isinstance(ctx.context, OpExpr) and ctx.context.op in ("//", "%"):
+        # floor_divide and remainder have no complex loop (TypeError).
+        for operand in (ctx.type, arg):
+            part = _parts_or_unpack(operand)
+            if part is not None and _dtype_base(part[1]) == "c":
+                name = "floor_divide" if ctx.context.op == "//" else "remainder"
+                ctx.api.fail(
+                    f"ufunc '{name}' not supported for complex inputs",
+                    ctx.context,
+                    code=NUMTY_BROADCAST,
+                )
+                return ctx.default_return_type
+    squared = (
+        isinstance(ctx.context, OpExpr)
+        and ctx.context.op == "**"
+        and pairs[0][1] is ctx.context.right
+        and _weak_name(arg) == "builtins.int"
+        and _int_value(arg) == 2
+    )
+    if _is_bool_operand(ctx.type) and (squared or _is_bool_operand(arg)):
         dims = _broadcast_dims(ctx, ctx.type, arg)
         if dims is None:
             return ctx.default_return_type
@@ -7815,8 +8076,12 @@ def _solve_reduction(
     out_dtype = force_dtype if force_dtype is not None else dtype
     ndim = len(dims)
     normalized: list[int] = []
+    # sum/prod/max/min/any/all take axis 0 or -1 on a 0-d array; the
+    # mean family counts elements along the axis first and rejects it.
+    # (The nan* twins go through nansum-style code and accept it.)
+    strict_0d = op in ("mean", "var", "std")
     for ax in axis:
-        norm = _normalize_axis_0d(ax, ndim)
+        norm = _normalize_axis(ax, ndim) if strict_0d else _normalize_axis_0d(ax, ndim)
         if norm is None:
             ctx.api.fail(
                 f"{op} axis {ax} is out of range for {ndim} dimensions "
@@ -8272,6 +8537,9 @@ def ascontiguousarray_function_hook(ctx: FunctionContext) -> Type:
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
+    if not dims:
+        # Both guarantee ndim >= 1: a 0-d input comes back as (1,).
+        dims = [1]
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
         if named is None:
@@ -8358,6 +8626,15 @@ def linspace_function_hook(ctx: FunctionContext) -> Type:
     Rank-only stubs reject correct Literal annotations, so solve the
     count exactly. Symbolic counts propagate; anything else bails.
     """
+    # start/stop may be array-likes, and the result is then (num, *shape):
+    # only scalar endpoints are solved here.
+    for name, index in (("start", 0), ("stop", 1)):
+        end_pair = _formal_pair(ctx, name)
+        if end_pair is None:
+            positional = _all_positionals(ctx)
+            end_pair = positional[index] if len(positional) > index else None
+        if end_pair is not None and _scalar_key(end_pair[0]) is None:
+            return ctx.default_return_type
     num_pair = _formal_pair(ctx, "num")
     if num_pair is None:
         pairs = _all_positionals(ctx)
@@ -11114,6 +11391,10 @@ def _solve_same_or_flat(
     op: str = "sort",
 ) -> Type:
     """sort/partition (same shape) and argsort/argpartition (integer out)."""
+    if int_out and not dims:
+        # argsort/argpartition treat a 0-d array as one element and
+        # return (1,); sort and partition reject it (axis out of range).
+        dims = [1]
     if axis == "absent":
         # The default axis is -1, which never changes the shape.
         return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
@@ -11416,6 +11697,10 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
     q_dims = _percentile_q_dims(pairs[1][0], pairs[1][1])
     if q_dims is None:
         return ctx.default_return_type
+    if len(q_dims) > 1:
+        # numpy takes some multi-dimensional q and rejects others
+        # ("q must be a scalar or 1d") depending on the path taken.
+        return ctx.default_return_type
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     if axis is None:
         return ctx.default_return_type
@@ -11450,14 +11735,50 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
     if ks is None:
         return ctx.default_return_type
     kind, _size = ks
-    if kind == "f":
-        out_dtype = dtype_a
-    elif kind in ("i", "u", "b"):
-        out_dtype = _construct_dtype(ctx, "numpy.float64")
-    else:
+    if kind == "c":
+        ctx.api.fail(
+            "percentile needs an array of real numbers, got a complex array",
+            ctx.context,
+            code=NUMTY_BROADCAST,
+        )
         return ctx.default_return_type
+    if kind not in ("f", "i", "u"):
+        # bool input is rejected or kept as bool depending on q.
+        return ctx.default_return_type
+    # The result dtype is result_type(a, q), lifted to float64 when
+    # that is an integer. A Python scalar q is weak and leaves a's
+    # dtype alone; a list display is a float64 array; an array or
+    # numpy scalar q brings its own dtype (f16 data, f32 q -> f32).
+    q_tp, q_expr = pairs[1]
+    q_dtype: Type | None
+    if isinstance(q_expr, (ListExpr, TupleExpr)):
+        q_dtype = _construct_dtype(ctx, "numpy.float64")
+    elif _weak_name(q_tp) is not None:
+        q_dtype = dtype_a
+    else:
+        q_parts = _ndarray_parts(q_tp)
+        if q_parts is not None:
+            q_dtype = q_parts[1]
+        else:
+            key = _scalar_key(q_tp)
+            q_dtype = _construct_dtype(ctx, key[1]) if key is not None else None
+    if q_dtype is None:
+        return ctx.default_return_type
+    q_ks = _dtype_kind_size(q_dtype)
+    if q_ks is None or q_ks[0] != "f":
+        # An integer q array takes numpy down a path that can keep the
+        # input's integer dtype, and a complex q is rejected.
+        return ctx.default_return_type
+    out_dtype = _promote_all(ctx, [dtype_a, q_dtype])
     if out_dtype is None:
         return ctx.default_return_type
+    out_ks = _dtype_kind_size(out_dtype)
+    if out_ks is None:
+        return ctx.default_return_type
+    if out_ks[0] != "f":
+        out_dtype = _construct_dtype(ctx, "numpy.float64")
+        if out_dtype is None:
+            return ctx.default_return_type
     return _ndarray_type(ctx, [*q_dims, *remaining], out_dtype)
 
 
@@ -11554,6 +11875,38 @@ def _check_average_weights(
     )
 
 
+def _average_weighted_dtype(
+    ctx: FunctionContext, avg: Type, array: Type, weights: Type
+) -> Type:
+    """The weighted average's dtype: result_type(a, weights[, float64]).
+
+    Unlike the unweighted mean, the weights join the promotion
+    (complex64 data with float64 weights is complex128), and integer
+    or bool data adds float64. Unknown weights bail to the stubs.
+    """
+    a_parts = _ndarray_parts(array)
+    w_parts = _ndarray_parts(weights)
+    if a_parts is None or w_parts is None:
+        return ctx.default_return_type
+    dtypes = [a_parts[1], w_parts[1]]
+    ks = _dtype_kind_size(a_parts[1])
+    if ks is None:
+        return ctx.default_return_type
+    if ks[0] in ("i", "u", "b"):
+        f64 = _construct_dtype(ctx, "numpy.float64")
+        if f64 is None:
+            return ctx.default_return_type
+        dtypes.append(f64)
+    out = _promote_all(ctx, dtypes)
+    if out is None:
+        return ctx.default_return_type
+    proper = get_proper_type(avg)
+    if isinstance(proper, Instance) and proper.type.fullname == NDARRAY_FULLNAME:
+        return proper.copy_modified(args=[proper.args[0], out])
+    scalar = _scalar_of_dtype(out)
+    return scalar if scalar is not None else ctx.default_return_type
+
+
 def average_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -11569,6 +11922,8 @@ def average_function_hook(ctx: FunctionContext) -> Type:
     if returned is None:
         return ctx.default_return_type
     avg = _reduction_inputs(ctx, pairs[0][0])
+    if weights is not None and not _is_none_type(weights[0]):
+        avg = _average_weighted_dtype(ctx, avg, pairs[0][0], weights[0])
     if not returned:
         return avg
     # returned=True: (average, sum_of_weights), same shape for both.
@@ -12643,6 +12998,18 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType):
             return ctx.default_signature
+        call = ctx.context
+        if isinstance(call, OpExpr) and call.op in ("//", "%"):
+            # No complex loop for floor_divide/remainder: the method
+            # hook reports it, so let the call through to reach it
+            # (an inline complex operand otherwise matches the first
+            # overload as `ndarray[Any, Any]` and nothing is said).
+            for side in (call.left, call.right):
+                side_part = _parts_or_unpack(ctx.api.get_expression_type(side))
+                if side_part is not None and _dtype_base(side_part[1]) == "c":
+                    return sig.copy_modified(
+                        arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                    )
         part_a = _ndarray_parts(ctx.type)
         if part_a is None:
             return ctx.default_signature
@@ -13474,6 +13841,15 @@ _UFUNC_KEEP = frozenset(
     }
 )
 _UFUNC_ABS = frozenset({"absolute", "abs"})
+# Ufuncs with no complex loop (numpy raises TypeError for complex input).
+_UFUNC_NO_COMPLEX = frozenset(
+    {
+        "cbrt", "floor", "ceil", "trunc", "fabs", "arctan2", "hypot", "fmod",
+        "copysign", "floor_divide", "remainder", "mod", "logaddexp",
+        "logaddexp2", "signbit", "deg2rad", "rad2deg", "degrees", "radians",
+        "nextafter", "spacing", "heaviside",
+    }
+)
 _UFUNC_FLOAT = frozenset(
     {
         "sqrt",
@@ -13653,6 +14029,11 @@ def _specs_dtype(
     array_dtypes: list[Type],
 ) -> Type | None:
     """dtype[...] for combined (kind, name) specs, reusing an input dtype."""
+    # result_type promotes the arrays (and numpy scalars) among
+    # themselves first and only then lets Python scalars in: bool with
+    # 0 and a uint8 array is uint8, not the int64 that bool-with-0
+    # alone gives.
+    specs = sorted(specs, key=lambda spec: spec[0] == "weak")
     current: tuple[str, str] | None = None
     for kind, spec_name in specs:
         if current is None:
@@ -13794,21 +14175,16 @@ def _broadcast_to_compatible(
     fail loudly; anything involving a symbolic dim that could be 1 bails
     (returns False) instead of guessing.
     """
-    if not dims:
-        # Scalar target: every source dim must be 1.
-        for s in arr_dims:
-            if isinstance(s, int):
-                if s != 1:
-                    ctx.api.fail(
-                        f"broadcast_to of shape {_dims_str(arr_dims)} cannot "
-                        f"broadcast to scalar shape {_dims_str(dims)}",
-                        ctx.context,
-                        code=NUMTY_SHAPE,
-                    )
-                    return False
-            else:
-                return False
-        return True
+    # A scalar target takes only a 0-d source: numpy refuses even (1,)
+    # ("cannot broadcast a non-scalar to a scalar array").
+    if not dims and arr_dims:
+        ctx.api.fail(
+            f"broadcast_to of shape {_dims_str(arr_dims)} cannot "
+            f"broadcast to scalar shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return False
     if len(arr_dims) > len(dims):
         ctx.api.fail(
             f"broadcast_to of shape {_dims_str(arr_dims)} cannot broadcast "
@@ -14086,6 +14462,59 @@ def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> 
 
 def ufunc_function_hook(ctx: FunctionContext, group: str) -> Type:
     return _solve_ufunc(ctx, group)
+
+
+def _bool_round(
+    ctx: FunctionContext | MethodContext, array: Type, plain: bool
+) -> Type:
+    """round on a bool array, the one input whose dtype it changes.
+
+    The stubs keep the dtype, which is right for every numeric input.
+    A bool array comes back float16 from a plain `round()`; with
+    `decimals` numpy takes another path (and can refuse outright), so
+    only the shape is kept there.
+    """
+    part = _parts_or_unpack(array)
+    if part is None or _dtype_base(part[1]) != "b":
+        return ctx.default_return_type
+    dims, _ = part
+    if not plain:
+        any_dtype = ctx.api.named_generic_type(
+            DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)]
+        )
+        return _ndarray_type(ctx, dims, any_dtype)
+    f16 = _construct_dtype(ctx, "numpy.float16")
+    if f16 is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, f16)
+
+
+def round_method_hook(ctx: MethodContext) -> Type:
+    return _bool_round(ctx, ctx.type, plain=not any(ctx.arg_types))
+
+
+def round_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    plain = sum(len(types) for types in ctx.arg_types) == 1
+    return _bool_round(ctx, pairs[0][0], plain)
+
+
+def angle_function_hook(ctx: FunctionContext) -> Type:
+    """np.angle: the input's shape, in the matching real float dtype.
+
+    complex64 gives float32 and complex128 float64; a float keeps its
+    dtype. Integer and bool inputs follow a table of their own (int8
+    is float16, bool is float64), so those stay with the stubs.
+    """
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    part = _parts_or_unpack(pairs[0][0])
+    if part is None or _dtype_base(part[1]) not in ("f", "c"):
+        return ctx.default_return_type
+    return _ufunc_types(ctx, "abs", pairs[0][0])
 
 
 def where_function_hook(ctx: FunctionContext) -> Type:
@@ -14601,6 +15030,18 @@ def _ufunc_call_solve(ctx: MethodContext) -> Type:
     name = _ufunc_name(ctx)
     if name is None:
         return ctx.default_return_type
+    if name in _UFUNC_NO_COMPLEX:
+        # No complex loop: numpy raises TypeError, so no shape to claim.
+        operands = _all_positionals_expanded(ctx)
+        for tp, _expr in operands or []:
+            part = _parts_or_unpack(tp)
+            if part is not None and _dtype_base(part[1]) == "c":
+                ctx.api.fail(
+                    f"ufunc '{name}' not supported for complex inputs",
+                    ctx.context,
+                    code=NUMTY_BROADCAST,
+                )
+                return ctx.default_return_type
     if name in _UFUNC_KEEP:
         # Per-loop tables (issue #61): bool square/reciprocal/conj ->
         # int8; bool sign/negative and float/complex invert have no loop.
@@ -14731,6 +15172,13 @@ def _ufunc_float_types(
         out_name = combined
     elif kind in ("i", "u", "b"):
         out = _smallest_float(combined)
+        if kind_l == "strong" and kind_r == "strong":
+            # numpy picks the first float loop both inputs cast to
+            # safely, so each operand is lifted on its own: int8 with
+            # uint8 is float16, although their common integer (int16)
+            # would need float32.
+            fl, fr = _smallest_float(name_l), _smallest_float(name_r)
+            out = _promote_strong(fl, fr) if fl and fr and fl != fr else fl
         if out is None:
             return ctx.default_return_type
         out_name = out
@@ -14790,6 +15238,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
     by_module: dict[str, dict[str, Callable[[FunctionContext], Type]]] = {
         "numpy._core.einsumfunc": {"einsum": einsum_function_hook},
         "numpy._core.fromnumeric": {
+            "round": round_function_hook,
             "all": partial(allany_function_hook, op="all"),
             "any": partial(allany_function_hook, op="any"),
             "clip": clip_function_hook,
@@ -14879,6 +15328,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "ifft2": fft2_function_hook,
             "ifftn": fftn_function_hook,
             "rfft": rfft_function_hook,
+            "irfft": irfft_function_hook,
+            "rfft2": rfft2_function_hook,
             "rfftn": rfftn_function_hook,
         },
         "numpy.fft._helper": {
@@ -14891,6 +15342,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "unique": unique_function_hook,
         },
         "numpy.lib._function_base_impl": {
+            "angle": angle_function_hook,
             "average": average_function_hook,
             "copy": copy_function_hook,
             "diff": diff_function_hook,
