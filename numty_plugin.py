@@ -1521,12 +1521,15 @@ def _dims_provably_ne(a: int | Type, b: int | Type) -> bool:
     """Provably-unequal dims: same linear vars, different constants.
 
     `N` vs `N-1`, `N+1` vs `N`, `M+2` vs `M` can never be equal (the
-    equality would require `0 == nonzero`). Anything else (different
-    vars `N` vs `M`, unknowns, div/mono forms, plain `int`) might be
-    equal at runtime, so it stays unprovable (issue #56: no false
-    errors). Used by broadcast/matmul/stack to flag real off-by-one
-    bugs from `np.diff` / `N+1` offsets (issue #32) instead of bailing
-    to a silent `?U`.
+    equality would require `0 == nonzero`). Single-var same-const
+    coeff diffs (`2*N` vs `N`), same-var monomial coeff diffs and
+    same-division plus diffs are also impossible up to a zero factor
+    the reshape int path already ignores. Anything else (different
+    vars `N` vs `M`, unknowns, div-vs-linear) might be equal at
+    runtime, so it stays unprovable (issue #56: no false errors). Used
+    by broadcast/matmul/stack to flag real off-by-one bugs from
+    `np.diff` / `N+1` offsets (issue #32) instead of bailing to a
+    silent `?U`. Extended for reshape sums/monos/divs (issue #137).
     """
     if _dim_eq(a, b):
         return False
@@ -1534,24 +1537,46 @@ def _dims_provably_ne(a: int | Type, b: int | Type) -> bool:
         return a != b
     fa = _resolve_dim(a)
     fb = _resolve_dim(b)
-    if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
-        return fa.coeffs == fb.coeffs and fa.const != fb.const
-    return False
+    return _forms_provably_ne(fa, fb)
 
 
 def _forms_provably_ne(fa: object, fb: object) -> bool:
     """Provably-unequal total products: same linear vars, different consts.
 
-    `N+1` vs `N`, `N+2` vs `N` can never be equal. Different vars, monos,
-    divs or unknowns stay unprovable (issue #56). Used by reshape
-    (issue #63) to flag off-by-pad totals without false errors.
+    `N+1` vs `N`, `N+2` vs `N` can never be equal. Same-var
+    single-term coeff diffs (`2*N` vs `N`, ignoring the `N == 0`
+    solution the int-factor path already ignores), same-var monomial
+    coeff diffs (`2*M*N` vs `M*N`) and same-division plus diffs
+    (`N//2+1` vs `N//2`) are also impossible. Different vars, divs vs
+    linears or unknowns stay unprovable (issue #56). Used by reshape
+    (issue #63) to flag off-by-pad totals without false errors;
+    extended for sums/monos/divs (issue #137).
     """
     if fa is None or fb is None:
         return False
     if fa == fb:
         return False
+    try:
+        if _form_has_unknown(fa) or _form_has_unknown(fb):
+            return False
+    except Exception:
+        pass
     if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
-        return fa.coeffs == fb.coeffs and fa.const != fb.const
+        if fa.coeffs == fb.coeffs and fa.const != fb.const:
+            return True
+        if (
+            len(fa.coeffs) == 1
+            and len(fb.coeffs) == 1
+            and fa.coeffs[0][0] == fb.coeffs[0][0]
+            and fa.const == fb.const
+            and fa.coeffs[0][1] != fb.coeffs[0][1]
+        ):
+            return True
+        return False
+    if isinstance(fa, _MonoForm) and isinstance(fb, _MonoForm):
+        return fa.vars == fb.vars and fa.coeff != fb.coeff
+    if isinstance(fa, _DivForm) and isinstance(fb, _DivForm):
+        return fa.inner == fb.inner and fa.div == fb.div and fa.plus != fb.plus
     return False
 
 
@@ -6832,6 +6857,58 @@ def _solve_reshape(
                 code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
+        if len(dims_old) == len(raw):
+            # Sums the product form cannot spell ((N+1)*M vs N*M,
+            # issue #137): same rank with a single provably-unequal dim
+            # pair and the rest equal means the totals differ (up to a
+            # zero factor the int path already ignores) — error instead
+            # of tracking the request.
+            ne_idx = -1
+            single = True
+            for i, (a, b) in enumerate(zip(dims_old, raw)):
+                if _dim_eq(a, b):
+                    continue
+                if _dims_provably_ne(a, b):
+                    if ne_idx != -1:
+                        single = False
+                        break
+                    ne_idx = i
+                else:
+                    single = False
+                    break
+            if ne_idx != -1 and single:
+                a_ne = dims_old[ne_idx]
+                b_ne = raw[ne_idx]
+                ctx.api.fail(
+                    f"reshape changes total size: {_dim_str(a_ne)} -> {_dim_str(b_ne)} "
+                    f"(shapes {_dims_str(dims_old)} vs {raw_str})",
+                    ctx.context,
+                    code=NUMTY_SHAPE,
+                )
+                return ctx.default_return_type
+        totals_equal = forms_equal or (
+            old_total is not None and new_total is not None and old_total == new_total
+        )
+        if not totals_equal and old_vars != new_vars:
+            # Unrepresentable or monomial/div totals that are not proven
+            # equal (issue #137): the request might be impossible
+            # (N//2+1 vs N, (N+1)*M vs N*M when the per-dim proof misses)
+            # but we cannot prove it, so bail to Any instead of tracking
+            # a precise impossible shape. Plain linear totals (N vs M)
+            # keep tracking — they hold by construction when legal.
+            # Verified equal totals (forms_equal) also keep tracking.
+            nonlin = (
+                old_form is None
+                or new_form is None
+                or isinstance(old_form, (_MonoForm, _DivForm))
+                or isinstance(new_form, (_MonoForm, _DivForm))
+                or old_total is None
+                or new_total is None
+                or isinstance(old_total, (_MonoForm, _DivForm))
+                or isinstance(new_total, (_MonoForm, _DivForm))
+            )
+            if nonlin:
+                return ctx.default_return_type
         if old_vars != new_vars:
             # Same int total but different symbolic factors (N vs M): the
             # equality is unprovable, but the requested shape holds by

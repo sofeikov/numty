@@ -2085,6 +2085,23 @@ def test_reshape_symbolic_total_mismatch() -> None:
     assert "reshape changes total size: N+2 -> N" in errors[1], result.stdout
 
 
+def test_reshape_total_sums_monos_divs() -> None:
+    # Issue #137: (N+1)*M vs N*M and 2*N*M vs N*M always raise;
+    # N//2+1 vs N (rfft, N=1,2 legal) bails to Any instead of
+    # tracking a precise impossible (N,).
+    result = run_mypy(FIXTURES / "bad_reshape_total_137.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert "reshape changes total size: N -> N+1" in errors[0], result.stdout
+    assert "(N, M) vs (N+1, M)" in errors[0], result.stdout
+    assert "reshape changes total size: M*N -> 2*M*N" in errors[1], result.stdout
+    assert "(N, M) vs (2*N, M)" in errors[1], result.stdout
+    assert reveals_by_line(result) == {
+        29: '"numpy.ndarray[Any, Any]"',
+    }, result.stdout
+
+
 def test_no_crash_ok_clean() -> None:
     # Issue #41: sort(axis=None) and 0-d dot/inner must never crash.
     result = run_mypy(FIXTURES / "no_crash_ok.py")
