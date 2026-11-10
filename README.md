@@ -112,9 +112,9 @@ error: Incompatible return value type (got "ndarray[tuple[batch, heads, seq, seq
   latest long run (42,000 expressions, seeds 101-130, NumPy 2.5.4,
   mypy 2.4.1) had **no disagreements**. Each symbolic expression is
   run at four sets of sizes, empty axes included, which makes 105,000
-  comparisons: 60,958 exact shapes matched NumPy's, and of the 29,252
-  NumPy rejects, 18,242 were reported before running. Three cases hit
-  documented gaps in NumPy's own stubs and 172 hit the empty-axis
+  comparisons: 59,524 exact shapes matched NumPy's, and of the 28,670
+  NumPy rejects, 18,002 were reported before running. Five cases hit
+  documented gaps in NumPy's own stubs and 143 hit the empty-axis
   limit on symbolic subtraction (see
   [Checked against numpy](#checked-against-numpy)).
 - **It finds seeded bugs.** [bench/](bench) hides 18 realistic
@@ -858,7 +858,11 @@ across all operands, `linalg.solve` maps ints to `float64` and rejects
 `einsum` parses the subscript string (explicit, implicit,
 ellipsis, diagonals) and `linalg` checks squareness and inner dims while
 tracking dtypes (`eigh` stays real, `svd` shrinks with
-`full_matrices=False`). `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
+`full_matrices=False`). `linalg.cross` takes batches of vectors of any
+rank, where NumPy's stubs stop at 2-D. `np.round` and `np.around` keep
+the shape and dtype; a bool array comes back `float16`, and rounding
+one to `decimals` other than 0, which NumPy refuses, is typed `Any`
+(numty reports shape errors, not dtype errors). `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
 `dtype=` you name is used as-is when it resolves; anything exotic bails
 out instead of guessing.
 
