@@ -2070,6 +2070,48 @@ def test_solve_0d_mismatch() -> None:
     assert "linalg.solve: b has 0 dimensions" in errors[0], result.stdout
 
 
+def test_inline_generic_call_ok_clean_and_runs() -> None:
+    # Issue #55: nested generic calls keep shapes inline (1 level from
+    # the issue plus 2-4 level ML nesting), concrete and symbolic.
+    result = run_mypy(FIXTURES / "inline_generic_call_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        36: f'"numpy.ndarray[tuple[Literal[4], Literal[3]], {f64}]"',
+        37: f'"numpy.ndarray[tuple[Literal[4], Literal[5]], {f64}]"',
+        38: f'"numpy.ndarray[tuple[Literal[4], Literal[5]], {f64}]"',
+        39: f'"numpy.ndarray[tuple[Literal[3]], {f64}]"',
+        40: f'"numpy.ndarray[tuple[Literal[4], Literal[5]], {f64}]"',
+        41: '"numpy.float64"',
+        42: f'"numpy.ndarray[tuple[Literal[4], Literal[5]], {f64}]"',
+        43: f'"numpy.ndarray[tuple[Literal[4], Literal[7]], {f64}]"',
+        47: f'"numpy.ndarray[tuple[n, h], {f64}]"',
+        48: f'"numpy.ndarray[tuple[n, h], {f64}]"',
+        49: f'"numpy.ndarray[tuple[h], {f64}]"',
+    }, result.stdout
+    assert _run_fixture("inline_generic_call_ok.py") == [
+        "(4, 3)",
+        "(4, 5)",
+        "(4, 5)",
+        "(4, 5)",
+        "(4, 5)",
+        "(4, 7)",
+    ]
+
+
+def test_inline_generic_call_mismatch() -> None:
+    # Issue #55: the nested shape survives, so the (4, 5) vs (4, 6)
+    # mismatch is flagged instead of passing silently through Any.
+    assert_operator_mismatch(
+        run_mypy(FIXTURES / "bad_inline_generic_call.py"),
+        "broadcast shapes disagree at trailing axis 0",
+        "5 vs 6",
+        "(4, 5)",
+        "(4, 6)",
+    )
+
+
 def test_offsets_calls_ok_clean_and_runs() -> None:
     # Issue #32 finish: expression returns infer through calls instead of
     # going Any. `make_offsets(a: I64[K]) -> I64["M+1"]` reveals K+1 in the
