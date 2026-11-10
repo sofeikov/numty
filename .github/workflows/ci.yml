@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Run tests (including sklearn dogfood)
+        # scikit-learn stays an optional local dep (tests importorskip
+        # without it), but CI must exercise the sklearn fixtures so a
+        # red dogfood file fails the suite (issue #163).
+        run: uv run --with scikit-learn pytest

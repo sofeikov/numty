@@ -9,6 +9,10 @@ Adaptations:
 - method -> free function taking `theta`, `var`, `class_prior`
   explicitly (same arithmetic on the same arrays)
 - `.T` needs no adaptation (tracked natively)
+- `n_ij` scalar/vector rebind split into two names: mypy forbids
+  rebinding a name to a different type (`float64` then
+  `ndarray[tuple[n_samples], ...]`), so the scalar keeps its own
+  name; the arithmetic is unchanged
 
 Dims use jaxtyping-style string specs; the only declaration is the one
 single-word spec (`n_classes` appears alone in the prior's shape).
@@ -31,8 +35,8 @@ def joint_log_likelihood(
     joint_log_likelihood = []
     for i in range(len(class_prior)):
         jointi = np.log(class_prior[i])
-        n_ij = -0.5 * np.sum(np.log(2.0 * np.pi * var[i, :]))
-        n_ij = n_ij - 0.5 * np.sum(((X - theta[i, :]) ** 2) / (var[i, :]), axis=1)
+        n_ij_scalar = -0.5 * np.sum(np.log(2.0 * np.pi * var[i, :]))
+        n_ij = n_ij_scalar - 0.5 * np.sum(((X - theta[i, :]) ** 2) / (var[i, :]), axis=1)
         joint_log_likelihood.append(jointi + n_ij)
 
     joint_log_likelihood = np.stack(joint_log_likelihood).T
