@@ -59,8 +59,8 @@ Success: no issues found in 1 source file
 ```
 
 Adaptations, all documented in the file: dense path only,
-`safe_sparse_dot` → `np.matmul` (plain `@` is unchecked by design —
-only the named call solves), `scipy.linalg.solve` →
+`safe_sparse_dot` → `np.matmul` (the named call solves, as does plain
+`@` since issue #140), `scipy.linalg.solve` →
 `numpy.linalg.solve`, unweighted means. Pass a
 wrongly-sized target and the mistake sklearn raises `ValueError` for at
 runtime is caught before anything runs:
@@ -1083,10 +1083,11 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   `test_static.py`): mypy does not reliably invalidate plugin results
   across plugin edits, so never trust the default cache while hacking
   on the plugin.
-- The `@` operator is accepted but unchecked: operator dispatch consulted
-  the method hook inconsistently in testing. Raw `np.matmul` solves
-  through the ufunc hook instead, as does the `numty.matmul` wrapper.
-  Same for reflected ops beyond the hooked pairs.
+- The `@` operator solves through the same matmul hooks as raw
+  `np.matmul` and the `numty.matmul` wrapper (`__matmul__`/`__rmatmul__`,
+  with `__imatmul__` checked in place): wrong shapes fail with the same
+  `[numty-shape]` error and correct shapes stay precise instead of
+  dissolving to `Any`.
 - numty needs mypy to follow imports (the default). Under
   `--follow-imports=skip` mypy skips `numty` itself, so every
   `F64[...]`-annotated parameter and return becomes `Any` and nothing

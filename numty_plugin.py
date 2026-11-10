@@ -18,7 +18,8 @@ What it does:
   from the left operand. Over a shared *Ts, (*Ts, N, M) pairs solve the
   same way (inner dims align, batches broadcast through the unpack; a
   lone concrete 1-D/2-D operand contributes an empty batch). The @
-  operator is accepted but unchecked (see the method-hook note below).
+  operator solves through the same matmul hooks (__matmul__/__rmatmul__,
+  with __imatmul__ checked in place).
 - __add__/__mul__ unify operand shapes with NumPy broadcast rules, so
   precision survives whole function bodies. `//`, `%`, `divmod`, `^`,
   `<<`, `>>` and int/bool `&`/`|` use the same broadcast (divmod
@@ -392,6 +393,15 @@ class NumtyPlugin(Plugin):
             "numpy.ndarray.__ror__",
         }:
             return _broadcast_signature_hook
+        # Matmul operators: suppress the mechanical [operator] duplicate
+        # when the method hook already reports the mismatch (issue #140).
+        # Same widening trick as broadcast; clean calls keep default.
+        if fullname in {
+            "numpy.ndarray.__matmul__",
+            "numpy.ndarray.__rmatmul__",
+            "numpy.ndarray.__imatmul__",
+        }:
+            return _matmul_signature_hook
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
         # A hook here would make every method call in the program (list,
@@ -1341,11 +1351,12 @@ class NumtyPlugin(Plugin):
         return substituted_attribute_hook
 
     def _method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
-        # NOTE: no __matmul__ hook. In testing, operator dispatch consulted
-        # the method hook inconsistently across statements for @ (silent
-        # when it should fire, once misattributed to another line), while
-        # the numty.matmul function hook stayed deterministic. @ therefore
-        # uses numpy's default checking; use the wrapper for solving.
+        if fullname == "numpy.ndarray.__matmul__":
+            return matmul_method_hook
+        if fullname == "numpy.ndarray.__rmatmul__":
+            return rmatmul_method_hook
+        if fullname == "numpy.ndarray.__imatmul__":
+            return imatmul_method_hook
         if fullname in {
             "numpy.ndarray.__add__",
             "numpy.ndarray.__radd__",
@@ -4058,6 +4069,49 @@ def dot_method_hook(ctx: MethodContext) -> Type:
     if not matched:
         return ctx.default_return_type
     return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), left, right)
+
+
+def matmul_method_hook(ctx: MethodContext) -> Type:
+    """ndarray.__matmul__ twin of np.matmul: same solver on (self, arg).
+
+    Issue #140: `@` used to fall through to numpy's default checking,
+    so wrong shapes passed silently and right shapes dissolved to Any.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    left, right = ctx.type, pairs[0][0]
+    if not _matmul_has_dims(ctx, [left, right]):
+        return ctx.default_return_type
+    return _solve_matmul(ctx, left, right)
+
+
+def rmatmul_method_hook(ctx: MethodContext) -> Type:
+    """ndarray.__rmatmul__: reflected operands, same solver (issue #140)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    left, right = pairs[0][0], ctx.type
+    if not _matmul_has_dims(ctx, [left, right]):
+        return ctx.default_return_type
+    return _solve_matmul(ctx, left, right)
+
+
+def imatmul_method_hook(ctx: MethodContext) -> Type:
+    """ndarray.__imatmul__: check like matmul, keep the stubs' return.
+
+    A legal `a @= b` computes into `a`, so the result shape equals the
+    target's; like the other in-place hooks this keeps the default
+    return and only adds the [numty-shape] error (issue #140).
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    left, right = ctx.type, pairs[0][0]
+    if not _matmul_has_dims(ctx, [left, right]):
+        return ctx.default_return_type
+    _solve_matmul(ctx, left, right)
+    return ctx.default_return_type
 
 
 def inner_function_hook(ctx: FunctionContext) -> Type:
@@ -12152,6 +12206,86 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
         _, msg = _broadcast_result(list(dims_a), list(dims_b), None)
         if msg is None:
             return ctx.default_signature
+        return sig.copy_modified(
+            arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+        )
+    except Exception:
+        return ctx.default_signature
+
+
+def _matmul_signature_hook(ctx: MethodSigContext) -> Type:
+    """Widen formals to Any on provable matmul mismatch (issue #140).
+
+    The method hook reports `matmul ... disagree` then mypy's overload
+    fallback checks the actuals against an early (bool) overload and
+    reports a mechanical [operator] duplicate. When the operands'
+    true-order shapes provably clash (same conditions the method hook
+    errors on: 0-d/scalar operands, inner or batch mismatch), return
+    Any formals so the fallback's arg check succeeds and only the
+    single [numty-shape] error remains. All other calls keep the
+    default signature.
+    """
+    try:
+        sig = ctx.default_signature
+        if not isinstance(sig, CallableType):
+            return ctx.default_signature
+        from mypy.nodes import CallExpr as _CallExpr
+        from mypy.nodes import OpExpr as _OpExpr
+
+        call = ctx.context
+        left_tp: Type | None = None
+        right_tp: Type | None = None
+        if isinstance(call, _OpExpr):
+            # `a @ b`: true runtime order is (left, right) for both the
+            # forward (__matmul__) and the reverse (__rmatmul__) check.
+            # `a @= b` never arrives as an OpExpr.
+            if call.op != "@":
+                return ctx.default_signature
+            try:
+                left_tp = ctx.api.get_expression_type(call.left)
+                right_tp = ctx.api.get_expression_type(call.right)
+            except Exception:
+                return ctx.default_signature
+        elif isinstance(call, _CallExpr) and call.args:
+            # Explicit `a.__matmul__(b)` / `a.__imatmul__(b)`: (self, arg).
+            # Explicit `b.__rmatmul__(a)`: true order is (arg, self).
+            callee = call.callee
+            name = getattr(callee, "name", None)
+            try:
+                arg_tp = ctx.api.get_expression_type(call.args[0])
+            except Exception:
+                return ctx.default_signature
+            if name == "__rmatmul__":
+                left_tp, right_tp = arg_tp, ctx.type
+            elif name in ("__matmul__", "__imatmul__"):
+                left_tp, right_tp = ctx.type, arg_tp
+            else:
+                return ctx.default_signature
+        else:
+            return ctx.default_signature
+        if left_tp is None or right_tp is None:
+            return ctx.default_signature
+        # 0-d arrays and scalars: the method hook rejects these outright.
+        for tp in (left_tp, right_tp):
+            parts = _ndarray_parts(tp)
+            if parts is not None and not parts[0]:
+                return sig.copy_modified(
+                    arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                )
+            if _scalar_key(tp) is not None:
+                return sig.copy_modified(
+                    arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                )
+        parts_a, parts_b = _operand_parts(left_tp, right_tp)
+        if parts_a is not None and parts_b is not None:
+            (dims_a, _), (dims_b, _) = parts_a, parts_b
+            _, message = _matmul_result(dims_a, dims_b, None)
+            if message is None:
+                return ctx.default_signature
+        else:
+            _, message, _, _ = _matmul_unpack_dims(left_tp, right_tp)
+            if message is None:
+                return ctx.default_signature
         return sig.copy_modified(
             arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
         )
