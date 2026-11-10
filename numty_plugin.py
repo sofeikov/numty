@@ -5939,11 +5939,11 @@ def _broadcast_result(
 ) -> tuple[list[int | Type] | None, str | None]:
     """Broadcast two known shapes; (None, None) to bail; (None, msg) on error.
 
-    Same-name TypeVars are equal. Anything else unprovable keeps the
-    axis instead of bailing the whole shape (issue #56): a literal
-    against a symbolic dim is that literal (if the broadcast succeeds
-    the axis is that size), two different symbolics become a fresh
-    unknown. Provably-unequal linear forms (N vs N-1, N+1 vs N from
+    Same-name TypeVars are equal. Anything else unprovable mints a
+    fresh unknown instead of bailing the whole shape (issue #56 for
+    two different symbolics; issue #138 for a literal against a
+    symbolic dim, which is unprovable either way and must not claim
+    the literal). Provably-unequal linear forms (N vs N-1, N+1 vs N from
     np.diff / offsets, issue #32) are errors, not silent unknowns.
     Without ctx the old bail is kept (callers without shape
     context); every ctx-bearing caller passes it.
@@ -5968,10 +5968,6 @@ def _broadcast_result(
             )
         elif ctx is None:
             return None, None
-        elif isinstance(x, int) and isinstance(y, TypeVarType):
-            out.append(x)
-        elif isinstance(y, int) and isinstance(x, TypeVarType):
-            out.append(y)
         else:
             out.append(_fresh_unknown(ctx, "bcast", k))
     shared = min(len(a), len(b))
