@@ -2,7 +2,8 @@
 
 Plain standard typing plus one small mypy plugin. Rank via tuple length,
 fixed sizes via Literal, cross-argument solving in the plugin.
-Checkable by mypy, pyright, or ty (plugin solving is mypy-only).
+Rank aliases and sized arrays check under mypy, pyright, or ty; the
+F64-style heads and the shape solver need the mypy plugin (#5).
 """
 from __future__ import annotations
 
@@ -199,7 +200,7 @@ def narrow(m: LooseArray, witness: FloatArray[S]) -> FloatArray[S]:
     return cast(FloatArray[S], m)
 
 
-# General matmul solving lives in the mypy plugin (numty_plugin.py), which
+# General matmul solving lives in the mypy plugin (numty_plugin/), which
 # computes output shapes for any rank and promotes mixed dtypes. An earlier
 # attempt with axis TypeVars failed silently: ndarray's shape parameter is
 # effectively covariant, so a shared TypeVar joins conflicting literals
