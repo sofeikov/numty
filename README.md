@@ -108,9 +108,11 @@ Success: no issues found in 1 source file
 Two things the chain exercises deliberately: reshapes spell their
 kept dims through `.shape` (bare `TypeVar`s are not runtime values —
 `h.reshape(batch, seq, 2, 4)` would crash at import, and the checker
-rejects it too), and rebinding a new shape to an old name is an error,
-not a silent widening. This exact function is
-`tests/fixtures/chained_block.py`: checked clean, runs to `(5, 7, 16)`.
+rejects it too), and rebinding a new shape to an old name needs
+`allow_redefinition = True` (recommended below) — under default mypy
+it is an `[assignment]` error, not a silent widening. This exact
+function is `tests/fixtures/chained_block.py`: checked clean, runs to
+`(5, 7, 16)`.
 
 ## One signature, every rank
 
@@ -808,6 +810,12 @@ on `demo.py:30` and `demo.py:34`; `uvx pyright@1.1.408 --pythonpath
 `--pythonpath` it cannot find numpy). ty 0.0.97 is pinned in the dev group,
 and `tests/test_ty.py` holds the ty line to exactly those two.
 
+Ordinary numpy code rebinds names to new shapes (`x = x.sum(axis=1)`,
+`a = a.T`); under default mypy each is an `[assignment]` error. The
+recommended config is `allow_redefinition = True` in `mypy.ini` (or
+`--allow-redefinition` on the command line) — the solver stays precise
+under it (see `tests/fixtures/rebind_allow_ok.py`).
+
 ### Installing elsewhere
 
 `numty` ships as regular packages (`numty` plus the plugin and the two
@@ -818,7 +826,18 @@ install just works — no `PYTHONPATH` or `mypy_path` needed:
 uv pip install numty
 ```
 
-with `plugins = numty_plugin` in your `mypy.ini`. Editable installs are
+with this in your `mypy.ini` (the flag is recommended: ordinary
+numpy code rebinds names to new shapes, e.g. `x = x.sum(axis=1)`,
+which is an `[assignment]` error under default mypy; see
+`tests/fixtures/rebind_allow_ok.py`):
+
+```ini
+[mypy]
+plugins = numty_plugin
+allow_redefinition = True
+```
+
+Editable installs are
 a single `.pth` to the checkout, so `numty` and the tools all import
 live from one place.
 
@@ -1091,9 +1110,12 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   type checking, as does every rebinding in
   `tests/fixtures/mixed_rebind_ok.py`. Later stub ops on such a result
   may answer `ndarray[Any, Any]`, losing the dtype as well. Since a
-  transpose moves the literal, rebinding a name to its own transpose
-  (`e = np.zeros((n, 3))` then `e = e.T`) is an assignment error, as it
-  already was for all-literal shapes: bind the transpose to a new name.
+  transpose moves the literal, so rebinding a name to its own transpose
+  (`e = np.zeros((n, 3))` then `e = e.T`) is an `[assignment]` error
+  under default mypy, as it already was for all-literal shapes. With
+  the recommended `allow_redefinition = True` it checks clean (see
+  `tests/fixtures/rebind_allow_ok.py`); otherwise bind the transpose
+  to a new name.
   Written inline as an argument whose expected literal differs, a
   builder falls through to numpy's catch-all overload and goes
   unchecked, as before. Assign it to a name first to have it checked.
