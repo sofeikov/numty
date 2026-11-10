@@ -487,11 +487,11 @@ existing files, a plugin cannot read jaxtyping's dim strings — they ride
 inside `Annotated` metadata, which no mypy type-analyze hook ever sees
 (probed every hook: only jaxtyping's internals fire, the string never
 arrives). So the bridge is a one-time source rewrite instead of a hook:
-[numty_convert.py](numty_convert.py) mechanically
+[numty_convert](numty_convert/) mechanically
 translates the annotations, then gets out of the way:
 
 ```sh
-python numty_convert.py mlp.py mlp_static.py   # warnings go to stderr, if any
+python -m numty_convert mlp.py mlp_static.py   # warnings go to stderr, if any
 ```
 
 ```python
@@ -611,7 +611,7 @@ a, b = (clean(v) for v in (p1, p2))  # both: the union (body still checked)
 
 So when the shapes must reach the code below, spell the display; when
 only the per-member checking matters, the generator form is fine.
-`numty_codmod --unpack-displays` rewrites the displayable forms for
+`python -m numty_codmod --unpack-displays` rewrites the displayable forms for
 you, including mapped comprehensions over bare names
 (`(f(v) for v in (p1, p2))` -> `(f(p1), f(p2))`).
 
@@ -808,18 +808,17 @@ and `tests/test_ty.py` holds the ty line to exactly those two.
 
 ### Installing elsewhere
 
-`numty` ships as a regular package (`numty/__init__.py` plus the
-PEP 561 `numty/py.typed` marker), so an out-of-tree install just works —
-no `PYTHONPATH` or `mypy_path` needed:
+`numty` ships as regular packages (`numty` plus the plugin and the two
+tools, each with its own PEP 561 `py.typed` marker), so an out-of-tree
+install just works — no `PYTHONPATH` or `mypy_path` needed:
 
 ```sh
 uv pip install numty
 ```
 
-with `plugins = numty_plugin` in your `mypy.ini`. (pip's PEP 660
-editable installs use a custom finder hook mypy cannot see; if
-`from numty import F32` reveals `Any` from an editable checkout, either
-reinstall non-editable or point `mypy_path` at the checkout.)
+with `plugins = numty_plugin` in your `mypy.ini`. Editable installs are
+a single `.pth` to the checkout, so `numty` and the tools all import
+live from one place.
 
 mypy skips the bodies of unannotated functions by default, so a script
 or notebook cell written as `def main():` gets no shape checking at all.
@@ -966,7 +965,7 @@ Three layers, each building on the previous one:
 |---|---|---|
 | Rank aliases | `Matrix = ndarray[tuple[int, int], ...]` — tuple length is the rank | mypy, pyright, ty |
 | Your own sizes | `A2x3 = FloatArray[tuple[Literal[2], Literal[3]], ...]`, or `Array2D[Literal[2], Literal[3]]` | mypy, pyright, ty |
-| Shape solver | [numty_plugin.py](numty_plugin.py) hooks constructors, `matmul` (incl. `(*Ts, N, M)` pairs), arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape` (incl. symbolic conservation and `*Ts` block regroups), rank-changing ops (`transpose`/`.T` reversal incl. over `*Ts`), shape builders, comparisons, bool logic (`&`/`\|`), `any`/`all`, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, symbolic TypeVar dims (same name unifies, ranks check, the rest bails), call-site TypeVar conflicts, enum-driven stacks, folds constant int expressions and `len()` (`Final` arithmetic, enum member counts), solves shapes itself | mypy only |
+| Shape solver | [numty_plugin](numty_plugin/) hooks constructors, `matmul` (incl. `(*Ts, N, M)` pairs), arithmetic ops and ufuncs (with promotion), `where`/`clip`/`broadcast_to`, `reshape` (incl. symbolic conservation and `*Ts` block regroups), rank-changing ops (`transpose`/`.T` reversal incl. over `*Ts`), shape builders, comparisons, bool logic (`&`/`\|`), `any`/`all`, the arg family, `einsum`, `linalg` solvers, fancy indexing, `take_along_axis`, symbolic TypeVar dims (same name unifies, ranks check, the rest bails), call-site TypeVar conflicts, enum-driven stacks, folds constant int expressions and `len()` (`Final` arithmetic, enum member counts), solves shapes itself | mypy only |
 
 The first two layers are pure standard typing — no magic, portable everywhere.
 The library ships only the generic bases (`FloatArray`, `FlexArray`,
@@ -1137,7 +1136,7 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   list comprehension, `tuple(...)`, starred targets, and `map` (which
   dissolves to `Any`) all behave this way. The body still checks per
   member; per-name precision needs the tuple display (or
-  `numty_codmod --unpack-displays`, which unrolls mapped comprehensions
+  `python -m numty_codmod --unpack-displays`, which unrolls mapped comprehensions
   over bare names to the display).
 - Different TypeVars (`N` vs `M`) never conflict, even when provably
   different at a call site — only same-name TypeVars are unified.
@@ -1160,7 +1159,7 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   shape-preserving `ident`, loose `matmul` fallback, familiar-style heads
   (`F64` and friends) with ready-made dims (`batch`, `features`, …)
   plus the PEP 561 `py.typed` marker.
-- [numty_plugin.py](numty_plugin.py) — the solver.
+- [numty_plugin](numty_plugin/) — the solver.
 - [demo.py](demo.py) — good and bad usages, clean under
   both checkers except the two intentional errors.
 - [bench/](bench) — realistic benchmark (MLP training,
@@ -1178,7 +1177,7 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   `numty/__init__.py demo.py` (exactly the 2 demo errors) and over
   [flex_portable.py](tests/fixtures/flex_portable.py) (`FlexArray`
   keeps its rank checks without the plugin).
-- [numty_convert.py](numty_convert.py) +
+- [numty_convert](numty_convert/) +
   [tests/test_convert.py](tests/test_convert.py) —
   the jaxtyping bridge: one-time annotation rewrite with goldens for every
   dim kind and an end-to-end MLP (clean + seeded-bug twins in

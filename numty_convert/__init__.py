@@ -1009,7 +1009,3 @@ def _prune_jaxtyping(text: str) -> str:
         elif own_lines:
             edits.append((source.starts[stmt.lineno - 1], source.starts[last_line], ""))
     return splice(text, edits)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))

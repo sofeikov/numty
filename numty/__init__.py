@@ -2,7 +2,8 @@
 
 Plain standard typing plus one small mypy plugin. Rank via tuple length,
 fixed sizes via Literal, cross-argument solving in the plugin.
-Checkable by mypy, pyright, or ty (plugin solving is mypy-only).
+Rank aliases and sized arrays check under mypy, pyright, or ty; the
+F64-style heads and the shape solver need the mypy plugin (#5).
 """
 from __future__ import annotations
 

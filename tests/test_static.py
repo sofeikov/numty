@@ -3241,7 +3241,7 @@ def test_every_plugin_fail_site_passes_an_error_code() -> None:
     # in the source. A new ctx.api.fail without code= would print [misc].
     import ast
 
-    tree = ast.parse((ROOT / "numty_plugin.py").read_text())
+    tree = ast.parse((ROOT / "numty_plugin" / "__init__.py").read_text())
     sites = [
         node
         for node in ast.walk(tree)
@@ -3253,7 +3253,7 @@ def test_every_plugin_fail_site_passes_an_error_code() -> None:
     ]
     assert len(sites) > 100, len(sites)
     missing = [n.lineno for n in sites if not any(k.arg == "code" for k in n.keywords)]
-    assert not missing, f"ctx.api.fail without code= at numty_plugin.py lines {missing}"
+    assert not missing, f"ctx.api.fail without code= at numty_plugin lines {missing}"
 
 
 def test_flexarray_portable_fixture_under_mypy() -> None:

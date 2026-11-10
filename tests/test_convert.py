@@ -533,8 +533,9 @@ def test_crlf_conversion_keeps_line_endings() -> None:
 
 def _cli(*args: str, cwd: Path) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
-        [sys.executable, str(ROOT / "numty_convert.py"), *args],
+        [sys.executable, "-m", "numty_convert", *args],
         cwd=cwd,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
         capture_output=True,
         text=True,
         timeout=60,

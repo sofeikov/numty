@@ -871,7 +871,3 @@ def main(argv: list[str]) -> int:
             src, self_ops=args.self_ops, unpack_displays=args.unpack_displays
         ),
     )
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
