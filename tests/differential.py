@@ -21,6 +21,13 @@ A symbolic answer is a claim about every size, so each case is run
 under every assignment in SIZE_ASSIGNMENTS (one mypy run, several numpy
 evaluations): odd and even sizes, and an empty axis.
 
+Issue #185: parameters may also carry a variadic prefix
+(`F64[Unpack[Ts], N, M]`), instantiated at runtime with the prefixes in
+TS_PREFIXES (ranks 0, 1 and 2). Every such case is evaluated under each
+(size, prefix) combination, and a revealed `*Ts` is substituted with the
+prefix before the shape is compared. Generic helpers may carry `*Ts`
+too, with the reference in `Helper.__call__` binding the shared prefix.
+
 Used by tests/test_differential.py; run it by hand for a longer hunt:
 
     PYTHONPATH=. python -m tests.differential --seeds 1-20 --count 800
@@ -128,6 +135,13 @@ SYMBOL_HEADS = {
     "U8": "uint8",
     "Bool": "bool",
 }
+# A variadic prefix, e.g. `F64[*Ts, N, M]` (issue #185). Operands carrying
+# it are instantiated at runtime with prefixes of rank 0, 1 and 2, and
+# every such case is evaluated under each prefix, the way sizes are
+# varied. The marker lives in shape tuples as the string "*Ts"; it is
+# spelled `Unpack[Ts]` in annotations and `*Ts` in reveals.
+TS_DIM: object = "*Ts"
+TS_PREFIXES: tuple[tuple[int, ...], ...] = ((), (2,), (2, 6))
 
 
 # --------------------------------------------------------------------------
@@ -721,6 +735,142 @@ class SymGen(Gen):
         a = self.operand()
         return f"np.pad({a.text}, {self.rng.choice(('1', '(1, 2)'))})"
 
+    # -- *Ts operands (issue #185) ----------------------------------------
+    # A variadic prefix, e.g. `F64[*Ts, N, M]`, instantiated at runtime
+    # with prefixes of rank 0, 1 and 2 (see TS_PREFIXES). The marker lives
+    # in shape tuples as "*Ts" and is spelled `Unpack[Ts]` in annotations.
+
+    def ts_shape(self, rank_suffix: int | None = None) -> tuple[object, ...]:
+        r = self.rng
+        if rank_suffix is None:
+            rank_suffix = r.choice((1, 1, 2, 2, 3))
+        suffix = self.shape(rank_suffix)
+        return (TS_DIM,) + tuple(suffix)  # type: ignore[arg-type]
+
+    def ts_operand(self, shape: tuple[object, ...] | None = None, dtype: str | None = None) -> Operand:
+        if shape is None:
+            shape = self.ts_shape()
+        head = {
+            None: self.rng.choice(("F64", "F64", "F64", "F32", "I64", "U8")),
+            "": "F64",
+            "bool": "Bool",
+            "np.int64": "I64",
+        }.get(dtype, "F64")
+        name = f"a{len(self.params)}"
+        self.params.append((name, head, tuple(shape)))
+        return Operand(name, tuple(shape))  # type: ignore[arg-type]
+
+    def ts_near(self, shape: tuple[object, ...]) -> Operand:
+        """An operand that often fits next to a *Ts shape, sometimes not."""
+        r = self.rng
+        roll = r.random()
+        if roll < 0.45:
+            return self.ts_operand(tuple(shape))
+        if roll < 0.60 and len(shape) > 1:
+            lst = list(shape)
+            idx = r.randrange(1, len(lst))
+            pool: tuple[object, ...] = ("N", "M", "K", "P", 2, 3) + SYMBOL_FORMULAS
+            lst[idx] = r.choice(pool)
+            return self.ts_operand(tuple(lst))
+        if roll < 0.75:
+            lst = list(shape)
+            choice = r.choice(("drop_ts", "drop_last", "add"))
+            if choice == "drop_ts" and TS_DIM in lst:
+                lst = [d for d in lst if d != TS_DIM]
+                if not lst:
+                    lst = [2]
+                # A fixed-rank shape: use the plain operand path.
+                return self.operand(tuple(lst))
+            if choice == "drop_last" and len(lst) > 1:
+                return self.ts_operand(tuple(lst[:-1]))
+            pool = ("N", "M", 2, 3)
+            return self.ts_operand(tuple(lst) + (r.choice(pool),))
+        return self.ts_operand()
+
+    def ts_binary(self) -> str:
+        """Same-shape ops threading a *Ts item through (issue #185)."""
+        a = self.ts_operand()
+        b = self.ts_near(tuple(a.shape))  # type: ignore[arg-type]
+        if self.rng.random() < 0.3:
+            name = self.rng.choice(("add", "subtract", "multiply", "maximum", "minimum"))
+            return f"np.{name}({a.text}, {b.text})"
+        op = self.rng.choice(("+", "-", "*", "/", "//", "%", "**", "<", "<=", "==", "!=", ">=", ">"))
+        return f"{a.text} {op} {b.text}"
+
+    def ts_matmul(self) -> str:
+        """Matmul over (*Ts, N, M) pairs, plus inner and batch conflicts."""
+        r = self.rng
+        if r.random() < 0.6:
+            s0: object = r.choice(("N", "M", "K", "P", 2, 3) + SYMBOL_FORMULAS)
+            s1: object = r.choice(("N", "M", "K", "P", 2, 3) + SYMBOL_FORMULAS)
+            s2: object = r.choice(("N", "M", "K", "P", 2, 3) + SYMBOL_FORMULAS)
+            a_suffix = (s0, s1)
+            b_suffix = (s1, s2)
+        else:
+            a_suffix = tuple(self.shape(2))
+            b_suffix = tuple(self.shape(2))
+        if r.random() < 0.15:
+            lead_a: object = r.choice((2, 3, "N"))
+            lead_b: object = r.choice((3, 2, "M"))
+            a_shape: tuple[object, ...] = (lead_a, TS_DIM) + tuple(a_suffix)
+            b_shape: tuple[object, ...] = (lead_b, TS_DIM) + tuple(b_suffix)
+        else:
+            a_shape = (TS_DIM,) + tuple(a_suffix)
+            b_shape = (TS_DIM,) + tuple(b_suffix)
+        if r.random() < 0.10:
+            # Wrong rank: drop the unpack or a trailing dim.
+            lst = list(b_shape)
+            if TS_DIM in lst and r.random() < 0.5:
+                lst = [d for d in lst if d != TS_DIM] or [2]
+                b = self.operand(tuple(lst))
+                a = self.ts_operand(a_shape)
+                form = r.choice(("np.matmul({}, {})", "{} @ {}", "np.dot({}, {})"))
+                return form.format(a.text, b.text)
+            if len(lst) > 1:
+                b_shape = tuple(lst[:-1])
+        a = self.ts_operand(a_shape)
+        b = self.ts_operand(b_shape)
+        form = r.choice(("np.matmul({}, {})", "{} @ {}", "np.dot({}, {})"))
+        return form.format(a.text, b.text)
+
+    def ts_reshape(self) -> str:
+        """Reshape over *Ts (issue #185): exact, bailing and error paths."""
+        r = self.rng
+        roll = r.random()
+        if roll < 0.15:
+            # Provable total-size clash on ints: 6 * prod(*Ts) vs 8.
+            a = self.ts_operand((TS_DIM, 2, 3))
+            target = r.choice(("((2, 4))", "(2, 4)"))
+            form = r.choice(("{}.reshape({})", "np.reshape({}, {})"))
+            return form.format(a.text, target)
+        if roll < 0.30:
+            # Exact for the empty prefix: (*Ts, 2, 3) -> (6,) holds at
+            # rank 0 and raises otherwise (allowed), so the claim is
+            # checked where it holds.
+            a = self.ts_operand((TS_DIM, 2, 3))
+            target = r.choice(("6", "(6,)", "(2, 3)"))
+            form = r.choice(("{}.reshape({})", "np.reshape({}, {})"))
+            return form.format(a.text, target)
+        a = self.ts_operand()
+        if r.random() < 0.5:
+            target = r.choice(("-1", "(-1,)", "(1, -1)", "(-1, 1)", "(2, -1)"))
+            return f"{a.text}.reshape({target})"
+        target = f"{a.text}.shape[::-1]"
+        return f"{a.text}.reshape({target})"
+
+    def ts_reduction(self) -> str:
+        """Reductions over *Ts: provable suffix axes, bails and errors."""
+        r = self.rng
+        a = self.ts_operand()
+        if r.random() < 0.5:
+            name = r.choice(("sum", "mean", "max", "min", "prod", "std", "var"))
+            axis = r.choice((-1, -2, -1, 0, "(0, -1)", "(-1, -1)", "None"))
+            keep = ", keepdims=True" if r.random() < 0.3 else ""
+            return f"{a.text}.{name}(axis={axis}{keep})"
+        name = r.choice(("sum", "mean", "max", "argmax", "sort", "cumsum"))
+        axis = r.choice((-1, -2, 0))
+        return f"np.{name}({a.text}, axis={axis})"
+
     def call(self) -> str:
         """A call to a generic function whose signature carries formulas.
 
@@ -815,6 +965,115 @@ class SymGen(Gen):
         tail = r.choice(("", "", "", ".T", ".sum(axis=0)", "[::-1]"))
         return f"{helper.call(', '.join(args))}{tail}"
 
+    def ts_call(self) -> str:
+        """A call to a generic function whose signature carries *Ts.
+
+        Like `call`, but the formals thread a shared `Unpack[Ts]` segment
+        (at the front, sometimes after a leading dim) and the return keeps
+        or drops it. `Helper.__call__` binds the variadic segment from
+        the actual arrays.
+        """
+        r = self.rng
+        names = r.sample(("N", "M", "K"), r.choice((1, 2, 2, 3)))
+
+        def formula(pool: tuple[str, ...]) -> str:
+            a = r.choice(names)
+            return r.choice(pool).format(a=a, b=r.choice(names))
+
+        def formal_suffix() -> object:
+            roll = r.random()
+            if roll < 0.65:
+                return r.choice(names)
+            if roll < 0.8:
+                return r.choice((2, 3))
+            return formula(("{a}+1", "{a}+2", "2*{a}"))
+
+        formals: list[tuple[str, tuple[object, ...]]] = []
+        for _ in range(r.choice((1, 1, 2))):
+            suffix = tuple(formal_suffix() for _ in range(r.choice((1, 2, 2))))
+            if r.random() < 0.2:
+                lead: object = r.choice((2, 3, "N", "M"))
+                dims: tuple[object, ...] = (lead, TS_DIM) + suffix
+            else:
+                dims = (TS_DIM,) + suffix
+            formals.append((r.choice(tuple(SYMBOL_HEADS)), dims))
+        bound = sorted({n for _, dims in formals for d in dims for n in _names_in(d) if n != "Ts"})
+        if not bound:
+            head, dims = formals[0]
+            # dims starts with Ts (or lead+Ts); append a name to the suffix.
+            if TS_DIM in dims:
+                idx = list(dims).index(TS_DIM)
+                dims = tuple(list(dims[: idx + 1]) + [names[0]] + list(dims[idx + 1 :]))
+            else:
+                dims = (names[0],) + dims[1:]
+            formals[0] = (head, dims)
+            bound = [names[0]]
+        names = bound
+
+        def returned() -> object:
+            roll = r.random()
+            if roll < 0.4:
+                return r.choice(names)
+            if roll < 0.5:
+                return r.choice((2, 3))
+            return formula(("{a}+1", "{a}+2", "2*{a}", "{a}+{b}"))
+
+        ret_suffix = tuple(returned() for _ in range(r.choice((1, 2))))
+        if r.random() < 0.8:
+            ret_dims: tuple[object, ...] = (TS_DIM,) + ret_suffix
+        else:
+            ret_dims = ret_suffix
+        ret = (r.choice(tuple(SYMBOL_HEADS)), ret_dims)
+        kind = r.choice(Helper.KINDS) if r.random() < 0.5 else "function"
+        helper = Helper(f"g{self.helper_count}", formals, ret, False, kind)
+        self.helper_count += 1
+        self.helpers.append(helper)
+
+        pool: tuple[object, ...] = ("N", "N", "M", "M", "K", "P", 2, 3) + SYMBOL_FORMULAS
+        binding = {n: r.choice(pool) for n in names}
+        args = []
+        for head, dims in formals:
+            shape: list[object] = []
+            for d in dims:
+                if d == TS_DIM:
+                    shape.append(TS_DIM)
+                else:
+                    shape.append(_substitute(d, binding))
+            roll = r.random()
+            if roll < 0.10:
+                idxs = [i for i, d in enumerate(shape) if d != TS_DIM]
+                if idxs:
+                    shape[r.choice(idxs)] = r.choice(pool)
+            elif roll < 0.15:
+                if TS_DIM in shape and r.random() < 0.5:
+                    shape = [d for d in shape if d != TS_DIM] or [2]
+                elif len(shape) > 1:
+                    shape = shape[:-1]
+                else:
+                    shape = shape + shape
+            if r.random() < 0.08:
+                head = r.choice(tuple(SYMBOL_HEADS))
+            name = f"a{len(self.params)}"
+            self.params.append((name, head, tuple(shape)))
+            roll = r.random()
+            if roll < 0.7:
+                args.append(name)
+            elif roll < 0.8:
+                args.append(f"np.concatenate([{name}, {name}])")
+            elif roll < 0.9:
+                args.append(f"np.pad({name}, 1)")
+            else:
+                # `.T` on a *Ts operand bails to Any (transpose cannot
+                # spell a reversed *Ts), and an Any actual would leave
+                # formula returns as the caller's own names (wrong exact,
+                # not unknown). Keep the arg exact instead (issue #185).
+                args.append(name)
+        # No `.T` tail: `.T` on a *Ts result keeps the input shape in the
+        # stubs (wrong exact), which the oracle would flag. `.sum(axis=0)`
+        # bails to Any (safe) and `[::-1]` preserves the shape.
+        tail = r.choice(("", "", "", "", ".sum(axis=0)", "[::-1]"))
+        return f"{helper.call(', '.join(args))}{tail}"
+
     FAMILIES = (
         Gen.binary_operator, Gen.binary_operator, Gen.scalar_operator, Gen.unary,
         matmul, matmul, Gen.method_reduction, Gen.method_reduction,
@@ -826,6 +1085,8 @@ class SymGen(Gen):
         Gen.all_any, Gen.rounding, Gen.divmod_builtin, Gen.linalg_cross,
         Gen.array_method, Gen.array_method, Gen.rng_method,
         call, call, call, call,
+        ts_binary, ts_binary, ts_matmul, ts_matmul, ts_reshape, ts_reshape,
+        ts_reduction, ts_reduction, ts_call, ts_call,
     )
 
     def case(self) -> "Case":
@@ -841,6 +1102,8 @@ def _names_in(dim: object) -> list[str]:
 
 def _substitute(dim: object, binding: dict[str, object]) -> object:
     """A helper's dim with the caller's dims put in for its names."""
+    if dim == TS_DIM:
+        return TS_DIM
     if not isinstance(dim, str):
         return dim
     if dim in binding:
@@ -922,35 +1185,100 @@ class Helper:
     def __call__(self, *arrays: object) -> np.ndarray:
         if len(arrays) != len(self.formals):
             raise TypeError("wrong number of arguments")
-        env: dict[str, int] = {}
-        formulas: list[tuple[str, int]] = []
+        has_ts = any(TS_DIM in dims for _, dims in self.formals) or TS_DIM in self.ret[1]
+        if not has_ts:
+            env: dict[str, int] = {}
+            formulas: list[tuple[str, int]] = []
+            for (head, dims), array in zip(self.formals, arrays):
+                if not isinstance(array, np.ndarray) or str(array.dtype) != SYMBOL_HEADS[head]:
+                    raise TypeError(f"expected a {SYMBOL_HEADS[head]} array")
+                if array.ndim != len(dims):
+                    raise ValueError(f"expected rank {len(dims)}, got {array.ndim}")
+                for dim, size in zip(dims, array.shape):
+                    if isinstance(dim, int):
+                        if dim != size:
+                            raise ValueError(f"expected {dim}, got {size}")
+                    elif dim.isidentifier():  # type: ignore[attr-defined]
+                        if env.setdefault(cast(str, dim), size) != size:
+                            raise ValueError(f"{dim} is both {env[cast(str, dim)]} and {size}")
+                    else:
+                        formulas.append((cast(str, dim), size))
+            for dim, size in formulas:
+                free = sorted(set(_names_in(dim)) - set(env))
+                if free:
+                    # One name, increasing in it: solve by search.
+                    (name,) = free
+                    fits = [n for n in range(size + 1) if _value(dim, {**env, name: n}) == size]
+                    if not fits:
+                        raise ValueError(f"no {name} makes {dim} equal {size}")
+                    env[name] = fits[0]
+                elif _value(dim, env) != size:
+                    raise ValueError(f"{dim} is {_value(dim, env)}, got {size}")
+            head, dims = self.ret
+            return np.ones(tuple(_value(d, env) for d in dims), dtype=SYMBOL_HEADS[head])
+        # *Ts path: bind the shared variadic segment plus the known dims.
+        env_ts: dict[str, int] = {}
+        formulas_ts: list[tuple[str, int]] = []
+        ts_binding: tuple[int, ...] | None = None
+
+        def check_dim(dim: object, size: int) -> None:
+            if isinstance(dim, int):
+                if dim != size:
+                    raise ValueError(f"expected {dim}, got {size}")
+            elif isinstance(dim, str) and dim.isidentifier():
+                if env_ts.setdefault(dim, size) != size:
+                    raise ValueError(f"{dim} is both {env_ts[dim]} and {size}")
+            else:
+                assert isinstance(dim, str)
+                formulas_ts.append((dim, size))
+
         for (head, dims), array in zip(self.formals, arrays):
             if not isinstance(array, np.ndarray) or str(array.dtype) != SYMBOL_HEADS[head]:
                 raise TypeError(f"expected a {SYMBOL_HEADS[head]} array")
-            if array.ndim != len(dims):
-                raise ValueError(f"expected rank {len(dims)}, got {array.ndim}")
-            for dim, size in zip(dims, array.shape):
-                if isinstance(dim, int):
-                    if dim != size:
-                        raise ValueError(f"expected {dim}, got {size}")
-                elif dim.isidentifier():  # type: ignore[attr-defined]
-                    if env.setdefault(cast(str, dim), size) != size:
-                        raise ValueError(f"{dim} is both {env[cast(str, dim)]} and {size}")
-                else:
-                    formulas.append((cast(str, dim), size))
-        for dim, size in formulas:
-            free = sorted(set(_names_in(dim)) - set(env))
+            if TS_DIM not in dims:
+                if array.ndim != len(dims):
+                    raise ValueError(f"expected rank {len(dims)}, got {array.ndim}")
+                for dim, size in zip(dims, array.shape):
+                    check_dim(dim, size)
+                continue
+            idx = list(dims).index(TS_DIM)
+            pre = dims[:idx]
+            post = dims[idx + 1 :]
+            if array.ndim < len(pre) + len(post):
+                raise ValueError(
+                    f"expected at least rank {len(pre) + len(post)}, got {array.ndim}"
+                )
+            ts_part = array.shape[len(pre) : array.ndim - len(post) if post else array.ndim]
+            if ts_binding is None:
+                ts_binding = tuple(ts_part)
+            elif tuple(ts_part) != ts_binding:
+                raise ValueError(f"Ts is both {ts_binding} and {tuple(ts_part)}")
+            for dim, size in zip(pre, array.shape[: len(pre)]):
+                check_dim(dim, size)
+            if post:
+                for dim, size in zip(post, array.shape[array.ndim - len(post) :]):
+                    check_dim(dim, size)
+        for dim, size in formulas_ts:
+            free = sorted(set(_names_in(dim)) - set(env_ts))
             if free:
-                # One name, increasing in it: solve by search.
                 (name,) = free
-                fits = [n for n in range(size + 1) if _value(dim, {**env, name: n}) == size]
+                fits = [n for n in range(size + 1) if _value(dim, {**env_ts, name: n}) == size]
                 if not fits:
                     raise ValueError(f"no {name} makes {dim} equal {size}")
-                env[name] = fits[0]
-            elif _value(dim, env) != size:
-                raise ValueError(f"{dim} is {_value(dim, env)}, got {size}")
+                env_ts[name] = fits[0]
+            elif _value(dim, env_ts) != size:
+                raise ValueError(f"{dim} is {_value(dim, env_ts)}, got {size}")
+        if ts_binding is None:
+            ts_binding = ()
         head, dims = self.ret
-        return np.ones(tuple(_value(d, env) for d in dims), dtype=SYMBOL_HEADS[head])
+        out: list[int] = []
+        for d in dims:
+            if d == TS_DIM:
+                out.extend(ts_binding)
+            else:
+                assert isinstance(d, (int, str))
+                out.append(_value(d, env_ts))
+        return np.ones(tuple(out), dtype=SYMBOL_HEADS[head])
 
 
 @dataclass
@@ -963,17 +1291,37 @@ class Case:
     def symbolic(self) -> bool:
         return bool(self.params)
 
+    @property
+    def has_ts(self) -> bool:
+        for _, _, shape in self.params:
+            if TS_DIM in shape:
+                return True
+        for h in self.helpers:
+            for _, dims in h.formals:
+                if TS_DIM in dims:
+                    return True
+            if TS_DIM in h.ret[1]:
+                return True
+        return False
+
     def signature(self) -> str:
         parts = []
         for name, head, shape in self.params:
             parts.append(f"{name}: {head}[{_spell_dims(shape)}]")
         return ", ".join(parts)
 
-    def runtime_namespace(self, sizes: dict[str, int] = SYMBOL_SIZES) -> dict[str, object]:
+    def runtime_namespace(
+        self, sizes: dict[str, int] = SYMBOL_SIZES, ts_prefix: tuple[int, ...] = ()
+    ) -> dict[str, object]:
         ns: dict[str, object] = {"np": np}
         for name, head, shape in self.params:
-            concrete = tuple(_dim_size(d, sizes) for d in shape)
-            ns[name] = np.ones(concrete, dtype=SYMBOL_HEADS[head])
+            concrete: list[int] = []
+            for d in shape:
+                if d == TS_DIM:
+                    concrete.extend(ts_prefix)
+                else:
+                    concrete.append(_dim_size(d, sizes))
+            ns[name] = np.ones(tuple(concrete), dtype=SYMBOL_HEADS[head])
         for helper in self.helpers:
             helper.bind(ns)
         return ns
@@ -981,9 +1329,15 @@ class Case:
 
 def _spell_dims(shape: tuple[object, ...]) -> str:
     """Dims as written inside `F64[...]`: a formula has to be quoted."""
-    return ", ".join(
-        f'"{d}"' if isinstance(d, str) and not d.isidentifier() else str(d) for d in shape
-    )
+    parts: list[str] = []
+    for d in shape:
+        if d == TS_DIM:
+            parts.append("Unpack[Ts]")
+        elif isinstance(d, str) and not d.isidentifier():
+            parts.append(f'"{d}"')
+        else:
+            parts.append(str(d))
+    return ", ".join(parts)
 
 
 def _dim_size(dim: object, sizes: dict[str, int]) -> int:
@@ -1010,11 +1364,13 @@ def render(cases: list[Case]) -> tuple[str, list[int]]:
     refuses a run with an error anywhere else.
     """
     out = [
-        "from typing import TypeVar",
+        "from typing import TypeVar, TypeVarTuple, Unpack",
         "import numpy as np",
         "from numty import F64, F32, I64, U8, Bool",
         *(f'{name} = TypeVar("{name}", bound=int)' for name in SYMBOL_SIZES),
     ]
+    if any(c.has_ts for c in cases):
+        out.append('Ts = TypeVarTuple("Ts")')
     lines: list[int] = []
     for i, case in enumerate(cases):
         for helper in case.helpers:
@@ -1158,7 +1514,9 @@ class ArrayClaim:
         return self.dims is not None and all(d is not None for d in self.dims)
 
 
-def array_claim(node: Node, sizes: dict[str, int] = SYMBOL_SIZES) -> ArrayClaim | None:
+def array_claim(
+    node: Node, sizes: dict[str, int] = SYMBOL_SIZES, ts_prefix: tuple[int, ...] = ()
+) -> ArrayClaim | None:
     if node.name != "numpy.ndarray" or len(node.args) != 2:
         return None
     shape, dtype = node.args
@@ -1166,13 +1524,19 @@ def array_claim(node: Node, sizes: dict[str, int] = SYMBOL_SIZES) -> ArrayClaim 
     if shape.name in ("tuple", "builtins.tuple"):
         if len(shape.args) == 1 and shape.args[0].name == "()":
             dims = []
-        elif any(a.name == "..." for a in shape.args) or any(
-            a.name.startswith(("Unpack", "*")) for a in shape.args
-        ):
-            dims = None
         else:
             dims = []
             for a in shape.args:
+                if a.name == "*Ts" or (
+                    a.name in ("Unpack", "typing.Unpack", "typing_extensions.Unpack")
+                    and len(a.args) == 1
+                    and a.args[0].name == "Ts"
+                ):
+                    dims.extend(list(ts_prefix))
+                    continue
+                if a.name == "..." or a.name.startswith(("Unpack", "*")):
+                    dims = None
+                    break
                 if a.name == "Literal" and a.args and a.args[0].name.lstrip("-").isdigit():
                     dims.append(int(a.args[0].name))
                 elif not a.args:
@@ -1198,6 +1562,7 @@ class Finding:
     static: str
     runtime: str
     sizes: dict[str, int] | None = None  # symbolic cases: the assignment
+    ts_prefix: tuple[int, ...] | None = None  # *Ts cases: the prefix rank
 
     def __str__(self) -> str:
         where = f"def f({self.case.signature()}): " if self.case.symbolic else ""
@@ -1205,6 +1570,10 @@ class Finding:
         at = ""
         if self.sizes is not None:
             at = " with " + ", ".join(f"{k}={v}" for k, v in self.sizes.items())
+            if self.ts_prefix:
+                at += f", Ts={self.ts_prefix}"
+            elif self.case.has_ts:
+                at += ", Ts=()"
         return (
             f"{self.kind}: {where}{self.case.expr}\n    numty: {self.static}"
             f"\n    numpy{at}: {self.runtime}"
@@ -1225,9 +1594,14 @@ def _check_array(claim: ArrayClaim, value: np.ndarray | np.generic) -> str | Non
     return None
 
 
-def _compare(node: Node, value: object, sizes: dict[str, int] = SYMBOL_SIZES) -> str | None:
+def _compare(
+    node: Node,
+    value: object,
+    sizes: dict[str, int] = SYMBOL_SIZES,
+    ts_prefix: tuple[int, ...] = (),
+) -> str | None:
     """Kind of mismatch between a revealed type and a runtime value."""
-    claim = array_claim(node, sizes)
+    claim = array_claim(node, sizes, ts_prefix)
     if claim is not None:
         if isinstance(value, (np.ndarray, np.generic)):
             return _check_array(claim, value)
@@ -1236,12 +1610,12 @@ def _compare(node: Node, value: object, sizes: dict[str, int] = SYMBOL_SIZES) ->
         if node.name in ("tuple", "builtins.tuple") and len(node.args) == len(value):
             if not any(a.name == "..." for a in node.args):
                 for sub, item in zip(node.args, value):
-                    bad = _compare(sub, item, sizes)
+                    bad = _compare(sub, item, sizes, ts_prefix)
                     if bad:
                         return bad
         elif node.name in ("list", "builtins.list") and len(node.args) == 1:
             for item in value:
-                bad = _compare(node.args[0], item, sizes)
+                bad = _compare(node.args[0], item, sizes, ts_prefix)
                 if bad:
                     return bad
     return None
@@ -1257,12 +1631,14 @@ def _describe(value: object) -> str:
     return type(value).__name__
 
 
-def evaluate(case: Case, sizes: dict[str, int] = SYMBOL_SIZES) -> object:
+def evaluate(
+    case: Case, sizes: dict[str, int] = SYMBOL_SIZES, ts_prefix: tuple[int, ...] = ()
+) -> object:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with np.errstate(all="ignore"):
             try:
-                return eval(case.expr, case.runtime_namespace(sizes))
+                return eval(case.expr, case.runtime_namespace(sizes, ts_prefix))
             except Exception as exc:  # the exception is the answer
                 return exc
 
@@ -1331,17 +1707,34 @@ def check(
         stats[key] = stats.get(key, 0) + 1
 
     def report(
-        kind: str, case: Case, static: str, value: object, sizes: dict[str, int]
+        kind: str,
+        case: Case,
+        static: str,
+        value: object,
+        sizes: dict[str, int],
+        ts_prefix: tuple[int, ...] = (),
     ) -> None:
         for known_kind, pattern, _why in KNOWN_GAPS:
             if kind == known_kind and re.search(pattern, case.expr):
                 count(f"known gap: {kind}")
                 return
         shown = sizes if case.symbolic else None
-        findings.append(Finding(kind, case, static, _describe(value), shown))
+        ts_shown: tuple[int, ...] | None = ts_prefix if case.has_ts else None
+        # Empty prefix is still a prefix rank: show it for *Ts cases so
+        # two findings that differ only by rank do not look identical.
+        if case.has_ts and ts_shown is None:
+            ts_shown = ()
+        findings.append(Finding(kind, case, static, _describe(value), shown, ts_shown))
         count(kind)
 
-    def judge(case: Case, line: int, sizes: dict[str, int], value: object, raises: bool) -> None:
+    def judge(
+        case: Case,
+        line: int,
+        sizes: dict[str, int],
+        value: object,
+        raises: bool,
+        ts_prefix: tuple[int, ...] = (),
+    ) -> None:
         static = reveals.get(line, "<no reveal>")
         errs = errors.get(line, [])
         asserting = [e for e in errs if any(f"[{c}]" in e for c in _ASSERTING_CODES)]
@@ -1354,9 +1747,9 @@ def check(
                 return
             if isinstance(value, _SHAPE_ERRORS) and static != "<no reveal>":
                 node = parse_type(static)
-                claim = array_claim(node, sizes)
+                claim = array_claim(node, sizes, ts_prefix)
                 if claim is not None and claim.concrete and not case.symbolic:
-                    report("CLAIM_ON_ERROR", case, static, value, sizes)
+                    report("CLAIM_ON_ERROR", case, static, value, sizes, ts_prefix)
                     return
             count("numpy raises, not flagged (allowed)")
             return
@@ -1367,32 +1760,37 @@ def check(
             count(SPECIAL_SIZES)
             return
         if blamed:
-            report("FALSE_POSITIVE", case, blamed[0], value, sizes)
+            report("FALSE_POSITIVE", case, blamed[0], value, sizes, ts_prefix)
             return
         if static == "<no reveal>":
             count("no reveal")
             return
-        bad = _compare(parse_type(static), value, sizes)
+        bad = _compare(parse_type(static), value, sizes, ts_prefix)
         if bad == "WRONG_SHAPE" and case.symbolic and _negative_dim(static, sizes):
             count(BELOW_DOMAIN)
             return
         if bad:
-            report(bad, case, static, value, sizes)
+            report(bad, case, static, value, sizes, ts_prefix)
             return
-        claim = array_claim(parse_type(static), sizes)
+        claim = array_claim(parse_type(static), sizes, ts_prefix)
         if claim is not None and claim.concrete and isinstance(value, np.ndarray):
             count("agree: exact shape")
         else:
             count("agree: partial or no claim")
 
     for case, line in zip(cases, lines):
-        used = assignments if case.symbolic else assignments[:1]
-        values = [evaluate(case, sizes) for sizes in used]
+        if not case.symbolic:
+            used: list[tuple[dict[str, int], tuple[int, ...]]] = [(assignments[0], ())]
+        elif case.has_ts:
+            used = [(s, t) for s in assignments for t in TS_PREFIXES]
+        else:
+            used = [(s, ()) for s in assignments]
+        values = [evaluate(case, sizes, ts) for sizes, ts in used]
         raises = any(
             isinstance(v, BaseException) and not isinstance(v, _DATA_ERRORS) for v in values
         )
-        for sizes, value in zip(used, values):
-            judge(case, line, sizes, value, raises)
+        for (sizes, ts), value in zip(used, values):
+            judge(case, line, sizes, value, raises, ts)
     return findings, stats
 
 

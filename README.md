@@ -1199,7 +1199,11 @@ it with fixed sizes, and substitutes them into the revealed dims, so
 is a claim about every size, so each case is evaluated under four
 assignments from one mypy run: odd sizes, even sizes, and two with an
 empty axis. Parameters may carry formulas themselves (`F64[N, "N+1"]`),
-so rules also meet inputs that are already expressions.
+so rules also meet inputs that are already expressions. Parameters may
+also carry a variadic prefix (`F64[Unpack[Ts], N, M]`), instantiated at
+runtime with prefixes of rank 0, 1 and 2; every such case is evaluated
+under each prefix, and a revealed `*Ts` is substituted with the prefix
+before the shape is compared.
 
 Symbolic mode also calls generic functions it writes itself, such as
 `def g(x0: F64[N, "N+1"]) -> F64["2*N", M]`, with arguments in the
@@ -1209,6 +1213,9 @@ argument shapes, then build what the return spells. numty's answer at
 the call site has to match it. Half of these are declared on a class,
 as an instance method, a static method, a class method or `__call__`,
 since methods reach the plugin by a different path than functions.
+Some helpers carry `*Ts` themselves (e.g. `def g(x0: F64[Unpack[Ts], M])
+-> F64[Unpack[Ts], "M+1"]`); the reference binds the shared prefix from
+the actual arrays and solves the suffix like before.
 
 The suite runs a small fixed-seed sample of both modes plus every
 expression the oracle has caught so far, pinned by hand. For a longer
