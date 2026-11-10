@@ -72,6 +72,7 @@ import ast
 import json
 import keyword
 import os
+import sys
 from collections.abc import Callable, Iterator
 from functools import partial
 from typing import NamedTuple, cast
@@ -182,6 +183,60 @@ NUMTY_UNSOLVED = ErrorCode(
     "numty",
     sub_code_of=MISC,
 )
+NUMTY_INTERNAL = ErrorCode(
+    "numty-internal",
+    "numty itself failed on this expression; the result is unchecked",
+    "numty",
+    sub_code_of=MISC,
+)
+
+
+def _numty_debug() -> bool:
+    """Whether NUMTY_DEBUG=1 asks plugin exceptions to propagate."""
+    return os.environ.get("NUMTY_DEBUG") == "1"
+
+
+def _swallowed(ctx: object, where: str) -> None:
+    """The one policy for an exception caught inside the plugin (issue #164).
+
+    Call it first in every `except Exception:` block. A plugin bug must
+    never abort the mypy run, but it must not pass for a clean result
+    either:
+
+    - NUMTY_DEBUG=1 re-raises the exception being handled, so the test
+      suite (which sets it) fails on any swallowed exception and
+      developers get the traceback;
+    - otherwise the failure is recorded in NUMTY_TRACE with outcome
+      `crash` and reported at the call site as [numty-internal]. mypy
+      drops repeated identical messages on a line, so no dedup state is
+      kept here (process-lifetime dedup hid errors under dmypy, #44).
+
+    `ctx` is any hook context (or None where none is in reach: those
+    sites are trace-only outside debug mode). Conditions that are
+    expected in normal operation should be caught by a narrower
+    `except` instead of coming through here.
+    """
+    exc = sys.exception()
+    if _numty_debug() and exc is not None:
+        raise exc
+    detail = f"{type(exc).__name__}: {exc}" if exc is not None else "unknown error"
+    api = getattr(ctx, "api", None)
+    context = getattr(ctx, "context", None)
+    if ctx is not None:
+        _trace_event(ctx, where, "crash", detail)  # type: ignore[arg-type]
+    fail = getattr(api, "fail", None)
+    if fail is None or context is None:
+        return
+    try:
+        fail(
+            f"numty internal error in {where}: {detail} "
+            "(result is unchecked; please report this)",
+            context,
+            code=NUMTY_INTERNAL,
+        )
+    except Exception:  # reporting must never be the thing that crashes
+        if _numty_debug():
+            raise
 
 
 def _numty_trace_path() -> str | None:
@@ -230,7 +285,7 @@ def _trace_event(
                 )
                 + "\n"
             )
-    except Exception:
+    except OSError:
         return
 
 
@@ -247,6 +302,7 @@ def _operands_have_known_shape(operands: list[Type]) -> bool:
                 if _parts_or_unpack(arr) is not None:
                     return True
     except Exception:
+        _swallowed(None, "_operands_have_known_shape")
         return False
     return False
 
@@ -343,6 +399,7 @@ class NumtyPlugin(Plugin):
         try:
             sig = self._callsite_check(ctx)
         except Exception:
+            _swallowed(ctx, "callsite_signature_hook")
             return ctx.default_signature
         _note_rank_mismatches(ctx, sig)
         return sig
@@ -425,6 +482,7 @@ class NumtyPlugin(Plugin):
         try:
             sym = self.lookup_fully_qualified(class_name)
         except Exception:
+            _swallowed(None, "_method_may_take_array")
             return True
         if sym is None or not isinstance(sym.node, TypeInfo):
             return True
@@ -485,6 +543,7 @@ class NumtyPlugin(Plugin):
                         variables=tuple(sig.variables) + tuple(missing)
                     )
         except Exception:
+            _swallowed(ctx, "method_signature_hook")
             pass
         # Call-site shape conflicts (issue #53): the same shared-TypeVar
         # check free functions get. Skipped for overloads (per-candidate
@@ -500,6 +559,7 @@ class NumtyPlugin(Plugin):
             ):
                 _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
         except Exception:
+            _swallowed(ctx, "method_signature_hook")
             pass
         _note_rank_mismatches(ctx, sig)
         return sig
@@ -527,6 +587,7 @@ class NumtyPlugin(Plugin):
         try:
             sym = self.lookup_fully_qualified(fullname)
         except Exception:
+            _swallowed(None, "_resolves_to_tvar")
             return False
         return sym is not None and isinstance(sym.node, TypeVarLikeExpr)
 
@@ -535,12 +596,14 @@ class NumtyPlugin(Plugin):
         try:
             sym = self.lookup_fully_qualified(class_fullname)
         except Exception:
+            _swallowed(None, "_is_class_tvar")
             return False
         if sym is None or not isinstance(sym.node, TypeInfo):
             return False
         try:
             return any(v.fullname == fullname for v in sym.node.type_vars)
         except Exception:
+            _swallowed(None, "_is_class_tvar")
             return False
 
     def _is_fam_int_name(self, fullname: str) -> bool:
@@ -601,6 +664,7 @@ class NumtyPlugin(Plugin):
         try:
             _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
         except Exception:
+            _swallowed(ctx, "_callsite_check")
             pass
         # Expression returns (issue #32 finish): mypy cannot infer M+1
         # from M, so callers of `-> I64["M+1"]` saw Any. Substitute the
@@ -613,6 +677,7 @@ class NumtyPlugin(Plugin):
             if new_ret is not None:
                 sig = sig.copy_modified(ret_type=new_ret)
         except Exception:
+            _swallowed(ctx, "_callsite_check")
             pass
         return sig
 
@@ -649,6 +714,7 @@ class NumtyPlugin(Plugin):
         try:
             sym = self.lookup_fully_qualified(fullname)
         except Exception:
+            _swallowed(None, "get_type_analyze_hook")
             return None
         if sym is None or not isinstance(sym.node, TypeInfo):
             return None
@@ -664,6 +730,7 @@ class NumtyPlugin(Plugin):
                     analyzed = [ctx.api.analyze_type(a) for a in ctx.type.args]
                     return ctx.api.named_type(fullname, analyzed)
             except Exception:
+                _swallowed(ctx, "bare_hook")
                 pass
             short = fullname.rsplit(".", 1)[-1]
             try:
@@ -674,6 +741,7 @@ class NumtyPlugin(Plugin):
                     code=NUMTY_ANNOTATION,
                 )
             except Exception:
+                _swallowed(ctx, "bare_hook")
                 pass
             return AnyType(TypeOfAny.from_error)
 
@@ -1047,6 +1115,7 @@ class NumtyPlugin(Plugin):
                 if isinstance(v, TypeVarType)
             }
         except Exception:
+            _swallowed(ctx, "_fam_expr")
             pass
         return obj
 
@@ -1161,6 +1230,7 @@ class NumtyPlugin(Plugin):
         try:
             ns = scope.namespace
         except Exception:
+            _swallowed(ctx, "_fam_ensure_implicit")
             ns = ""
         key = (ns, word)
         fullname = f"__numty_implicit__.{ns}.{word}" if ns else f"__numty_implicit__.{word}"
@@ -1180,9 +1250,11 @@ class NumtyPlugin(Plugin):
                     try:
                         scope.bind_existing(cached)
                     except Exception:
+                        _swallowed(ctx, "_fam_ensure_implicit")
                         pass
                     return cached
             except Exception:
+                _swallowed(ctx, "_fam_ensure_implicit")
                 pass
         upper = ctx.api.named_type("builtins.int", [], node.line, node.column)
         expr = TypeVarExpr(
@@ -1643,6 +1715,7 @@ def _forms_provably_ne(fa: object, fb: object) -> bool:
         if _form_has_unknown(fa) or _form_has_unknown(fb):
             return False
     except Exception:
+        _swallowed(None, "_forms_provably_ne")
         pass
     if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
         if fa.coeffs == fb.coeffs and fa.const != fb.const:
@@ -1809,6 +1882,7 @@ def _form_from_fullname(fullname: str) -> _LinForm | _DivForm | _MonoForm | None
     try:
         form = _eval_form(tree.body)
     except Exception:
+        _swallowed(None, "_form_from_fullname")
         return None
     _expr_forms[fullname] = form
     return form
@@ -1851,8 +1925,10 @@ def _current_scope_vars(
                     if isinstance(tv, TypeVarType):
                         found.setdefault(tv.fullname, tv)
             except Exception:
+                _swallowed(ctx, "_current_scope_vars")
                 continue
     except Exception:
+        _swallowed(ctx, "_current_scope_vars")
         pass
     return found
 
@@ -1975,6 +2051,7 @@ def _expr_var(
             if consts:
                 _expr_constituents.setdefault(fullname, {}).update(consts)
         except Exception:
+            _swallowed(ctx, "_expr_var")
             pass
     return obj
 
@@ -2121,6 +2198,7 @@ def _materialize_dim(
                     if consts is not None and want in consts:
                         return consts[want]
         except Exception:
+            _swallowed(ctx, "_materialize_dim")
             pass
         # 2) diff(M+1)->M: the input expr knows its own scope's M.
         if isinstance(prefer, TypeVarType):
@@ -2539,22 +2617,38 @@ def _split_flat(
     return dims[: found[0]], item, dims[found[0] + 1 :]
 
 
-def _iter_tvarlikes(tp: Type) -> Iterator[TypeVarLikeType]:
-    """Every TypeVar-like nested in an analyzed type (any container)."""
+def _iter_tvarlikes(
+    tp: Type, _seen: frozenset[TypeAliasType] = frozenset()
+) -> Iterator[TypeVarLikeType]:
+    """Every TypeVar-like nested in an analyzed type (any container).
+
+    A recursive alias (`Json = dict[str, "Json"] | list["Json"]`, or the
+    nested-sequence aliases behind numpy's ArrayLike) expands to a type
+    that mentions itself, so each alias is expanded once per path:
+    without that this recursed until RecursionError, which the
+    call-site hooks used to swallow, dropping their checks for the
+    whole call (issue #164).
+    """
+    if isinstance(tp, TypeAliasType):
+        if tp in _seen:
+            return
+        _seen = _seen | {tp}
+        for a in tp.args:
+            yield from _iter_tvarlikes(a, _seen)
     tp = get_proper_type(tp)
     if isinstance(tp, TypeVarLikeType):
         yield tp
     elif isinstance(tp, Instance):
         for a in tp.args:
-            yield from _iter_tvarlikes(a)
+            yield from _iter_tvarlikes(a, _seen)
     elif isinstance(tp, TupleType):
         for item in tp.items:
-            yield from _iter_tvarlikes(item)
+            yield from _iter_tvarlikes(item, _seen)
     elif isinstance(tp, UnionType):
         for item in tp.relevant_items():
-            yield from _iter_tvarlikes(item)
+            yield from _iter_tvarlikes(item, _seen)
     elif isinstance(tp, UnpackType):
-        yield from _iter_tvarlikes(tp.type)
+        yield from _iter_tvarlikes(tp.type, _seen)
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
@@ -2662,6 +2756,7 @@ def _pairs_for_actual(
         try:
             actual_tp = ctx.api.get_expression_type(actual_expr)
         except Exception:
+            _swallowed(ctx, "_pairs_for_actual")
             return []
         aparts = _parts_or_unpack(actual_tp)
         if aparts is None:
@@ -2682,6 +2777,7 @@ def _pairs_for_actual(
             try:
                 el_tp = ctx.api.get_expression_type(el)
             except Exception:
+                _swallowed(ctx, "_pairs_for_actual")
                 continue
             el_parts = _parts_or_unpack(el_tp)
             if el_parts is None:
@@ -2691,6 +2787,7 @@ def _pairs_for_actual(
     try:
         actual_tp = ctx.api.get_expression_type(actual_expr)
     except Exception:
+        _swallowed(ctx, "_pairs_for_actual")
         return []
     aproper = get_proper_type(actual_tp)
     if isinstance(aproper, TupleType):
@@ -2796,6 +2893,7 @@ def _callsite_expr_bindings(
         try:
             actual_tp = ctx.api.get_expression_type(actuals[0])
         except Exception:
+            _swallowed(ctx, "_callsite_expr_bindings")
             continue
         parts = _ndarray_parts(actual_tp)
         if parts is None:
@@ -2850,6 +2948,7 @@ def _callsite_expr_bindings(
                             if found is not None:
                                 bindings[m_full] = found
             except Exception:
+                _swallowed(ctx, "_callsite_expr_bindings")
                 continue
     # Unknown-rank actuals (plain NDArray) never infer: bind the
     # formal's still-unbound tvars to a fresh unknown so the result
@@ -2863,6 +2962,7 @@ def _callsite_expr_bindings(
         try:
             actual_tp = ctx.api.get_expression_type(actuals[0])
         except Exception:
+            _swallowed(ctx, "_callsite_expr_bindings")
             continue
         if not _has_unknown_shape(actual_tp):
             continue
@@ -2871,6 +2971,7 @@ def _callsite_expr_bindings(
                 try:
                     bindings[tvar.fullname] = _fresh_unknown(ctx, "callsite", dim)
                 except Exception:
+                    _swallowed(ctx, "_callsite_expr_bindings")
                     continue
     return bindings
 
@@ -2892,6 +2993,7 @@ def _substitute_return_exprs(
     try:
         ret_parts = _ndarray_parts(sig.ret_type)
     except Exception:
+        _swallowed(ctx, "_substitute_return_exprs")
         return None
     if ret_parts is None:
         return None
@@ -3004,10 +3106,12 @@ def _substitute_return_exprs(
                         const_map
                     )
             except Exception:
+                _swallowed(ctx, "_substitute_return_exprs")
                 pass
             new_dims.append(new_obj)
             changed = True
         except Exception:
+            _swallowed(ctx, "_substitute_return_exprs")
             return None
     if not changed:
         return None
@@ -3066,12 +3170,15 @@ def _substitute_return_exprs(
         try:
             new_shape = shape.copy_modified(items=new_items)
         except Exception:
+            _swallowed(ctx, "_substitute_return_exprs")
             new_shape = TupleType(new_items, shape.fallback, line=shape.line, column=shape.column)
         try:
             return proper.copy_modified(args=[new_shape, proper.args[1]])
         except Exception:
+            _swallowed(ctx, "_substitute_return_exprs")
             return Instance(proper.type, [new_shape, proper.args[1]], line=proper.line, column=proper.column)
     except Exception:
+        _swallowed(ctx, "_substitute_return_exprs")
         return None
 
 
@@ -3228,12 +3335,14 @@ def _info_mentions_array(info: TypeInfo) -> bool:
             try:
                 sym = info.names[name]
             except Exception:
+                _swallowed(None, "_info_mentions_array")
                 continue
             node = sym.node
             tp = getattr(node, "type", None)
             if tp is not None and _mentions_ndarray(tp):
                 return True
     except Exception:
+        _swallowed(None, "_info_mentions_array")
         return False
     return False
 
@@ -3261,6 +3370,7 @@ def _note_rank_mismatches(ctx: FunctionSigContext | MethodSigContext, sig: Type)
                 where.set_line(arg.line, arg.column + 1)
             ctx.api.note(message, where, code=ARG_TYPE)
     except Exception:
+        _swallowed(ctx, "_note_rank_mismatches")
         return
 
 
@@ -3624,14 +3734,11 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
             try:
                 result = hook(ctx)
             except Exception:
+                _swallowed(ctx, fullname)
                 # Crash barrier (issue #41): no shape hook may abort the
                 # whole mypy run with INTERNAL ERROR, hiding every later
-                # diagnostic. Bail to the stubs instead. Re-raise under
-                # NUMTY_DEBUG=1 so tests/developers still see tracebacks.
-                import os as _os
-
-                if _os.environ.get("NUMTY_DEBUG") == "1":
-                    raise
+                # diagnostic. Reported above ([numty-internal], issue
+                # #164; NUMTY_DEBUG=1 re-raises), then bail to the stubs.
                 result = default
             if result is default:
                 # Generic bail: any hook that kept the stubs' type. This
@@ -7441,6 +7548,7 @@ def _construct_datetime_dtype(
         )
         return ctx.api.named_generic_type(DTYPE_FULLNAME, [element])
     except Exception:
+        _swallowed(ctx, "_construct_datetime_dtype")
         return None
 
 _WEAK_SCALARS = frozenset(
@@ -7842,6 +7950,7 @@ def _exact_element(
             bit = Instance(info, [])
             return ctx.api.named_generic_type(base, [bit, bit] if twice else [bit])
         except Exception:
+            _swallowed(ctx, "_exact_element")
             continue
     return None
 
@@ -8469,6 +8578,7 @@ def _comprehension_parts(
     try:
         item_tp = ctx.api.get_expression_type(gen.left_expr)
     except Exception:
+        _swallowed(ctx, "_comprehension_parts")
         return None
     if item_tp is None:
         return None
@@ -8596,6 +8706,7 @@ def _element_expr_type(ctx: FunctionContext, expr: Expression) -> Type | None:
     try:
         tp: Type | None = ctx.api.get_expression_type(expr)
     except Exception:
+        _swallowed(ctx, "_element_expr_type")
         tp = None
     if tp is not None and _ndarray_parts(tp) is not None:
         return tp
@@ -10002,6 +10113,7 @@ def _fold_index_bound(
         try:
             bound_tp = ctx.api.get_expression_type(expr)
         except Exception:
+            _swallowed(ctx, "_fold_index_bound")
             bound_tp = None
         if bound_tp is not None:
             modules = getattr(ctx.api, "modules", None) or {}
@@ -11487,6 +11599,7 @@ def _flatten_total_dim(
     try:
         return _mul_dims(ctx, op, 0, dims)
     except Exception:
+        _swallowed(ctx, "_flatten_total_dim")
         return None
 
 
@@ -12390,6 +12503,7 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
         try:
             x_tp = ctx.api.get_expression_type(x_expr)
         except Exception:
+            _swallowed(ctx, "_norm_signature_hook")
             return ctx.default_signature
         part = _ndarray_parts(x_tp)
         if part is None:
@@ -12405,6 +12519,7 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
         try:
             ord_tp = ctx.api.get_expression_type(ord_expr)
         except Exception:
+            _swallowed(ctx, "_norm_signature_hook")
             return ctx.default_signature
         if _is_none_type(ord_tp):
             return ctx.default_signature
@@ -12423,6 +12538,7 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
             try:
                 axis_tp = ctx.api.get_expression_type(axis_exprs[0])
             except Exception:
+                _swallowed(ctx, "_norm_signature_hook")
                 return ctx.default_signature
             parsed = _parse_axis_arg((axis_tp, axis_exprs[0]))
             if parsed is None:
@@ -12449,6 +12565,7 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
         new_arg_types[axis_idx] = AnyType(TypeOfAny.explicit)
         return sig.copy_modified(arg_types=new_arg_types)
     except Exception:
+        _swallowed(ctx, "_norm_signature_hook")
         return ctx.default_signature
 
 
@@ -12482,6 +12599,7 @@ def _reshape_signature_hook(ctx: MethodSigContext) -> Type:
             try:
                 tp = ctx.api.get_expression_type(expr)
             except Exception:
+                _swallowed(ctx, "_reshape_signature_hook")
                 return ctx.default_signature
             pairs.append((tp, expr))
         if not pairs:
@@ -12507,6 +12625,7 @@ def _reshape_signature_hook(ctx: MethodSigContext) -> Type:
             arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
         )
     except Exception:
+        _swallowed(ctx, "_reshape_signature_hook")
         return ctx.default_signature
 
 
@@ -12561,6 +12680,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
                                 arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
                             )
             except Exception:
+                _swallowed(ctx, "_broadcast_signature_hook")
                 pass
             try:
                 left_tp = ctx.api.get_expression_type(call.left)
@@ -12574,6 +12694,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
                                 arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
                             )
             except Exception:
+                _swallowed(ctx, "_broadcast_signature_hook")
                 pass
             return ctx.default_signature
         elif isinstance(call, _CallExpr) and call.args:
@@ -12586,6 +12707,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
         try:
             other_tp = ctx.api.get_expression_type(other_expr)
         except Exception:
+            _swallowed(ctx, "_broadcast_signature_hook")
             return ctx.default_signature
         part_b = _ndarray_parts(other_tp)
         if part_b is None:
@@ -12600,6 +12722,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
             arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
         )
     except Exception:
+        _swallowed(ctx, "_broadcast_signature_hook")
         return ctx.default_signature
 
 
@@ -12635,6 +12758,7 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> Type:
                 left_tp = ctx.api.get_expression_type(call.left)
                 right_tp = ctx.api.get_expression_type(call.right)
             except Exception:
+                _swallowed(ctx, "_matmul_signature_hook")
                 return ctx.default_signature
         elif isinstance(call, _CallExpr) and call.args:
             # Explicit `a.__matmul__(b)` / `a.__imatmul__(b)`: (self, arg).
@@ -12644,6 +12768,7 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> Type:
             try:
                 arg_tp = ctx.api.get_expression_type(call.args[0])
             except Exception:
+                _swallowed(ctx, "_matmul_signature_hook")
                 return ctx.default_signature
             if name == "__rmatmul__":
                 left_tp, right_tp = arg_tp, ctx.type
@@ -12680,6 +12805,7 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> Type:
             arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
         )
     except Exception:
+        _swallowed(ctx, "_matmul_signature_hook")
         return ctx.default_signature
 
 
@@ -12716,6 +12842,7 @@ def _einsum_signature_hook(ctx: FunctionSigContext) -> Type:
             try:
                 tp = ctx.api.get_expression_type(expr)
             except Exception:
+                _swallowed(ctx, "_einsum_signature_hook")
                 return ctx.default_signature
             part = _ndarray_parts(tp)
             if part is None:
@@ -12750,6 +12877,7 @@ def _einsum_signature_hook(ctx: FunctionSigContext) -> Type:
                     return ctx.default_signature
         return ctx.default_signature
     except Exception:
+        _swallowed(ctx, "_einsum_signature_hook")
         return ctx.default_signature
 
 
@@ -14191,6 +14319,7 @@ def substituted_attribute_hook(ctx: AttributeContext) -> Type:
     try:
         tvars = base.type.defn.type_vars
     except Exception:
+        _swallowed(ctx, "substituted_attribute_hook")
         return default
     if len(tvars) != len(base.args):
         return default
@@ -14202,6 +14331,7 @@ def substituted_attribute_hook(ctx: AttributeContext) -> Type:
     try:
         sub = _subst_attr_type(ctx, default, mapping)
     except Exception:
+        _swallowed(ctx, "substituted_attribute_hook")
         return default
     if sub is None:
         return default
