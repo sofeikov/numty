@@ -2012,6 +2012,37 @@ def test_provable_linear_mismatch() -> None:
     assert "stack shapes differ: (N+2,), (N,)" in errors[3], result.stdout
 
 
+def test_comprehension_unknown_bails_not_false_proof() -> None:
+    # Issue #63: every element of [x[m] for m in masks] shares one ?U,
+    # so matmul must bail (Any) and never claim a false (3, 3).
+    result = run_mypy(FIXTURES / "unknown_comprehension_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    assert reveals_by_line(result) == {
+        13: '"Any"',
+        18: '"Any"',
+    }, result.stdout
+
+
+def test_einsum_symbolic_conflict() -> None:
+    # Issue #63: einsum label N vs N+2 from off-by-pad is provable.
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_einsum_symbolic.py"),
+        "einsum label 'n' has conflicting sizes: N vs N+2",
+        '"einsum"',
+    )
+
+
+def test_reshape_symbolic_total_mismatch() -> None:
+    # Issue #63: reshape of N+1 to N and N+2 to (N, 1) always raises.
+    result = run_mypy(FIXTURES / "bad_reshape_symbolic_total.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert "reshape changes total size: N+1 -> N" in errors[0], result.stdout
+    assert "reshape changes total size: N+2 -> N" in errors[1], result.stdout
+
+
 def test_offsets_calls_ok_clean_and_runs() -> None:
     # Issue #32 finish: expression returns infer through calls instead of
     # going Any. `make_offsets(a: I64[K]) -> I64["M+1"]` reveals K+1 in the

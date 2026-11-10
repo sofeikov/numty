@@ -1469,16 +1469,24 @@ def _dim_eq(a: int | Type, b: int | Type) -> bool:
 
     Expression variables resolve through the registry, so N*2 built at two
     sites compares equal; anything unresolvable falls back to False.
+    ?U unknowns never prove equal, not even to themselves (issue #63):
+    one mask site serves every comprehension element, so sharing ?U0
+    would claim false (3, 3) matmuls. The result bails instead.
     """
     if isinstance(a, int) and isinstance(b, int):
         return a == b
     if isinstance(a, TypeVarType) and isinstance(b, TypeVarType):
         if a.fullname == b.fullname:
+            if _is_unknown_fullname(a.fullname):
+                return False
             return True
     fa = _resolve_dim(a)
     fb = _resolve_dim(b)
     if fa is not None and fb is not None:
-        return fa == fb
+        if fa == fb:
+            if _form_has_unknown(fa):
+                return False
+            return True
     return False
 
 
@@ -1499,6 +1507,22 @@ def _dims_provably_ne(a: int | Type, b: int | Type) -> bool:
         return a != b
     fa = _resolve_dim(a)
     fb = _resolve_dim(b)
+    if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
+        return fa.coeffs == fb.coeffs and fa.const != fb.const
+    return False
+
+
+def _forms_provably_ne(fa: object, fb: object) -> bool:
+    """Provably-unequal total products: same linear vars, different consts.
+
+    `N+1` vs `N`, `N+2` vs `N` can never be equal. Different vars, monos,
+    divs or unknowns stay unprovable (issue #56). Used by reshape
+    (issue #63) to flag off-by-pad totals without false errors.
+    """
+    if fa is None or fb is None:
+        return False
+    if fa == fb:
+        return False
     if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
         return fa.coeffs == fb.coeffs and fa.const != fb.const
     return False
@@ -2074,6 +2098,15 @@ def _linear_product(dims: list[int | Type]) -> _LinForm | _MonoForm | None:
         if acc is None:
             return None
     return acc
+
+
+def _reshape_total_form(dims: list[int | Type]) -> object:
+    """Total elements for reshape legality: single dim resolves directly
+    (so N+1, N+2 sums are comparable), multi-dim uses the pure-product
+    canonical form; None when unrepresentable (issue #63)."""
+    if len(dims) == 1:
+        return _resolve_dim(dims[0])
+    return _linear_product(dims)
 
 
 def _check_dim_eq(
@@ -3547,27 +3580,38 @@ def _matmul_result(
 ) -> tuple[list[int | Type] | None, str | None]:
     """Output dims on success; (None, None) to bail; (None, msg) on error.
 
-    An unprovable inner pair (N vs M, ?U vs ?U) is not a clash and the
+    An unprovable inner pair (N vs M, ?U vs ?U') is not a clash and the
     output dims do not depend on it (issue #56), so the outer dims are
-    still returned instead of bailing the whole result to Any.
+    still returned instead of bailing the whole result to Any. The one
+    exception is the same ?U on both sides (issue #63): one mask site
+    serves every comprehension element, so equality would falsely prove
+    (3, 3) — bail instead.
     """
     if not a or not b:
         return None, None
     if len(a) == 1 and len(b) == 1:
+        if _is_same_unknown(a[0], b[0]):
+            return None, None
         _, message = _matmul_inner(a[0], b[0])
         if message is not None:
             return None, message
         return [], None
     if len(a) == 1:
+        if _is_same_unknown(a[0], b[-2]):
+            return None, None
         _, message = _matmul_inner(a[0], b[-2])
         if message is not None:
             return None, message
         return [*b[:-2], b[-1]], None
     if len(b) == 1:
+        if _is_same_unknown(a[-1], b[0]):
+            return None, None
         _, message = _matmul_inner(a[-1], b[0])
         if message is not None:
             return None, message
         return a[:-1], None
+    if _is_same_unknown(a[-1], b[-2]):
+        return None, None
     _, message = _matmul_inner(a[-1], b[-2])
     if message is not None:
         return None, message
@@ -6290,6 +6334,38 @@ _unknown_ids: dict[str, TypeVarId] = {}
 # each (module, line) has minted. Names only: identity stays the id.
 _unknown_names: dict[str, str] = {}
 _unknown_per_line: dict[tuple[str, int], int] = {}
+# Unknowns minted inside a comprehension (issue #63): one site is
+# evaluated once per element at runtime, so every element shares the
+# same ?U even when sizes differ. Never prove such an unknown equal,
+# not even to itself — the result bails instead of claiming (3, 3).
+# In practice every shared ?U is treated this way (not just
+# comprehensions): same-array uses bail to a fresh ?U instead of a
+# false proof, which is safe and never a false error.
+_UNKNOWN_PREFIX = "__numty_unknown__."
+
+
+def _is_unknown_fullname(name: str) -> bool:
+    return name.startswith(_UNKNOWN_PREFIX)
+
+
+def _form_has_unknown(form: object) -> bool:
+    """Whether a canonical form mentions any ?U unknown."""
+    if isinstance(form, _LinForm):
+        return any(_is_unknown_fullname(name) for name, _ in form.coeffs)
+    if isinstance(form, _MonoForm):
+        return any(_is_unknown_fullname(v) for v in form.vars)
+    return False
+
+
+def _is_same_unknown(a: int | Type, b: int | Type) -> bool:
+    """Same ?U on both sides (issue #63): one mask site serves every
+    comprehension element, so equality would be a false proof."""
+    return (
+        isinstance(a, TypeVarType)
+        and isinstance(b, TypeVarType)
+        and a.fullname == b.fullname
+        and _is_unknown_fullname(a.fullname)
+    )
 
 
 def _unknown_display_name(module: str, line: int, fullname: str) -> str:
@@ -6644,6 +6720,34 @@ def _solve_reshape(
                     ctx.context,
                     code=NUMTY_SHAPE,
                 )
+            return ctx.default_return_type
+        if _forms_provably_ne(old_form, new_form):
+            # Same int total but provably-unequal symbolic totals
+            # (N+1 vs N, N+2 vs N*1 from off-by-pad, issue #63):
+            # no assignment of N satisfies the equality, so the call
+            # always raises — error instead of tracking the request.
+            assert old_form is not None and new_form is not None
+            ctx.api.fail(
+                f"reshape changes total size: {_expr_str(old_form)} -> "
+                f"{_expr_str(new_form)} "
+                f"(shapes {_dims_str(dims_old)} vs {raw_str})",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
+        old_total = _reshape_total_form(dims_old)
+        new_total = _reshape_total_form(raw)
+        if _forms_provably_ne(old_total, new_total):
+            # Single-dim sums the product form cannot spell (N+1 vs N,
+            # N+2 vs N): same vars, different consts, always unequal.
+            assert old_total is not None and new_total is not None
+            ctx.api.fail(
+                f"reshape changes total size: {_expr_str(old_total)} -> "
+                f"{_expr_str(new_total)} "
+                f"(shapes {_dims_str(dims_old)} vs {raw_str})",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
             return ctx.default_return_type
         if old_vars != new_vars:
             # Same int total but different symbolic factors (N vs M): the
@@ -10883,6 +10987,14 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
                     ctx.api.fail(
                         f"einsum label '{label}' has conflicting sizes: "
                         f"{known} vs {size} (shape {_dims_str(dims)})",
+                        ctx.context,
+                        code=NUMTY_SHAPE,
+                    )
+                    return ctx.default_return_type
+                elif _dims_provably_ne(known, size):
+                    ctx.api.fail(
+                        f"einsum label '{label}' has conflicting sizes: "
+                        f"{_dim_str(known)} vs {_dim_str(size)} (shape {_dims_str(dims)})",
                         ctx.context,
                         code=NUMTY_SHAPE,
                     )
