@@ -130,3 +130,123 @@ def test_warm_matches_cold() -> None:
             "runtime: ValueError",
             "runtime: (6,)",
         ]
+
+
+LIBMOD146 = '''\
+from numty import F32
+
+
+def dup(x: F32["myhid myrest"]) -> F32["2*myhid myrest"]:
+    return x  # type: ignore[return-value]
+
+
+def inc(x: F32["N M"]) -> F32["N+1 M"]:
+    return x  # type: ignore[return-value]
+'''
+
+USEMOD146 = '''\
+from libmod import dup, inc
+from numty import F32
+
+
+def caller(a: F32["myhid myrest"]):
+    y = dup(a)
+    reveal_type(y)
+
+
+def caller2(b: F32["N M"]):
+    z = inc(b)
+    reveal_type(z)
+'''
+
+SAMEFILE146 = '''\
+from numty import F32
+
+
+def f1(x: F32["myhid myrest"]) -> F32["2*myhid myrest"]:
+    return x  # type: ignore[return-value]
+
+
+def f2(x: F32["myhid myrest"]) -> F32["2*myhid myrest"]:
+    return x  # type: ignore[return-value]
+
+
+def use(a: F32["myhid myrest"]):
+    y = f1(a)
+    z = f2(a)
+    reveal_type(y)
+    reveal_type(z)
+'''
+
+
+def _run_mypy_files(
+    cwd: Path, cache: Path, *files: str
+) -> "subprocess.CompletedProcess[str]":
+    env = {**os.environ, "PYTHONPATH": str(ROOT), "MYPYPATH": str(ROOT)}
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mypy",
+            "--config-file",
+            str(ROOT / "mypy.ini"),
+            "--cache-dir",
+            str(cache),
+            *files,
+        ],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_implicit_expr_cold_warm_parity() -> None:
+    """Cold/warm/dmypy parity for implicit expr dims (issue #146)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        (work / "libmod.py").write_text(LIBMOD146)
+        (work / "usemod.py").write_text(USEMOD146)
+        cache = work / "cache"
+
+        cold = _run_mypy_files(work, cache, "usemod.py", "libmod.py")
+        with open(work / "usemod.py", "a") as fh:
+            fh.write("# edit\n")
+        warm = _run_mypy_files(work, cache, "usemod.py", "libmod.py")
+
+        assert cold.stdout == warm.stdout, (
+            f"--- cold ---\n{cold.stdout}\n--- warm ---\n{warm.stdout}"
+        )
+        # Cold used to bail to var-annotated + Any; both must now be
+        # precise with no annotation error.
+        assert 'Need type annotation for "y"' not in cold.stdout, cold.stdout
+        assert 'Need type annotation for "z"' not in cold.stdout, cold.stdout
+        assert "tuple[Any, Any]" not in cold.stdout, cold.stdout
+        for shape in ("tuple[2*myhid, myrest]", "tuple[N+1, M]"):
+            assert shape in cold.stdout, cold.stdout
+
+
+def test_implicit_two_func_same_file_parity() -> None:
+    """Two funcs sharing one implicit spec agree cold and warm (issue #146)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        (work / "both.py").write_text(SAMEFILE146)
+        cache = work / "cache"
+
+        cold = _run_mypy_files(work, cache, "both.py")
+        with open(work / "both.py", "a") as fh:
+            fh.write("# edit\n")
+        warm = _run_mypy_files(work, cache, "both.py")
+
+        assert cold.stdout == warm.stdout, (
+            f"--- cold ---\n{cold.stdout}\n--- warm ---\n{warm.stdout}"
+        )
+        assert 'Need type annotation for "y"' not in cold.stdout, cold.stdout
+        assert 'Need type annotation for "z"' not in cold.stdout, cold.stdout
+        assert "tuple[Any, Any]" not in cold.stdout, cold.stdout
+        assert cold.stdout.count("tuple[2*myhid, myrest]") == 2, cold.stdout

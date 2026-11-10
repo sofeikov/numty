@@ -1137,25 +1137,43 @@ class NumtyPlugin(Plugin):
         object for the same (function namespace, word) via bind_existing,
         so one word is one dim per function, like declared TypeVars.
         Different functions keep independent vars via the namespace key.
+
+        Issue #146: the fullname itself must carry the namespace
+        (`__numty_implicit__.<ns>.<word>`), not just the cache key. A
+        shared `__numty_implicit__.myhid` fullname makes two functions'
+        dims (and any `2*myhid` expr forms built on them) the same
+        variable with the same per-scope id, so cold (both modules in
+        one process) confuses caller and callee objects and bails to
+        Any while warm (callee from cache) succeeds. Namespaced
+        fullnames keep every scope's dims distinct; the `_LATE_PREFIXES`
+        marker still matches.
         """
-        fullname = f"__numty_implicit__.{word}"
-        existing = scope.get_binding(fullname)
-        if existing is not None:
-            return existing
-        # Same function, different scope tree (signature vs body): reuse
-        # the signature's object instead of minting a lookalike.
         try:
             ns = scope.namespace
         except Exception:
             ns = ""
         key = (ns, word)
+        fullname = f"__numty_implicit__.{ns}.{word}" if ns else f"__numty_implicit__.{word}"
+        existing = scope.get_binding(fullname)
+        if existing is not None:
+            return existing
+        # Same function, different scope tree (signature vs body): reuse
+        # the signature's object instead of minting a lookalike.
         cached = _implicit_scope_vars.get(key)
         if cached is not None:
+            # A stale entry from another process lifetime (or a pre-#146
+            # cache with an unnamespaced fullname) must not shadow the
+            # current scope's own dim: only reuse when the fullnames
+            # agree, else fall through and mint fresh.
             try:
-                scope.bind_existing(cached)
+                if getattr(cached, "fullname", None) == fullname:
+                    try:
+                        scope.bind_existing(cached)
+                    except Exception:
+                        pass
+                    return cached
             except Exception:
                 pass
-            return cached
         upper = ctx.api.named_type("builtins.int", [], node.line, node.column)
         expr = TypeVarExpr(
             word,
@@ -2058,18 +2076,19 @@ def _materialize_dim(
         and form.const == 0
     ):
         want = form.coeffs[0][0]
-        # 1) diff(M+1)->M: the input expr knows its own scope's M.
-        if isinstance(prefer, TypeVarType):
-            consts = _expr_constituents.get(prefer.fullname)
-            if consts is not None and want in consts:
-                return consts[want]
-        # 2) Current call's own object (reshape/split second-function
-        # leak): prefer it over the process-wide registry.
+        # Issue #146: the process-wide `_expr_constituents`/`_seen_vars`
+        # registries hold whichever module was checked first, so a stale
+        # entry (another scope's object for the same fullname) must never
+        # shadow the current call's own object. Check the current call
+        # first, then the input expr's constituents, then the registry.
+        # 1) Current call's own object (reshape/split second-function
+        # leak, #146 cold-vs-warm): prefer it over the process-wide
+        # registry.
         try:
             current = _current_scope_vars(ctx)
             if want in current:
                 return current[want]
-            # 2b) Transitive (issue #43): the current call's args hold an
+            # 1b) Transitive (issue #43): the current call's args hold an
             # expr (e.g. repeat's N*2 feeding reshape's -1), not the bare
             # var. That expr's constituents were just recorded by the
             # inner call in this same body, so they are the current
@@ -2082,6 +2101,11 @@ def _materialize_dim(
                         return consts[want]
         except Exception:
             pass
+        # 2) diff(M+1)->M: the input expr knows its own scope's M.
+        if isinstance(prefer, TypeVarType):
+            consts = _expr_constituents.get(prefer.fullname)
+            if consts is not None and want in consts:
+                return consts[want]
         seen = _seen_vars.get(want)
         if seen is not None:
             return seen
