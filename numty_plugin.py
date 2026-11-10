@@ -8157,6 +8157,19 @@ def _is_dynamic_sequence(tp: Type, expr: Expression | None) -> bool:
     )
 
 
+def _is_empty_sequence(tp: Type, expr: Expression | None) -> bool:
+    """A statically-known empty sequence: `[]`, `()`, or an empty tuple type.
+
+    `_sequence_parts` folds these to None (no items to read), which is
+    indistinguishable from an unsolvable bail — but an empty sequence
+    always raises at runtime, so it is a provable arity error (issue #143).
+    """
+    if isinstance(expr, (ListExpr, TupleExpr)) and not expr.items:
+        return True
+    proper = get_proper_type(tp)
+    return isinstance(proper, TupleType) and not proper.items
+
+
 def _concat_axis(ctx: FunctionContext, pairs: list[tuple[Type, Expression | None]]) -> int | None | str:
     pair = _formal_pair(ctx, "axis")
     if pair is None:
@@ -8230,6 +8243,13 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
+        if _is_empty_sequence(pairs[0][0], pairs[0][1]):
+            ctx.api.fail(
+                "concatenate needs at least one array (got an empty sequence)",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
             elem = _dynamic_sequence_element(ctx, pairs[0][0], pairs[0][1])
             if elem is not None:
@@ -8353,6 +8373,13 @@ def _stack_solve(
     """Shared vstack/hstack/dstack/column_stack solver after promotion."""
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
+        if _is_empty_sequence(pairs[0][0], pairs[0][1]):
+            ctx.api.fail(
+                f"{kind} needs at least one array (got an empty sequence)",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
             elem = _dynamic_sequence_element(ctx, pairs[0][0], pairs[0][1])
             if elem is None:
@@ -8508,6 +8535,13 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
+        if _is_empty_sequence(pairs[0][0], pairs[0][1]):
+            ctx.api.fail(
+                "stack needs at least one array (got an empty sequence)",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
         if _is_dynamic_sequence(pairs[0][0], pairs[0][1]):
             elem = _dynamic_sequence_element(ctx, pairs[0][0], pairs[0][1])
             if elem is not None:
