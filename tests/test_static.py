@@ -196,6 +196,56 @@ def test_matmul_batch_mismatch() -> None:
     )
 
 
+def test_matmul_operator_mismatch() -> None:
+    # Issue #140: @ checks exactly like np.matmul: inner, batch,
+    # chained, vector, 0-d, scalar and @= fail with the same
+    # [numty-shape] message and no mechanical [operator] duplicate.
+    result = run_mypy(FIXTURES / "bad_matmul_operator.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 7, result.stdout
+    assert "matmul inner dimensions disagree: 3 vs 2" in errors[0], result.stdout
+    assert "matmul batch dimensions disagree" in errors[1], result.stdout
+    assert "(5,)" in errors[1] and "(4,)" in errors[1], result.stdout
+    assert "matmul inner dimensions disagree: 4 vs 2" in errors[2], result.stdout
+    assert "matmul inner dimensions disagree: 3 vs 4" in errors[3], result.stdout
+    assert "matmul operand 0 has no dimensions (a 0-d array)" in errors[4], result.stdout
+    assert "matmul operand 1 has no dimensions (a scalar float)" in errors[5], result.stdout
+    assert "matmul inner dimensions disagree: 3 vs 2" in errors[6], result.stdout
+    assert all("[numty-shape]" in line for line in errors), result.stdout
+    assert not [line for line in errors if "[operator]" in line], result.stdout
+
+
+def test_matmul_operator_ok_clean_and_runs() -> None:
+    # Issue #140: correct @ solves precise shapes (no more Any) and the
+    # runtime oracle agrees, including batched, chained, vector, @=
+    # and *Ts forms.
+    result = run_mypy(FIXTURES / "matmul_operator_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        14: f'"numpy.ndarray[tuple[Literal[2], Literal[4]], {f64}]"',
+        15: f'"numpy.ndarray[tuple[Literal[2], Literal[4]], {f64}]"',
+        20: f'"numpy.ndarray[tuple[Literal[5], Literal[2], Literal[4]], {f64}]"',
+        25: f'"numpy.ndarray[tuple[Literal[2], Literal[5]], {f64}]"',
+        29: '"numpy.float64"',
+        30: f'"numpy.ndarray[tuple[Literal[2]], {f64}]"',
+        31: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
+        37: f'"numpy.ndarray[tuple[Literal[2], Literal[2]], {f64}]"',
+        48: f'"numpy.ndarray[tuple[*Ts, Literal[4], Literal[6]], {f64}]"',
+    }, result.stdout
+    assert _run_fixture("matmul_operator_ok.py") == [
+        "(2, 4)",
+        "(2, 4)",
+        "(5, 2, 4)",
+        "(2, 5)",
+        "0.0",
+        "(2,)",
+        "(4,)",
+        "(2, 2)",
+    ]
+
+
 def assert_operator_mismatch(result: "subprocess.CompletedProcess[str]", *fragments: str) -> None:
     """Our solver message, plus mypy's generic operator error on top."""
     assert result.returncode == 1, result.stdout

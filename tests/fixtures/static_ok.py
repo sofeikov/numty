@@ -122,7 +122,7 @@ def unblessed_shapes_solve() -> None:
 
 
 def matmul_operator() -> None:
-    # @ is accepted but unchecked (numpy's default); use matmul() to solve.
+    # @ solves like matmul()/np.matmul (issue #140).
     use_2x4(np.zeros((2, 3)) @ np.zeros((3, 4)))
 
 
