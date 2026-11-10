@@ -3597,3 +3597,68 @@ def test_issue145_flatten_pin_ok() -> None:
         '"numpy.ndarray[tuple[batch, out], numpy.dtype[numpy.float64]]"'
     ), result.stdout
     assert _run_fixture("issue145_flatten_pin_ok.py") == ["ok"]
+
+
+# README showcase: the opening examples are these fixtures verbatim, so
+# the first thing a reader sees is pinned like everything else.
+
+
+def test_showcase_plain_numpy_two_bugs() -> None:
+    fixture = FIXTURES / "bad_showcase_plain.py"
+    # The point of the example: no numty import, no annotation.
+    source = fixture.read_text(encoding="utf-8")
+    assert "import numty" not in source and "from numty" not in source
+    assert "def " not in source and ": np." not in source
+    result = run_mypy(fixture)
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert errors[0].endswith(
+        ":13: error: matmul inner dimensions disagree: 784 vs 10  [numty-shape]"
+    ), result.stdout
+    assert errors[1].endswith(
+        ":17: error: true_divide shapes disagree: broadcast shapes disagree at "
+        "trailing axis 0: 10 vs 64 (shapes (64, 10) vs (64,))  [numty-broadcast]"
+    ), result.stdout
+
+
+def test_showcase_attention_clean_and_runs() -> None:
+    result = run_mypy(FIXTURES / "showcase_attention_ok.py")
+    assert result.returncode == 0, result.stdout
+    reveals = reveals_by_line(result)
+    assert list(reveals) == [25], result.stdout
+    assert "tuple[batch, heads, seq, seq]" in reveals[25], result.stdout
+    assert _run_fixture("showcase_attention_ok.py") == ["(2, 4, 7, 16)"]
+
+
+def test_showcase_attention_returning_weights() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_showcase_attention.py"),
+        "Incompatible return value",
+        "tuple[batch, heads, seq, seq]",
+        "tuple[batch, heads, seq, dim]",
+    )
+
+
+def test_showcase_algebra_formulas() -> None:
+    result = run_mypy(FIXTURES / "bad_showcase_algebra.py")
+    reveals = reveals_by_line(result)
+    golden = {
+        25: "tuple[batch, time-1]",
+        26: "tuple[batch, time//2+1]",
+        27: "tuple[batch, time-4, Literal[5]]",
+        28: "tuple[batch, time+4]",
+        29: "tuple[batch, 2*time]",
+        30: "tuple[batch, chan*height*width]",
+        31: "tuple[batch]",
+        32: "tuple[batch, time-1]",
+    }
+    assert sorted(reveals) == sorted(golden), result.stdout
+    for line, shape in golden.items():
+        assert f"ndarray[{shape}, " in reveals[line], (line, result.stdout)
+    assert "numpy.complex128" in reveals[26], result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 1, result.stdout
+    assert errors[0].endswith(
+        ":33: error: broadcast shapes disagree at trailing axis 0: time-1 vs time "
+        "(shapes (batch, time-1) vs (batch, time))  [numty-broadcast]"
+    ), result.stdout

@@ -6,6 +6,132 @@ computes garbage. [jaxtyping](https://docs.kidger.site/jaxtyping/) solved this
 at runtime. numty catches it *before anything runs*, using only what type
 checkers already understand plus one small mypy plugin.
 
+## Plain NumPy, no annotations: two bugs before anything runs
+
+This file imports nothing from numty and annotates nothing:
+
+```python
+import numpy as np
+
+images = np.zeros((64, 28, 28))
+weights = np.zeros((10, 784))  # transposed: should be (784, 10)
+bias = np.zeros(10)
+
+flat = images.reshape(64, -1)
+logits = flat @ weights + bias
+
+scores = np.zeros((64, 10))
+exp = np.exp(scores)
+probs = exp / exp.sum(axis=1)  # forgot keepdims=True
+```
+
+```text
+error: matmul inner dimensions disagree: 784 vs 10  [numty-shape]
+error: true_divide shapes disagree: broadcast shapes disagree at trailing axis 0: 10 vs 64 (shapes (64, 10) vs (64,))  [numty-broadcast]
+```
+
+mypy reports both without executing a line. numty worked out that
+`reshape(64, -1)` of `(64, 28, 28)` is `(64, 784)`, carried that into
+the `@`, and saw that `sum(axis=1)` drops an axis the division needs.
+The second bug is the dangerous kind: with 10 samples instead of 64,
+NumPy would broadcast `(10, 10) / (10,)` without complaint and return
+probabilities normalised along the wrong axis.
+
+## Name the sizes once and it does the algebra
+
+One signature, no annotations in the body. Every comment below is the
+shape numty infers, as a formula over the names in the signature:
+
+```python
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+from numty import F64, I64
+
+def features(
+    signal: F64["batch time"],
+    image: F64["batch chan height width"],
+    offsets: I64["batch+1"],
+) -> None:
+    np.diff(signal, axis=1)                     # (batch, time-1)
+    np.fft.rfft(signal, axis=1)                 # (batch, time//2+1), complex128
+    sliding_window_view(signal, 5, axis=1)      # (batch, time-4, 5)
+    np.pad(signal, ((0, 0), (2, 2)))            # (batch, time+4)
+    np.concatenate([signal, signal], axis=1)    # (batch, 2*time)
+    image.reshape(image.shape[0], -1)           # (batch, chan*height*width)
+    np.diff(offsets)                            # (batch,)
+    signal[:, 1:] - signal[:, :-1]              # (batch, time-1)
+    signal[:, 1:] - signal                      # off by one
+```
+
+```text
+error: broadcast shapes disagree at trailing axis 0: time-1 vs time (shapes (batch, time-1) vs (batch, time))  [numty-broadcast]
+```
+
+`batch`, `time`, `chan`, `height` and `width` are never declared: the
+strings mint them. The sizes are unknown until the function is called,
+and the off-by-one on the last line is still an error, because
+`time-1` cannot equal `time` whatever `time` is.
+
+## A whole attention block from one signature
+
+```python
+import numpy as np
+from numty import F32
+
+def attention(
+    q: F32["batch heads seq dim"],
+    k: F32["batch heads seq dim"],
+    v: F32["batch heads seq dim"],
+) -> F32["batch heads seq dim"]:
+    scores = q @ k.swapaxes(-1, -2)            # (batch, heads, seq, seq)
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    weights = np.exp(scores)
+    weights = weights / weights.sum(axis=-1, keepdims=True)
+    return weights @ v
+```
+
+```text
+Success: no issues found in 1 source file
+(2, 4, 7, 16)
+```
+
+Four symbolic dims through a batched matmul, a transpose, two
+keepdims reductions and two broadcasts, with the return checked
+against the signature. Return the weights by mistake (drop the `@ v`)
+and the two shapes are named side by side:
+
+```text
+error: Incompatible return value type (got "ndarray[tuple[batch, heads, seq, seq], dtype[floating[_32Bit]]]", expected "ndarray[tuple[batch, heads, seq, dim], dtype[floating[_32Bit]]]")  [return-value]
+```
+
+## Why trust it
+
+- **It is checked against NumPy itself.** A differential test
+  generates NumPy expressions, compares numty's inferred shape and
+  dtype with what NumPy returns, and fails on any disagreement. The
+  latest long run (42,000 expressions, seeds 101-130, NumPy 2.5.4,
+  mypy 2.4.1) had **no disagreements**: 24,601 exact shapes matched
+  NumPy's, and of the 11,195 expressions NumPy rejects, 8,398 were
+  reported before running. Three cases hit documented gaps in NumPy's
+  own stubs (see [Checked against numpy](#checked-against-numpy)).
+- **It finds seeded bugs.** [bench/](bench) hides 18 realistic
+  mistakes in MLP-training and math-library code; 17 are reported
+  before anything runs. The 18th passes a bare `np.ndarray`, so there
+  is no shape to check.
+- **It runs on real library code.** scikit-learn's Cholesky ridge
+  solver and NMF update are annotated, check clean, and are compared
+  with scikit-learn's own results in the test suite.
+- **Unknown is not an error.** When a size cannot be known statically
+  numty says nothing and keeps checking the dims around it, so
+  unannotated code stays quiet. Run over seven modules of NumPy's own
+  source (16,330 lines, with `--check-untyped-defs`), it added two
+  diagnostics, both the opt-out `numty-bail` notice.
+
+Every example above is a file in [tests/fixtures](tests/fixtures)
+(`bad_showcase_plain.py`, `bad_showcase_algebra.py`,
+`showcase_attention_ok.py`, `bad_showcase_attention.py`) and is pinned
+by the test suite, message for message.
+
 ## It works on real code: ridge regression from sklearn
 
 This is scikit-learn 1.9.1's dense Cholesky solver
