@@ -89,13 +89,15 @@ def test_strict_flags_lost_shape(tmp_path: Path) -> None:
     result = _run_mypy(src, cache, {"NUMTY_STRICT": "1"})
     assert result.returncode == 1, result.stdout
     assert "numty-unsolved" in result.stdout, result.stdout
-    # The median birth is on line 9 (the `s = ... / np.median(q)` line).
+    # Issue #183: np.median is now solved (it used to bail, birthing an
+    # unsolved on line 9). The unsolved is now the `s + mask` add on
+    # line 11, whose broadcast fails (7 vs 5) so the result is unchecked.
     lines = [
         int(line.split(":")[1])
         for line in result.stdout.splitlines()
         if "numty-unsolved" in line
     ]
-    assert 9 in lines, result.stdout
+    assert 11 in lines, result.stdout
 
 
 def test_no_strict_noise_by_default(tmp_path: Path) -> None:

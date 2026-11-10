@@ -220,7 +220,7 @@ def test_generic_calls_agree_with_the_signature(tmp_path: Path) -> None:
     # `capture` (the caller's N+1 is also the callee's dim) are unknown.
     assert stats["agree: exact shape"] == 4 * sizes, stats
     assert stats["agree: partial or no claim"] + stats.get(
-        "numpy raises, not flagged (allowed)", 0
+        "numpy raises, not flagged (unprovable)", 0
     ) == 2 * sizes, stats
 
 
@@ -321,7 +321,7 @@ def test_known_gaps_are_narrow() -> None:
     import re
 
     for kind, pattern, why in d.KNOWN_GAPS:
-        assert kind in {"WRONG_SHAPE", "WRONG_DTYPE", "CLAIM_ON_ERROR", "FALSE_POSITIVE"}
+        assert kind in {"WRONG_SHAPE", "WRONG_DTYPE", "CLAIM_ON_ERROR", "MISSED_ERROR", "FALSE_POSITIVE"}
         assert why
         assert not re.search(pattern, "np.zeros((2, 3)) + np.zeros((2, 3))")
 
@@ -372,6 +372,26 @@ REGRESSIONS: list[tuple[str, bool]] = [
     # permute_dims took `axes=` by keyword as no axes, and reversed.
     ("np.permute_dims(np.ones((5, 4, 2, 2), dtype=np.float16), axes=(1, 2, 0, 3))", False),
     ("np.permute_dims(np.ones((3, 3, 4), dtype=np.int32), axes=(0, 2, 1))", False),
+    # #183: symbolic mode never failed on a missed error. Sampling the
+    # "numpy raises, not flagged" bucket found these assignment-proof
+    # rejections (literal axis out of range for a known rank, rank
+    # outside the supported range, literal clashes): numty now flags them.
+    ("np.array_split(np.ones((5, 7, 7)), 3, axis=3)", True),
+    ("np.amax(np.ones((5,)), axis=-2)", True),
+    ("np.median(np.ones((7,)), axis=-2)", True),
+    ("np.array_split(np.ones((3,)), 2, axis=1)", True),
+    ("np.ones((5,)).trace()", True),
+    ("np.take(np.ones((5, 5)), [[0], [0]], axis=-3)", True),
+    ("np.diag(np.ones((3, 2, 3)))", True),
+    ("np.count_nonzero(np.ones((4, 3)), axis=-3)", True),
+    ("np.diagonal(np.ones((3,)))", True),
+    ("np.corrcoef(np.ones((5, 5, 5)))", True),
+    ("np.cov(np.zeros((5, 6, 5, 2)))", True),
+    ("np.dstack([np.ones((4, 3)), np.ones((2,))])", True),
+    ("np.where(np.zeros((7, 4)), np.ones((7, 3, 2)), np.ones((2, 3)))", True),
+    ("np.cross(np.ones((5, 7, 2)), np.ones((3, 4)))", True),
+    ("np.amin(np.ones((5,)), axis=1)", True),
+    ("np.ptp(np.ones((5,)), axis=1)", True),
 ]
 
 

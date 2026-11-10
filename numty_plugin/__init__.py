@@ -1620,6 +1620,10 @@ class NumtyPlugin(Plugin):
             return dot_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "repeat":
             return repeat_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "trace":
+            return trace_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "diagonal":
+            return diagonal_method_hook
         return None
 
 
@@ -4942,10 +4946,25 @@ def _take_solve(
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
+    # Issue #183: validate the axis before the indices, so a literal
+    # axis out of range for a known rank fails even when the index is
+    # too complex to solve (e.g. nested [[0], [0]] bails on indices).
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if isinstance(axis, list):
+        if len(axis) != 1 or not isinstance(axis[0], int):
+            ctx.api.fail("np.take axis must be an integer or None", ctx.context, code=NUMTY_AXIS)
+            return ctx.default_return_type
+        if _normalize_axis_0d(axis[0], len(dims)) is None:
+            ctx.api.fail(
+                f"take axis {axis[0]} is out of range for {len(dims)} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
+            return ctx.default_return_type
     idx_dims, is_scalar = _take_indices(pair)
     if idx_dims is None:
         return ctx.default_return_type
-    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     if axis == "absent" or axis == "none":
         # axis=None flattens: the result is exactly the index shape,
         # or a scalar for a scalar index.
@@ -4960,6 +4979,9 @@ def _take_solve(
             scalar = _scalar_of_dtype(dtype)
             return scalar if scalar is not None else ctx.default_return_type
         return _ndarray_type(ctx, idx_dims, dtype)
+    if axis is None:
+        # Unknown axis (e.g. symbolic): cannot judge, keep the stubs.
+        return ctx.default_return_type
     if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
         ctx.api.fail("np.take axis must be an integer or None", ctx.context, code=NUMTY_AXIS)
         return ctx.default_return_type
@@ -5172,6 +5194,104 @@ def fliplr_function_hook(ctx: FunctionContext) -> Type:
 
 def flipud_function_hook(ctx: FunctionContext) -> Type:
     return _same_shape_hook(ctx, "flipud", first="m", axis_index=None, rank_min=1)
+
+
+def _rank_check_hook(
+    ctx: FunctionContext | MethodContext,
+    array: Type,
+    op: str,
+    min_rank: int | None = None,
+    max_rank: int | None = None,
+) -> bool:
+    """True when `array` has a known rank in [min_rank, max_rank].
+
+    Issue #183: trace/diag/diagonal/corrcoef with a known rank outside
+    their supported range always raise, so they fail. Anything else
+    (unknown rank, working rank) bails to the stubs.
+    """
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        parts = _mixed_parts(array, partner=True)
+    if parts is None:
+        return True
+    dims, _ = parts
+    if _has_unpack(dims):
+        return True
+    ndim = len(dims)
+    if min_rank is not None and ndim < min_rank:
+        ctx.api.fail(
+            f"{op} requires at least {min_rank} dimensions, got {ndim} "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return False
+    if max_rank is not None and ndim > max_rank:
+        ctx.api.fail(
+            f"{op} requires at most {max_rank} dimensions, got {ndim} "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return False
+    return True
+
+
+def trace_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    if not _rank_check_hook(ctx, pairs[0][0], "trace", min_rank=2):
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def trace_method_hook(ctx: MethodContext) -> Type:
+    if not _rank_check_hook(ctx, ctx.type, "trace", min_rank=2):
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def diag_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    if not _rank_check_hook(ctx, pairs[0][0], "diag", min_rank=1, max_rank=2):
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def diagonal_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    if not _rank_check_hook(ctx, pairs[0][0], "diagonal", min_rank=2):
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def diagonal_method_hook(ctx: MethodContext) -> Type:
+    if not _rank_check_hook(ctx, ctx.type, "diagonal", min_rank=2):
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def corrcoef_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    if not _rank_check_hook(ctx, pairs[0][0], "corrcoef", max_rank=2):
+        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def cov_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    if not _rank_check_hook(ctx, pairs[0][0], "cov", max_rank=2):
+        return ctx.default_return_type
+    return ctx.default_return_type
 
 
 def roll_function_hook(ctx: FunctionContext) -> Type:
@@ -6426,6 +6546,76 @@ def split_function_hook(ctx: FunctionContext) -> Type:
     return ctx.api.named_generic_type("builtins.list", [element])
 
 
+def array_split_function_hook(ctx: FunctionContext) -> Type:
+    """array_split: like split, but unequal division is allowed.
+
+    Issue #183: array_split with a literal axis out of range for a known
+    rank always raises, so it must fail even though the section sizes
+    are unknowable (unequal sections mint an unknown). Otherwise bail
+    to the stubs, preserving current silence on working code.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    found_axis = _hook_pair(ctx, "ary", "axis", 2)
+    found_sections = _hook_pair(ctx, "ary", "indices_or_sections", 1)
+    if found_axis == "incomplete" or found_sections == "incomplete":
+        return ctx.default_return_type
+    assert not isinstance(found_axis, str) and not isinstance(found_sections, str)
+    axis = 0
+    if found_axis is not None:
+        folded = _int_or_none(found_axis)
+        if folded == "bail" or folded is None:
+            return ctx.default_return_type
+        assert isinstance(folded, int)
+        axis = folded
+    target = _normalize_axis(axis, len(dims))
+    if target is None:
+        ctx.api.fail(
+            f"array_split axis {axis} is out of range for {len(dims)} dimensions "
+            f"(shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out = list(dims)
+    if found_sections is None:
+        return ctx.default_return_type
+    sections = _int_or_none(found_sections)
+    if isinstance(sections, int):
+        if sections < 1:
+            ctx.api.fail(
+                f"array_split sections must be positive, got {sections}",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
+        # Unequal division is allowed, so the section length is
+        # unknowable even for literal dims: mint an unknown.
+        out[target] = _fresh_unknown(ctx, "array_split", target)
+    elif sections == "bail":
+        seq = _fft_seq_arg(found_sections)
+        if seq == "bail" or isinstance(seq, str):
+            proper = get_proper_type(found_sections[0])
+            if (
+                isinstance(proper, Instance)
+                and proper.type.fullname == "builtins.int"
+            ) or isinstance(proper, TypeVarType):
+                out[target] = _fresh_unknown(ctx, "array_split", target)
+            else:
+                return ctx.default_return_type
+        else:
+            out[target] = _fresh_unknown(ctx, "array_split", target)
+    else:
+        return ctx.default_return_type
+    element = _ndarray_type(ctx, out, dtype)
+    return ctx.api.named_generic_type("builtins.list", [element])
+
+
 def _select_index_elem(
     ctx: FunctionContext, op: str, index: int
 ) -> Type | None:
@@ -6463,6 +6653,41 @@ def nonzero_function_hook(ctx: FunctionContext) -> Type:
     if not pairs:
         return ctx.default_return_type
     return _nonzero_like(ctx, "nonzero", pairs[0][0])
+
+
+def count_nonzero_function_hook(ctx: FunctionContext) -> Type:
+    """count_nonzero: axis must be in range for a known rank (issue #183).
+
+    The count itself stays with the stubs (int vs array-of-ints depends
+    on axis=None); only a literal axis out of range for a known rank
+    always raises, so it fails. Anything else bails, preserving current
+    silence on working code. Like reductions, axis 0/-1 on a 0-d array
+    is allowed.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
+    if axis is None:
+        return ctx.default_return_type
+    if axis in ("absent", "none"):
+        return ctx.default_return_type
+    if not isinstance(axis, list):
+        return ctx.default_return_type
+    for ax in axis:
+        if _normalize_axis_0d(ax, len(dims)) is None:
+            ctx.api.fail(
+                f"count_nonzero axis {ax} is out of range for {len(dims)} dimensions "
+                f"(shape {_dims_str(dims)})",
+                ctx.context,
+                code=NUMTY_AXIS,
+            )
+            return ctx.default_return_type
+    return ctx.default_return_type
 
 
 def flatnonzero_function_hook(ctx: FunctionContext) -> Type:
@@ -8396,11 +8621,12 @@ def _solve_expand_dims(
 def _reduction_out_dtype(
     ctx: FunctionContext | MethodContext, op: str, dtype: Type
 ) -> Type | None:
-    """Output dtype for sum/prod/mean/std/var/max/min (issue #61).
+    """Output dtype for sum/prod/mean/std/var/max/min/median (issue #61).
 
-    sum/prod of bool/int -> int64 (uint -> uint64); mean/std/var of
-    bool/int/uint -> float64; std/var of complex -> real float; max/min
-    keep the input dtype. Anything else bails.
+    sum/prod of bool/int -> int64 (uint -> uint64); mean/std/var/median
+    of bool/int/uint -> float64; std/var of complex -> real float;
+    max/min/median keep the input dtype (median of ints promotes like
+    mean). Anything else bails.
     """
     name = _dtype_fullname(dtype)
     if name is None:
@@ -8420,7 +8646,7 @@ def _reduction_out_dtype(
         if kind in ("b", "i"):
             return _construct_dtype(ctx, "numpy.int64")
         return dtype
-    if base in ("mean", "std", "var"):
+    if base in ("mean", "std", "var", "median"):
         if kind in ("b", "i", "u"):
             return _construct_dtype(ctx, "numpy.float64")
         if kind == "c" and base in ("std", "var"):
@@ -9497,6 +9723,10 @@ def _concat_merge(
 ) -> Type:
     """Merge rank-checked items along norm; mismatches fail with op."""
     out = list(items[0][0])
+    # Issue #183: fail on any provably-different dim even when an
+    # earlier dim is only possibly different (e.g. dstack of (P, 3)
+    # with (2,): P vs 1 could match, but 3 vs 2 never can). Scan all
+    # dims for a hard mismatch first, bailing only when none exists.
     for dims, _ in items[1:]:
         for i, d in enumerate(dims):
             if i != norm and not _dim_eq(out[i], d):
@@ -9510,6 +9740,9 @@ def _concat_merge(
                         code=NUMTY_SHAPE,
                     )
                     return ctx.default_return_type
+    for dims, _ in items[1:]:
+        for i, d in enumerate(dims):
+            if i != norm and not _dim_eq(out[i], d):
                 return ctx.default_return_type
         if isinstance(out[norm], int) and isinstance(dims[norm], int):
             out[norm] = out[norm] + dims[norm]
@@ -10497,6 +10730,21 @@ def _reduction_types(
         return _solve_reduction_unpack(
             ctx, *split, dtype, axis, keepdims, has_dtype, out_dtype, op=op
         )
+    # Issue #183: validate a literal axis before the dtype bail, so a
+    # known-rank axis error fails even when the dtype is unsolved
+    # (median before its dtype table, datetime mean, ...).
+    if isinstance(axis, list):
+        strict_0d = op in ("mean", "var", "std")
+        for ax in axis:
+            norm = _normalize_axis(ax, len(dims)) if strict_0d else _normalize_axis_0d(ax, len(dims))
+            if norm is None:
+                ctx.api.fail(
+                    f"{op} axis {ax} is out of range for {len(dims)} dimensions "
+                    f"(shape {_dims_str(dims)})",
+                    ctx.context,
+                    code=NUMTY_AXIS,
+                )
+                return ctx.default_return_type
     out_dtype = _reduction_out_dtype(ctx, op, dtype)
     if out_dtype is None:
         # mean(datetime) always raises (UFuncTypeError, issue #144):
@@ -14167,6 +14415,27 @@ def cross_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     vec_a, vec_b = dims_a[norm_a], dims_b[norm_b]
+    # Issue #183: fail on a literal vector size that can never be 3,
+    # even when the other side is symbolic (e.g. 2 vs P, where 2 != 3
+    # always raises whatever P is). Both-symbolic (N vs N) stays silent:
+    # N could be 3, and cross-position conflicts (N must be 3 for the
+    # vector but 2 for the broadcast) need follow-up reasoning.
+    if isinstance(vec_a, int) and vec_a != 3:
+        ctx.api.fail(
+            f"cross requires 3-dimensional vectors, got {vec_a} and {_dim_str(vec_b)} "
+            f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if isinstance(vec_b, int) and vec_b != 3:
+        ctx.api.fail(
+            f"cross requires 3-dimensional vectors, got {_dim_str(vec_a)} and {vec_b} "
+            f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
     if not isinstance(vec_a, int) or not isinstance(vec_b, int):
         return ctx.default_return_type
     if vec_a != 3 or vec_b != 3:
@@ -14415,6 +14684,48 @@ def _broadcast_shapes(
     ctx: FunctionContext | MethodContext, shapes: list[list[int | Type]], op: str
 ) -> list[int | Type] | None:
     """Broadcast known shapes pairwise; None (after failing) on conflict."""
+    # Issue #183: check literal clashes across *all* shapes first. Pairwise
+    # merging mints an unknown for an unprovable mismatch (P vs 2, where P
+    # could be 2) and loses the literal, hiding a later hard clash (2 vs 3
+    # from two other operands). Two literals that are both not 1 and differ
+    # at the same trailing position can never broadcast, whatever the
+    # TypeVars do.
+    if shapes:
+        max_rank = max(len(s) for s in shapes)
+        for k in range(max_rank):
+            seen: dict[int, list[int]] = {}
+            for idx, s in enumerate(shapes):
+                if k < len(s):
+                    d = s[len(s) - 1 - k]
+                    if isinstance(d, int) and d != 1:
+                        seen.setdefault(d, []).append(idx)
+            if len(seen) > 1:
+                # Report the first two differing literals in shape order,
+                # matching the pairwise message style ("trailing axis 0:
+                # 3 vs 2") so existing expectations keep passing.
+                first: int | None = None
+                second: int | None = None
+                for s in shapes:
+                    if k < len(s):
+                        d = s[len(s) - 1 - k]
+                        if isinstance(d, int) and d != 1:
+                            if first is None:
+                                first = d
+                            elif d != first:
+                                second = d
+                                break
+                assert first is not None and second is not None
+                if len(shapes) == 2:
+                    shape_part = f"{_dims_str(shapes[0])} vs {_dims_str(shapes[1])}"
+                else:
+                    shape_part = ", ".join(_dims_str(s) for s in shapes)
+                ctx.api.fail(
+                    f"{op} shapes disagree: broadcast shapes disagree at trailing axis {k}: "
+                    f"{first} vs {second} (shapes {shape_part})",
+                    ctx.context,
+                    code=NUMTY_BROADCAST,
+                )
+                return None
     dims: list[int | Type] = []
     first = True
     for other in shapes:
@@ -15710,14 +16021,18 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "around": round_function_hook,
             "all": partial(allany_function_hook, op="all"),
             "any": partial(allany_function_hook, op="any"),
+            "amax": partial(reduction_function_hook, op="amax"),
+            "amin": partial(reduction_function_hook, op="amin"),
             "clip": clip_function_hook,
             "cumprod": partial(cumsum_function_hook, op="cumprod"),
             "cumsum": partial(cumsum_function_hook, op="cumsum"),
+            "diagonal": diagonal_function_hook,
             "max": partial(reduction_function_hook, op="max"),
             "mean": partial(reduction_function_hook, op="mean"),
             "min": partial(reduction_function_hook, op="min"),
             "nonzero": nonzero_function_hook,
             "prod": partial(reduction_function_hook, op="prod"),
+            "ptp": partial(reduction_function_hook, op="ptp"),
             "ravel": ravel_function_hook,
             "repeat": repeat_function_hook,
             "reshape": reshape_function_hook,
@@ -15726,6 +16041,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "std": partial(reduction_function_hook, op="std"),
             "sum": partial(reduction_function_hook, op="sum"),
             "take": take_function_hook,
+            "trace": trace_function_hook,
             "transpose": transpose_function_hook,
             "swapaxes": swapaxes_function_hook,
             "matrix_transpose": matrix_transpose_function_hook,
@@ -15761,7 +16077,9 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "argwhere": argwhere_function_hook,
             "convolve": convolve_function_hook,
             "correlate": correlate_function_hook,
+            "count_nonzero": count_nonzero_function_hook,
             "cross": cross_function_hook,
+            "diagonal": diagonal_function_hook,
             "flatnonzero": flatnonzero_function_hook,
             "full": full_function_hook,
             "full_like": like_function_hook,
@@ -15776,6 +16094,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "swapaxes": swapaxes_function_hook,
             "matrix_transpose": matrix_transpose_function_hook,
             "tensordot": tensordot_function_hook,
+            "trace": trace_function_hook,
             "zeros_like": like_function_hook,
         },
         "numpy._core.function_base": {
@@ -15814,6 +16133,9 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "angle": angle_function_hook,
             "average": average_function_hook,
             "copy": copy_function_hook,
+            "corrcoef": corrcoef_function_hook,
+            "cov": cov_function_hook,
+            "diag": diag_function_hook,
             "diff": diff_function_hook,
             "flip": flip_function_hook,
             "gradient": gradient_function_hook,
@@ -15843,6 +16165,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "nanvar": partial(reduction_function_hook, op="nanvar"),
         },
         "numpy.lib._shape_base_impl": {
+            "array_split": array_split_function_hook,
             "column_stack": column_stack_function_hook,
             "dstack": dstack_function_hook,
             "expand_dims": expand_dims_function_hook,
@@ -15856,6 +16179,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "sliding_window_view": sliding_window_view_function_hook,
         },
         "numpy.lib._twodim_base_impl": {
+            "diag": diag_function_hook,
+            "diagonal": diagonal_function_hook,
             "eye": eye_function_hook,
             "fliplr": fliplr_function_hook,
             "flipud": flipud_function_hook,

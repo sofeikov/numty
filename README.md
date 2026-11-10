@@ -116,7 +116,11 @@ error: Incompatible return value type (got "ndarray[tuple[batch, heads, seq, seq
   NumPy rejects, 17,160 were reported before running. Three cases hit
   documented gaps in NumPy's own stubs and 137 hit the empty-axis
   limit on symbolic subtraction (see
-  [Checked against numpy](#checked-against-numpy)).
+  [Checked against numpy](#checked-against-numpy)). Rejections are now
+  split into flagged vs unprovable (e.g. `N` vs `M`, which could
+  coincide): assignment-proof misses fail as `MISSED_ERROR` (0 in the
+  suite; `cross`/`repeat`/`vdot`/stacking cross-position, helpers,
+  formulas and `*Ts` need follow-up).
 - **It finds seeded bugs.** [bench/](bench) hides 18 realistic
   mistakes in MLP-training and math-library code; 17 are reported
   before anything runs. The 18th passes a bare `np.ndarray`, so there
@@ -1187,14 +1191,25 @@ and compares. A run fails when
 
 - numty claims a shape or dtype numpy does not produce,
 - numpy rejects an expression that numty gave a fully concrete type
-  with no diagnostic, or
+  with no diagnostic (concrete mode, `CLAIM_ON_ERROR`),
+- numpy rejects a symbolic expression under *every* small size
+  assignment (1-3 for each name, including equal names) with no
+  diagnostic (issue #183, `MISSED_ERROR`), or
 - numty reports a shape error on an expression numpy accepts. For a
   symbolic expression that means accepts at every set of sizes tried:
   an error there is about sizes in general (see the limitation on
   symbolic errors below).
 
-Losing precision (an unknown dim, `Any`, a bail) never fails: only a
-wrong answer does. Two modes share the machinery. Concrete mode builds
+Losing precision (an unknown dim, `Any`, a bail) is allowed only when
+the rejection is unprovable: some size assignment would make the
+expression work (`F64[N] + F64[M]` with `N == M`). An assignment-proof
+rejection is a miss, not prudence. `SIZE_ASSIGNMENTS` keeps names
+distinct (and never 1) by design, so it cannot make this distinction
+on its own; the oracle probes 1-3 including equal names separately.
+TypeError dtype loops, `cross` with a repeated name, `repeat`/`vdot`/
+stacking with cross-position same-name conflicts, and helpers /
+formulas / `*Ts` (which need formula/prefix reasoning) stay
+unprovable for now as follow-up. Two modes share the machinery. Concrete mode builds
 operands with literal shapes across twelve dtypes. Symbolic mode wraps
 the expression in a function with `F64[N, M]`-style parameters, calls
 it with fixed sizes, and substitutes them into the revealed dims, so
@@ -1244,9 +1259,11 @@ CLAIM_ON_ERROR: np.searchsorted(np.ones((3, 3)), np.ones((6,)))
 What it does not cover: wrong answers that come from numpy's own stubs
 on calls numty does not hook are listed in `KNOWN_GAPS` in
 `tests/differential.py` rather than failed (two entries today:
-`cov`/`corrcoef` and `digitize` on complex input), and in symbolic
-mode an expression numpy rejects is never counted against numty,
-since distinct dims are unprovable by design. A symbolic dim that
+`cov`/`corrcoef` and `digitize` on complex input). In symbolic mode,
+rejections that survive every small size assignment are split from the
+unprovable bucket (`numpy raises, not flagged (unprovable)`) and fail
+as `MISSED_ERROR`; the remaining unprovable (e.g. `N` vs `M`, reshape
+with `-1` on a size that could divide) stays allowed by design. A symbolic dim that
 comes out negative at the sizes used (`N-1` on an empty axis) is
 counted as a known gap too; see the limitation on symbolic
 subtraction below.
