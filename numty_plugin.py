@@ -11880,7 +11880,510 @@ def linalg_function_hook(ctx: FunctionContext, op: str) -> Type:
         return _linalg_lstsq(ctx)
     if op == "norm":
         return _linalg_norm(ctx)
+    if op == "det":
+        return _linalg_det(ctx)
+    if op == "slogdet":
+        return _linalg_slogdet(ctx)
+    if op == "qr":
+        return _linalg_qr(ctx)
+    if op == "matrix_power":
+        return _linalg_matrix_power(ctx)
+    if op == "cond":
+        return _linalg_cond(ctx)
+    if op == "tensorsolve":
+        return _linalg_tensorsolve(ctx)
     return ctx.default_return_type
+
+
+def _linalg_det(ctx: FunctionContext) -> Type:
+    """linalg.det: square (..., N, N) in, scalar/batch out."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    if len(dims) < 2:
+        ctx.api.fail(
+            f"linalg.det requires a square (..., N, N) array, got shape "
+            f"{_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if not _check_dim_eq(
+        ctx,
+        dims[-1],
+        dims[-2],
+        f"linalg.det requires a square (..., N, N) array, got shape "
+        f"{_dims_str(dims)}",
+    ):
+        return ctx.default_return_type
+    if _reject_float16_linalg(ctx, dtype, "det"):
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, _size = ks
+    if kind in ("i", "u", "b"):
+        out_dtype = _construct_dtype(ctx, "numpy.float64")
+    elif kind in ("f", "c"):
+        out_dtype = dtype
+    else:
+        return ctx.default_return_type
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _maybe_scalar(ctx, dims[:-2], out_dtype)
+
+
+def _linalg_slogdet(ctx: FunctionContext) -> Type:
+    """linalg.slogdet: square in, (sign, logabsdet) tuple out."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    if len(dims) < 2:
+        ctx.api.fail(
+            f"linalg.slogdet requires a square (..., N, N) array, got shape "
+            f"{_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if not _check_dim_eq(
+        ctx,
+        dims[-1],
+        dims[-2],
+        f"linalg.slogdet requires a square (..., N, N) array, got shape "
+        f"{_dims_str(dims)}",
+    ):
+        return ctx.default_return_type
+    if _reject_float16_linalg(ctx, dtype, "slogdet"):
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, size = ks
+    if kind in ("i", "u", "b"):
+        sign_dtype = _construct_dtype(ctx, "numpy.float64")
+        log_dtype = _construct_dtype(ctx, "numpy.float64")
+    elif kind == "f":
+        sign_dtype = dtype
+        log_dtype = dtype
+    elif kind == "c":
+        sign_dtype = dtype
+        log_name = _linalg_real_name(kind, size)
+        if log_name is None:
+            return ctx.default_return_type
+        log_dtype = _linalg_dtype(ctx, dtype, log_name)
+    else:
+        return ctx.default_return_type
+    if sign_dtype is None or log_dtype is None:
+        return ctx.default_return_type
+    batch = dims[:-2]
+    sign = _maybe_scalar(ctx, batch, sign_dtype)
+    logabs = _maybe_scalar(ctx, batch, log_dtype)
+    return _linalg_tuple(ctx, [sign, logabs])
+
+
+def _linalg_qr(ctx: FunctionContext) -> Type:
+    """linalg.qr: rank>=2 in, (Q, R) tuple (or R / raw tuple) out."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    if len(dims) < 2:
+        ctx.api.fail(
+            f"linalg.qr requires at least 2 dimensions, got shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    mode_pair = _formal_pair(ctx, "mode")
+    if mode_pair is None:
+        mode = "reduced"
+    else:
+        mode = _string_value(mode_pair[0])
+        if mode is None:
+            return ctx.default_return_type
+    if mode in ("full", "f"):
+        mode = "reduced"
+    elif mode in ("economic", "e"):
+        mode = "r"
+    if mode not in ("reduced", "complete", "r", "raw"):
+        return ctx.default_return_type
+    if _reject_float16_linalg(ctx, dtype, "qr"):
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, _size = ks
+    if kind in ("i", "u", "b"):
+        out_dtype = _construct_dtype(ctx, "numpy.float64")
+    elif kind in ("f", "c"):
+        out_dtype = dtype
+    else:
+        return ctx.default_return_type
+    if out_dtype is None:
+        return ctx.default_return_type
+    batch = dims[:-2]
+    rows, cols = dims[-2], dims[-1]
+    if mode == "complete":
+        return _linalg_tuple(
+            ctx,
+            [
+                _ndarray_type(ctx, [*batch, rows, rows], out_dtype),
+                _ndarray_type(ctx, [*batch, rows, cols], out_dtype),
+            ],
+        )
+    if not isinstance(rows, int) or not isinstance(cols, int):
+        return ctx.default_return_type
+    inner = min(rows, cols)
+    if mode == "reduced":
+        return _linalg_tuple(
+            ctx,
+            [
+                _ndarray_type(ctx, [*batch, rows, inner], out_dtype),
+                _ndarray_type(ctx, [*batch, inner, cols], out_dtype),
+            ],
+        )
+    if mode == "r":
+        return _ndarray_type(ctx, [*batch, inner, cols], out_dtype)
+    return _linalg_tuple(
+        ctx,
+        [
+            _ndarray_type(ctx, [*batch, cols, rows], out_dtype),
+            _ndarray_type(ctx, [*batch, inner], out_dtype),
+        ],
+    )
+
+
+def _linalg_matrix_power(ctx: FunctionContext) -> Type:
+    """linalg.matrix_power: square (..., N, N) in, same shape out."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    if len(dims) < 2:
+        ctx.api.fail(
+            f"linalg.matrix_power requires a square (..., N, N) array, got shape "
+            f"{_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if not _check_dim_eq(
+        ctx,
+        dims[-1],
+        dims[-2],
+        f"linalg.matrix_power requires a square (..., N, N) array, got shape "
+        f"{_dims_str(dims)}",
+    ):
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    kind, _size = ks
+    out_dtype: Type | None = dtype
+    if kind in ("i", "u", "b"):
+        n_pair = _formal_pair(ctx, "n")
+        if n_pair is None:
+            return ctx.default_return_type
+        n_value = _fold_single(n_pair)
+        if n_value is None:
+            return ctx.default_return_type
+        if n_value < 0:
+            out_dtype = _construct_dtype(ctx, "numpy.float64")
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, dims, out_dtype)
+
+
+def _linalg_cond(ctx: FunctionContext) -> Type:
+    """linalg.cond: rank>=2 in, scalar/batch real out (not square)."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    if len(dims) < 2:
+        ctx.api.fail(
+            f"linalg.cond requires at least 2 dimensions, got shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    if _reject_float16_linalg(ctx, dtype, "cond"):
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return ctx.default_return_type
+    name = _linalg_real_name(*ks)
+    if name is None:
+        return ctx.default_return_type
+    out_dtype = _linalg_dtype(ctx, dtype, name)
+    if out_dtype is None:
+        return ctx.default_return_type
+    return _maybe_scalar(ctx, dims[:-2], out_dtype)
+
+
+def _linalg_tensorsolve(ctx: FunctionContext) -> Type:
+    """linalg.tensorsolve: prod(a[b.ndim:]) == prod(a[:b.ndim]), shape Q out."""
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    part_a = _ndarray_parts(pairs[0][0])
+    part_b = _ndarray_parts(pairs[1][0])
+    if part_a is None or part_b is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = part_a
+    dims_b, dtype_b = part_b
+    if _has_unpack(dims_a) or _has_unpack(dims_b):
+        return ctx.default_return_type
+    axes_pair = _formal_pair(ctx, "axes")
+    if axes_pair is not None and not _is_none_type(axes_pair[0]):
+        return ctx.default_return_type
+    an, bn = len(dims_a), len(dims_b)
+    if bn == 0:
+        oldshape: list[int | Type] = list(dims_a)
+    elif an - bn == 0:
+        oldshape = list(dims_a)
+    else:
+        oldshape = list(dims_a[-(an - bn) :])
+    if any(not isinstance(d, int) for d in dims_a) or any(
+        not isinstance(d, int) for d in dims_b
+    ):
+        return ctx.default_return_type
+    prod = 1
+    for d in oldshape:
+        assert isinstance(d, int)
+        prod *= d
+    size_a = 1
+    for d in dims_a:
+        assert isinstance(d, int)
+        size_a *= d
+    if size_a != prod * prod:
+        ctx.api.fail(
+            f"linalg.tensorsolve requires prod(a.shape[b.ndim:]) == "
+            f"prod(a.shape[:b.ndim]) (shapes {_dims_str(dims_a)} vs "
+            f"{_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    prod_b = 1
+    for d in dims_b:
+        assert isinstance(d, int)
+        prod_b *= d
+    if prod_b != prod:
+        ctx.api.fail(
+            f"linalg.tensorsolve inner dimensions disagree: {prod_b} vs "
+            f"{prod} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    dtype = _linalg_solve_dtype(ctx, dtype_a, dtype_b)
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, oldshape, dtype)
+
+
+def _cross_int_value(
+    ctx: FunctionContext, name: str, default: int
+) -> int | None:
+    """Folded int for a cross axis formal (default when absent), None to bail."""
+    pair = _formal_pair(ctx, name)
+    if pair is None:
+        return default
+    value = _fold_single(pair)
+    return value
+
+
+def cross_function_hook(ctx: FunctionContext) -> Type:
+    """np.cross: broadcast (arrays of) 3-vectors, 3-vector size checked."""
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    part_a = _ndarray_parts(pairs[0][0])
+    part_b = _ndarray_parts(pairs[1][0])
+    if part_a is None or part_b is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = part_a
+    dims_b, dtype_b = part_b
+    if _has_unpack(dims_a) or _has_unpack(dims_b):
+        return ctx.default_return_type
+    if not dims_a or not dims_b:
+        ctx.api.fail(
+            f"cross requires at least 1 dimension, got shapes {_dims_str(dims_a)} "
+            f"vs {_dims_str(dims_b)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is not None and not _is_none_type(axis_pair[0]):
+        axis_value = _fold_single(axis_pair)
+        if axis_value is None:
+            return ctx.default_return_type
+        axisa = axisb = axisc = axis_value
+    else:
+        axisa = _cross_int_value(ctx, "axisa", -1)
+        axisb = _cross_int_value(ctx, "axisb", -1)
+        axisc = _cross_int_value(ctx, "axisc", -1)
+        if axisa is None or axisb is None or axisc is None:
+            return ctx.default_return_type
+    assert isinstance(axisa, int) and isinstance(axisb, int) and isinstance(axisc, int)
+    norm_a = _normalize_axis(axisa, len(dims_a))
+    if norm_a is None:
+        ctx.api.fail(
+            f"cross axisa {axisa} is out of range for {len(dims_a)} dimensions "
+            f"(shape {_dims_str(dims_a)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    norm_b = _normalize_axis(axisb, len(dims_b))
+    if norm_b is None:
+        ctx.api.fail(
+            f"cross axisb {axisb} is out of range for {len(dims_b)} dimensions "
+            f"(shape {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    vec_a, vec_b = dims_a[norm_a], dims_b[norm_b]
+    if not isinstance(vec_a, int) or not isinstance(vec_b, int):
+        return ctx.default_return_type
+    if vec_a != 3 or vec_b != 3:
+        ctx.api.fail(
+            f"cross requires 3-dimensional vectors, got {vec_a} and {vec_b} "
+            f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    wo_a = [d for i, d in enumerate(dims_a) if i != norm_a]
+    wo_b = [d for i, d in enumerate(dims_b) if i != norm_b]
+    bcast, cause = _broadcast_result(wo_a, wo_b, ctx)
+    if cause is not None:
+        ctx.api.fail(f"cross {cause}", ctx.context, code=NUMTY_BROADCAST)
+        return ctx.default_return_type
+    assert bcast is not None
+    out = [*bcast, 3]
+    norm_c = _normalize_axis(axisc, len(out))
+    if norm_c is None:
+        ctx.api.fail(
+            f"cross axisc {axisc} is out of range for {len(out)} dimensions "
+            f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out.insert(norm_c, out.pop())
+    dtype = _promote_all(ctx, [dtype_a, dtype_b])
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out, dtype)
+
+
+def linalg_cross_function_hook(ctx: FunctionContext) -> Type:
+    """np.linalg.cross: single-axis variant of np.cross."""
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    part_a = _ndarray_parts(pairs[0][0])
+    part_b = _ndarray_parts(pairs[1][0])
+    if part_a is None or part_b is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = part_a
+    dims_b, dtype_b = part_b
+    if _has_unpack(dims_a) or _has_unpack(dims_b):
+        return ctx.default_return_type
+    if not dims_a or not dims_b:
+        ctx.api.fail(
+            f"linalg.cross requires at least 1 dimension, got shapes "
+            f"{_dims_str(dims_a)} vs {_dims_str(dims_b)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    axis_value = _cross_int_value(ctx, "axis", -1)
+    if axis_value is None:
+        return ctx.default_return_type
+    norm_a = _normalize_axis(axis_value, len(dims_a))
+    if norm_a is None:
+        ctx.api.fail(
+            f"linalg.cross axis {axis_value} is out of range for {len(dims_a)} "
+            f"dimensions (shape {_dims_str(dims_a)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    norm_b = _normalize_axis(axis_value, len(dims_b))
+    if norm_b is None:
+        ctx.api.fail(
+            f"linalg.cross axis {axis_value} is out of range for {len(dims_b)} "
+            f"dimensions (shape {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    vec_a, vec_b = dims_a[norm_a], dims_b[norm_b]
+    if not isinstance(vec_a, int) or not isinstance(vec_b, int):
+        return ctx.default_return_type
+    if vec_a != 3 or vec_b != 3:
+        ctx.api.fail(
+            f"linalg.cross requires 3-dimensional vectors, got {vec_a} and {vec_b} "
+            f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    wo_a = [d for i, d in enumerate(dims_a) if i != norm_a]
+    wo_b = [d for i, d in enumerate(dims_b) if i != norm_b]
+    bcast, cause = _broadcast_result(wo_a, wo_b, ctx)
+    if cause is not None:
+        ctx.api.fail(f"linalg.cross {cause}", ctx.context, code=NUMTY_BROADCAST)
+        return ctx.default_return_type
+    assert bcast is not None
+    out = [*bcast, 3]
+    norm_c = _normalize_axis(axis_value, len(out))
+    if norm_c is None:
+        ctx.api.fail(
+            f"linalg.cross axis {axis_value} is out of range for {len(out)} "
+            f"dimensions (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return ctx.default_return_type
+    out.insert(norm_c, out.pop())
+    dtype = _promote_all(ctx, [dtype_a, dtype_b])
+    if dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out, dtype)
 
 
 _UFUNC_KEEP = frozenset(
@@ -13266,6 +13769,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "argwhere": argwhere_function_hook,
             "convolve": convolve_function_hook,
             "correlate": correlate_function_hook,
+            "cross": cross_function_hook,
             "flatnonzero": flatnonzero_function_hook,
             "full": full_function_hook,
             "full_like": like_function_hook,
@@ -13374,18 +13878,25 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             # numpy.linalg.tensordot is np.tensordot with keyword-only
             # axes; numpy.linalg.outer (1-D only) is deliberately absent.
             "tensordot": tensordot_function_hook,
+            "cross": linalg_cross_function_hook,
             **{
                 op: partial(linalg_function_hook, op=op)
                 for op in (
                     "cholesky",
+                    "cond",
+                    "det",
                     "eig",
                     "eigh",
                     "inv",
                     "lstsq",
+                    "matrix_power",
                     "norm",
                     "pinv",
+                    "qr",
+                    "slogdet",
                     "solve",
                     "svd",
+                    "tensorsolve",
                 )
             },
         },

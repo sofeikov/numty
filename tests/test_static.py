@@ -678,6 +678,88 @@ def test_pinv_rank_mismatch() -> None:
     )
 
 
+def test_det_square_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_det_square.py"),
+        "linalg.det requires a square (..., N, N) array, got shape (2, 3)",
+        '"det"',
+    )
+
+
+def test_slogdet_square_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_slogdet_square.py"),
+        "linalg.slogdet requires a square (..., N, N) array, got shape (2, 3)",
+        '"slogdet"',
+    )
+
+
+def test_qr_rank_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_qr_rank.py"),
+        "linalg.qr requires at least 2 dimensions, got shape (3,)",
+        '"qr"',
+    )
+
+
+def test_matrix_power_square_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_matrix_power_square.py"),
+        "linalg.matrix_power requires a square (..., N, N) array, got shape (2, 3)",
+    )
+
+
+def test_cond_rank_mismatch() -> None:
+    assert_rank_mismatch(
+        run_mypy(FIXTURES / "bad_cond_rank.py"),
+        "linalg.cond requires at least 2 dimensions, got shape (3,)",
+        '"cond"',
+    )
+
+
+def test_tensorsolve_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_tensorsolve_mismatch.py"),
+        "linalg.tensorsolve requires prod(a.shape[b.ndim:]) == "
+        "prod(a.shape[:b.ndim]) (shapes (2, 3) vs (4,))",
+    )
+
+
+def test_cross_vector_mismatch() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_cross_vector.py"),
+        "cross requires 3-dimensional vectors, got 3 and 4",
+        "(3,)",
+        "(4,)",
+    )
+
+
+def test_issue141_linalg_guards_ok() -> None:
+    # Issue #141: the seven repro calls now error above and solve here.
+    result = run_mypy(FIXTURES / "issue141_linalg_guards_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[6] == '"numpy.float64"', result.stdout
+    assert notes[7] == '"tuple[numpy.float64, numpy.float64]"', result.stdout
+    assert notes[8] == (
+        '"tuple[numpy.ndarray[tuple[Literal[3], Literal[3]], '
+        'numpy.dtype[numpy.float64]], numpy.ndarray[tuple[Literal[3], '
+        'Literal[4]], numpy.dtype[numpy.float64]]]"'
+    ), result.stdout
+    assert notes[9] == (
+        '"numpy.ndarray[tuple[Literal[2], Literal[2]], '
+        'numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[10] == '"numpy.float64"', result.stdout
+    assert notes[11] == (
+        '"numpy.ndarray[tuple[Literal[2], Literal[2]], '
+        'numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[12] == (
+        '"numpy.ndarray[tuple[Literal[3]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+
+
 def test_percentile_axis_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_percentile_axis.py"),
