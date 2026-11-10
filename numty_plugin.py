@@ -1085,11 +1085,33 @@ class NumtyPlugin(Plugin):
         can never collide with a real symbol. Recorded in
         `_fam_late_bound` like any other late binding, so calls check and
         infer normally.
+
+        Issue #145: a local pin (`r: F64["batch out"]`) is analyzed in a
+        scope that does not see the signature's bindings, so a fresh mint
+        there has the same display name but a different id and native
+        subtype checking fails on identical shapes. Reuse the signature's
+        object for the same (function namespace, word) via bind_existing,
+        so one word is one dim per function, like declared TypeVars.
+        Different functions keep independent vars via the namespace key.
         """
         fullname = f"__numty_implicit__.{word}"
         existing = scope.get_binding(fullname)
         if existing is not None:
             return existing
+        # Same function, different scope tree (signature vs body): reuse
+        # the signature's object instead of minting a lookalike.
+        try:
+            ns = scope.namespace
+        except Exception:
+            ns = ""
+        key = (ns, word)
+        cached = _implicit_scope_vars.get(key)
+        if cached is not None:
+            try:
+                scope.bind_existing(cached)
+            except Exception:
+                pass
+            return cached
         upper = ctx.api.named_type("builtins.int", [], node.line, node.column)
         expr = TypeVarExpr(
             word,
@@ -1101,6 +1123,7 @@ class NumtyPlugin(Plugin):
         )
         bound = scope.bind_new(word, expr, analyzer.fail_func, node)
         self._fam_late_bound.add(fullname)
+        _implicit_scope_vars[key] = bound
         return bound
 
     def _fam_bare(
@@ -1427,6 +1450,10 @@ class NumtyPlugin(Plugin):
             return partial(reduction_method_hook, op=short)
         if fullname.startswith("numpy.ndarray.") and short in {"cumsum", "cumprod"}:
             return cumsum_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "ravel":
+            return ravel_method_hook
+        if fullname.startswith("numpy.ndarray.") and short == "flatten":
+            return flatten_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "take":
             return take_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "swapaxes":
@@ -1574,6 +1601,14 @@ class _MonoForm(NamedTuple):
 _expr_forms: dict[str, _LinForm | _DivForm | _MonoForm] = {}
 _expr_ids: dict[str, TypeVarId] = {}
 _seen_vars: dict[str, TypeVarType] = {}
+# Implicit dims by defining function (issue #145): (namespace, word) ->
+# the TypeVarType minted for the signature. A local `r: F64["batch out"]`
+# is analyzed in a scope that does not see the signature's bindings, so a
+# fresh mint there has the same display name but a different id and native
+# subtype checking fails on identical shapes. Reusing the signature's
+# object (via bind_existing) keeps one word one dim per function, like
+# declared TypeVars, while different functions keep independent vars.
+_implicit_scope_vars: dict[tuple[str, str], TypeVarLikeType] = {}
 # Per-expr constituent objects by scope (issue #32 finish): expr fullname
 # -> {constituent fullname -> TypeVarType object from the defining scope}.
 # Lets diff(M+1) -> M return the *current* function's M instead of the
@@ -10817,14 +10852,41 @@ def average_function_hook(ctx: FunctionContext) -> Type:
     return _linalg_tuple(ctx, [avg, avg])
 
 
+def _flatten_total_dim(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], op: str
+) -> int | Type | None:
+    """Total elements for a flatten (ravel/cumsum axis=None), else None.
+
+    Issue #145: method flatten paths pinned to the literal total like
+    reshape(-1). All-literal totals stay ints; pure-symbolic totals stay
+    exact (monomials) via _mul_dims. Unknown-containing dims (?U, Div,
+    unresolvable) stay with the stubs: the ?U-empty edge (empty-mask ?U
+    vs ?U-1, which numpy clamps) is left untouched beyond this bail.
+    """
+    if _has_unpack(dims):
+        return None
+    for d in dims:
+        if isinstance(d, TypeVarType) and _is_unknown_fullname(d.fullname):
+            return None
+        f = _resolve_dim(d)
+        if f is None or isinstance(f, _DivForm) or _form_has_unknown(f):
+            return None
+    if not dims:
+        return 1
+    try:
+        return _mul_dims(ctx, op, 0, dims)
+    except Exception:
+        return None
+
+
 def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
     """cumsum/cumprod keep the input shape; only axis=None flattens.
 
-    The flattened size is a products of dims we cannot spell, so
-    axis=None (the default) stays with the stubs, except for 1-D
-    inputs where axis=None keeps the shape (issue #32: np.cumsum
-    without axis on I64[N] is (N,)). dtype is whatever the
-    stubs claim: only the shape is solved here.
+    axis=None flattens to the literal total like reshape(-1) (issue
+    #145): (4, 3) -> (12,). 1-D inputs keep the shape (issue #32:
+    np.cumsum without axis on I64[N] is (N,)). Unknown-containing dims
+    stay with the stubs. dtype is whatever the stubs claim: only the
+    shape is solved here.
     """
     parts = _parts_or_unpack(array)
     if parts is None:
@@ -10834,9 +10896,41 @@ def _cumsum_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
         return ctx.default_return_type
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
-        # Missing axis (default None): 1-D keeps shape, ND flattens (bail).
+        # Missing axis (default None): 1-D keeps shape, ND flattens.
         if axis in ("absent", "none") and len(dims) == 1:
             axis = [0]
+        elif axis in ("absent", "none"):
+            total = _flatten_total_dim(ctx, dims, "cumsum")
+            if total is None:
+                return ctx.default_return_type
+            dtype_pair = _formal_pair(ctx, "dtype")
+            if dtype_pair is not None and not _is_none_type(dtype_pair[0]):
+                return ctx.default_return_type
+            name = _dtype_fullname(dtype)
+            if name in (
+                "numpy.bool",
+                "numpy.int8",
+                "numpy.int16",
+                "numpy.int32",
+                "numpy.int64",
+            ):
+                promoted = _construct_dtype(ctx, "numpy.int64")
+                if promoted is None:
+                    return ctx.default_return_type
+                return _ndarray_type(ctx, [total], promoted)
+            if name in (
+                "numpy.uint8",
+                "numpy.uint16",
+                "numpy.uint32",
+                "numpy.uint64",
+            ):
+                promoted = _construct_dtype(ctx, "numpy.uint64")
+                if promoted is None:
+                    return ctx.default_return_type
+                return _ndarray_type(ctx, [total], promoted)
+            if name is None or name not in REDUCTION_DTYPES:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, [total], dtype)
         else:
             return ctx.default_return_type
     norm = _normalize_axis_0d(axis[0], len(dims))
@@ -10883,6 +10977,39 @@ def cumsum_function_hook(ctx: FunctionContext) -> Type:
 
 def cumsum_method_hook(ctx: MethodContext) -> Type:
     return _cumsum_solve(ctx, ctx.type)
+
+
+def _ravel_solve(ctx: FunctionContext | MethodContext, array: Type) -> Type:
+    """ravel/flatten flatten to the literal total (issue #145).
+
+    (4, 3) -> (12,), like reshape(-1); 0-d -> (1,). Unknown-containing
+    dims stay with the stubs (the ?U-empty edge is untouched).
+    """
+    parts = _parts_or_unpack(array)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if _has_unpack(dims):
+        return ctx.default_return_type
+    total = _flatten_total_dim(ctx, dims, "ravel")
+    if total is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, [total], dtype)
+
+
+def ravel_method_hook(ctx: MethodContext) -> Type:
+    return _ravel_solve(ctx, ctx.type)
+
+
+def flatten_method_hook(ctx: MethodContext) -> Type:
+    return _ravel_solve(ctx, ctx.type)
+
+
+def ravel_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _ravel_solve(ctx, pairs[0][0])
 
 
 def diff_function_hook(ctx: FunctionContext) -> Type:
@@ -13019,6 +13146,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "min": partial(reduction_function_hook, op="min"),
             "nonzero": nonzero_function_hook,
             "prod": partial(reduction_function_hook, op="prod"),
+            "ravel": ravel_function_hook,
             "repeat": repeat_function_hook,
             "reshape": reshape_function_hook,
             "searchsorted": searchsorted_function_hook,

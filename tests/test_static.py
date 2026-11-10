@@ -3292,3 +3292,22 @@ def test_matlib_zeros_is_not_a_vector() -> None:
         "Incompatible types in assignment",
         'expression has type "matrix[tuple[int, int], dtype[float64]]"',
     )
+
+
+def test_issue145_flatten_pin_ok() -> None:
+    # Issue #145: method flatten paths (cumsum/cumprod axis=None, ravel,
+    # flatten) pinned to the literal total like the function forms, and
+    # the implicit string-spec local pin reuses the signature's dims.
+    result = run_mypy(FIXTURES / "issue145_flatten_pin_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    f64_12 = '"numpy.ndarray[tuple[Literal[12]], numpy.dtype[numpy.float64]]"'
+    for line in (28, 29, 30, 31, 32, 33, 34):
+        assert notes[line] == f64_12, result.stdout
+    assert notes[39] == (
+        '"numpy.ndarray[tuple[batch, out], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert notes[40] == (
+        '"numpy.ndarray[tuple[batch, out], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+    assert _run_fixture("issue145_flatten_pin_ok.py") == ["ok"]
