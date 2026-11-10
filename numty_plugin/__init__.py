@@ -5431,7 +5431,7 @@ def _fftn_solve(
         return _rfft_complex_input(ctx, op)
     if s is None and axes is None:
         # Default axes: the last two for fft2/ifft2, every axis otherwise.
-        need = 2 if op == "fft2" else 1 if rfft else 0
+        need = 2 if op in ("fft2", "rfft2") else 1 if rfft else 0
         if ndim < need:
             ctx.api.fail(
                 f"{op} needs at least {need} dimension{'s' if need > 1 else ''}, "
@@ -5553,6 +5553,23 @@ def fft2_function_hook(ctx: FunctionContext) -> Type:
     if s is not None:
         return ctx.default_return_type
     return _fftn_solve(ctx, "fft2", pairs[0][0], axes, s, False)
+
+
+def rfft2_function_hook(ctx: FunctionContext) -> Type:
+    """np.fft.rfft2: real 2-D fft over the last two axes, no s.
+
+    Same contract as fft2_function_hook; the last axis halves.
+    """
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    parsed = _fft_s_axes(ctx)
+    if parsed is None:
+        return ctx.default_return_type
+    s, axes = parsed
+    if isinstance(s, str) or isinstance(axes, str) or s is not None:
+        return ctx.default_return_type
+    return _fftn_solve(ctx, "rfft2", pairs[0][0], axes, s, True)
 
 
 def fftshift_function_hook(ctx: FunctionContext) -> Type:
@@ -8061,7 +8078,8 @@ def _solve_reduction(
     normalized: list[int] = []
     # sum/prod/max/min/any/all take axis 0 or -1 on a 0-d array; the
     # mean family counts elements along the axis first and rejects it.
-    strict_0d = op.removeprefix("nan") in ("mean", "var", "std")
+    # (The nan* twins go through nansum-style code and accept it.)
+    strict_0d = op in ("mean", "var", "std")
     for ax in axis:
         norm = _normalize_axis(ax, ndim) if strict_0d else _normalize_axis_0d(ax, ndim)
         if norm is None:
@@ -11717,8 +11735,15 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
     if ks is None:
         return ctx.default_return_type
     kind, _size = ks
+    if kind == "c":
+        ctx.api.fail(
+            "percentile needs an array of real numbers, got a complex array",
+            ctx.context,
+            code=NUMTY_BROADCAST,
+        )
+        return ctx.default_return_type
     if kind not in ("f", "i", "u"):
-        # numpy rejects bool and complex input here (TypeError).
+        # bool input is rejected or kept as bool depending on q.
         return ctx.default_return_type
     # The result dtype is result_type(a, q), lifted to float64 when
     # that is an integer. A Python scalar q is weak and leaves a's
@@ -14150,21 +14175,16 @@ def _broadcast_to_compatible(
     fail loudly; anything involving a symbolic dim that could be 1 bails
     (returns False) instead of guessing.
     """
-    if not dims:
-        # Scalar target: every source dim must be 1.
-        for s in arr_dims:
-            if isinstance(s, int):
-                if s != 1:
-                    ctx.api.fail(
-                        f"broadcast_to of shape {_dims_str(arr_dims)} cannot "
-                        f"broadcast to scalar shape {_dims_str(dims)}",
-                        ctx.context,
-                        code=NUMTY_SHAPE,
-                    )
-                    return False
-            else:
-                return False
-        return True
+    # A scalar target takes only a 0-d source: numpy refuses even (1,)
+    # ("cannot broadcast a non-scalar to a scalar array").
+    if not dims and arr_dims:
+        ctx.api.fail(
+            f"broadcast_to of shape {_dims_str(arr_dims)} cannot "
+            f"broadcast to scalar shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return False
     if len(arr_dims) > len(dims):
         ctx.api.fail(
             f"broadcast_to of shape {_dims_str(arr_dims)} cannot broadcast "
@@ -15309,6 +15329,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "ifftn": fftn_function_hook,
             "rfft": rfft_function_hook,
             "irfft": irfft_function_hook,
+            "rfft2": rfft2_function_hook,
             "rfftn": rfftn_function_hook,
         },
         "numpy.fft._helper": {

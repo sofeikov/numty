@@ -166,3 +166,22 @@ def test_regressions_stay_fixed(tmp_path: Path) -> None:
     assert not findings, "\n".join(str(f) for f in findings)
     expected = sum(1 for _, raises in REGRESSIONS if raises)
     assert stats.get("numpy raises, flagged", 0) == expected, stats
+
+
+def test_regressions_from_unseen_seeds(tmp_path: Path) -> None:
+    # Second batch, from seeds the first round of fixes never saw.
+    table = [
+        ("np.nanmean(np.ones((), dtype=np.float32), axis=0)", False),
+        ("np.mean(np.ones(()), axis=0)", True),
+        ("np.broadcast_to(np.ones((1,)), ())", True),
+        ("np.broadcast_to(np.ones(()), (3,))", False),
+        ("np.quantile(np.ones((4, 4), dtype=np.complex128), 0.5)", True),
+        ("np.fft.rfft2(np.zeros(()))", True),
+        ("np.fft.rfft2(np.zeros((2, 4, 6)))", False),
+    ]
+    cases = [d.Case(expr) for expr, _ in table]
+    for case, (expr, raises) in zip(cases, table):
+        assert isinstance(d.evaluate(case), Exception) == raises, expr
+    findings, stats = d.check(cases, tmp_path)
+    assert not findings, "\n".join(str(f) for f in findings)
+    assert stats.get("numpy raises, flagged", 0) == sum(1 for _, r in table if r), stats
