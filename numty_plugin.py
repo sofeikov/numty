@@ -3472,7 +3472,18 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                 _trace_event(ctx, fullname, "unhooked", "no hook for this op")
             result = default
         else:
-            result = hook(ctx)
+            try:
+                result = hook(ctx)
+            except Exception:
+                # Crash barrier (issue #41): no shape hook may abort the
+                # whole mypy run with INTERNAL ERROR, hiding every later
+                # diagnostic. Bail to the stubs instead. Re-raise under
+                # NUMTY_DEBUG=1 so tests/developers still see tracebacks.
+                import os as _os
+
+                if _os.environ.get("NUMTY_DEBUG") == "1":
+                    raise
+                result = default
             if result is default:
                 # Generic bail: any hook that kept the stubs' type. This
                 # makes the 506 give-up sites visible without churning
@@ -3876,6 +3887,9 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if not dims_a or not dims_b:
+        # 0-d operand: dot is broadcast multiplication (issue #41).
+        return _solve_broadcast(ctx, pair[0], pair[1])
     if len(dims_a) == 1 and len(dims_b) == 1:
         # Vector inner product is a scalar (the stubs agree).
         matched, message = _contract_pair("dot", dims_a[0], dims_b[0])
@@ -3912,6 +3926,9 @@ def dot_method_hook(ctx: MethodContext) -> Type:
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if not dims_a or not dims_b:
+        # 0-d operand: dot is broadcast multiplication (issue #41).
+        return _solve_broadcast(ctx, left, right)
     if len(dims_a) == 1 and len(dims_b) == 1:
         matched, message = _contract_pair("dot", dims_a[0], dims_b[0])
         if message is not None:
@@ -3945,6 +3962,9 @@ def inner_function_hook(ctx: FunctionContext) -> Type:
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if not dims_a or not dims_b:
+        # 0-d operand: inner is broadcast multiplication (issue #41).
+        return _solve_broadcast(ctx, pair[0], pair[1])
     matched, message = _contract_pair("inner", dims_a[-1], dims_b[-1])
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
@@ -10272,9 +10292,7 @@ def _solve_same_or_flat(
         return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
     if not isinstance(axis, list):
         if axis == "none":
-            total = 1
-            for d in dims:
-                total *= d
+            total = _mul_dims(ctx, "sort", 0, dims)
             return _ndarray_type(ctx, [total], _default_dtype(ctx) if int_out else dtype)
         return ctx.default_return_type
     ndim = len(dims)
@@ -11145,6 +11163,14 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
     ):
         return ctx.default_return_type
     size = dims_a[-1]
+    if not dims_b:
+        ctx.api.fail(
+            "linalg.solve: b has 0 dimensions "
+            f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
     if len(dims_b) == 1:
         if not _check_dim_eq(
             ctx,
