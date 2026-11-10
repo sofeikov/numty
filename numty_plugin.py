@@ -3855,14 +3855,17 @@ def _contract_pair(
 ) -> tuple[bool, str | None]:
     """(match, error) for one contracted dim pair.
 
-    Match on equality, error when both ints differ, and (False, None)
-    to bail on anything unprovable. Mirrors _matmul_inner with an
-    op-specific message.
+    Match on equality, error when both ints differ or linear forms are
+    provably unequal (N+1 vs N, issue #139), and (False, None) to bail
+    on anything unprovable (N vs M, ?U vs ?U'). Mirrors _matmul_inner
+    with an op-specific message.
     """
     if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
     if isinstance(x, int) and isinstance(y, int):
         return False, f"{op} contracted dimensions disagree: {x} vs {y}"
+    if _dims_provably_ne(x, y):
+        return False, f"{op} contracted dimensions disagree: {_dim_str(x)} vs {_dim_str(y)}"
     return False, None
 
 
@@ -4056,6 +4059,27 @@ def vdot_function_hook(ctx: FunctionContext) -> Type:
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
+    form_a = _reshape_total_form(dims_a)
+    form_b = _reshape_total_form(dims_b)
+    if _forms_provably_ne(form_a, form_b):
+        assert form_a is not None and form_b is not None
+        ctx.api.fail(
+            f"vdot operands have different sizes: {_expr_str(form_a)} vs {_expr_str(form_b)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    # Unknown (?U) totals never prove equal, not even to themselves
+    # (issue #63): bail instead of claiming a scalar.
+    for form in (form_a, form_b):
+        if form is not None and _form_has_unknown(form):
+            return ctx.default_return_type
+    for d in (*dims_a, *dims_b):
+        if isinstance(d, TypeVarType) and _is_unknown_fullname(d.fullname):
+            return ctx.default_return_type
+        f = _resolve_dim(d)
+        if f is not None and _form_has_unknown(f):
+            return ctx.default_return_type
     return _promoted_scalar(ctx, parts_a[1], parts_b[1])
 
 
