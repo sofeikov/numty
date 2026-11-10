@@ -2063,6 +2063,82 @@ def test_cumsum_axis_mismatch() -> None:
     )
 
 
+def test_ufunc_methods_ok_clean_and_runs() -> None:
+    # Issue #142: ufunc reduce drops the axis, accumulate keeps the
+    # shape, outer concatenates operand shapes, reduceat sizes the axis
+    # by the indices length; add.at still returns None. Golden reveals
+    # plus a runtime oracle.
+    result = run_mypy(FIXTURES / "ufunc_methods_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    any_dt = "numpy.ndarray[tuple[{}], Any]"
+    assert reveals_by_line(result) == {
+        20: f'"{any_dt.format("M")}"',
+        21: f'"{any_dt.format("N")}"',
+        22: f'"{any_dt.format("N, M")}"',
+        23: f'"{any_dt.format("N, M, Literal[2]")}"',
+        28: f'"{any_dt.format("Literal[3]")}"',
+        29: f'"{any_dt.format("Literal[2]")}"',
+        30: f'"{any_dt.format("Literal[2], Literal[1]")}"',
+        31: '"Any"',
+        32: f'"{any_dt.format("Literal[2], Literal[3]")}"',
+        33: f'"{any_dt.format("Literal[3], Literal[4]")}"',
+        34: f'"{any_dt.format("Literal[3]")}"',
+        35: f'"{any_dt.format("Literal[2]")}"',
+        36: f'"{any_dt.format("Literal[2]")}"',
+        37: f'"{any_dt.format("Literal[4], Literal[2]")}"',
+        38: '"numpy.ndarray[tuple[Literal[2]], '
+        'numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"',
+        39: '"None"',
+    }, result.stdout
+    assert _run_fixture("ufunc_methods_ok.py") == [
+        "(7,)",
+        "(5,)",
+        "(5, 1)",
+        "()",
+        "(5, 7)",
+        "(3, 4)",
+        "(3,)",
+        "(5,)",
+        "(2,)",
+        "(4, 2)",
+        "(5,)",
+        "None",
+        "(3,)",
+        "(2,)",
+        "(2, 3)",
+        "(2, 3, 2)",
+    ]
+
+
+def test_ufunc_method_axis_mismatch() -> None:
+    # Issue #142: out-of-range ufunc-method axes fail with [numty-axis].
+    result = run_mypy(FIXTURES / "bad_ufunc_method_axis.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 4, result.stdout
+    assert errors[0].startswith(
+        "tests/fixtures/bad_ufunc_method_axis.py:6: error:"
+    ), result.stdout
+    assert "reduce axis 5 is out of range for 2 dimensions" in errors[0], result.stdout
+    assert errors[1].startswith(
+        "tests/fixtures/bad_ufunc_method_axis.py:7: error:"
+    ), result.stdout
+    assert "accumulate axis -3 is out of range for 2 dimensions" in errors[1], (
+        result.stdout
+    )
+    assert errors[2].startswith(
+        "tests/fixtures/bad_ufunc_method_axis.py:8: error:"
+    ), result.stdout
+    assert "reduce axis 2 is out of range for 2 dimensions" in errors[2], result.stdout
+    assert errors[3].startswith(
+        "tests/fixtures/bad_ufunc_method_axis.py:9: error:"
+    ), result.stdout
+    assert "reduceat axis 1 is out of range for 1 dimensions" in errors[3], (
+        result.stdout
+    )
+
+
 def test_diff_size_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_diff_size.py"),
