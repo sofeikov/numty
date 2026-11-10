@@ -1482,6 +1482,28 @@ def _dim_eq(a: int | Type, b: int | Type) -> bool:
     return False
 
 
+def _dims_provably_ne(a: int | Type, b: int | Type) -> bool:
+    """Provably-unequal dims: same linear vars, different constants.
+
+    `N` vs `N-1`, `N+1` vs `N`, `M+2` vs `M` can never be equal (the
+    equality would require `0 == nonzero`). Anything else (different
+    vars `N` vs `M`, unknowns, div/mono forms, plain `int`) might be
+    equal at runtime, so it stays unprovable (issue #56: no false
+    errors). Used by broadcast/matmul/stack to flag real off-by-one
+    bugs from `np.diff` / `N+1` offsets (issue #32) instead of bailing
+    to a silent `?U`.
+    """
+    if _dim_eq(a, b):
+        return False
+    if isinstance(a, int) and isinstance(b, int):
+        return a != b
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
+        return fa.coeffs == fb.coeffs and fa.const != fb.const
+    return False
+
+
 def _dim_str(d: int | Type) -> str:
     if isinstance(d, int):
         return str(d)
@@ -3505,13 +3527,16 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
 
 def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
     """(match, error) for inner dims: match on equality, error when both
-    ints differ, and (False, None) to bail on anything unprovable. A
-    plain `int` (dynamic) dim is assumed to match: it never reaches the
-    output, and unknown is not an error."""
+    ints differ or linear forms are provably unequal (N vs N-1 from
+    np.diff, N vs N+2 from pad, issue #32), and (False, None) to bail
+    on anything unprovable. A plain `int` (dynamic) dim is assumed to
+    match: it never reaches the output, and unknown is not an error."""
     if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
     if isinstance(x, int) and isinstance(y, int):
         return False, f"matmul inner dimensions disagree: {x} vs {y}"
+    if _dims_provably_ne(x, y):
+        return False, f"matmul inner dimensions disagree: {_dim_str(x)} vs {_dim_str(y)}"
     return False, None
 
 
@@ -5846,7 +5871,9 @@ def _broadcast_result(
     axis instead of bailing the whole shape (issue #56): a literal
     against a symbolic dim is that literal (if the broadcast succeeds
     the axis is that size), two different symbolics become a fresh
-    unknown. Without ctx the old bail is kept (callers without shape
+    unknown. Provably-unequal linear forms (N vs N-1, N+1 vs N from
+    np.diff / offsets, issue #32) are errors, not silent unknowns.
+    Without ctx the old bail is kept (callers without shape
     context); every ctx-bearing caller passes it.
     """
     out: list[int | Type] = []
@@ -5861,6 +5888,11 @@ def _broadcast_result(
             return None, (
                 f"broadcast shapes disagree at trailing axis {k}: "
                 f"{x} vs {y} (shapes {_dims_str(a)} vs {_dims_str(b)})"
+            )
+        elif _dims_provably_ne(x, y):
+            return None, (
+                f"broadcast shapes disagree at trailing axis {k}: "
+                f"{_dim_str(x)} vs {_dim_str(y)} (shapes {_dims_str(a)} vs {_dims_str(b)})"
             )
         elif ctx is None:
             return None, None
@@ -5892,7 +5924,8 @@ def _merge_known_pair(
     """One pairwise broadcast step: (merged dim, None), or (None, msg).
 
     (None, None) bails out silently; (None, msg) records a provable
-    int clash for the caller to fail with.
+    int clash — or a provably-unequal linear pair (N vs N-1, issue
+    #32) — for the caller to fail with.
     """
     if _dim_eq(x, y):
         return x, None
@@ -5903,6 +5936,10 @@ def _merge_known_pair(
     if isinstance(x, int) and isinstance(y, int):
         return None, (
             f"broadcast shapes disagree at {axis}: {x} vs {y} (shapes {full})"
+        )
+    if _dims_provably_ne(x, y):
+        return None, (
+            f"broadcast shapes disagree at {axis}: {_dim_str(x)} vs {_dim_str(y)} (shapes {full})"
         )
     return None, None
 
@@ -8154,9 +8191,11 @@ def _concat_merge(
     for dims, _ in items[1:]:
         for i, d in enumerate(dims):
             if i != norm and not _dim_eq(out[i], d):
-                if isinstance(out[i], int) and isinstance(d, int):
+                if (isinstance(out[i], int) and isinstance(d, int)) or _dims_provably_ne(
+                    out[i], d
+                ):
                     ctx.api.fail(
-                        f"{op} dimension {i} differs: {out[i]} vs {d} "
+                        f"{op} dimension {i} differs: {_dim_str(out[i])} vs {_dim_str(d)} "
                         f"(shapes {_dims_str(out)} vs {_dims_str(dims)})",
                         ctx.context,
                         code=NUMTY_SHAPE,
@@ -8365,7 +8404,20 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     first = items[0][0]
     for dims, _ in items[1:]:
         if len(dims) != len(first) or not all(_dim_eq(x, y) for x, y in zip(first, dims)):
-            if all(isinstance(d, int) for d in dims) and all(isinstance(d, int) for d in first):
+            provable = len(dims) != len(first) or any(
+                _dims_provably_ne(x, y) for x, y in zip(first, dims)
+            )
+            if all(isinstance(d, int) for d in dims) and all(
+                isinstance(d, int) for d in first
+            ):
+                ctx.api.fail(
+                    "stack shapes differ: "
+                    + ", ".join(_dims_str(dims) for dims, _ in items),
+                    ctx.context,
+                    code=NUMTY_SHAPE,
+                )
+                return ctx.default_return_type
+            if provable:
                 ctx.api.fail(
                     "stack shapes differ: "
                     + ", ".join(_dims_str(dims) for dims, _ in items),

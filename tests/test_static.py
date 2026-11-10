@@ -1997,6 +1997,21 @@ def test_offsets_lengths_mismatch() -> None:
     )
 
 
+def test_provable_linear_mismatch() -> None:
+    # Issue #32: same-var different-const dims (N vs N-1 from np.diff,
+    # N vs N+2 from np.pad) are provably unequal, so broadcast/matmul/
+    # stack fail instead of bailing to a silent ?U/Any.
+    result = run_mypy(FIXTURES / "bad_provable_linear.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 4, result.stdout
+    assert "broadcast shapes disagree at trailing axis 0" in errors[0], result.stdout
+    assert "N vs N-1" in errors[0], result.stdout
+    assert "Unsupported operand types for -" in errors[1], result.stdout
+    assert "matmul inner dimensions disagree: N vs N+2" in errors[2], result.stdout
+    assert "stack shapes differ: (N+2,), (N,)" in errors[3], result.stdout
+
+
 def test_offsets_calls_ok_clean_and_runs() -> None:
     # Issue #32 finish: expression returns infer through calls instead of
     # going Any. `make_offsets(a: I64[K]) -> I64["M+1"]` reveals K+1 in the
