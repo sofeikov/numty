@@ -165,6 +165,32 @@ def test_generic_call_reference() -> None:
         solved(np.ones(1))
 
 
+def test_generic_call_kinds() -> None:
+    # The same contract declared on a class. Each kind has to render to
+    # source whose call text also runs against the reference.
+    for kind, text in {
+        "function": "g7(a)",
+        "method": "C7().g7(a)",
+        "static": "C7.g7(a)",
+        "class": "C7.g7(a)",
+        "callable": "C7()(a)",
+    }.items():
+        g = d.Helper("g7", [("F64", ("N",))], ("F64", ("N", "N+1")), kind=kind)
+        assert g.call("a") == text
+        ns: dict[str, object] = {"a": np.ones(4)}
+        g.bind(ns)
+        assert eval(text, ns).shape == (4, 5), kind
+    static = d.Helper("g7", [("F64", ("N",))], ("F64", ("N",)), kind="static")
+    assert static.definition() == [
+        "class C7:",
+        "    @staticmethod",
+        "    def g7(x0: F64[N]) -> F64[N]:",
+        "        raise NotImplementedError",
+    ]
+    method = d.Helper("g7", [("F64", ("N",))], ("F64", ("N",)), kind="callable")
+    assert method.definition()[1] == "    def __call__(self, x0: F64[N]) -> F64[N]:"
+
+
 def test_generic_calls_agree_with_the_signature(tmp_path: Path) -> None:
     # Pinned from the generic-call family's first run, where each of
     # these came back with a wrong dim or `Never`.

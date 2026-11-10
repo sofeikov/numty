@@ -551,6 +551,75 @@ class Gen:
         axis = f", axis={self.axis(len(a.shape))}" if r.random() < 0.5 else ""
         return f"np.linalg.cross({a.text}, {b.text}{axis})"
 
+    def array_method(self) -> str:
+        """ndarray methods, which have hooks of their own apart from `np.*`."""
+        r = self.rng
+        a = self.operand()
+        rank = len(a.shape)
+        ax = self.axis(rank)
+        perm = tuple(r.sample(range(rank), rank))
+        keep = ", keepdims=True" if r.random() < 0.3 else ""
+        reduce = r.choice(("sum", "prod", "mean", "min", "max", "std", "var", "any", "all"))
+        arg = r.choice(("argmax", "argmin", "argsort"))
+        return r.choice(
+            (
+                f"{a.text}.take(0, axis={ax})",
+                f"{a.text}.take([0, 0, 0], axis={ax})",
+                f"{a.text}.take([0, 0])",
+                f"{a.text}.take({self.index(self.shape(r.choice((1, 2)))).text}, {ax})",
+                f"{a.text}.repeat(2)",
+                f"{a.text}.repeat({r.randint(1, 3)}, axis={ax})",
+                f"{a.text}.repeat(3, {ax})",
+                f"{a.text}.squeeze(axis={ax})",
+                f"{a.text}.squeeze({ax})",
+                f"{a.text}.transpose(*{perm!r})",
+                f"{a.text}.transpose({perm!r})",
+                f"{a.text}.swapaxes({self.axis(rank)}, {self.axis(rank)})",
+                f"{a.text}.ravel()",
+                f"{a.text}.flatten()",
+                f"{a.text}.cumsum({ax})",
+                f"{a.text}.cumprod(axis={ax})",
+                f"{a.text}.{reduce}({ax}{keep})",
+                f"{a.text}.{reduce}(axis=(0, -1){keep})",
+                f"{a.text}.{reduce}(axis=None{keep})",
+                f"{a.text}.{arg}({ax})",
+                f"{a.text}.{arg}(axis=None)",
+                f"{a.text}.argpartition(0, axis={ax})",
+                f"{a.text}.clip({self.near(a.shape).text}, 1)",
+                f"{a.text}.clip(min=0)",
+                f"{a.text}.dot({self.near(a.shape).text})",
+                f"{a.text}.__divmod__({self.near(a.shape).text})",
+                f"{a.text}.astype(np.complex64)",
+                f"{a.text}.astype(bool)",
+            )
+        )
+
+    def rng_method(self) -> str:
+        r = self.rng
+        a = self.operand()
+        size = f"{a.text}.shape"
+        source = r.choice(("np.random.default_rng(0)", "np.random.RandomState(0)"))
+        if source.endswith("RandomState(0)") and r.random() < 0.3:
+            return f"{source}.{r.choice(('rand', 'randn'))}(*{size})"
+        return source + r.choice(
+            (
+                f".normal(size={size})",
+                f".normal(0.0, 1.0, {size})",
+                f".random({size})",
+                f".random(size={size})",
+                f".standard_normal({size})",
+                f".uniform(size={size})",
+                f".uniform(0, 1, {size})",
+                f".integers(0, 5, size={size})" if "default_rng" in source else f".randint(0, 5, size={size})",
+                f".choice(5, size={size})",
+                f".choice({a.text}.ravel(), {size})",
+                f".permutation({a.text})",
+                f".permutation(4)",
+                f".normal(size=3)",
+                f".normal()",
+            )
+        )
+
     def chain(self) -> str:
         a = self.operand()
         b = self.operand(a.shape)
@@ -566,7 +635,8 @@ class Gen:
         where, clip, shape_helper, shape_helper, tile_repeat, pad, linalg, linalg_solve,
         einsum, take, take_along_axis, expand_squeeze, broadcast_to, fft, split,
         roll_rot, builder, average, edit, window, lookup, ufunc_method, chain,
-        all_any, rounding, divmod_builtin, linalg_cross,
+        all_any, rounding, divmod_builtin, linalg_cross, array_method, array_method,
+        rng_method,
     )
 
     def expression(self) -> str:
@@ -713,7 +783,8 @@ class SymGen(Gen):
             names = [word[n] for n in names]
         else:
             words = False
-        helper = Helper(f"g{self.helper_count}", formals, ret, words)
+        kind = r.choice(Helper.KINDS) if r.random() < 0.5 else "function"
+        helper = Helper(f"g{self.helper_count}", formals, ret, words, kind)
         self.helper_count += 1
         self.helpers.append(helper)
 
@@ -742,7 +813,7 @@ class SymGen(Gen):
             else:
                 args.append(f"{name}.T")
         tail = r.choice(("", "", "", ".T", ".sum(axis=0)", "[::-1]"))
-        return f"{helper.name}({', '.join(args)}){tail}"
+        return f"{helper.call(', '.join(args))}{tail}"
 
     FAMILIES = (
         Gen.binary_operator, Gen.binary_operator, Gen.scalar_operator, Gen.unary,
@@ -753,6 +824,7 @@ class SymGen(Gen):
         Gen.expand_squeeze, Gen.fft, Gen.roll_rot, Gen.take, Gen.products,
         Gen.einsum, Gen.window, chain, Gen.split, Gen.edit,
         Gen.all_any, Gen.rounding, Gen.divmod_builtin, Gen.linalg_cross,
+        Gen.array_method, Gen.array_method, Gen.rng_method,
         call, call, call, call,
     )
 
@@ -796,6 +868,47 @@ class Helper:
     formals: list[tuple[str, tuple[object, ...]]]
     ret: tuple[str, tuple[object, ...]]
     words: bool = False
+    # How it is declared and called: a plain function, or on a class as
+    # an instance method, a static method, a class method or `__call__`.
+    kind: str = "function"
+
+    KINDS = ("function", "method", "static", "class", "callable")
+
+    @property
+    def owner(self) -> str:
+        return f"C{self.name[1:]}"
+
+    def definition(self) -> list[str]:
+        """The source lines that declare it; the body never runs."""
+        if self.kind == "function":
+            return [self.signature(), "    raise NotImplementedError"]
+        decorator = {"static": ["    @staticmethod"], "class": ["    @classmethod"]}
+        receiver = {"static": "", "class": "cls, "}.get(self.kind, "self, ")
+        name = "__call__" if self.kind == "callable" else self.name
+        head = self.signature().replace(f"def {self.name}(", f"def {name}({receiver}", 1)
+        return [
+            f"class {self.owner}:",
+            *decorator.get(self.kind, []),
+            f"    {head}",
+            "        raise NotImplementedError",
+        ]
+
+    def call(self, args: str) -> str:
+        return {
+            "function": f"{self.name}({args})",
+            "method": f"{self.owner}().{self.name}({args})",
+            "static": f"{self.owner}.{self.name}({args})",
+            "class": f"{self.owner}.{self.name}({args})",
+            "callable": f"{self.owner}()({args})",
+        }[self.kind]
+
+    def bind(self, ns: dict[str, object]) -> None:
+        """Put what `call` names into a runtime namespace."""
+        if self.kind == "function":
+            ns[self.name] = self
+            return
+        holder = type(self.owner, (), {self.name: staticmethod(self), "__call__": lambda _s, *a: self(*a)})
+        ns[self.owner] = holder
 
     def _spec(self, head: str, dims: tuple[object, ...]) -> str:
         if self.words:
@@ -862,7 +975,7 @@ class Case:
             concrete = tuple(_dim_size(d, sizes) for d in shape)
             ns[name] = np.ones(concrete, dtype=SYMBOL_HEADS[head])
         for helper in self.helpers:
-            ns[helper.name] = helper
+            helper.bind(ns)
         return ns
 
 
@@ -905,8 +1018,7 @@ def render(cases: list[Case]) -> tuple[str, list[int]]:
     lines: list[int] = []
     for i, case in enumerate(cases):
         for helper in case.helpers:
-            out.append(helper.signature())
-            out.append("    raise NotImplementedError")
+            out.extend(helper.definition())
         if case.symbolic:
             out.append(f"def f{i}({case.signature()}) -> None:")
             out.append(f"    reveal_type({case.expr})")

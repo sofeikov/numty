@@ -551,18 +551,18 @@ class NumtyPlugin(Plugin):
         # check free functions get. Skipped for overloads (per-candidate
         # hooks would false-positive) and guarded separately so a failure
         # here can never lose the repaired signature above.
+        overloaded = isinstance(ctx.context, CallExpr) and isinstance(
+            ctx.context.callee.node if hasattr(ctx.context.callee, "node") else None,
+            OverloadedFuncDef,
+        )
         try:
-            if isinstance(sig, CallableType) and not (
-                isinstance(ctx.context, CallExpr)
-                and isinstance(
-                    ctx.context.callee.node if hasattr(ctx.context.callee, "node") else None,
-                    OverloadedFuncDef,
-                )
-            ):
+            if isinstance(sig, CallableType) and not overloaded:
                 _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
         except Exception:
             _swallowed(ctx, "method_signature_hook")
             pass
+        if isinstance(sig, CallableType) and not overloaded:
+            sig = _callsite_formula_return(sig, ctx)
         _note_rank_mismatches(ctx, sig)
         return sig
 
@@ -668,33 +668,7 @@ class NumtyPlugin(Plugin):
         except Exception:
             _swallowed(ctx, "_callsite_check")
             pass
-        # Expression returns (issue #32 finish): mypy cannot infer M+1
-        # from M, so callers of `-> I64["M+1"]` saw Any. Substitute the
-        # actual bindings into the return ourselves (plain vars reuse the
-        # caller's object, new exprs reuse the form-keyed global id).
-        try:
-            formals = _shape_tvar_formals(sig)
-            bindings = _callsite_expr_bindings(sig, formals, ctx)
-            new_ret = _substitute_return_exprs(sig, bindings, ctx)
-            if new_ret is not None:
-                # Formula variables only the old return mentioned are
-                # no longer the callee's to bind (see the note in
-                # `_substitute_return_exprs`).
-                formal_ids = {
-                    tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)
-                }
-                sig = sig.copy_modified(
-                    ret_type=new_ret,
-                    variables=[
-                        v
-                        for v in sig.variables
-                        if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
-                    ],
-                )
-        except Exception:
-            _swallowed(ctx, "_callsite_check")
-            pass
-        return sig
+        return _callsite_formula_return(sig, ctx)
 
     # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty/__init__.py): the
     # dtype rides the head name, dims ride flat args. Hooked here because
@@ -2922,10 +2896,42 @@ def _emit_call_site_conflicts(
                 break
 
 
+def _callsite_formula_return(
+    sig: CallableType, ctx: FunctionSigContext | MethodSigContext
+) -> CallableType:
+    """`sig` with formula dims in its return put in the caller's terms.
+
+    mypy cannot infer M+1 from M, so callers of `-> I64["M+1"]` saw Any
+    (issue #32). The actual bindings are substituted into the return
+    here: plain vars reuse the caller's object, new exprs reuse the
+    form-keyed global id. Functions and methods share this.
+    """
+    try:
+        formals = _shape_tvar_formals(sig)
+        bindings = _callsite_expr_bindings(sig, formals, ctx)
+        new_ret = _substitute_return_exprs(sig, bindings, ctx)
+        if new_ret is None:
+            return sig
+        # Formula variables only the old return mentioned are no longer
+        # the callee's to bind (see the note in `_substitute_return_exprs`).
+        formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
+        return sig.copy_modified(
+            ret_type=new_ret,
+            variables=[
+                v
+                for v in sig.variables
+                if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
+            ],
+        )
+    except Exception:
+        _swallowed(ctx, "_callsite_formula_return")
+        return sig
+
+
 def _callsite_expr_bindings(
     sig: CallableType,
     formals: list[tuple[int, list[tuple[int, TypeVarType]]]],
-    ctx: FunctionSigContext,
+    ctx: FunctionSigContext | MethodSigContext,
 ) -> dict[str, int | Type | _LinForm]:
     """Callee var fullname -> actual dim for expression returns (issue #32).
 
@@ -3042,7 +3048,7 @@ def _callsite_expr_bindings(
 def _substitute_return_exprs(
     sig: CallableType,
     bindings: dict[str, int | Type | _LinForm],
-    ctx: FunctionSigContext,
+    ctx: FunctionSigContext | MethodSigContext,
 ) -> Type | None:
     """Return type with callee expr vars substituted by call bindings.
 
@@ -11716,6 +11722,13 @@ def rng_method_hook(ctx: MethodContext, op: str) -> Type:
         if parts is None:
             return ctx.default_return_type
         dims, dtype = parts
+        if not dims:
+            ctx.api.fail(
+                "permutation requires an int or at least 1 dimension, got shape ()",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+            return ctx.default_return_type
         return _ndarray_type(ctx, dims, dtype)
     return ctx.default_return_type
 
