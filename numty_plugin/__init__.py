@@ -250,6 +250,110 @@ def _numty_strict() -> bool:
     return os.environ.get("NUMTY_STRICT") == "1"
 
 
+# Startup gates (issue #164 step 2): hooks key on private numpy module
+# paths and on mypy internals, so a version drift can silently unhook
+# everything (#67: constructor hooks never fired on numpy 2.2-2.4).
+# Tested versions are pinned in pyproject.toml (mypy==2.4.1,
+# numpy>=2.5); warn loudly outside them.
+_TESTED_MYPY_VERSION = "2.4.1"
+_TESTED_MYPY_MAJOR = 2
+_TESTED_MYPY_MINOR = 4
+_MIN_NUMPY_VERSION: tuple[int, ...] = (2, 5)
+
+# Hooked fullnames that must resolve in the loaded stubs. If any is
+# missing, hooks for that module silently never fire, so the first
+# hook lookup warns naming them.
+_CANARY_FULLNAMES: tuple[str, ...] = (
+    "numpy._core.multiarray.zeros",
+    "numpy._core.multiarray.asarray",
+    "numpy._core.fromnumeric.reshape",
+    "numpy._core.einsumfunc.einsum",
+    "numpy.linalg._linalg.norm",
+    "numpy.ndarray.reshape",
+    "numpy.ndarray.__matmul__",
+    "numpy.ufunc.__call__",
+)
+
+_CANARY_BY_MODULE: dict[str, tuple[str, ...]] = {}
+for _canary in _CANARY_FULLNAMES:
+    _module, _, _ = _canary.rpartition(".")
+    _CANARY_BY_MODULE[_module] = _CANARY_BY_MODULE.get(_module, ()) + (_canary,)
+del _canary, _module
+
+
+def _parse_version_tuple(version: str) -> tuple[int, ...]:
+    """Leading numeric components of a version string ("2.4.1" -> (2, 4, 1))."""
+    parts: list[int] = []
+    for piece in version.strip().split("."):
+        num = ""
+        for ch in piece:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if not num:
+            break
+        parts.append(int(num))
+    return tuple(parts)
+
+
+def _mypy_version_warning(version: str) -> str | None:
+    """Loud warning when `version` leaves the tested mypy range, else None."""
+    got = _parse_version_tuple(version)
+    if len(got) < 2 or got[0] != _TESTED_MYPY_MAJOR or got[1] != _TESTED_MYPY_MINOR:
+        return (
+            f"numty: warning: untested mypy version {version} "
+            f"(tested with {_TESTED_MYPY_VERSION}); "
+            "hooks may silently not fire (see issue #164)"
+        )
+    return None
+
+
+def _numpy_version_warning(version: str) -> str | None:
+    """Loud warning when `version` is below the minimum numpy, else None."""
+    got = _parse_version_tuple(version)
+    if not got:
+        return None
+    if got < _MIN_NUMPY_VERSION:
+        want = ".".join(str(p) for p in _MIN_NUMPY_VERSION)
+        return (
+            f"numty: warning: untested numpy version {version} "
+            f"(minimum supported is {want}); "
+            "hooks may silently not fire (see issue #164)"
+        )
+    return None
+
+
+def _installed_numpy_version() -> str | None:
+    """Installed numpy version, or None when it cannot be determined."""
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("numpy")
+    except Exception:
+        _swallowed(None, "_installed_numpy_version")
+        return None
+
+
+def _installed_numpy_warning() -> str | None:
+    """Loud warning when the installed numpy leaves the supported range."""
+    try:
+        numpy_version = _installed_numpy_version()
+    except Exception:
+        _swallowed(None, "_installed_numpy_warning")
+        return None
+    if numpy_version is None:
+        return None
+    return _numpy_version_warning(numpy_version)
+
+
+def _warn_startup(message: str) -> None:
+    try:
+        print(message, file=sys.stderr)
+    except Exception:  # reporting must never be the thing that crashes
+        pass
+
+
 def _trace_event(
     ctx: FunctionContext | MethodContext | AttributeContext,
     op: str,
@@ -368,6 +472,9 @@ class _FamBail(Exception):
 
 
 def plugin(version: str) -> type[Plugin]:
+    for warning in (_mypy_version_warning(version), _installed_numpy_warning()):
+        if warning is not None:
+            _warn_startup(warning)
     return NumtyPlugin
 
 
@@ -379,6 +486,57 @@ class NumtyPlugin(Plugin):
         # missing from the analyzed function's variables; the call-site
         # hook adds them back so concrete calls still check and infer.
         self._fam_late_bound: set[str] = set()
+        # Issue #164 step 2: stub canary state, once per module per run.
+        self._startup_canary_checked: set[str] = set()
+
+    def _ensure_startup_check(self, fullname: str) -> None:
+        """Warn once about hooked names missing from the loaded stubs.
+
+        Runs on hook lookup during type checking, when every reachable
+        module is fully loaded: the requested `fullname` itself must
+        resolve first, which proves its module is in the symbol table.
+        Only canary entries under that same module are judged then, so
+        a module the checked code never imports stays silent instead
+        of false-positive warning. (Signature and type-analyze hooks
+        run during semantic analysis, when modules are still loading,
+        so they do not run this check.)
+        """
+        if not fullname.startswith("numpy."):
+            return
+        try:
+            module, _, _ = fullname.rpartition(".")
+            candidates = _CANARY_BY_MODULE.get(module)
+            if not candidates:
+                return
+            unchecked = [c for c in candidates if c not in self._startup_canary_checked]
+            if not unchecked:
+                return
+            try:
+                sym = self.lookup_fully_qualified(fullname)
+            except Exception:
+                _swallowed(None, "_startup_canary")
+                return
+            if sym is None or getattr(sym, "node", None) is None:
+                return  # module not loaded yet; retry on a later hook
+            missing: list[str] = []
+            for candidate in unchecked:
+                try:
+                    resolved = self.lookup_fully_qualified(candidate)
+                except Exception:
+                    _swallowed(None, "_startup_canary")
+                    continue
+                self._startup_canary_checked.add(candidate)
+                if resolved is None or getattr(resolved, "node", None) is None:
+                    missing.append(candidate)
+            if missing:
+                _warn_startup(
+                    "numty: warning: "
+                    f"{len(missing)} hooked name(s) missing from the loaded "
+                    "numpy stubs, those hooks will silently never fire "
+                    f"(see issue #164): {', '.join(missing)}"
+                )
+        except Exception:
+            _swallowed(None, "startup_check")
 
     def get_function_signature_hook(
         self, fullname: str
@@ -1389,14 +1547,17 @@ class NumtyPlugin(Plugin):
     # Every numpy hook goes through _guard_mixed (see there); the solver
     # dispatch itself lives in the underscored getters below.
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
+        self._ensure_startup_check(fullname)
         return _guard_mixed(fullname, self._function_hook(fullname))
 
     def get_attribute_hook(
         self, fullname: str
     ) -> Callable[[AttributeContext], Type] | None:
+        self._ensure_startup_check(fullname)
         return _guard_mixed(fullname, self._attribute_hook(fullname))
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
+        self._ensure_startup_check(fullname)
         return _guard_mixed(fullname, self._method_hook(fullname))
 
     def _function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:

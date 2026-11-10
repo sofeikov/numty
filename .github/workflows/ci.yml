@@ -6,6 +6,14 @@ on:
 
 jobs:
   test:
+    # Issue #164 step 2: hooks key on private numpy module paths, so the
+    # oldest supported numpy (2.5, the `numpy>=2.5` floor) and the latest
+    # release both run the suite. A stub rename that silently unhooks
+    # everything must fail here, not in production.
+    strategy:
+      matrix:
+        numpy: ["minimum", "latest"]
+    name: test (numpy ${{ matrix.numpy }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,4 +27,9 @@ jobs:
         # scikit-learn stays an optional local dep (tests importorskip
         # without it), but CI must exercise the sklearn fixtures so a
         # red dogfood file fails the suite (issue #163).
-        run: uv run --with scikit-learn pytest
+        run: |
+          if [ "${{ matrix.numpy }}" = "minimum" ]; then
+            uv run --with 'numpy==2.5.*' --with scikit-learn pytest
+          else
+            uv run --with scikit-learn pytest
+          fi
