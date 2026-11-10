@@ -110,7 +110,7 @@ def test_warm_matches_cold() -> None:
             "tuple[Literal[5], Literal[3]]",
             "tuple[Literal[2], Literal[4]]",
             "tuple[Literal[2], Literal[3]]",
-            "tuple[N+2]",
+            "tuple[Literal[6]]",
         ):
             assert shape in cold.stdout, cold.stdout
 

@@ -1271,7 +1271,7 @@ class NumtyPlugin(Plugin):
             "numpy._ArrayOrScalarCommon.mT",
         }:
             return mt_attribute_hook
-        return None
+        return substituted_attribute_hook
 
     def _method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
         # NOTE: no __matmul__ hook. In testing, operator dispatch consulted
@@ -1783,7 +1783,7 @@ def _expr_str(form: _LinForm | _DivForm | _MonoForm) -> str:
 
 
 def _expr_var(
-    ctx: FunctionContext | MethodContext, op: str, index: int, form: _LinForm | _DivForm | _MonoForm
+    ctx: FunctionContext | MethodContext | AttributeContext, op: str, index: int, form: _LinForm | _DivForm | _MonoForm
 ) -> TypeVarType:
     """Mint (or reuse) the variable denoting a dim expression (issue #32).
 
@@ -6420,7 +6420,7 @@ def _unknown_display_name(module: str, line: int, fullname: str) -> str:
 
 
 def _fresh_unknown(
-    ctx: FunctionContext | MethodContext, role: str, index: int
+    ctx: FunctionContext | MethodContext | AttributeContext, role: str, index: int
 ) -> TypeVarType:
     """A fresh unknown dim, stable per source site across passes.
 
@@ -12354,6 +12354,153 @@ def _astype_type(ctx: FunctionContext | MethodContext, tp: Type, named: Type) ->
         return ctx.default_return_type
     dims, _ = parts
     return _ndarray_type(ctx, dims, named)
+
+
+def _has_expr_var(tp: Type, seen: set[int] | None = None) -> bool:
+    """Whether a type mentions a numty dim-expression var (issue #128)."""
+    if seen is None:
+        seen = set()
+    if id(tp) in seen:
+        return False
+    seen.add(id(tp))
+    proper = get_proper_type(tp)
+    if isinstance(proper, TypeVarType):
+        return proper.fullname.startswith(_EXPR_PREFIX)
+    if isinstance(proper, TupleType):
+        return any(_has_expr_var(item, seen) for item in proper.items)
+    if isinstance(proper, Instance):
+        return any(_has_expr_var(arg, seen) for arg in proper.args)
+    if isinstance(proper, UnionType):
+        return any(_has_expr_var(item, seen) for item in proper.relevant_items())
+    return False
+
+
+def _subst_expr_dim(
+    ctx: AttributeContext, dim: int | Type, mapping: dict[str, Type]
+) -> int | Type | None:
+    """An attribute dim with class args substituted (issue #128).
+
+    Expression vars (`N+2` stored on `self`) are rewritten from their
+    stored form; `N := 4` turns `N+2` into `6`. Returns None when the
+    result cannot be spelled (caller widens to a fresh unknown).
+    """
+    if isinstance(dim, int):
+        return dim
+    if not isinstance(dim, TypeVarType):
+        return dim
+    if not dim.fullname.startswith(_EXPR_PREFIX):
+        return dim
+    form = _form_of(dim)
+    if not isinstance(form, _LinForm):
+        return None
+    const = form.const
+    coeffs: list[tuple[str, int]] = []
+    for name, coeff in form.coeffs:
+        if _is_unknown_fullname(name):
+            coeffs.append((name, coeff))
+            continue
+        actual = mapping.get(name)
+        if actual is None:
+            return None
+        value = _dim_value(actual)
+        if isinstance(value, int):
+            const += coeff * value
+        elif isinstance(value, TypeVarType):
+            coeffs.append((value.fullname, coeff))
+        else:
+            return None
+    coeffs = [(n, c) for n, c in coeffs if c != 0]
+    if not coeffs:
+        return const
+    if len(coeffs) == 1 and coeffs[0][1] == 1 and const == 0:
+        # A single substituted var: return the real object, not a lookalike.
+        for tp in mapping.values():
+            proper = get_proper_type(tp)
+            if isinstance(proper, TypeVarType) and proper.fullname == coeffs[0][0]:
+                return proper
+    return _expr_var(ctx, "attr", 0, _LinForm(tuple(sorted(coeffs)), const))
+
+
+def _subst_attr_type(
+    ctx: AttributeContext, tp: Type, mapping: dict[str, Type]
+) -> Type | None:
+    """Attribute type with class args substituted; None to widen instead."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, TypeVarType):
+        if not proper.fullname.startswith(_EXPR_PREFIX):
+            return proper
+        dim = _subst_expr_dim(ctx, proper, mapping)
+        if dim is None:
+            return None
+        if isinstance(dim, int):
+            int_instance = ctx.api.named_generic_type(INT_FULLNAME, [])
+            return LiteralType(dim, fallback=int_instance)
+        return dim
+    if isinstance(proper, TupleType):
+        items: list[Type] = []
+        for item in proper.items:
+            if isinstance(item, UnpackType):
+                return None
+            sub = _subst_attr_type(ctx, item, mapping)
+            if sub is None:
+                return None
+            items.append(sub)
+        return proper.copy_modified(items=items)
+    if isinstance(proper, Instance):
+        args: list[Type] = []
+        for arg in proper.args:
+            if isinstance(arg, UnpackType):
+                return None
+            sub = _subst_attr_type(ctx, arg, mapping)
+            if sub is None:
+                return None
+            args.append(sub)
+        if args == list(proper.args):
+            return proper
+        return proper.copy_modified(args=args)
+    if isinstance(proper, UnionType):
+        items = []
+        for item in proper.relevant_items():
+            sub = _subst_attr_type(ctx, item, mapping)
+            if sub is None:
+                return None
+            items.append(sub)
+        return proper.copy_modified(items=items)
+    return proper
+
+
+def substituted_attribute_hook(ctx: AttributeContext) -> Type:
+    """Generic attribute access: substitute class args into expr dims.
+
+    Expression vars (`N+2`) mint a fresh id mypy never substitutes, so
+    `Padded[Literal[4]].p` leaks an unbound `N+2` (issue #128). Rewrite
+    from the stored form with the base's type arguments; widen to a
+    fresh unknown when the result cannot be spelled.
+    """
+    default = ctx.default_attr_type
+    if not _has_expr_var(default):
+        return default
+    base = get_proper_type(ctx.type)
+    if not isinstance(base, Instance):
+        return default
+    try:
+        tvars = base.type.defn.type_vars
+    except Exception:
+        return default
+    if len(tvars) != len(base.args):
+        return default
+    mapping: dict[str, Type] = {}
+    for tvar, arg in zip(tvars, base.args):
+        fullname = getattr(tvar, "fullname", None)
+        if isinstance(fullname, str):
+            mapping[fullname] = arg
+    try:
+        sub = _subst_attr_type(ctx, default, mapping)
+    except Exception:
+        return default
+    if sub is None:
+        return default
+    return sub
 
 
 def shape_attribute_hook(ctx: AttributeContext) -> Type:

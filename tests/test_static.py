@@ -2102,6 +2102,22 @@ def test_matrix_transpose_rank_mismatch() -> None:
     assert "matrix_transpose requires rank >= 2, got shape ()" in errors[2], result.stdout
 
 
+def test_class_attr_substitution() -> None:
+    # Issue #128: Padded[Literal[4]].p substitutes N := 4 into N+2.
+    result = run_mypy(FIXTURES / "bad_class_attr.py")
+    assert result.returncode == 1, result.stdout
+    assert reveals_by_line(result) == {
+        17: '"numpy.ndarray[tuple[Literal[6]], numpy.dtype[numpy.float64]]"',
+    }, result.stdout
+    assert_operator_mismatch(
+        run_mypy(FIXTURES / "bad_class_attr.py"),
+        "broadcast shapes disagree at trailing axis 0",
+        "6 vs 9",
+        "(6,)",
+        "(9,)",
+    )
+
+
 def test_inline_generic_call_ok_clean_and_runs() -> None:
     # Issue #55: nested generic calls keep shapes inline (1 level from
     # the issue plus 2-4 level ML nesting), concrete and symbolic.
