@@ -3581,8 +3581,35 @@ def _shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
     return [single] if single is not None else None
 
 
+def _builder_fold_dim_expr(
+    ctx: FunctionContext | MethodContext, expr: Expression, index: int
+) -> int | Type | None:
+    """_fold_dim_expr without per-scope side effects (issue #186).
+
+    Form ids are shared on purpose (an inferred `N+1` must be the same
+    variable as an annotated one), but the constituent objects (`N` in
+    `N+1`) are per-function: overwriting them with the builder site's
+    objects makes a later `x[1:]` in another function return the wrong
+    `N` (`N@edges` vs `N@trimmed`). Snapshot and restore those two
+    registries around the fold.
+    """
+    seen_snapshot = dict(_seen_vars)
+    const_snapshot = {k: dict(v) for k, v in _expr_constituents.items()}
+    try:
+        return _fold_dim_expr(ctx, expr, index)
+    finally:
+        _seen_vars.clear()
+        _seen_vars.update(seen_snapshot)
+        _expr_constituents.clear()
+        _expr_constituents.update(const_snapshot)
+
+
 def _builder_shape(
-    tp: Type, expr: Expression | None, default: Type, shaped_stub: bool = True
+    ctx: FunctionContext | MethodContext,
+    tp: Type,
+    expr: Expression | None,
+    default: Type,
+    shaped_stub: bool = True,
 ) -> list[int | Type] | None:
     """Dims of a builder's shape (zeros/ones/empty/full, *_like shape=, size=).
 
@@ -3598,10 +3625,37 @@ def _builder_shape(
     shaped_stub says the stubs type this shape argument into the result
     (zeros/ones/empty/full); *_like shape= and size= stubs answer
     tuple[Any, ...], which there is nothing to take from.
+
+    A size written as arithmetic over known sizes (issue #186) is folded
+    with the dim algebra, like reshape targets (#184): `u.shape[0] *
+    u.shape[1]`, `2 * u.shape[0]`, `u.shape[0] + 1`. What the algebra
+    cannot spell (a sum times a sum) is a fresh unknown, which is still
+    a size.
+
+    Builder folding is side-effect free for the dim registries: it reuses
+    the shared form ids (so an inferred `N+1` is the same variable as an
+    annotated one) but never overwrites the per-scope constituents that
+    later slices/diffs need (`x[1:]` on `F64[N+1]` must give the current
+    function's `N`, not the builder site's).
     """
     dims = _shape_from_arg(tp, expr)
     if dims is not None:
         return list(dims)
+    if expr is not None and not isinstance(expr, (TupleExpr, ListExpr, StarExpr)):
+        if isinstance(expr, OpExpr) and _fold_int(expr) is None:
+            try:
+                folded = _builder_fold_dim_expr(ctx, expr, 0)
+                if isinstance(folded, int):
+                    return [folded]
+                if isinstance(folded, TypeVarType):
+                    return [folded]
+            except Exception:
+                _swallowed(None, "_builder_shape")
+                pass
+        dim = _dim_value(tp)
+        if isinstance(dim, (int, TypeVarType)):
+            return [dim]
+        return None
     proper = get_proper_type(tp)
     if (
         not isinstance(expr, TupleExpr)
@@ -3625,6 +3679,18 @@ def _builder_shape(
     for i, (item, item_tp) in enumerate(zip(expr.items, proper.items)):
         if isinstance(item, StarExpr):
             return None
+        if isinstance(item, OpExpr) and _fold_int(item) is None:
+            try:
+                folded = _builder_fold_dim_expr(ctx, item, i)
+                if isinstance(folded, int):
+                    out.append(folded)
+                    continue
+                if isinstance(folded, TypeVarType):
+                    out.append(folded)
+                    continue
+            except Exception:
+                _swallowed(None, "_builder_shape")
+                pass
         value = _fold_int(item)
         dim = value if value is not None else _dim_value(item_tp)
         if dim is None and stub_items is not None:
@@ -4098,7 +4164,7 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
             shape_arg, shape_expr = named
     if shape_arg is None:
         return ctx.default_return_type
-    dims = _builder_shape(shape_arg, shape_expr, ctx.default_return_type)
+    dims = _builder_shape(ctx, shape_arg, shape_expr, ctx.default_return_type)
     if dims is None:
         return ctx.default_return_type
     if not _dims_fit_intp(ctx, dims):
@@ -8813,7 +8879,7 @@ def _like_types(ctx: FunctionContext, tp: Type) -> Type:
     dims, dtype = parts
     shape_pair = _formal_pair(ctx, "shape")
     if shape_pair is not None and not _is_none_type(shape_pair[0]):
-        override = _builder_shape(*shape_pair, ctx.default_return_type, shaped_stub=False)
+        override = _builder_shape(ctx, *shape_pair, ctx.default_return_type, shaped_stub=False)
         if override is None:
             return ctx.default_return_type
         dims = override
@@ -8867,7 +8933,7 @@ def full_function_hook(ctx: FunctionContext) -> Type:
     fill_pair = _formal_pair(ctx, "fill_value")
     if shape_pair is None or fill_pair is None:
         return ctx.default_return_type
-    dims = _builder_shape(*shape_pair, ctx.default_return_type)
+    dims = _builder_shape(ctx, *shape_pair, ctx.default_return_type)
     if dims is None:
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -11866,7 +11932,7 @@ def _parse_size_arg(ctx: MethodContext) -> list[int | Type] | str | None:
         return "absent"
     if _is_none_type(pair[0]):
         return "none"
-    dims = _builder_shape(*pair, ctx.default_return_type, shaped_stub=False)
+    dims = _builder_shape(ctx, *pair, ctx.default_return_type, shaped_stub=False)
     if dims is not None and any(_is_plain_int(d) for d in dims):
         # A mixed size= stays with the stubs (tuple[Any, ...]). Unlike
         # np.zeros, whose overloads take the shape from the assignment's
@@ -11910,7 +11976,7 @@ def rng_method_hook(ctx: MethodContext, op: str) -> Type:
         return ctx.default_return_type
     first_tp, first_expr = pairs[0]
     if op == "choice":
-        size = _parse_axis_arg(_formal_pair(ctx, "size"))
+        size = _parse_size_arg(ctx)
         if size is None:
             return ctx.default_return_type
         if isinstance(size, str):
