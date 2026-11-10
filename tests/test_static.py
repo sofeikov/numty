@@ -882,6 +882,38 @@ def test_dtype_wrong_fails() -> None:
     assert "signedinteger[_64Bit]" in errors[8] and "signedinteger[_32Bit]" in errors[8], result.stdout
 
 
+def test_dtype_144_ok() -> None:
+    # Issue #144: datetime family, reciprocal/power scalar paths, det/qr.
+    result = run_mypy(FIXTURES / "dtype_144_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert len(notes) == 11, result.stdout
+    assert "datetime64" in notes[16] and "Literal[2]" in notes[16], result.stdout
+    assert "datetime64" in notes[17] and "Literal[2]" in notes[17], result.stdout
+    assert "timedelta64" in notes[18] and "Literal[2]" in notes[18], result.stdout
+    assert "timedelta64" in notes[19] and "Literal[1]" in notes[19], result.stdout
+    assert "datetime64" in notes[20] and "Literal[2]" in notes[20], result.stdout
+    assert "_32Bit" in notes[24] and "floating" in notes[24], result.stdout
+    assert "complexfloating" in notes[25] and "_32Bit" in notes[25], result.stdout
+    assert "floating" in notes[26] and "_32Bit" in notes[26], result.stdout
+    assert "signedinteger" in notes[27] and "_32Bit" in notes[27], result.stdout
+    assert '"numpy.floating' in notes[31] and "_32Bit" in notes[31], result.stdout
+    assert "Literal[2], Literal[2]" in notes[32] and "_32Bit" in notes[32], result.stdout
+    assert _run_fixture("dtype_144_ok.py") == ["ok"]
+
+
+def test_mean_datetime_bails() -> None:
+    # Issue #144: mean(datetime) always raises: error, no float64 claim.
+    result = run_mypy(FIXTURES / "bad_mean_datetime.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 1, result.stdout
+    assert "arg-type" in errors[0], result.stdout
+    notes = reveals_by_line(result)
+    assert notes[11] == '"Any"', result.stdout
+    assert "float64" not in notes[11], result.stdout
+
+
 def test_any_axis_out_of_range() -> None:
     # Issue #148: OOB names op and shape.
     assert_single_error(
