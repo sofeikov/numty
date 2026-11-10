@@ -394,6 +394,22 @@ def test_stack_shape_mismatch() -> None:
     )
 
 
+def test_stack_empty_sequence() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_stack_empty.py"),
+        "stack needs at least one array (got an empty sequence)",
+        "[numty-shape]",
+    )
+
+
+def test_concatenate_empty_sequence() -> None:
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_concat_empty.py"),
+        "concatenate needs at least one array (got an empty sequence)",
+        "[numty-shape]",
+    )
+
+
 def test_arange_step_mismatch() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_arange_step.py"),
