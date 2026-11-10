@@ -3662,3 +3662,71 @@ def test_showcase_algebra_formulas() -> None:
         ":33: error: broadcast shapes disagree at trailing axis 0: time-1 vs time "
         "(shapes (batch, time-1) vs (batch, time))  [numty-broadcast]"
     ), result.stdout
+
+
+def test_rebind_allow_redefinition_ok() -> None:
+    # Issue #162: ordinary rebinds need allow_redefinition=True; with it
+    # the solver stays precise (reduction/transpose/reshape, if/else
+    # union with per-member matmul). The loop accumulator is the known
+    # weak spot: union plus the stubs fallback, so matmul on it is Any.
+    result = run_mypy(
+        FIXTURES / "rebind_allow_ok.py", flags=("--allow-redefinition",)
+    )
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    iu = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]"
+    assert reveals_by_line(result) == {
+        22: f'"numpy.ndarray[tuple[batch], {f64}]"',
+        28: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {f64}]"',
+        30: f'"numpy.ndarray[tuple[Literal[4], Literal[3]], {f64}]"',
+        32: f'"numpy.ndarray[tuple[Literal[12]], {iu}]"',
+        34: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {iu}]"',
+        38: f'"numpy.ndarray[tuple[Literal[0], Literal[3]], {f64}] | numpy.ndarray[tuple[Literal[1], Literal[3]], {f64}] | numpy.ndarray[tuple[Any, ...], numpy.dtype[Any]]"',
+        46: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {f64}] | numpy.ndarray[tuple[Literal[5], Literal[4]], {f64}]"',
+        47: f'"numpy.ndarray[tuple[Literal[3], Literal[2]], {f64}] | numpy.ndarray[tuple[Literal[5], Literal[2]], {f64}]"',
+    }, result.stdout
+    assert _run_fixture("rebind_allow_ok.py") == [
+        "(5,)",
+        "(4, 3)",
+        "(3, 4)",
+        "(3, 3)",
+        "(3, 2)",
+        "(5, 2)",
+    ]
+
+
+def test_rebind_strict_fails() -> None:
+    # Same file under default flags: each rebind is an [assignment]
+    # error (plus the return-value follow-on), documenting why the flag
+    # is recommended.
+    result = run_mypy(FIXTURES / "rebind_allow_ok.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 6, result.stdout
+    assert sum("[assignment]" in line for line in errors) == 5, result.stdout
+    assert sum("Incompatible return value" in line for line in errors) == 1, (
+        result.stdout
+    )
+
+
+def test_ok_fixtures_clean_under_allow_redefinition() -> None:
+    # Issue #162: every *_ok fixture stays clean with the flag (one
+    # mypy run, not one subprocess per file).
+    ok_files = sorted(FIXTURES.glob("*_ok.py"))
+    assert ok_files, "no *_ok fixtures found"
+    result = run_mypy(*ok_files, flags=("--allow-redefinition",))
+    assert result.returncode == 0, result.stdout
+
+
+def test_sklearn_clean_under_allow_redefinition() -> None:
+    # Issue #162: sklearn dogfood stays precise with the flag; gnb keeps
+    # its single [numty-bail] (the rebind split from #163 is flag-proof).
+    pytest.importorskip("sklearn")
+    for name in ("sklearn_ridge.py", "sklearn_nmf.py", "sklearn_normalize.py"):
+        result = run_mypy(FIXTURES / name, flags=("--allow-redefinition",))
+        assert result.returncode == 0, result.stdout
+    result = run_mypy(FIXTURES / "sklearn_gnb.py", flags=("--allow-redefinition",))
+    assert_single_error(
+        result,
+        "stack needs a sequence of known length",
+    )
