@@ -1021,6 +1021,53 @@ against `F64[batch, features]` fails with `expected "F64[Never,
 Never]"` under plain mypy) and results become `F64[Any, Any]`
 ([#5](https://github.com/sofeikov/numty/issues/5)).
 
+## Checked against numpy
+
+The fixtures pin the cases someone thought of. The differential oracle
+covers the ones nobody did: it generates numpy expressions, asks
+mypy+numty for the type of each, evaluates the same text with numpy,
+and compares. A run fails when
+
+- numty claims a shape or dtype numpy does not produce,
+- numpy rejects an expression that numty gave a fully concrete type
+  with no diagnostic, or
+- numty reports a shape error on an expression numpy accepts.
+
+Losing precision (an unknown dim, `Any`, a bail) never fails: only a
+wrong answer does. Two modes share the machinery. Concrete mode builds
+operands with literal shapes across twelve dtypes. Symbolic mode wraps
+the expression in a function with `F64[N, M]`-style parameters, calls
+it with fixed sizes, and substitutes them into the revealed dims, so
+`N+1`, `N*M` and `N//2+1` are checked as arithmetic.
+
+The suite runs a small fixed-seed sample of both modes plus every
+expression the oracle has caught so far, pinned by hand. For a longer
+hunt:
+
+```bash
+NUMTY_FUZZ_SEEDS=1-30 NUMTY_FUZZ_COUNT=700 uv run pytest tests/test_differential.py
+```
+
+```bash
+PYTHONPATH=. python -m tests.differential --seeds 1-30 --count 700
+```
+
+Each disagreement prints the expression, numty's type and numpy's
+result:
+
+```text
+CLAIM_ON_ERROR: np.searchsorted(np.ones((3, 3)), np.ones((6,)))
+    numty: numpy.ndarray[tuple[Literal[6]], numpy.dtype[numpy.signedinteger[...]]]
+    numpy: raises ValueError: object too deep for desired array
+```
+
+What it does not cover: wrong answers that come from numpy's own stubs
+on calls numty does not hook are listed in `KNOWN_GAPS` in
+`tests/differential.py` rather than failed (two entries today:
+`cov`/`corrcoef` and `digitize` on complex input), and in symbolic
+mode an expression numpy rejects is never counted against numty,
+since distinct dims are unprovable by design.
+
 ## Limitations, stated plainly
 
 - The plugin is mypy-only and pinned to mypy internals that occasionally
@@ -1199,6 +1246,10 @@ Never]"` under plain mypy) and results become `F64[Any, Any]`
   each bad one must fail with our message, and `reveal_type` pins must show
   precise shapes on the good paths. The `f64_ok` + `bad_f64_*` fixtures do
   the same for the familiar-style heads (clean end-to-end MLP included).
+- [tests/test_differential.py](tests/test_differential.py) +
+  [tests/differential.py](tests/differential.py) — the differential
+  oracle: generated numpy expressions, numty's type against numpy's
+  result (see "Checked against numpy").
 - [tests/test_ty.py](tests/test_ty.py) — runs the pinned ty over
   `numty/__init__.py demo.py` (exactly the 2 demo errors) and over
   [flex_portable.py](tests/fixtures/flex_portable.py) (`FlexArray`
