@@ -17,6 +17,9 @@ Two modes share the machinery. Concrete mode builds every operand with
 a literal shape. Symbolic mode wraps the expression in a function whose
 parameters carry TypeVar dims (`F64[N, M]`), then calls it with fixed
 sizes and substitutes them into the revealed dims (`N+1`, `N*M`, ...).
+A symbolic answer is a claim about every size, so each case is run
+under every assignment in SIZE_ASSIGNMENTS (one mypy run, several numpy
+evaluations): odd and even sizes, and an empty axis.
 
 Used by tests/test_differential.py; run it by hand for a longer hunt:
 
@@ -69,6 +72,15 @@ KNOWN_GAPS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
+# A symbolic dim that comes out negative under a size assignment (`N-1`
+# at N=0, from `a[1:]`) is counted under this key, not failed, whether
+# it sits in the revealed shape or in the error numty reports.
+# numty's subtraction is exact where numpy's slicing and `diff`
+# saturate at zero, so such a formula only holds for sizes at least as
+# large as what it subtracts. A wrong answer whose dims all stay
+# non-negative still fails.
+BELOW_DOMAIN = "known gap: size below the formula's domain"
+
 DIMS = (1, 2, 3, 4, 5, 6)
 DTYPES = (
     "",
@@ -87,6 +99,17 @@ DTYPES = (
 # Symbolic mode: sizes are distinct and never 1, so two different names
 # can neither broadcast nor coincide by accident.
 SYMBOL_SIZES = {"N": 3, "M": 5, "K": 7, "P": 4}
+# What a symbolic case is evaluated under. The first is the default.
+# The second flips every parity (`N//2+1`, `(N+1)//2`); the last two
+# make one axis empty, where `2*N == N` and `N*M == N` hold after all.
+# Zero keeps the rule above: unlike 1, an empty axis does not broadcast
+# against other sizes.
+SIZE_ASSIGNMENTS: tuple[dict[str, int], ...] = (
+    SYMBOL_SIZES,
+    {"N": 4, "M": 6, "K": 8, "P": 5},
+    {"N": 0, "M": 5, "K": 7, "P": 4},
+    {"N": 3, "M": 0, "K": 7, "P": 4},
+)
 SYMBOL_HEADS = {
     "F64": "float64",
     "F32": "float32",
@@ -595,11 +618,11 @@ class Case:
             parts.append(f"{name}: {head}[{dims}]")
         return ", ".join(parts)
 
-    def runtime_namespace(self) -> dict[str, object]:
+    def runtime_namespace(self, sizes: dict[str, int] = SYMBOL_SIZES) -> dict[str, object]:
         ns: dict[str, object] = {"np": np}
         for name, head, shape in self.params:
-            sizes = tuple(SYMBOL_SIZES[d] if isinstance(d, str) else cast(int, d) for d in shape)
-            ns[name] = np.ones(sizes, dtype=SYMBOL_HEADS[head])
+            concrete = tuple(sizes[d] if isinstance(d, str) else cast(int, d) for d in shape)
+            ns[name] = np.ones(concrete, dtype=SYMBOL_HEADS[head])
         return ns
 
 
@@ -718,8 +741,8 @@ def dtype_names(node: Node) -> set[str] | None:
     return None
 
 
-def _eval_dim(text: str) -> int | None:
-    """A revealed dim (`N`, `N+1`, `N*M`, `N//2+1`) under SYMBOL_SIZES."""
+def _eval_dim(text: str, sizes: dict[str, int] = SYMBOL_SIZES) -> int | None:
+    """A revealed dim (`N`, `N+1`, `N*M`, `N//2+1`) under `sizes`."""
     try:
         tree = ast.parse(text, mode="eval")
     except SyntaxError:
@@ -731,10 +754,22 @@ def _eval_dim(text: str) -> int | None:
     for sub in ast.walk(tree):
         if not isinstance(sub, allowed):
             return None
-        if isinstance(sub, ast.Name) and sub.id not in SYMBOL_SIZES:
+        if isinstance(sub, ast.Name) and sub.id not in sizes:
             return None
-    value = eval(compile(tree, "<dim>", "eval"), {"__builtins__": {}}, dict(SYMBOL_SIZES))
+    value = eval(compile(tree, "<dim>", "eval"), {"__builtins__": {}}, dict(sizes))
     return value if isinstance(value, int) else None
+
+
+def _negative_dim(text: str, sizes: dict[str, int]) -> bool:
+    """Whether a dim formula spelled in `text` is negative under `sizes`."""
+    for token in re.findall(r"[A-Z0-9+*/-]+", text):
+        # Only formulas over a size name: a bare `-1` is an axis.
+        if not any(name in token for name in sizes):
+            continue
+        value = _eval_dim(token.strip("+*/"), sizes)
+        if value is not None and value < 0:
+            return True
+    return False
 
 
 @dataclass
@@ -749,7 +784,7 @@ class ArrayClaim:
         return self.dims is not None and all(d is not None for d in self.dims)
 
 
-def array_claim(node: Node) -> ArrayClaim | None:
+def array_claim(node: Node, sizes: dict[str, int] = SYMBOL_SIZES) -> ArrayClaim | None:
     if node.name != "numpy.ndarray" or len(node.args) != 2:
         return None
     shape, dtype = node.args
@@ -767,7 +802,7 @@ def array_claim(node: Node) -> ArrayClaim | None:
                 if a.name == "Literal" and a.args and a.args[0].name.lstrip("-").isdigit():
                     dims.append(int(a.args[0].name))
                 elif not a.args:
-                    dims.append(_eval_dim(a.name))
+                    dims.append(_eval_dim(a.name, sizes))
                 else:
                     dims.append(None)
     else:
@@ -788,10 +823,17 @@ class Finding:
     case: Case
     static: str
     runtime: str
+    sizes: dict[str, int] | None = None  # symbolic cases: the assignment
 
     def __str__(self) -> str:
         where = f"def f({self.case.signature()}): " if self.case.symbolic else ""
-        return f"{self.kind}: {where}{self.case.expr}\n    numty: {self.static}\n    numpy: {self.runtime}"
+        at = ""
+        if self.sizes is not None:
+            at = " with " + ", ".join(f"{k}={v}" for k, v in self.sizes.items())
+        return (
+            f"{self.kind}: {where}{self.case.expr}\n    numty: {self.static}"
+            f"\n    numpy{at}: {self.runtime}"
+        )
 
 
 def _check_array(claim: ArrayClaim, value: np.ndarray | np.generic) -> str | None:
@@ -808,9 +850,9 @@ def _check_array(claim: ArrayClaim, value: np.ndarray | np.generic) -> str | Non
     return None
 
 
-def _compare(node: Node, value: object) -> str | None:
+def _compare(node: Node, value: object, sizes: dict[str, int] = SYMBOL_SIZES) -> str | None:
     """Kind of mismatch between a revealed type and a runtime value."""
-    claim = array_claim(node)
+    claim = array_claim(node, sizes)
     if claim is not None:
         if isinstance(value, (np.ndarray, np.generic)):
             return _check_array(claim, value)
@@ -819,12 +861,12 @@ def _compare(node: Node, value: object) -> str | None:
         if node.name in ("tuple", "builtins.tuple") and len(node.args) == len(value):
             if not any(a.name == "..." for a in node.args):
                 for sub, item in zip(node.args, value):
-                    bad = _compare(sub, item)
+                    bad = _compare(sub, item, sizes)
                     if bad:
                         return bad
         elif node.name in ("list", "builtins.list") and len(node.args) == 1:
             for item in value:
-                bad = _compare(node.args[0], item)
+                bad = _compare(node.args[0], item, sizes)
                 if bad:
                     return bad
     return None
@@ -840,12 +882,12 @@ def _describe(value: object) -> str:
     return type(value).__name__
 
 
-def evaluate(case: Case) -> object:
+def evaluate(case: Case, sizes: dict[str, int] = SYMBOL_SIZES) -> object:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with np.errstate(all="ignore"):
             try:
-                return eval(case.expr, case.runtime_namespace())
+                return eval(case.expr, case.runtime_namespace(sizes))
             except Exception as exc:  # the exception is the answer
                 return exc
 
@@ -884,7 +926,17 @@ def run_mypy(source: str, workdir: Path) -> tuple[dict[int, str], dict[int, list
     return reveals, errors, raw
 
 
-def check(cases: list[Case], workdir: Path) -> tuple[list[Finding], dict[str, int]]:
+def check(
+    cases: list[Case],
+    workdir: Path,
+    assignments: tuple[dict[str, int], ...] = SIZE_ASSIGNMENTS,
+) -> tuple[list[Finding], dict[str, int]]:
+    """Findings and outcome counts for `cases`.
+
+    mypy runs once. A symbolic case is then evaluated under every size
+    assignment and counted once per assignment; a concrete case has no
+    sizes to vary and is counted once.
+    """
     source, lines = render(cases)
     reveals, errors, raw = run_mypy(source, workdir)
     if "INTERNAL ERROR" in raw or "Traceback (most recent call last)" in raw:
@@ -895,49 +947,62 @@ def check(cases: list[Case], workdir: Path) -> tuple[list[Finding], dict[str, in
     def count(key: str) -> None:
         stats[key] = stats.get(key, 0) + 1
 
-    def report(kind: str, case: Case, static: str, value: object) -> None:
+    def report(
+        kind: str, case: Case, static: str, value: object, sizes: dict[str, int]
+    ) -> None:
         for known_kind, pattern, _why in KNOWN_GAPS:
             if kind == known_kind and re.search(pattern, case.expr):
                 count(f"known gap: {kind}")
                 return
-        findings.append(Finding(kind, case, static, _describe(value)))
+        shown = sizes if case.symbolic else None
+        findings.append(Finding(kind, case, static, _describe(value), shown))
         count(kind)
 
-    for case, line in zip(cases, lines):
-        value = evaluate(case)
+    def judge(case: Case, line: int, sizes: dict[str, int]) -> None:
+        value = evaluate(case, sizes)
         static = reveals.get(line, "<no reveal>")
         errs = errors.get(line, [])
         asserting = [e for e in errs if any(f"[{c}]" in e for c in _ASSERTING_CODES)]
         if isinstance(value, _DATA_ERRORS):
             count("skipped: data-dependent runtime error")
-            continue
+            return
         if isinstance(value, BaseException):
             if errs:
                 count("numpy raises, flagged")
-                continue
+                return
             if isinstance(value, _SHAPE_ERRORS) and static != "<no reveal>":
                 node = parse_type(static)
-                claim = array_claim(node)
+                claim = array_claim(node, sizes)
                 if claim is not None and claim.concrete and not case.symbolic:
-                    report("CLAIM_ON_ERROR", case, static, value)
-                    continue
+                    report("CLAIM_ON_ERROR", case, static, value, sizes)
+                    return
             count("numpy raises, not flagged (allowed)")
-            continue
+            return
+        if asserting and case.symbolic and _negative_dim(asserting[0], sizes):
+            count(BELOW_DOMAIN)
+            return
         if asserting:
-            report("FALSE_POSITIVE", case, asserting[0], value)
-            continue
+            report("FALSE_POSITIVE", case, asserting[0], value, sizes)
+            return
         if static == "<no reveal>":
             count("no reveal")
-            continue
-        bad = _compare(parse_type(static), value)
+            return
+        bad = _compare(parse_type(static), value, sizes)
+        if bad == "WRONG_SHAPE" and case.symbolic and _negative_dim(static, sizes):
+            count(BELOW_DOMAIN)
+            return
         if bad:
-            report(bad, case, static, value)
-            continue
-        claim = array_claim(parse_type(static))
+            report(bad, case, static, value, sizes)
+            return
+        claim = array_claim(parse_type(static), sizes)
         if claim is not None and claim.concrete and isinstance(value, np.ndarray):
             count("agree: exact shape")
         else:
             count("agree: partial or no claim")
+
+    for case, line in zip(cases, lines):
+        for sizes in assignments if case.symbolic else assignments[:1]:
+            judge(case, line, sizes)
     return findings, stats
 
 

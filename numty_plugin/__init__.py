@@ -1674,19 +1674,20 @@ def _dim_eq(a: int | Type, b: int | Type) -> bool:
     return False
 
 
-def _dims_provably_ne(a: int | Type, b: int | Type) -> bool:
-    """Provably-unequal dims: same linear vars, different constants.
+def _dims_provably_ne(a: int | Type, b: int | Type, nonzero: bool = False) -> bool:
+    """Provably-unequal dims: no sizes at all make them equal.
 
     `N` vs `N-1`, `N+1` vs `N`, `M+2` vs `M` can never be equal (the
-    equality would require `0 == nonzero`). Single-var same-const
-    coeff diffs (`2*N` vs `N`), same-var monomial coeff diffs and
-    same-division plus diffs are also impossible up to a zero factor
-    the reshape int path already ignores. Anything else (different
-    vars `N` vs `M`, unknowns, div-vs-linear) might be equal at
-    runtime, so it stays unprovable (issue #56: no false errors). Used
-    by broadcast/matmul/stack to flag real off-by-one bugs from
-    `np.diff` / `N+1` offsets (issue #32) instead of bailing to a
-    silent `?U`. Extended for reshape sums/monos/divs (issue #137).
+    equality would require `0 == nonzero`), and neither can
+    `N//2+1` vs `N//2`. Anything else (different vars `N` vs `M`,
+    unknowns, div-vs-linear) might be equal at runtime, so it stays
+    unprovable (issue #56: no false errors). Used by broadcast/matmul/
+    stack to flag real off-by-one bugs from `np.diff` / `N+1` offsets
+    (issue #32) instead of bailing to a silent `?U`.
+
+    `nonzero=True` also counts pairs that are equal only on an empty
+    axis (`2*N` vs `N`, see `_forms_provably_ne`). Only reshape asks
+    for that.
     """
     if _dim_eq(a, b):
         return False
@@ -1694,20 +1695,23 @@ def _dims_provably_ne(a: int | Type, b: int | Type) -> bool:
         return a != b
     fa = _resolve_dim(a)
     fb = _resolve_dim(b)
-    return _forms_provably_ne(fa, fb)
+    return _forms_provably_ne(fa, fb, nonzero)
 
 
-def _forms_provably_ne(fa: object, fb: object) -> bool:
-    """Provably-unequal total products: same linear vars, different consts.
+def _forms_provably_ne(fa: object, fb: object, nonzero: bool = False) -> bool:
+    """Provably-unequal forms: same linear vars, different consts.
 
-    `N+1` vs `N`, `N+2` vs `N` can never be equal. Same-var
-    single-term coeff diffs (`2*N` vs `N`, ignoring the `N == 0`
-    solution the int-factor path already ignores), same-var monomial
-    coeff diffs (`2*M*N` vs `M*N`) and same-division plus diffs
-    (`N//2+1` vs `N//2`) are also impossible. Different vars, divs vs
-    linears or unknowns stay unprovable (issue #56). Used by reshape
-    (issue #63) to flag off-by-pad totals without false errors;
-    extended for sums/monos/divs (issue #137).
+    `N+1` vs `N` and `N+2` vs `N` can never be equal, and neither can
+    same-division plus diffs (`N//2+1` vs `N//2`). Different vars,
+    divs vs linears or unknowns stay unprovable (issue #56).
+
+    Coefficient diffs are different: `2*N` vs `N` and `2*M*N` vs `M*N`
+    are equal exactly when a variable is 0, and an empty axis is a
+    legal size, so numpy accepts `np.vdot` of `(2, M)` and `(M,)` at
+    `M == 0`. They count only under `nonzero=True`, which reshape
+    passes because its literal-factor check already reads totals up
+    to a zero factor (issues #63, #137). Every other caller keeps to
+    what holds for all sizes.
     """
     if fa is None or fb is None:
         return False
@@ -1723,7 +1727,8 @@ def _forms_provably_ne(fa: object, fb: object) -> bool:
         if fa.coeffs == fb.coeffs and fa.const != fb.const:
             return True
         if (
-            len(fa.coeffs) == 1
+            nonzero
+            and len(fa.coeffs) == 1
             and len(fb.coeffs) == 1
             and fa.coeffs[0][0] == fb.coeffs[0][0]
             and fa.const == fb.const
@@ -1732,7 +1737,7 @@ def _forms_provably_ne(fa: object, fb: object) -> bool:
             return True
         return False
     if isinstance(fa, _MonoForm) and isinstance(fb, _MonoForm):
-        return fa.vars == fb.vars and fa.coeff != fb.coeff
+        return nonzero and fa.vars == fb.vars and fa.coeff != fb.coeff
     if isinstance(fa, _DivForm) and isinstance(fb, _DivForm):
         return fa.inner == fb.inner and fa.div == fb.div and fa.plus != fb.plus
     return False
@@ -7376,7 +7381,7 @@ def _solve_reshape(
                     code=NUMTY_SHAPE,
                 )
             return ctx.default_return_type
-        if _forms_provably_ne(old_form, new_form):
+        if _forms_provably_ne(old_form, new_form, nonzero=True):
             # Same int total but provably-unequal symbolic totals
             # (N+1 vs N, N+2 vs N*1 from off-by-pad, issue #63):
             # no assignment of N satisfies the equality, so the call
@@ -7392,7 +7397,7 @@ def _solve_reshape(
             return ctx.default_return_type
         old_total = _reshape_total_form(dims_old)
         new_total = _reshape_total_form(raw)
-        if _forms_provably_ne(old_total, new_total):
+        if _forms_provably_ne(old_total, new_total, nonzero=True):
             # Single-dim sums the product form cannot spell (N+1 vs N,
             # N+2 vs N): same vars, different consts, always unequal.
             assert old_total is not None and new_total is not None
@@ -7415,7 +7420,7 @@ def _solve_reshape(
             for i, (a, b) in enumerate(zip(dims_old, raw)):
                 if _dim_eq(a, b):
                     continue
-                if _dims_provably_ne(a, b):
+                if _dims_provably_ne(a, b, nonzero=True):
                     if ne_idx != -1:
                         single = False
                         break
