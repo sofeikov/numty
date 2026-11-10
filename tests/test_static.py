@@ -2078,6 +2078,19 @@ def test_diff_0d_mismatch() -> None:
     )
 
 
+def test_take_convolve_0d_ok_clean() -> None:
+    # Issue #131: take/convolve accept 0-d via the flattening path.
+    result = run_mypy(FIXTURES / "take_convolve_0d_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        6: f'"numpy.ndarray[tuple[Literal[1]], {f64}]"',
+        7: f'"numpy.ndarray[tuple[Literal[1]], {f64}]"',
+        8: '"numpy.float64"',
+    }, result.stdout
+
+
 def test_inline_generic_call_ok_clean_and_runs() -> None:
     # Issue #55: nested generic calls keep shapes inline (1 level from
     # the issue plus 2-4 level ML nesting), concrete and symbolic.

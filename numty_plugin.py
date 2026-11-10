@@ -4287,7 +4287,7 @@ def _take_solve(
     if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
         ctx.api.fail("np.take axis must be an integer or None", ctx.context, code=NUMTY_AXIS)
         return ctx.default_return_type
-    norm = _normalize_axis(axis[0], len(dims))
+    norm = _normalize_axis_0d(axis[0], len(dims))
     if norm is None:
         ctx.api.fail(
             f"axis {axis[0]} is out of range for {len(dims)} dimensions "
@@ -4296,11 +4296,14 @@ def _take_solve(
             code=NUMTY_AXIS,
         )
         return ctx.default_return_type
+    # 0-d arrays flatten to one element (issue #131): bounds check
+    # against size 1, result shape from the empty prefix/suffix.
+    size = dims[norm] if dims else 1
     # numpy skips the index check when a dim before the axis is 0:
     # there is no row to take from.
     empty_outer = any(isinstance(d, int) and d == 0 for d in dims[:norm])
     if not empty_outer and not _take_in_bounds(
-        ctx, pair, dims[norm], f"axis {axis[0]} of size {dims[norm]}", dims
+        ctx, pair, size, f"axis {axis[0]} of size {size}", dims
     ):
         return ctx.default_return_type
     if is_scalar:
@@ -4622,6 +4625,11 @@ def _convolve_solve(
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
+    if len(dims_a) == 0:
+        # 0-d arrays flatten to one element (issue #131).
+        dims_a = [1]
+    if len(dims_b) == 0:
+        dims_b = [1]
     if len(dims_a) != 1 or len(dims_b) != 1:
         ctx.api.fail(
             f"{op} only supports 1-dimensional arrays "
