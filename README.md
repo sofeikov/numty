@@ -112,9 +112,9 @@ error: Incompatible return value type (got "ndarray[tuple[batch, heads, seq, seq
   latest long run (42,000 expressions, seeds 101-130, NumPy 2.5.4,
   mypy 2.4.1) had **no disagreements**. Each symbolic expression is
   run at four sets of sizes, empty axes included, which makes 105,000
-  comparisons: 59,524 exact shapes matched NumPy's, and of the 28,670
-  NumPy rejects, 18,002 were reported before running. Five cases hit
-  documented gaps in NumPy's own stubs and 143 hit the empty-axis
+  comparisons: 60,709 exact shapes matched NumPy's, and of the 27,632
+  NumPy rejects, 17,484 were reported before running. Three cases hit
+  documented gaps in NumPy's own stubs and 144 hit the empty-axis
   limit on symbolic subtraction (see
   [Checked against numpy](#checked-against-numpy)).
 - **It finds seeded bugs.** [bench/](bench) hides 18 realistic
@@ -1206,7 +1206,9 @@ Symbolic mode also calls generic functions it writes itself, such as
 caller's own names. There is no numpy answer for those, so the oracle
 carries its own reading of a signature: bind the names from the
 argument shapes, then build what the return spells. numty's answer at
-the call site has to match it.
+the call site has to match it. Half of these are declared on a class,
+as an instance method, a static method, a class method or `__call__`,
+since methods reach the plugin by a different path than functions.
 
 The suite runs a small fixed-seed sample of both modes plus every
 expression the oracle has caught so far, pinned by hand. For a longer

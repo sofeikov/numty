@@ -1081,6 +1081,39 @@ def test_round_bool_with_decimals_claims_nothing() -> None:
     assert reveals_by_line(result) == {8: '"Any"', 9: '"Any"', 10: '"Any"'}, result.stdout
 
 
+def test_callsite_formula_returns_through_methods() -> None:
+    # Found by the oracle once it declared its generic helpers on
+    # classes: methods had the call-site conflict check but not the
+    # formula-return handling functions have, so `-> F64[N, "N+1"]` on
+    # an instance, static or class method or on `__call__` came back
+    # with `Never` for the formula dim.
+    result = run_mypy(FIXTURES / "callsite_formula_methods_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        36: f'"{f64.format("2*M+1, 2*M+2")}"',
+        37: f'"{f64.format("2*M+2*N, M+N")}"',
+        38: f'"{f64.format("N+2")}"',
+        39: f'"{f64.format("M, 2*M")}"',
+        40: f'"{f64.format("Literal[4], Literal[5]")}"',
+        41: f'"{f64.format("Literal[3]")}"',
+    }, result.stdout
+    assert _run_fixture("callsite_formula_methods_ok.py") == [
+        "(7, 8)", "(10, 5)", "(4,)", "(3, 6)", "(4, 5)", "(3,)",
+    ]
+
+
+def test_permutation_of_a_0d_array() -> None:
+    # numpy raises; numty used to reveal shape () for it.
+    result = run_mypy(FIXTURES / "bad_permutation_0d.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line.split(": error: ")[1] for line in result.stdout.splitlines() if ": error:" in line]
+    assert errors == [
+        "permutation requires an int or at least 1 dimension, got shape ()  [numty-shape]"
+    ] * 2, result.stdout
+    assert len(reveals_by_line(result)) == 2, result.stdout
+
+
 def test_callsite_conflict() -> None:
     result = run_mypy(FIXTURES / "bad_callsite_conflict.py")
     assert result.returncode == 1, result.stdout
