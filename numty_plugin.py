@@ -10827,6 +10827,13 @@ def diff_function_hook(ctx: FunctionContext) -> Type:
     if _has_unpack(dims):
         return ctx.default_return_type
     ndim = len(dims)
+    if ndim < 1:
+        ctx.api.fail(
+            f"np.diff requires at least 1 dimension, got shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     if axis == "absent":
         ax = ndim - 1

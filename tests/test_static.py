@@ -2070,6 +2070,14 @@ def test_solve_0d_mismatch() -> None:
     assert "linalg.solve: b has 0 dimensions" in errors[0], result.stdout
 
 
+def test_diff_0d_mismatch() -> None:
+    # Issue #130: np.diff on 0-d is a normal error, not a silent Any bail.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_diff_0d.py"),
+        "np.diff requires at least 1 dimension, got shape ()",
+    )
+
+
 def test_inline_generic_call_ok_clean_and_runs() -> None:
     # Issue #55: nested generic calls keep shapes inline (1 level from
     # the issue plus 2-4 level ML nesting), concrete and symbolic.
