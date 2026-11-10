@@ -1,3 +1,5 @@
+# Copyright (c) 2007-2026 The scikit-learn developers (BSD-3-Clause, see LICENSES/scikit-learn-BSD-3-Clause.txt).
+# SPDX-License-Identifier: BSD-3-Clause
 """Unit-norm scaling -- excerpted from scikit-learn 1.9.1.
 
 Source: `sklearn/preprocessing/_data.py::normalize`, dense l2 path

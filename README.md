@@ -51,7 +51,9 @@ def solve_cholesky(
 
 The full file (`tests/fixtures/sklearn_ridge.py`) adds mean-centering,
 intercept recovery, and a run that asserts `allclose` agreement with
-`Ridge(alpha=1.0, solver="cholesky")`:
+`Ridge(alpha=1.0, solver="cholesky")`. Excerpts from scikit-learn 1.9.1
+are BSD-3-Clause, © 2007-2026 The scikit-learn developers — see
+`LICENSES/scikit-learn-BSD-3-Clause.txt`:
 
 ```text
 Success: no issues found in 1 source file

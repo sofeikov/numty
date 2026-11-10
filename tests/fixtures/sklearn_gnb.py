@@ -1,3 +1,5 @@
+# Copyright (c) 2007-2026 The scikit-learn developers (BSD-3-Clause, see LICENSES/scikit-learn-BSD-3-Clause.txt).
+# SPDX-License-Identifier: BSD-3-Clause
 """GaussianNB log-likelihood -- excerpted from scikit-learn 1.9.1.
 
 Source: `sklearn/naive_bayes.py::GaussianNB._joint_log_likelihood`
