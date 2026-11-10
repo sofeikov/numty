@@ -219,8 +219,10 @@ def test_broadcast_mismatch() -> None:
 
 def test_unknown_broadcast_keeps_rank_and_dtype() -> None:
     # Issue #56: one unprovable axis used to dissolve the whole result
-    # into Any; now the axis is a fresh unknown (or the literal, when
-    # one side is a literal) and rank, known dims and dtype survive.
+    # into Any; now the axis is a fresh unknown and rank, known dims
+    # and dtype survive. Issue #138: a literal against a symbolic dim
+    # is likewise unprovable, so it mints a fresh unknown instead of
+    # claiming the literal.
     result = run_mypy(FIXTURES / "unknown_broadcast_ok.py")
     assert result.returncode == 0, result.stdout
     notes = [
@@ -232,7 +234,7 @@ def test_unknown_broadcast_keeps_rank_and_dtype() -> None:
     assert notes == [
         f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
         f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
-        f'numpy.ndarray[tuple[Literal[4], Literal[3]], {f64}]"',
+        f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
         f'numpy.ndarray[tuple[P, D], {f64}]"',
         f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
     ], result.stdout
@@ -251,6 +253,30 @@ def test_unknown_broadcast_downstream_error() -> None:
         "matmul inner dimensions disagree: 3 vs 4",
         line=15,
     )
+
+
+def test_broadcast_int_symbolic_mints_unknown() -> None:
+    # Issue #138: literal-vs-symbolic claimed the literal; now it mints
+    # a fresh ?U (1s and same-name symbolics stay precise).
+    result = run_mypy(FIXTURES / "broadcast_int_symbolic_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = [
+        re.sub(r"\?U@\d+[a-z]?", "?U", line.split('Revealed type is "', 1)[1])
+        for line in result.stdout.splitlines()
+        if "Revealed type" in line
+    ]
+    f64 = "numpy.dtype[numpy.float64]"
+    assert notes == [
+        f'numpy.ndarray[tuple[?U], {f64}]"',
+        f'numpy.ndarray[tuple[?U], {f64}]"',
+        f'numpy.ndarray[tuple[N], {f64}]"',
+        f'numpy.ndarray[tuple[N], {f64}]"',
+        f'numpy.ndarray[tuple[N], {f64}]"',
+    ], result.stdout
+    assert _run_fixture("broadcast_int_symbolic_ok.py") == [
+        "(5,)",
+        "(3,)",
+    ]
 
 
 def test_unknown_slice_keeps_sibling_dims() -> None:
