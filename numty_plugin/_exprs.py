@@ -134,7 +134,7 @@ def _form_of(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
 
 
 def _current_scope_vars(
-    ctx: FunctionContext | MethodContext,
+    ctx: FunctionContext | MethodContext | AttributeContext,
 ) -> dict[str, TypeVarType]:
     """TypeVars visible in the current call's actual types, by fullname.
 

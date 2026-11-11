@@ -2,6 +2,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 
 from mypy.nodes import ARG_POS, ARG_STAR, ARG_STAR2, Expression, ListExpr, NameExpr, OpExpr, StarExpr, TupleExpr
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
@@ -14,11 +15,11 @@ from ._exprs import _expr_str
 
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _is_bare_name_dim, _linear_product, 
-    _reshape_total_form, _fold_int, _ndarray_parts, _ndarray_type, _shape_from_arg, 
+    _reshape_total_form, _fold_int, _ndarray_parts, _ndarray_type, _shape_from_arg, _int_shape_from_arg, 
     NDARRAY_FULLNAME, INT_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME
 )
 
-def _dims_str(dims: list[int | Type]) -> str:
+def _dims_str(dims: Sequence[int | Type]) -> str:
     """Shape for messages: tuple-style, symbolic dims by name."""
     inner = ", ".join(_dim_str(d) for d in dims)
     if len(dims) == 1:
@@ -659,7 +660,7 @@ def _parse_axis_arg(pair: tuple[Type, Expression | None] | None) -> list[int] | 
     tp, expr = pair
     if _is_none_type(tp):
         return "none"
-    return _shape_from_arg(tp, expr)
+    return _int_shape_from_arg(tp, expr)
 
 
 def _normalize_axis(ax: int, ndim: int) -> int | None:
@@ -775,7 +776,7 @@ def _solve_transpose(
     if not rest:
         axes = list(reversed(range(ndim)))
     elif len(rest) == 1:
-        single = _shape_from_arg(rest[0][0], rest[0][1])
+        single = _int_shape_from_arg(rest[0][0], rest[0][1])
         if single is None:
             first_tp = rest[0][0]
             if _is_none_type(first_tp):
@@ -1110,7 +1111,7 @@ def transpose_function_hook(ctx: FunctionContext) -> Type:
     if not rest:
         axes_pair = _formal_pair(ctx, "axes")
         if axes_pair is not None and not _is_none_type(axes_pair[0]):
-            axes = _shape_from_arg(axes_pair[0], axes_pair[1])
+            axes = _int_shape_from_arg(axes_pair[0], axes_pair[1])
             if axes is None:
                 return ctx.default_return_type
             return _apply_permutation(ctx, dims, dtype, axes)
@@ -1131,7 +1132,7 @@ def transpose_function_hook(ctx: FunctionContext) -> Type:
     if isinstance(expr, (TupleExpr, ListExpr)) or (
         expr is None and isinstance(get_proper_type(tp), TupleType)
     ):
-        axes = _shape_from_arg(tp, expr)
+        axes = _int_shape_from_arg(tp, expr)
         if axes is None:
             return ctx.default_return_type
         return _apply_permutation(ctx, dims, dtype, axes)
@@ -1261,7 +1262,7 @@ def _moveaxis_permutation(
 def _parse_shape_like(pair: tuple[Type, Expression | None] | None) -> list[int] | None:
     if pair is None:
         return None
-    return _shape_from_arg(pair[0], pair[1])
+    return _int_shape_from_arg(pair[0], pair[1])
 
 
 def moveaxis_function_hook(ctx: FunctionContext) -> Type:
@@ -1388,7 +1389,7 @@ def rollaxis_function_hook(ctx: FunctionContext) -> Type:
 
 
 def _matrix_transpose_solve(
-    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
+    ctx: FunctionContext | MethodContext | AttributeContext, dims: list[int | Type], dtype: Type
 ) -> Type:
     ndim = len(dims)
     if ndim < 2:
@@ -1443,7 +1444,7 @@ def permute_dims_function_hook(ctx: FunctionContext) -> Type:
     if axes_pair is None or _is_none_type(axes_pair[0]):
         # No axes: reverse
         return _ndarray_type(ctx, list(reversed(dims)), dtype)
-    axes = _shape_from_arg(axes_pair[0], axes_pair[1])
+    axes = _int_shape_from_arg(axes_pair[0], axes_pair[1])
     if axes is None:
         return ctx.default_return_type
     return _apply_permutation(ctx, dims, dtype, axes)

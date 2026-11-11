@@ -15,7 +15,7 @@ from ._trace import _numty_strict, _numty_trace_path, _trace_event
 from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES, _datetime_string_kind
 
 from ._types import (
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, 
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, _int_shape_from_arg, 
     _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME
 )
 
@@ -340,7 +340,7 @@ def _widen_literal_dims(
         shape = get_proper_type(proper.args[0])
         if isinstance(shape, TupleType):
             axes = (int_axes or {}).get(len(shape.items), set())
-            items = [
+            items: list[Type] = [
                 AnyType(TypeOfAny.explicit)
                 if (literals and isinstance(i, LiteralType)) or (k in axes and _is_plain_int(i))
                 else i
@@ -491,7 +491,8 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
 
     def guarded(ctx: FunctionContext | MethodContext | AttributeContext) -> Type:
         if isinstance(ctx, AttributeContext):
-            default, operands = ctx.default_attr_type, [ctx.type]
+            default = ctx.default_attr_type
+            operands: list[Type] = [ctx.type]
         else:
             default = ctx.default_return_type
             operands = [t for ts in ctx.arg_types for t in ts]
@@ -1323,7 +1324,7 @@ def _sequence_parts(
             items.append((list(dims), dtype))
         return items or None
     if isinstance(expr, ListExpr):
-        items = []
+        items: list[tuple[list[int | Type], Type]] = []
         for item_expr in expr.items:
             item_tp = ctx.api.get_expression_type(item_expr)
             if item_tp is None:
@@ -1386,7 +1387,7 @@ def _concat_axis(ctx: FunctionContext, pairs: list[tuple[Type, Expression | None
     pair = _formal_pair(ctx, "axis")
     if pair is None:
         if len(pairs) > 1:
-            vals = _shape_from_arg(pairs[1][0], pairs[1][1])
+            vals = _int_shape_from_arg(pairs[1][0], pairs[1][1])
             if vals is None or len(vals) != 1:
                 return None
             return vals[0]
@@ -1399,7 +1400,7 @@ def _single_axis_value(pair: tuple[Type, Expression | None]) -> int | None | str
     tp, expr = pair
     if _is_none_type(tp):
         return "none"
-    vals = _shape_from_arg(tp, expr)
+    vals = _int_shape_from_arg(tp, expr)
     if vals is None or len(vals) != 1:
         return None
     return vals[0]
@@ -1578,13 +1579,14 @@ def _concat_merge(
         for i, d in enumerate(dims):
             if i != norm and not _dim_eq(out[i], d):
                 return ctx.default_return_type
-        if isinstance(out[norm], int) and isinstance(dims[norm], int):
-            out[norm] = out[norm] + dims[norm]
+        acc, extra = out[norm], dims[norm]
+        if isinstance(acc, int) and isinstance(extra, int):
+            out[norm] = acc + extra
         else:
             # Symbolic lengths add exactly (issue #32): 1+N -> N+1,
             # N+M -> N+M via linear forms. Unrepresentable (Div/Mono)
             # mints a fresh unknown, never a bail to Any.
-            out[norm] = _dim_add2(ctx, op, norm, out[norm], dims[norm])
+            out[norm] = _dim_add2(ctx, op, norm, acc, extra)
     return _ndarray_type(ctx, out, dtype)
 
 

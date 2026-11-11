@@ -237,8 +237,13 @@ def _fft_seq_arg(
             types = list(proper.items)
         else:
             types = [None] * len(expr.items)
-        out = [_fft_seq_entry(e, t) for e, t in zip(expr.items, types)]
-        return out if all(v != "bad" for v in out) else "bail"
+        out: list[int | None] = []
+        for e, t in zip(expr.items, types):
+            entry = _fft_seq_entry(e, t)
+            if isinstance(entry, str):
+                return "bail"
+            out.append(entry)
+        return out
     proper = get_proper_type(tp)
     if isinstance(proper, TupleType):
         out2: list[int | None] = []

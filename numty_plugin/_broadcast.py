@@ -1,6 +1,7 @@
 """Broadcast/operator/compare/ufunc hooks (Phase 3, #197). Merged mesh (operators+compare+logical+ufunc+where/clip, one module). Shared helpers live in sibling modules and are imported through the facade inside each function (a top-level import would cycle). NUMTY/_bail/_swallowed from _errors direct. _fresh_unknown only via facade lazy. _broadcast_result is the monkeypatch seam (test_internal BROKEN_PLUGIN patches facade name; callers resolve via facade global)."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE
@@ -874,10 +875,10 @@ def _solve_where(ctx: FunctionContext) -> Type:
 
 def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: Type) -> Type:
     from numty_plugin import _ndarray_type, _parts_or_unpack
-    specs = [_operand_spec(tp) for tp in (cond, x, y)]
-    if any(spec is None for spec in specs):
+    raw_specs = [_operand_spec(tp) for tp in (cond, x, y)]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
         return ctx.default_return_type
-    assert all(spec is not None for spec in specs)
     shapes = [dims for dims, _, _ in specs if dims is not None]
     if not shapes:
         return ctx.default_return_type
@@ -924,10 +925,10 @@ def _solve_clip(ctx: FunctionContext) -> Type:
 def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type:
     from numty_plugin import _ndarray_type, _parts_or_unpack
     # NumPy 2 promotes across all operands (like a ufunc).
-    specs = [_operand_spec(tp) for tp in types]
-    if any(spec is None for spec in specs):
+    raw_specs = [_operand_spec(tp) for tp in types]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
         return ctx.default_return_type
-    assert all(spec is not None for spec in specs)
     shapes = [dims for dims, _, _ in specs if dims is not None]
     if not shapes:
         return ctx.default_return_type
@@ -972,8 +973,8 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
 
 def _broadcast_to_compatible(
     ctx: FunctionContext,
-    arr_dims: list[int | Type],
-    dims: list[int | Type],
+    arr_dims: Sequence[int | Type],
+    dims: Sequence[int | Type],
 ) -> bool:
     """Whether an array shape broadcasts to the target (issue #46).
 
@@ -1021,7 +1022,7 @@ def _broadcast_to_compatible(
     return True
 
 
-def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int]) -> Type:
+def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int | Type]) -> Type:
     from numty_plugin import _WEAK_DEFAULT, _construct_dtype, _has_unpack, _ndarray_parts, _ndarray_type
     spec = _operand_spec(tp)
     if spec is None:
@@ -1380,10 +1381,10 @@ def _truediv_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
     from numty_plugin import _construct_dtype, _maybe_scalar, _ndarray_parts
-    specs = [_operand_spec(left), _operand_spec(right)]
-    if any(spec is None for spec in specs):
+    raw_specs = [_operand_spec(left), _operand_spec(right)]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
         return ctx.default_return_type
-    assert all(spec is not None for spec in specs)
     shapes = [dims for dims, _, _ in specs if dims is not None]
     dims = _broadcast_shapes(ctx, shapes, "true_divide") if shapes else []
     if dims is None:
@@ -1440,7 +1441,7 @@ def clip_method_hook(ctx: MethodContext) -> Type:
     return _clip_types(ctx, types)
 
 
-def _ufunc_name(ctx: FunctionContext | MethodContext) -> str | None:
+def _ufunc_name(ctx: MethodContext) -> str | None:
     """The ufunc name from its Literal type argument, else None."""
     proper = get_proper_type(ctx.type)
     if not isinstance(proper, Instance) or not proper.args:
@@ -1592,10 +1593,10 @@ def _ufunc_float_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
     from numty_plugin import _maybe_scalar, _ndarray_parts, _promote_strong
-    specs = [_operand_spec(left), _operand_spec(right)]
-    if any(spec is None for spec in specs):
+    raw_specs = [_operand_spec(left), _operand_spec(right)]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
         return ctx.default_return_type
-    assert all(spec is not None for spec in specs)
     shapes = [dims for dims, _, _ in specs if dims is not None]
     dims = _broadcast_shapes(ctx, shapes, "ufunc") if shapes else []
     if dims is None:
@@ -1646,10 +1647,10 @@ def _ufunc_bool_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
     from numty_plugin import _construct_dtype, _maybe_scalar
-    specs = [_operand_spec(left), _operand_spec(right)]
-    if any(spec is None for spec in specs):
+    raw_specs = [_operand_spec(left), _operand_spec(right)]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
         return ctx.default_return_type
-    assert all(spec is not None for spec in specs)
     shapes = [dims for dims, _, _ in specs if dims is not None]
     if not shapes:
         return ctx.default_return_type

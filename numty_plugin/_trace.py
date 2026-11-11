@@ -10,7 +10,7 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from mypy.plugin import AttributeContext, FunctionContext, MethodContext
+    pass
 
 
 def _numty_trace_path() -> str | None:
@@ -25,7 +25,7 @@ def _numty_strict() -> bool:
 
 
 def _trace_event(
-    ctx: FunctionContext | MethodContext | AttributeContext,
+    ctx: object,
     op: str,
     outcome: str,
     reason: str,

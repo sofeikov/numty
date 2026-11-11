@@ -2690,6 +2690,21 @@ def test_offsets_calls_mismatch() -> None:
     )
 
 
+def test_union_attr_substitutes_expr_dims() -> None:
+    # A union-typed attribute with expression dims (`F64["N+1"] | None`)
+    # reported [numty-internal] at every access: the substitution
+    # called UnionType.copy_modified, which does not exist. Found by ty.
+    result = run_mypy(FIXTURES / "union_attr_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[Literal[{}]], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        30: f'"{f64.format(4)} | None"',
+        31: f'"{f64.format(4)} | {f64.format(6)}"',
+    }, result.stdout
+    assert _run_fixture("union_attr_ok.py") == ["None", "(6,)"]
+
+
 def test_same_tvar_roundtrip_ok() -> None:
     # Issue #43: two byte-identical bodies sharing one TypeVar check
     # identically. The reshape -1 roundtrip (repeat -> N*2 -> N) used to

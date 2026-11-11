@@ -15,7 +15,13 @@ from ._forms import _is_unknown_fullname
 from ._state import STATE
 
 if TYPE_CHECKING:
-    from mypy.plugin import AttributeContext, FunctionContext, MethodContext
+    from mypy.plugin import (
+        AttributeContext,
+        FunctionContext,
+        FunctionSigContext,
+        MethodContext,
+        MethodSigContext,
+    )
     from mypy.types import Type
 
 
@@ -61,7 +67,9 @@ def _unknown_display_name(module: str, line: int, fullname: str) -> str:
 
 
 def _fresh_unknown(
-    ctx: FunctionContext | MethodContext | AttributeContext, role: str, index: int
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext,
+    role: str,
+    index: int,
 ) -> TypeVarType:
     """A fresh unknown dim, stable per source site across passes.
 

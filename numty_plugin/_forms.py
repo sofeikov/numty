@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import ast
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 class _LinForm(NamedTuple):
     """Canonical linear dim: sum(coeff * var) + const, coeffs sorted by var."""
@@ -99,7 +99,7 @@ def _eval_form(node: ast.AST) -> _LinForm | _DivForm | _MonoForm:
     if kind == "_LinForm" and set(kw) == {"coeffs", "const"}:
         return _LinForm(coeffs(kw["coeffs"]), num(kw["const"]))
     if kind == "_DivForm" and set(kw) == {"inner", "div", "plus"}:
-        return _DivForm(_eval_form(kw["inner"]), num(kw["div"]), num(kw["plus"]))
+        return _DivForm(cast(_LinForm, _eval_form(kw["inner"])), num(kw["div"]), num(kw["plus"]))
     if kind == "_MonoForm" and set(kw) == {"coeff", "vars"}:
         return _MonoForm(num(kw["coeff"]), strs(kw["vars"]))
     raise ValueError("unknown form")
