@@ -1548,6 +1548,39 @@ def test_mask_length_mismatch() -> None:
     )
 
 
+def test_mask_int_dims_keep_dtype() -> None:
+    # Issue #226: Bool[int] mask on F64[int] keeps dtype, not Any.
+    result = run_mypy(FIXTURES / "index_mask_int_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "float64" in notes[11] and "?U@" in notes[11], result.stdout
+    assert "float64" in notes[12] and "?U@" in notes[12], result.stdout
+    assert notes[13] == '"numpy.float64"', result.stdout
+
+
+def test_mask_symbolic_length_mismatch() -> None:
+    # Issue #228: N-1 vs N mask reports like literal 4 vs 5, for getitem
+    # and setitem.
+    result = run_mypy(FIXTURES / "bad_mask_symbolic_len.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 3, result.stdout
+    for line in errors:
+        assert "boolean index did not match" in line, result.stdout
+        assert "[numty-axis]" in line, result.stdout
+
+
+def test_int_scalar_and_list_indices() -> None:
+    # Issue #231: np.intp/np.int64 scalars index like int; x[[-1]] is (1, N).
+    result = run_mypy(FIXTURES / "index_int_scalar_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "tuple[N]" in notes[15], result.stdout
+    assert "tuple[N]" in notes[16], result.stdout
+    assert "tuple[N]" in notes[17], result.stdout
+    assert "tuple[Literal[1], N]" in notes[20], result.stdout
+
+
 def test_mask_nd_axis_out_of_range() -> None:
     # Issue #49: the 2-D mask is rank 1, so mean(axis=1) is an axis error.
     assert_single_error(
