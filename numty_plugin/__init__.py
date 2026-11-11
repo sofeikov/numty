@@ -216,6 +216,14 @@ from ._forms import (  # noqa: F401
     _lin_scale,
     _mono_normalize,
 )
+from ._unknowns import (  # noqa: F401
+    _fresh_unknown,
+    _is_same_unknown,
+    _unknown_display_name,
+    _unknown_ids,
+    _unknown_names,
+    _unknown_per_line,
+)
 from ._exprs import (  # noqa: F401
     _EXPR_PREFIX,
     _LATE_PREFIXES,
@@ -232,9 +240,6 @@ from ._exprs import (  # noqa: F401
     _resolve_dim,
     _seen_vars,
     _short_var,
-    _unknown_ids,
-    _unknown_names,
-    _unknown_per_line,
     _current_scope_vars,
 )
 
@@ -6969,78 +6974,6 @@ def _reshape_new_dims(
     return dims or None
 
 
-
-
-def _is_same_unknown(a: int | Type, b: int | Type) -> bool:
-    """Same ?U on both sides (issue #63): one mask site serves every
-    comprehension element, so equality would be a false proof."""
-    return (
-        isinstance(a, TypeVarType)
-        and isinstance(b, TypeVarType)
-        and a.fullname == b.fullname
-        and _is_unknown_fullname(a.fullname)
-    )
-
-
-def _unknown_display_name(module: str, line: int, fullname: str) -> str:
-    """Readable, per-site name for an unknown: ?U@14, then ?U@14b, ...
-
-    Named after the line that minted it, so unrelated unknowns print
-    differently and the name points at its source; a second distinct
-    site on the same line gets a letter suffix. Stable per site, like
-    the id, so re-checks and overload candidates print identically.
-    """
-    name = _unknown_names.get(fullname)
-    if name is None:
-        n = _unknown_per_line.get((module, line), 0)
-        _unknown_per_line[(module, line)] = n + 1
-        if n == 0:
-            suffix = ""
-        elif n < 26:
-            suffix = chr(ord("a") + n)
-        else:
-            suffix = f"_{n + 1}"
-        name = f"?U@{line}{suffix}"
-        _unknown_names[fullname] = name
-    return name
-
-
-def _fresh_unknown(
-    ctx: FunctionContext | MethodContext | AttributeContext, role: str, index: int
-) -> TypeVarType:
-    """A fresh unknown dim, stable per source site across passes.
-
-    Data-dependent sizes (mask counts, dynamic lengths, uninferable
-    reshapes) cannot be spelled, but their positions are known: mint a
-    variable for the position instead of failing or bailing. Site-keyed
-    (target + line + column + role + index) so overload candidates and
-    re-checks mint the identical variable — differing ids would look
-    like disagreement to overload resolution and collapse to Any.
-    Unknowns unify with anything, so they dissolve precision but can
-    never produce a false error; ranks and known dims keep checking
-    around them.
-    """
-    tree = getattr(ctx.api, "tree", None)
-    module = getattr(tree, "fullname", "") or ""
-    line = ctx.context.line
-    column = ctx.context.column
-    key = f"{module}_{line}_{column}_{role}_{index}"
-    vid = _unknown_ids.get(key)
-    if vid is None:
-        vid = TypeVarId.new(0)
-        _unknown_ids[key] = vid
-    fullname = f"__numty_unknown__.{key}"
-    upper = ctx.api.named_generic_type("builtins.int", [])
-    return TypeVarType(
-        name=_unknown_display_name(module, line, fullname),
-        fullname=fullname,
-        id=vid,
-        values=[],
-        upper_bound=upper,
-        default=AnyType(TypeOfAny.from_omitted_generics),
-        line=line,
-        column=column,
-    )
 
 
 def _solve_reshape_unpack(
