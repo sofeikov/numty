@@ -238,6 +238,8 @@ from ._exprs import (  # noqa: F401
     _implicit_scope_vars,
     _materialize_dim,
     _mono_str,
+    _ns_of_ctx,
+    _normalize_ns,
     _resolve_dim,
     _seen_vars,
     _short_var,
@@ -2055,9 +2057,22 @@ def _callsite_expr_bindings(
                     if adim.fullname == a_full:
                         found = adim
                     else:
-                        found = _expr_constituents.get(adim.fullname, {}).get(a_full)
+                        _ns = _ns_of_ctx(ctx)
+                        _consts = _expr_constituents.get(adim.fullname, {})
+                        found = _consts.get((_ns, a_full))
+                        if found is None:
+                            for (_n, _f), _obj in _consts.items():
+                                if _f == a_full:
+                                    found = _obj
+                                    break
                 if found is None:
-                    found = _seen_vars.get(a_full)
+                    _ns = _ns_of_ctx(ctx)
+                    found = _seen_vars.get((_ns, a_full))
+                    if found is None:
+                        for (_n, _f), _obj in _seen_vars.items():
+                            if _f == a_full:
+                                found = _obj
+                                break
                 bindings[m_full] = found if found is not None else solved
             except Exception:
                 _swallowed(ctx, "_callsite_expr_bindings")
@@ -2142,15 +2157,24 @@ def _substitute_return_exprs(
     new_dims: list[int | Type] = []
     changed = False
     # For building new expr vars we need constituent objects by fullname.
+    # Caller-ns first (Phase 4 Phase 1 namespaced B keys), then any-ns.
     obj_by_fullname: dict[str, TypeVarType] = {}
     for v in bindings.values():
         if isinstance(v, TypeVarType):
             obj_by_fullname.setdefault(v.fullname, v)
+    _ns = _ns_of_ctx(ctx)
     for consts in _expr_constituents.values():
-        for k, v in consts.items():
-            obj_by_fullname.setdefault(k, v)
-    for k, v in _seen_vars.items():
-        obj_by_fullname.setdefault(k, v)
+        for (_n, _f), _v in consts.items():
+            if _n == _ns:
+                obj_by_fullname.setdefault(_f, _v)
+    for (_n, _f), _v in _seen_vars.items():
+        if _n == _ns:
+            obj_by_fullname.setdefault(_f, _v)
+    for consts in _expr_constituents.values():
+        for (_n, _f), _v in consts.items():
+            obj_by_fullname.setdefault(_f, _v)
+    for (_n, _f), _v in _seen_vars.items():
+        obj_by_fullname.setdefault(_f, _v)
     for index, d in enumerate(rdims):
         try:
             if isinstance(d, int):
@@ -2252,11 +2276,11 @@ def _substitute_return_exprs(
             )
             # Constituents for later diff() of this inferred expr.
             try:
-                const_map: dict[str, TypeVarType] = {}
+                const_map: dict[tuple[str, str], TypeVarType] = {}
                 for cfull in merged:
                     o = obj_by_fullname.get(cfull)
                     if o is not None:
-                        const_map[cfull] = o
+                        const_map[(_ns_of_ctx(ctx), cfull)] = o
                 if const_map:
                     _expr_constituents.setdefault(new_fullname, {}).update(
                         const_map
