@@ -446,8 +446,9 @@ def _consume_suffix(
         if item[0] == "newaxis":
             out.append(1)
         else:
-            assert slot[idx] is not None
-            out.extend(slot[idx])
+            frag = slot[idx]
+            assert frag is not None
+            out.extend(frag)
     return suffix[: p + 1], out
 
 

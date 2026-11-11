@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
     from mypy.plugin import FunctionSigContext
     from mypy.plugin import MethodContext
+    from mypy.types import FunctionLike
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
@@ -324,7 +325,8 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
-    if any(not isinstance(d, int) for d in dims[-2:]):
+    rows, cols = dims[-2], dims[-1]
+    if not isinstance(rows, int) or not isinstance(cols, int):
         # K = min(M, N) is unknowable with symbolic dims.
         return ctx.default_return_type
     full = _linalg_flag(ctx, "full_matrices", True)
@@ -345,12 +347,13 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
     s_name = _linalg_real_name(kind, size)
     if s_name is None:
         return ctx.default_return_type
-    uv_dtype = _linalg_dtype(ctx, dtype, uv_name)
+    # _linalg_dtype returns `dtype` when the name is its own fullname;
+    # a None name is that same case.
+    uv_dtype = dtype if uv_name is None else _linalg_dtype(ctx, dtype, uv_name)
     s_dtype = _linalg_dtype(ctx, dtype, s_name)
     if uv_dtype is None or s_dtype is None:
         return ctx.default_return_type
     batch = dims[:-2]
-    rows, cols = dims[-2], dims[-1]
     inner = min(rows, cols)
     s_type = _ndarray_type(ctx, [*batch, inner], s_dtype)
     if not compute_uv:
@@ -471,7 +474,7 @@ def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -
     return True
 
 
-def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
+def _norm_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     """Widen ord/axis to Any when the call would fail _norm_ord_fits (issue #148).
 
     The function hook rejects every overload candidate for fro/nuc with a
@@ -568,7 +571,7 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
         return ctx.default_signature
 
 
-def _linalg_cross_signature_hook(ctx: FunctionSigContext) -> Type:
+def _linalg_cross_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     """Let `np.linalg.cross` take arrays of rank 3 and up.
 
     The stubs type both operands as 1-D or 2-D, so a batch of vectors

@@ -12,7 +12,7 @@ from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
 if TYPE_CHECKING:
     from mypy.nodes import CallExpr, StrExpr
     from mypy.plugin import FunctionContext, FunctionSigContext
-    from mypy.types import CallableType, Type
+    from mypy.types import CallableType, FunctionLike, Type
 
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import ARG_POS, ARG_STAR, CallExpr, StrExpr
@@ -56,7 +56,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
     if _formal_pair(ctx, "out") is not None:
         return ctx.default_return_type
     operands = pairs[1:]
-    parts: list[tuple[list[int], Type]] = []
+    parts: list[tuple[list[int | Type], Type]] = []
     for tp, _ in operands:
         part = _ndarray_parts(tp)
         if part is None:
@@ -218,7 +218,7 @@ def einsum_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out_dims, dtype)
 
 
-def _einsum_signature_hook(ctx: FunctionSigContext) -> Type:
+def _einsum_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     """Widen *operands to Any on provable int label clash (issue #148).
 
     The function hook reports the clash then mypy's fallback (bool

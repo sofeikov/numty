@@ -96,8 +96,8 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
     except _FamBail:
         return AnyType(TypeOfAny.from_error)
     line, column = ctx.context.line, ctx.context.column
-    int_inst = ctx.api.named_type("builtins.int", [], line, column)
-    int_tuple = ctx.api.named_type("builtins.tuple", [int_inst], line, column)
+    int_inst = cast(TypeAnalyser, ctx.api).named_type("builtins.int", [], line, column)
+    int_tuple = cast(TypeAnalyser, ctx.api).named_type("builtins.tuple", [int_inst], line, column)
     items: list[Type] = []
     for d in dims:
         if isinstance(d, int):
@@ -117,7 +117,7 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
             items.append(d)
     shape = TupleType(
         items,
-        ctx.api.named_type(
+        cast(TypeAnalyser, ctx.api).named_type(
             "builtins.tuple", [AnyType(TypeOfAny.explicit)], line, column
         ),
         line=line,
@@ -127,18 +127,18 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
     # use the alias target itself, so formals match what the numpy
     # stubs produce for the same scalar (e.g. signedinteger[_32Bit]).
     element: Type | None = None
-    sym = ctx.api.lookup_fully_qualified(dtype_fullname)
+    sym = cast(TypeAnalyser, ctx.api).lookup_fully_qualified(dtype_fullname)
     node = sym.node if sym is not None else None
     if isinstance(node, TypeInfo):
-        element = ctx.api.named_type(dtype_fullname, [], line, column)
+        element = cast(TypeAnalyser, ctx.api).named_type(dtype_fullname, [], line, column)
     elif isinstance(node, TypeAlias):
         target = get_proper_type(node.target)
         if isinstance(target, Instance):
             element = target
     if element is None:
         raise _FamFail(f"{head}: cannot resolve dtype {dtype_fullname}")
-    dtype = ctx.api.named_type("numpy.dtype", [element], line, column)
-    return ctx.api.named_type("numpy.ndarray", [shape, dtype], line, column)
+    dtype = cast(TypeAnalyser, ctx.api).named_type("numpy.dtype", [element], line, column)
+    return cast(TypeAnalyser, ctx.api).named_type("numpy.ndarray", [shape, dtype], line, column)
 
 
 def _fam_arg(
@@ -407,7 +407,7 @@ def _fam_expr(
         _expr_ids[fullname] = vid
     _expr_forms[fullname] = form
     display = _expr_str(form)
-    upper = ctx.api.named_type("builtins.int", [], node.line, node.column)
+    upper = cast(TypeAnalyser, ctx.api).named_type("builtins.int", [], node.line, node.column)
     obj = TypeVarType(
         name=display,
         fullname=fullname,
@@ -580,7 +580,7 @@ def _fam_ensure_implicit(
         except Exception:
             _swallowed(ctx, "_fam_ensure_implicit")
             pass
-    upper = ctx.api.named_type("builtins.int", [], node.line, node.column)
+    upper = cast(TypeAnalyser, ctx.api).named_type("builtins.int", [], node.line, node.column)
     expr = TypeVarExpr(
         word,
         fullname,

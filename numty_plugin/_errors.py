@@ -93,7 +93,7 @@ def _swallowed(ctx: object, where: str) -> None:
     api = getattr(ctx, "api", None)
     context = getattr(ctx, "context", None)
     if ctx is not None:
-        _trace_event(ctx, where, "crash", detail)  # type: ignore[arg-type]
+        _trace_event(ctx, where, "crash", detail)
     fail = getattr(api, "fail", None)
     if fail is None or context is None:
         return

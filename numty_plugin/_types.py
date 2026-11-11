@@ -2,7 +2,8 @@
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, cast
 
 from mypy.errorcodes import ARG_TYPE
 from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, CallExpr, Context, Expression, IntExpr, ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var
@@ -10,6 +11,9 @@ from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
 from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type
+
+if TYPE_CHECKING:
+    from mypy.checker import TypeChecker
 
 from ._errors import NUMTY_CALLSITE, NUMTY_SHAPE, _swallowed
 from ._forms import _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul, _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize
@@ -245,7 +249,7 @@ def _is_bare_name_dim(d: int | Type) -> bool:
     )
 
 
-def _linear_product(dims: list[int | Type]) -> _LinForm | _MonoForm | None:
+def _linear_product(dims: Sequence[int | Type]) -> _LinForm | _MonoForm | None:
     """Canonical total product: linear or single monomial, else None."""
     from numty_plugin import _resolve_dim
     acc: _LinForm | _MonoForm | None = _LinForm((), 1)
@@ -260,7 +264,7 @@ def _linear_product(dims: list[int | Type]) -> _LinForm | _MonoForm | None:
     return acc
 
 
-def _reshape_total_form(dims: list[int | Type]) -> object:
+def _reshape_total_form(dims: Sequence[int | Type]) -> _LinForm | _DivForm | _MonoForm | None:
     """Total elements for reshape legality: single dim resolves directly
     (so N+1, N+2 sums are comparable), multi-dim uses the pure-product
     canonical form; None when unrepresentable (issue #63)."""
@@ -645,13 +649,15 @@ def _align_pair(
     elements of one unpack segment never conflict with each other,
     only with the same position of another segment.
     """
-    raw: list[tuple[Type, int | Type, int | None]] = []
+    raw: list[tuple[int | Type, int | Type, int | None]] = []
     uidx = -1
+    unpack_dim: Type | None = None
     for k, fd in enumerate(fdims):
         if isinstance(fd, int):
             continue
         if isinstance(get_proper_type(fd), UnpackType):
             uidx = k
+            unpack_dim = fd
             break
     if uidx == -1:
         raw = [(fd, ad, None) for fd, ad in zip(fdims, adims)]
@@ -666,7 +672,8 @@ def _align_pair(
                 for fd, ad in zip(suf, adims[len(adims) - len(suf) :])
             )
         seg = adims[len(pre) : len(adims) - len(suf) if suf else len(adims)]
-        upack = get_proper_type(fdims[uidx])
+        assert unpack_dim is not None
+        upack = get_proper_type(unpack_dim)
         assert isinstance(upack, UnpackType)
         tvt = get_proper_type(upack.type)
         if isinstance(tvt, TypeVarTupleType):
@@ -1222,7 +1229,7 @@ def _substitute_return_exprs(
                     # when the bound object carries one, else bail.
                     made: Type | None = None
                     for v in bindings.values():
-                        if isinstance(v, int):
+                        if isinstance(v, (int, _LinForm)):
                             continue
                         vp = get_proper_type(v)
                         if isinstance(vp, LiteralType):
@@ -1242,7 +1249,7 @@ def _substitute_return_exprs(
             new_shape = shape.copy_modified(items=new_items)
         except Exception:
             _swallowed(ctx, "_substitute_return_exprs")
-            new_shape = TupleType(new_items, shape.fallback, line=shape.line, column=shape.column)
+            new_shape = TupleType(new_items, shape.partial_fallback, line=shape.line, column=shape.column)
         try:
             return proper.copy_modified(args=[new_shape, proper.args[1]])
         except Exception:
@@ -1439,7 +1446,8 @@ def _note_rank_mismatches(ctx: FunctionSigContext | MethodSigContext, sig: Type)
                 where.set_line(arg.line, arg.end_column)
             else:
                 where.set_line(arg.line, arg.column + 1)
-            ctx.api.note(message, where, code=ARG_TYPE)
+            # `note` is on the concrete checker, not on the plugin interface.
+            cast("TypeChecker", ctx.api).note(message, where, code=ARG_TYPE)
     except Exception:
         _swallowed(ctx, "_note_rank_mismatches")
         return
@@ -1447,7 +1455,7 @@ def _note_rank_mismatches(ctx: FunctionSigContext | MethodSigContext, sig: Type)
 
 def _ndarray_type(
     ctx: FunctionContext | MethodContext | AttributeContext,
-    dims: list[int | Type],
+    dims: Sequence[int | Type],
     dtype: Type,
 ) -> Instance:
     checker = ctx.api
@@ -1489,17 +1497,35 @@ def _single_shape_expr(ctx: FunctionContext | MethodContext) -> Expression | Non
     return None
 
 
-def _shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
+def _shape_from_arg(tp: Type, expr: Expression | None) -> list[int | Type] | None:
     """Dims from an argument: fold the expression first, types as fallback."""
     if expr is not None:
         dims = _fold_shape_expr(expr)
         if dims is not None:
-            return dims
+            return [*dims]
     shape = get_proper_type(tp)
     if isinstance(shape, TupleType):
         return _shape_dims(shape)
     single = _int_value(tp)
     return [single] if single is not None else None
+
+
+def _int_shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
+    """Like _shape_from_arg, for axis, index and count lists.
+
+    These callers compute with the entries as integers. A symbolic
+    entry (a TypeVar from the tuple type) is not usable there, so the
+    result is None and the caller bails.
+    """
+    dims = _shape_from_arg(tp, expr)
+    if dims is None:
+        return None
+    out: list[int] = []
+    for d in dims:
+        if not isinstance(d, int):
+            return None
+        out.append(d)
+    return out
 
 
 def _builder_fold_dim_expr(

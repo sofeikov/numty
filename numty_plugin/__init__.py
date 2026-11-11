@@ -65,7 +65,7 @@ from ._types import (  # noqa: F401
     _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr, _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members, _distribute_pairings, _union_results, 
     _distribute_solve, _split_flat, _iter_tvarlikes, _shape_tvar_formals, _strip_optional, _sequence_element, _align_pair, _pairs_for_actual, _conflict_pairs, _emit_call_site_conflicts, 
     _callsite_formula_return, _callsite_expr_bindings, _substitute_return_exprs, _fixed_shape, _shape_note_str, _rank_mismatch_notes, _reported_as_operator, _mentions_ndarray, _info_mentions_array, 
-    _note_rank_mismatches, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME, FLOAT64_FULLNAME, 
+    _note_rank_mismatches, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME, FLOAT64_FULLNAME, 
     DTYPE_FULLNAME, STR_FULLNAME, _SEQUENCE_FULLNAMES, _OPERATOR_DUNDERS
 )
 from ._builders import (  # noqa: F401

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from mypy.nodes import ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo, TypeVarLikeExpr, Var
 from mypy.plugin import AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext, Plugin
-from mypy.types import AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type
+from mypy.types import AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type
 
 if TYPE_CHECKING:
     from mypy.tvar_scope import TypeVarLikeScope
@@ -129,7 +129,7 @@ class NumtyPlugin(Plugin):
 
     def get_function_signature_hook(
         self, fullname: str
-    ) -> Callable[[FunctionSigContext], Type] | None:
+    ) -> Callable[[FunctionSigContext], FunctionLike] | None:
         # Dedicated hooks own numpy/numty calls; everything else with
         # shape TypeVars in its formals gets the call-site conflict
         # check. Overloads are skipped: the hook runs per candidate and
@@ -144,7 +144,7 @@ class NumtyPlugin(Plugin):
             return None
         return self.callsite_signature_hook
 
-    def callsite_signature_hook(self, ctx: FunctionSigContext) -> Type:
+    def callsite_signature_hook(self, ctx: FunctionSigContext) -> FunctionLike:
         try:
             sig = self._callsite_check(ctx)
         except Exception:
@@ -155,7 +155,7 @@ class NumtyPlugin(Plugin):
 
     def get_method_signature_hook(
         self, fullname: str
-    ) -> Callable[[MethodSigContext], Type] | None:
+    ) -> Callable[[MethodSigContext], FunctionLike] | None:
         # Instance/class/static methods and __call__ get the call-site
         # conflict check plus rank notes; anything else the checker
         # resolves without shape generics stays unhooked.
@@ -252,7 +252,7 @@ class NumtyPlugin(Plugin):
             return True
         return any(_mentions_ndarray(arg) for item in items for arg in item.arg_types)
 
-    def method_signature_hook(self, fullname: str, ctx: MethodSigContext) -> Type:
+    def method_signature_hook(self, fullname: str, ctx: MethodSigContext) -> FunctionLike:
         # This hook covers every method, so first run whatever a later
         # plugin (mypy's default one included) would have hooked here.
         sig: Type = ctx.default_signature
@@ -315,7 +315,7 @@ class NumtyPlugin(Plugin):
 
     def _later_plugin_hook(
         self, ctx: MethodSigContext, getter: str, fullname: str
-    ) -> Callable[[MethodSigContext], Type] | None:
+    ) -> Callable[[MethodSigContext], FunctionLike] | None:
         """The hook the plugins after this one return for `fullname`.
 
         mypy asks plugins in order and takes the first hook, so a
@@ -350,12 +350,12 @@ class NumtyPlugin(Plugin):
         if sym is None or not isinstance(sym.node, TypeInfo):
             return False
         try:
-            return any(v.fullname == fullname for v in sym.node.type_vars)
+            return any(v.fullname == fullname for v in sym.node.defn.type_vars)
         except Exception:
             _swallowed(None, "_is_class_tvar")
             return False
 
-    def _callsite_check(self, ctx: FunctionSigContext) -> Type:
+    def _callsite_check(self, ctx: FunctionSigContext) -> FunctionLike:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType):
             return sig
@@ -530,7 +530,7 @@ class NumtyPlugin(Plugin):
         self._ensure_startup_check(fullname)
         return _guard_mixed(fullname, self._method_hook(fullname))
 
-    def _function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
+    def _function_hook(self, fullname: str) -> Callable[..., Type] | None:
         if fullname == "builtins.len":
             return len_function_hook
         if fullname == "builtins.divmod":
@@ -758,7 +758,7 @@ class NumtyPlugin(Plugin):
         return None
 
 
-def _reshape_signature_hook(ctx: MethodSigContext) -> Type:
+def _reshape_signature_hook(ctx: MethodSigContext) -> FunctionLike:
     """Widen reshape formals to Any on provable int total mismatch (issue #148).
 
     The function hook reports `reshape changes total size` then mypy's
@@ -818,7 +818,7 @@ def _reshape_signature_hook(ctx: MethodSigContext) -> Type:
         return ctx.default_signature
 
 
-def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
+def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
     """Widen other to Any on provable broadcast mismatch (issue #148).
 
     The method hook reports `broadcast shapes disagree` then mypy reports
@@ -929,7 +929,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> Type:
         return ctx.default_signature
 
 
-def _matmul_signature_hook(ctx: MethodSigContext) -> Type:
+def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
     """Widen formals to Any on provable matmul mismatch (issue #140).
 
     The method hook reports `matmul ... disagree` then mypy's overload
@@ -1157,7 +1157,8 @@ def _subst_attr_type(
             if sub is None:
                 return None
             items.append(sub)
-        return proper.copy_modified(items=items)
+        # UnionType has no copy_modified (it raised AttributeError here).
+        return UnionType(items, proper.line, proper.column)
     return proper
 
 

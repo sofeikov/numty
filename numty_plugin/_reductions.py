@@ -11,7 +11,7 @@ from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
 from ._forms import _DivForm, _form_has_unknown, _is_unknown_fullname
 
 from ._types import (
-    _int_value, _dim_eq, _dim_add_const, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _distribute_solve, _split_flat, _ndarray_type, _shape_from_arg, 
+    _int_value, _dim_eq, _dim_add_const, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _distribute_solve, _split_flat, _ndarray_type, _int_shape_from_arg, 
     NDARRAY_FULLNAME
 )
 
@@ -684,7 +684,7 @@ def _final_slice_call(
 
 def _solve_argdrop(
     ctx: FunctionContext | MethodContext,
-    dims: list[int],
+    dims: list[int | Type],
     axis: list[int] | None | str,
     op: str = "argmax",
 ) -> Type:
@@ -795,7 +795,7 @@ def _kth_in_bounds(
     if any(isinstance(d, int) and d == 0 for d in dims):
         # numpy accepts any kth when there is nothing to partition.
         return True
-    kths = _shape_from_arg(*pair)
+    kths = _int_shape_from_arg(*pair)
     if not kths:
         return True
     size: int | Type
@@ -1025,12 +1025,13 @@ def _percentile_q_dims(
             return [0]
         if all(not isinstance(e, (ListExpr, TupleExpr)) for e in expr.items):
             return [len(expr.items)]
-        if all(isinstance(e, (ListExpr, TupleExpr)) for e in expr.items):
-            inner = [len(e.items) for e in expr.items]  # type: ignore[union-attr]
+        rows = [e for e in expr.items if isinstance(e, (ListExpr, TupleExpr))]
+        if len(rows) == len(expr.items):
+            inner = [len(e.items) for e in rows]
             if len(set(inner)) == 1 and all(
                 not isinstance(sub, (ListExpr, TupleExpr))
-                for e in expr.items
-                for sub in e.items  # type: ignore[union-attr]
+                for e in rows
+                for sub in e.items
             ):
                 return [len(expr.items), inner[0]]
         return None

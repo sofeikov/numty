@@ -8,7 +8,7 @@ jobs:
   lint:
     # Pyflakes rules through ruff (config in pyproject.toml). The split
     # of numty_plugin (#192) added 967 findings because no check ran.
-    name: lint (ruff)
+    name: lint (ruff, ty)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +20,11 @@ jobs:
           enable-cache: true
       - name: Run ruff
         run: uv run ruff check .
+      - name: Type-check the plugin with ty
+        # The plugin had 95 ty errors and no check. Three of them were
+        # real defects (a method that does not exist on UnionType, a
+        # wrong attribute on TupleType, a string compared as an object).
+        run: uv run ty check numty_plugin
 
   test:
     # Issue #164 step 2: hooks key on private numpy module paths, so the

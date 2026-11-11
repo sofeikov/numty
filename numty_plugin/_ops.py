@@ -680,7 +680,7 @@ def _repeat_display(
 
 
 def _repeat_display_size(
-    ctx: FunctionContext,
+    ctx: FunctionContext | MethodContext,
     dims: list[int | Type],
     axis: int | None,
     entries: list[int | None],
@@ -929,14 +929,12 @@ def _pad_widths(
                 subs = [None, None]
             before = _pad_side(e.items[0], subs[0])
             after = _pad_side(e.items[1], subs[1])
-            if before == "bad" or after == "bad":
+            if isinstance(before, str) or isinstance(after, str):
                 return "bad"
-            assert before != "bad" and after != "bad"
             return (before, after)
         single = _pad_side(e, t)
-        if single == "bad":
+        if isinstance(single, str):
             return "bad"
-        assert single != "bad"
         return (single, single)
 
     def collect(
@@ -988,14 +986,12 @@ def _pad_side_fallback(tp: Type) -> tuple[int | None, int | None] | str:
     if isinstance(proper, TupleType) and len(proper.items) == 2:
         before = _pad_side_fallback_single(proper.items[0])
         after = _pad_side_fallback_single(proper.items[1])
-        if before == "bad" or after == "bad":
+        if isinstance(before, str) or isinstance(after, str):
             return "bad"
-        assert before != "bad" and after != "bad"
         return (before, after)
     single = _pad_side_fallback_single(tp)
-    if single == "bad":
+    if isinstance(single, str):
         return "bad"
-    assert single != "bad"
     return (single, single)
 
 
@@ -1382,7 +1378,7 @@ def isin_function_hook(ctx: FunctionContext) -> Type:
 
 
 def _search_values_dims(
-    tp: Type, expr: Expression | None
+    tp: Type | None, expr: Expression | None
 ) -> list[int | Type] | None:
     """Shape of searchsorted values: [] scalar, dims otherwise, None to bail."""
     if expr is not None and isinstance(expr, (TupleExpr, ListExpr)):
@@ -1402,6 +1398,10 @@ def _search_values_dims(
         if any(sub != subs[0] for sub in subs[1:]):
             return None
         return [len(expr.items), *subs[0]]
+    if tp is None:
+        # Only the nested-literal recursion passes None, and that
+        # case returns above.
+        return None
     parts = _ndarray_parts(tp)
     if parts is not None:
         return list(parts[0])
