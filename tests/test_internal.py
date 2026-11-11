@@ -112,10 +112,11 @@ def test_every_broad_except_goes_through_the_policy() -> None:
     # very next line, except the reporting helpers themselves (those
     # lines carry "reporting must never"). Scans every .py under
     # numty_plugin/ so Phase 2 leaves (_*.py) are covered.
-    # NOTE: the floor is 76, not 77. grep -c "except Exception" gives 77
-    # because it also matches docstring prose ("every `except Exception:`
-    # block"). This test only counts lines STARTING with "except
-    # Exception", so 76 is correct. Do not raise to 77.
+    # NOTE: the floor is 75 (was 76 on the monolith). Monolith line-scan
+    # counted 76; Phase 2 removed a dead _swallowed-guarded try in
+    # _forms_provably_ne (pure after the move) as part of the leaf
+    # extraction, so 75 is the correct package floor. Do not raise to
+    # 77 (grep -c also matches docstring prose).
     plugin_dir = ROOT / "numty_plugin"
     files = sorted(
         p for p in plugin_dir.rglob("*.py") if "__pycache__" not in p.parts
@@ -135,7 +136,7 @@ def test_every_broad_except_goes_through_the_policy() -> None:
                 if not nxt.startswith("_swallowed(") and not inside_helper:
                     stray.append(f"{rel}:{i + 1}: {line.strip()} -> {nxt}")
     assert not stray, "broad except without _swallowed():\n" + "\n".join(stray)
-    assert total >= 76, f"broad-except total dropped: {total} < 76"
+    assert total >= 75, f"broad-except total dropped: {total} < 75"
 
 
 def test_swallowed_reraises_only_in_debug(monkeypatch: pytest.MonkeyPatch) -> None:
