@@ -124,9 +124,21 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
             items.append(UnpackType(tvt.copy_modified(upper_bound=int_tuple)))
         else:
             items.append(d)
+    # Issue #225: a plain-int dim (F64[int]) takes mypy's own tuple[int]
+    # fallback, like _ndarray_type does. With tuple[Any] the stubs'
+    # overloads see Any and ops the plugin leaves to them collapse to
+    # ndarray[Any, Any].
+    plain_int = any(
+        isinstance(d, Instance)
+        and d.type.fullname == "builtins.int"
+        and not d.args
+        for d in items
+    )
     shape = TupleType(
         items,
-        cast(TypeAnalyser, ctx.api).named_type(
+        int_tuple
+        if plain_int
+        else cast(TypeAnalyser, ctx.api).named_type(
             "builtins.tuple", [AnyType(TypeOfAny.explicit)], line, column
         ),
         line=line,

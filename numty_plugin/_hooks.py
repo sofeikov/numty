@@ -925,6 +925,12 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
                     )
         part_a = _ndarray_parts(ctx.type)
         if part_a is None:
+            # Issue #227: mixed/plain-int shapes bail in _ndarray_parts but
+            # the rank and literal axes are known via _movable_parts. Use
+            # those for the provable-mismatch check so the [operator]
+            # duplicate stays suppressed.
+            part_a = _movable_parts(ctx.type)
+        if part_a is None:
             return ctx.default_signature
         dims_a, _ = part_a
         if not dims_a:
@@ -940,6 +946,8 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             Issue #217: a union argument (e.g. F64[N] | F32[N]) must not
             hide a provable mismatch. Only pure array unions are handled
             (mirroring _union_members distribution); mixed unions bail.
+            Issue #227: plain-int/mixed shapes fall back to _movable_parts
+            so provable literal clashes still suppress [operator].
             """
             proper = get_proper_type(tp)
             if isinstance(proper, UnionType):
@@ -947,12 +955,16 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
                 for item in proper.relevant_items():
                     part = _ndarray_parts(item)
                     if part is None:
+                        part = _movable_parts(item)
+                    if part is None:
                         return None
                     dims, _ = part
                     if dims:
                         out.append(list(dims))
                 return out or None
             part = _ndarray_parts(tp)
+            if part is None:
+                part = _movable_parts(tp)
             if part is None:
                 return None
             dims, _ = part

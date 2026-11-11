@@ -6,18 +6,50 @@ Split from _broadcast so that _matmul can import it at top level.
 from __future__ import annotations
 
 from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import Type, TypeVarTupleType, UninhabitedType, UnpackType, get_proper_type
+from mypy.types import (
+    Instance, Type, TypeVarTupleType, TypeVarType, UninhabitedType, UnpackType, get_proper_type,
+)
 
-from ._errors import NUMTY_BROADCAST
+from ._errors import NUMTY_BROADCAST, _swallowed
 from ._dtypes import _promote_strong, _promote_weak
 from ._types import (
-    _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _ndarray_parts, _ndarray_type,
-    _unpack_shape,
+    NDARRAY_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _ndarray_parts,
+    _ndarray_type, _unpack_shape,
 )
 from ._reshape import (
-    _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _promote_dtypes, _scalar_key,
+    _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _is_plain_int, _movable_parts,
+    _promote_dtypes, _scalar_key,
 )
 from ._builders import _default_dtype, _scalar_ret_name
+
+
+def _whole_shape_var(tp: Type) -> tuple[TypeVarType, Type] | None:
+    """(shape TypeVar, dtype) for ndarray[_S, ...], else None (issue #229).
+
+    numpy's own "any shape, kept" spelling: the whole shape is one TypeVar
+    bound to tuple[int, ...]. Elementwise ops keep _S; two operands with
+    the same _S broadcast to _S.
+    """
+    proper = get_proper_type(tp)
+    if (
+        not isinstance(proper, Instance)
+        or proper.type.fullname != NDARRAY_FULLNAME
+        or len(proper.args) != 2
+    ):
+        return None
+    shape = get_proper_type(proper.args[0])
+    if isinstance(shape, TypeVarType):
+        return shape, proper.args[1]
+    return None
+
+
+def _whole_shape_type(ctx: FunctionContext | MethodContext, var: TypeVarType, dtype: Type) -> Type:
+    """ndarray[_S, dtype] preserving the whole-shape TypeVar identity."""
+    try:
+        return ctx.api.named_generic_type(NDARRAY_FULLNAME, [var, dtype])
+    except Exception:
+        _swallowed(ctx, "_whole_shape_type")
+        return ctx.default_return_type
 
 
 def _same_unpack(a: UnpackType, b: UnpackType) -> bool:
@@ -204,9 +236,102 @@ def _broadcast_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type, op: str | None = None
 ) -> Type:
     from numty_plugin import _broadcast_result
+    # Issue #229: whole-shape TypeVars (ndarray[_S, ...]) keep _S for
+    # elementwise ops. Same _S on both sides broadcasts to _S; _S with a
+    # scalar keeps _S. Anything else with _S bails (rank unknown).
+    wa = _whole_shape_var(left)
+    wb = _whole_shape_var(right)
+    if wa is not None or wb is not None:
+        if wa is not None and wb is not None:
+            if wa[0].fullname == wb[0].fullname:
+                name = _promote_dtypes(wa[1], wb[1])
+                if name is None:
+                    return _whole_shape_type(ctx, wa[0], _default_dtype(ctx))
+                if name == _dtype_fullname(wa[1]):
+                    return _whole_shape_type(ctx, wa[0], wa[1])
+                if name == _dtype_fullname(wb[1]):
+                    return _whole_shape_type(ctx, wa[0], wb[1])
+                dtype = _construct_dtype(ctx, name)
+                if dtype is None:
+                    return _whole_shape_type(ctx, wa[0], _default_dtype(ctx))
+                return _whole_shape_type(ctx, wa[0], dtype)
+            return ctx.default_return_type
+        if wa is not None and wb is None:
+            var, dtype = wa
+            other = right
+        elif wb is not None and wa is None:
+            var, dtype = wb
+            other = left
+        else:
+            return ctx.default_return_type
+        # Scalar is neutral for shape: keep _S (dtype via promotion when
+        # resolvable, else the array dtype).
+        key = _scalar_key(other)
+        if key is None:
+            name = _scalar_ret_name(other)
+            if name is None:
+                return ctx.default_return_type
+            key = ("strong", name)
+        strong = _dtype_fullname(dtype)
+        if strong is None:
+            return _whole_shape_type(ctx, var, dtype)
+        kind, scalar_name = key
+        pname = (
+            _promote_weak(scalar_name, strong)
+            if kind == "weak"
+            else _promote_strong(scalar_name, strong)
+        )
+        if pname is None:
+            return _whole_shape_type(ctx, var, _default_dtype(ctx))
+        if pname == strong:
+            return _whole_shape_type(ctx, var, dtype)
+        promoted = _construct_dtype(ctx, pname)
+        if promoted is None:
+            return _whole_shape_type(ctx, var, _default_dtype(ctx))
+        return _whole_shape_type(ctx, var, promoted)
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
     if a is None or b is None:
+        # Issue #227: plain-int dims (F64[int]) keep rank via _movable_parts.
+        # Pure-int shapes (no Literal mixed in the same operand) solve with
+        # ctx so unprovable pairs mint ?U instead of bailing to Any. Mixed
+        # shapes (Literal + plain int, #34) must keep bailing to preserve
+        # the widening path: only provable literal clashes are reported,
+        # via an error-only check (None ctx mints nothing).
+        ma = _movable_parts(left)
+        mb = _movable_parts(right)
+        if ma is not None and mb is not None:
+            from numty_plugin import _broadcast_result as _br
+
+            def _is_mixed_dims(dims: list[int | Type]) -> bool:
+                has_lit = any(isinstance(d, int) for d in dims)
+                has_plain = any(_is_plain_int(d) for d in dims)
+                return has_lit and has_plain
+
+            if _is_mixed_dims(list(ma[0])) or _is_mixed_dims(list(mb[0])):
+                _, msg = _br(list(ma[0]), list(mb[0]), None)
+                if msg is not None:
+                    ctx.api.fail(msg, ctx.context, code=NUMTY_BROADCAST)
+                    return ctx.default_return_type
+                return _solve_broadcast_unpack(ctx, left, right, a, b)
+            # Pure-int (or Any/unknown) path: solve with ctx.
+            dims, msg = _br(list(ma[0]), list(mb[0]), ctx)
+            if msg is not None:
+                ctx.api.fail(msg, ctx.context, code=NUMTY_BROADCAST)
+                return ctx.default_return_type
+            if dims is None:
+                return _solve_broadcast_unpack(ctx, left, right, a, b)
+            name = _promote_dtypes(ma[1], mb[1])
+            if name is None:
+                return _ndarray_type(ctx, dims, _default_dtype(ctx))
+            if name == _dtype_fullname(ma[1]):
+                return _ndarray_type(ctx, dims, ma[1])
+            if name == _dtype_fullname(mb[1]):
+                return _ndarray_type(ctx, dims, mb[1])
+            dtype = _construct_dtype(ctx, name)
+            if dtype is None:
+                return _ndarray_type(ctx, dims, _default_dtype(ctx))
+            return _ndarray_type(ctx, dims, dtype)
         return _solve_broadcast_unpack(ctx, left, right, a, b)
     dims_a, dtype_a = a
     dims_b, dtype_b = b
