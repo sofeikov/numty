@@ -31,8 +31,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 TOOLS = ("numty_plugin", "numty_convert", "numty_codmod", "numty_report")
 
-uv = shutil.which("uv")
-pytestmark = pytest.mark.skipif(uv is None, reason="uv is required (see README quickstart)")
+_uv_path = shutil.which("uv")
+pytestmark = pytest.mark.skipif(
+    _uv_path is None, reason="uv is required (see README quickstart)"
+)
+# The module is skipped without uv, so the fallback string is never run.
+uv = _uv_path or "uv"
 
 
 def _run(cmd: list[str], **kwargs) -> "subprocess.CompletedProcess[str]":

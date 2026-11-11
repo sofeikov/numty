@@ -338,10 +338,10 @@ def test_ts_comparison_substitutes_prefix() -> None:
     f64 = "numpy.dtype[numpy.float64]"
     revealed = f'numpy.ndarray[tuple[*Ts, Literal[4], Literal[6]], {f64}]'
     node = d.parse_type(revealed)
-    assert d.array_claim(node, {"N": 3}, ()) is not None
-    assert d.array_claim(node, {"N": 3}, ()).dims == [4, 6]
-    assert d.array_claim(node, {"N": 3}, (2,)).dims == [2, 4, 6]
-    assert d.array_claim(node, {"N": 3}, (2, 6)).dims == [2, 6, 4, 6]
+    for prefix, want in (((), [4, 6]), ((2,), [2, 4, 6]), ((2, 6), [2, 6, 4, 6])):
+        claim = d.array_claim(node, {"N": 3}, prefix)
+        assert claim is not None
+        assert claim.dims == want
     assert d._compare(node, np.zeros((4, 6)), {"N": 3}, ()) is None
     assert d._compare(node, np.zeros((2, 4, 6)), {"N": 3}, (2,)) is None
     assert (
@@ -358,7 +358,11 @@ def test_ts_families_agree_with_the_signature(tmp_path: Path) -> None:
     # *Ts came back as Never. Each of these now solves or bails safely.
     ts = d.TS_DIM
 
-    def case(expr: str, params: list[tuple[str, str, tuple[object, ...]]], helpers: list[d.Helper] | None = None) -> d.Case:
+    def case(
+        expr: str,
+        params: list[tuple[str, str, tuple[object, ...]]],
+        helpers: list[d.Helper] | None = None,
+    ) -> d.Case:
         return d.Case(expr, params, helpers or [])
 
     # Same-shape threading, matmul over (*Ts, N, M), and a suffix-axis
@@ -479,8 +483,14 @@ def test_empty_axis_is_not_a_size_mismatch(tmp_path: Path) -> None:
     # Found by the zero-size assignments: `2*M` and `M` are the same
     # size when M is 0, so numpy accepts these and numty must not call
     # them a mismatch. `M+1` vs `M` differ for every M and still error.
-    params = [("a0", "F64", (2, "M")), ("a1", "F64", ("M",))]
-    mono = [("a0", "F64", ("N", "M", 2)), ("a1", "I64", ("M", "N"))]
+    params: list[tuple[str, str, tuple[object, ...]]] = [
+        ("a0", "F64", (2, "M")),
+        ("a1", "F64", ("M",)),
+    ]
+    mono: list[tuple[str, str, tuple[object, ...]]] = [
+        ("a0", "F64", ("N", "M", 2)),
+        ("a1", "I64", ("M", "N")),
+    ]
     cases = [
         d.Case("np.vdot(a0, a1)", params),
         d.Case("np.vdot(a0, a1)", mono),

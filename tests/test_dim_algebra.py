@@ -194,7 +194,9 @@ def test_form_mul_multiplies(a: _LinForm | _MonoForm, b: _LinForm | _MonoForm) -
 
 @given(products, products, products)
 def test_form_mul_is_associative(a: Any, b: Any, c: Any) -> None:
-    assert p._form_mul(p._form_mul(a, b), c) == p._form_mul(a, p._form_mul(b, c))
+    ab: Any = p._form_mul(a, b)
+    bc: Any = p._form_mul(b, c)
+    assert p._form_mul(ab, c) == p._form_mul(a, bc)
 
 
 @given(lins, lins)
@@ -227,7 +229,8 @@ def test_canon_div_undoes_form_mul(a: Any, b: Any) -> None:
     # A zero numerator is left alone: `0 / K` is 0 only while K is not
     # 0, and reshape's `-1` cannot be inferred from an empty total.
     assume(not same_function(a, 0) and not same_function(b, 0))
-    assert p._canon_div(p._form_mul(a, b), b) == a
+    ab: Any = p._form_mul(a, b)
+    assert p._canon_div(ab, b) == a
 
 
 # --------------------------------------------------------------------------
@@ -492,7 +495,9 @@ def test_string_dims_mean_what_python_says(seed: int, tmp_path: Path) -> None:
         lines.append(len(source))
     reveals, errors, raw = d.run_mypy("\n".join(source) + "\n", tmp_path)
     assert "INTERNAL ERROR" not in raw and "Traceback" not in raw, raw[-3000:]
-    envs = [dict(zip(SHORT, vals)) for vals in itertools.product((0, 1, 2, 50), repeat=len(SHORT))]
+    envs: list[dict[str, int]] = [
+        dict(zip(SHORT, vals)) for vals in itertools.product((0, 1, 2, 50), repeat=len(SHORT))
+    ]
     refused = solved = 0
     for formula, line in zip(formulas, lines):
         want = [eval(formula, {"__builtins__": {}}, dict(env)) for env in envs]

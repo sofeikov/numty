@@ -9,7 +9,10 @@ import keyword
 from typing import TYPE_CHECKING, cast
 
 from ._errors import NUMTY_ANNOTATION, _swallowed
-from ._exprs import _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars, _normalize_ns, _seen_vars
+from ._exprs import (
+    _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars,
+    _normalize_ns, _seen_vars,
+)
 from ._forms import _LinForm, _form_never_size
 from ._types import (
     INT_FULLNAME, _dim_value,
@@ -32,7 +35,10 @@ if TYPE_CHECKING:
 
 from mypy.nodes import TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var
 from mypy.typeanal import TypeAnalyser
-from mypy.types import AnyType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny, TypeVarId, TypeVarTupleType, TypeVarType, UnboundType, UnpackType, get_proper_type
+from mypy.types import (
+    AnyType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny,
+    TypeVarId, TypeVarTupleType, TypeVarType, UnboundType, UnpackType, get_proper_type,
+)
 
 _FAM_HEAD_DTYPES = {
     "numty.F64": "numpy.float64",

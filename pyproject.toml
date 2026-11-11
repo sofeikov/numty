@@ -46,13 +46,20 @@ packages = ["numty", "numty_plugin", "numty_convert", "numty_codmod", "numty_rep
 addopts = "-n 4"
 
 [tool.ruff]
+line-length = 120
 # The fixtures are inputs for mypy and ty. Many of them are wrong on
 # purpose, so the linter does not read them.
 extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
-# Pyflakes only: unused imports, undefined names, unused variables.
-# F722 is off because string dims (`F64["batch features"]`) are not
-# Python expressions.
-select = ["F"]
+# Pyflakes (unused imports, undefined names, unused variables) and the
+# line-length limit. F722 is off because string dims
+# (`F64["batch features"]`) are not Python expressions.
+select = ["F", "E501"]
 ignore = ["F722"]
+
+[tool.ty.src]
+# Files that need the numty plugin to type-check, or that are wrong on
+# purpose: the fixtures, the runtime test (string dims and int dims in
+# annotations) and the demo (2 expected errors, pinned by test_ty.py).
+exclude = ["tests/fixtures", "tests/test_runtime.py", "demo.py"]

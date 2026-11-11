@@ -1,4 +1,7 @@
-"""_types.py — pure algebra/fold/shape (Phase 5, #199). Owns NDARRAY_FULLNAME etc. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+"""_types.py — pure algebra/fold/shape (Phase 5, #199). Owns NDARRAY_FULLNAME
+etc. (Phase 5, #199). Top-level imports go to earlier layers only (order in
+tests/test_layout.py, _LAYERS). A function-local facade import is used only
+for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -6,18 +9,31 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, cast
 
 from mypy.errorcodes import ARG_TYPE
-from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, CallExpr, Context, Expression, IntExpr, ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var
+from mypy.nodes import (
+    ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, CallExpr, Context, Expression, IntExpr,
+    ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var,
+)
 from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
 from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
-from mypy.types import AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type
+from mypy.types import (
+    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType,
+    TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType,
+    get_proper_type,
+)
 
 if TYPE_CHECKING:
     from mypy.checker import TypeChecker
 
 from ._errors import NUMTY_CALLSITE, NUMTY_SHAPE, _swallowed
-from ._forms import _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul, _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize
-from ._exprs import _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _ns_of_ctx, _seen_vars, _short_var
+from ._forms import (
+    _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul,
+    _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize,
+)
+from ._exprs import (
+    _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _lookup_ns,
+    _ns_of_ctx, _seen_vars, _short_var,
+)
 
 NDARRAY_FULLNAME = "numpy.ndarray"
 INT_FULLNAME = "builtins.int"
@@ -937,22 +953,11 @@ def _callsite_expr_bindings(
                     if adim.fullname == a_full:
                         found = adim
                     else:
-                        _ns = _ns_of_ctx(ctx)
-                        _consts = _expr_constituents.get(adim.fullname, {})
-                        found = _consts.get((_ns, a_full))
-                        if found is None:
-                            for (_n, _f), _obj in _consts.items():
-                                if _f == a_full:
-                                    found = _obj
-                                    break
+                        found = _lookup_ns(
+                            _expr_constituents.get(adim.fullname, {}), _ns_of_ctx(ctx), a_full
+                        )
                 if found is None:
-                    _ns = _ns_of_ctx(ctx)
-                    found = _seen_vars.get((_ns, a_full))
-                    if found is None:
-                        for (_n, _f), _obj in _seen_vars.items():
-                            if _f == a_full:
-                                found = _obj
-                                break
+                    found = _lookup_ns(_seen_vars, _ns_of_ctx(ctx), a_full)
                 bindings[m_full] = found if found is not None else solved
             except Exception:
                 _swallowed(ctx, "_callsite_expr_bindings")

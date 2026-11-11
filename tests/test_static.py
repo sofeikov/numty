@@ -5,6 +5,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -73,7 +74,7 @@ def _ensure_batch() -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _fresh_mypy_cache() -> None:
+def _fresh_mypy_cache() -> Iterator[None]:
     global _BATCH_READY
     _BATCH_RESULTS.clear()
     _BATCH_READY = False
@@ -2242,7 +2243,7 @@ def test_reduce_keepdims_ok_clean_and_runs() -> None:
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
     f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
-    iu = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]]"
+    iu = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]]"  # noqa: E501
     notes = {
         line: re.sub(r"\?U@\d+[a-z]?", "?U", note)
         for line, note in reveals_by_line(result).items()
@@ -2703,6 +2704,34 @@ def test_union_attr_substitutes_expr_dims() -> None:
         31: f'"{f64.format(4)} | {f64.format(6)}"',
     }, result.stdout
     assert _run_fixture("union_attr_ok.py") == ["None", "(6,)"]
+
+
+def test_class_tvar_in_method_call_ok() -> None:
+    # `self.same(y)` inside a generic class has the class TypeVar in its
+    # signature. `_is_class_tvar` read `.fullname` from a list of str and
+    # raised in the method signature hook: an INTERNAL ERROR in debug
+    # mode, a swallowed exception otherwise. Found by ty (#213).
+    result = run_mypy(FIXTURES / "class_tvar_method_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
+    assert reveals_by_line(result) == {
+        33: f'"{f64.format("N")}"',
+        38: f'"{f64.format("Literal[3]")}"',
+    }, result.stdout
+    assert _run_fixture("class_tvar_method_ok.py") == ["(3,)", "(3,)"]
+
+
+def test_symbolic_axes_bail_without_internal_error() -> None:
+    # An axis tuple typed with TypeVars reached integer comparisons and
+    # reported [numty-internal] (TypeError) for squeeze. The axis
+    # callers now use `_int_shape_from_arg` and bail (#213).
+    result = run_mypy(FIXTURES / "symbolic_axes_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    assert reveals_by_line(result) == {
+        line: '"numpy.ndarray[Any, Any]"' for line in (19, 20, 21)
+    }, result.stdout
 
 
 def test_same_tvar_roundtrip_ok() -> None:
@@ -3909,9 +3938,9 @@ def test_rebind_allow_redefinition_ok() -> None:
         30: f'"numpy.ndarray[tuple[Literal[4], Literal[3]], {f64}]"',
         32: f'"numpy.ndarray[tuple[Literal[12]], {iu}]"',
         34: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {iu}]"',
-        38: f'"numpy.ndarray[tuple[Literal[0], Literal[3]], {f64}] | numpy.ndarray[tuple[Literal[1], Literal[3]], {f64}] | numpy.ndarray[tuple[Any, ...], numpy.dtype[Any]]"',
-        46: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {f64}] | numpy.ndarray[tuple[Literal[5], Literal[4]], {f64}]"',
-        47: f'"numpy.ndarray[tuple[Literal[3], Literal[2]], {f64}] | numpy.ndarray[tuple[Literal[5], Literal[2]], {f64}]"',
+        38: f'"numpy.ndarray[tuple[Literal[0], Literal[3]], {f64}] | numpy.ndarray[tuple[Literal[1], Literal[3]], {f64}] | numpy.ndarray[tuple[Any, ...], numpy.dtype[Any]]"',  # noqa: E501
+        46: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {f64}] | numpy.ndarray[tuple[Literal[5], Literal[4]], {f64}]"',  # noqa: E501
+        47: f'"numpy.ndarray[tuple[Literal[3], Literal[2]], {f64}] | numpy.ndarray[tuple[Literal[5], Literal[2]], {f64}]"',  # noqa: E501
     }, result.stdout
     assert _run_fixture("rebind_allow_ok.py") == [
         "(5,)",

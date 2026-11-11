@@ -62,7 +62,7 @@ import sys
 
 from numty_convert import Edit, Source, run_cli, splice
 
-_SELF_OP_UFUNCS = {
+_SELF_OP_UFUNCS: dict[type[ast.operator], str] = {
     ast.Add: "add",
     ast.Sub: "subtract",
     ast.Mult: "multiply",
@@ -604,7 +604,7 @@ def _self_op_edits(
     return edits, warnings
 
 
-def _as_display(node: ast.expr) -> ast.expr | None:
+def _as_display(node: ast.expr) -> ast.Tuple | ast.List | None:
     """The literal display a value-identical unpack source denotes."""
     if isinstance(node, (ast.Tuple, ast.List)):
         return node

@@ -89,7 +89,7 @@ def _plug_with_lookup(mapping: dict[str, bool]) -> NumtyPlugin:
             return SimpleNamespace(node=object())
         return None
 
-    plug.lookup_fully_qualified = fake_lookup  # type: ignore[method-assign]
+    setattr(plug, "lookup_fully_qualified", fake_lookup)
     return plug
 
 

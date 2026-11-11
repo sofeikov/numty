@@ -50,7 +50,7 @@ import shutil
 import subprocess
 import sys
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -525,9 +525,15 @@ class Gen:
     def linalg(self) -> str:
         r = self.rng
         n = r.choice(DIMS)
-        a = self.operand(r.choice(((n, n), (n, n), self.shape(2), self.shape(3), self.shape(1))), r.choice(("", "", "np.float32", "np.int64", "np.complex128")))
+        a = self.operand(
+            r.choice(((n, n), (n, n), self.shape(2), self.shape(3), self.shape(1))),
+            r.choice(("", "", "np.float32", "np.int64", "np.complex128")),
+        )
         name = r.choice(
-            ("inv", "det", "cholesky", "eigvals", "pinv", "svd", "qr", "eigh", "slogdet", "matrix_rank", "eig", "eigvalsh", "norm", "cond", "matrix_transpose")
+            (
+                "inv", "det", "cholesky", "eigvals", "pinv", "svd", "qr", "eigh", "slogdet",
+                "matrix_rank", "eig", "eigvalsh", "norm", "cond", "matrix_transpose",
+            )
         )
         return f"np.linalg.{name}({a.text})"
 
@@ -597,7 +603,9 @@ class Gen:
 
     def builder(self) -> str:
         name = self.rng.choice(("eye", "identity", "arange", "linspace", "zeros", "ones", "full", "empty"))
-        args = self.rng.choice(("3", "(2, 3)", "4, 5", "(3,), 1.5", "0", "5, dtype=np.float32", "(2, 2), 7", "3, 4, dtype=int"))
+        args = self.rng.choice(
+            ("3", "(2, 3)", "4, 5", "(3,), 1.5", "0", "5, dtype=np.float32", "(2, 2), 7", "3, 4, dtype=int")
+        )
         return f"np.{name}({args})"
 
     def average(self) -> str:
@@ -775,7 +783,7 @@ class Gen:
         family_fn = self.rng.choice(self.FAMILIES)
         # Single choice (same rng draw as before): the expr stream for a
         # seed is unchanged. No extra draw for the family record.
-        self.current_family = family_fn.__name__
+        self.current_family = getattr(family_fn, "__name__")
         return family_fn(self)
 
 
@@ -812,7 +820,7 @@ class SymGen(Gen):
         }.get(dtype, "F64")
         name = f"a{len(self.params)}"
         self.params.append((name, head, tuple(shape)))
-        return Operand(name, tuple(shape))  # type: ignore[arg-type]
+        return Operand(name, cast("tuple[int, ...]", tuple(shape)))
 
     def near(self, shape) -> Operand:  # type: ignore[override]
         r = self.rng
@@ -1075,7 +1083,7 @@ class SymGen(Gen):
         }.get(dtype, "F64")
         name = f"a{len(self.params)}"
         self.params.append((name, head, tuple(shape)))
-        return Operand(name, tuple(shape))  # type: ignore[arg-type]
+        return Operand(name, cast("tuple[int, ...]", tuple(shape)))
 
     def ts_near(self, shape: tuple[object, ...]) -> Operand:
         """An operand that often fits next to a *Ts shape, sometimes not."""
@@ -1419,7 +1427,7 @@ def _names_in(dim: object) -> list[str]:
     return re.findall(r"[A-Za-z_]\w*", dim) if isinstance(dim, str) else []
 
 
-def _substitute(dim: object, binding: dict[str, object]) -> object:
+def _substitute(dim: object, binding: Mapping[str, object]) -> object:
     """A helper's dim with the caller's dims put in for its names."""
     if dim == TS_DIM:
         return TS_DIM
@@ -1517,7 +1525,7 @@ class Helper:
                     if isinstance(dim, int):
                         if dim != size:
                             raise ValueError(f"expected {dim}, got {size}")
-                    elif dim.isidentifier():  # type: ignore[attr-defined]
+                    elif cast(str, dim).isidentifier():
                         if env.setdefault(cast(str, dim), size) != size:
                             raise ValueError(f"{dim} is both {env[cast(str, dim)]} and {size}")
                     else:

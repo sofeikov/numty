@@ -8,6 +8,7 @@ pragmas, blank lines) must come back byte for byte.
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,7 @@ def _convert_cache_dir() -> Path:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _fresh_convert_cache() -> None:
+def _fresh_convert_cache() -> Iterator[None]:
     # Fresh per session (like test_static): mypy does not reliably
     # invalidate plugin results, but within one run the plugin is fixed
     # so incremental reuse across the 3 e2e checks stays fast.

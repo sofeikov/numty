@@ -1,4 +1,9 @@
-"""numpy.linalg hooks (Phase 3, #197). Top-level imports go to earlier layers only (tests/test_layout.py, _LAYERS); a function-local facade import is used only for a monkeypatch seam or a helper in a later layer. NUMTY/_bail/_swallowed from _errors direct. No direct _fresh_unknown (preserves facade patch seam)."""
+"""numpy.linalg hooks (Phase 3, #197). Top-level imports go to earlier layers
+only (tests/test_layout.py, _LAYERS); a function-local facade import is used
+only for a monkeypatch seam or a helper in a later layer.
+NUMTY/_bail/_swallowed from _errors direct. No direct _fresh_unknown
+(preserves facade patch seam).
+"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

@@ -779,7 +779,7 @@ class _Converter:
                         new = f"[{', '.join([*codes, 'type-var'])}]"
                         s, e = base + col + m.start(1), base + col + m.end(1)
                         edits.append((s, e, new))
-                # A bare `# type: ignore` already covers it.
+                # A bare type-ignore comment already covers it.
             elif line in line_ends:
                 content = self.source.lines[line - 1].rstrip("\r\n").rstrip(" \t")
                 pos = base + len(content)

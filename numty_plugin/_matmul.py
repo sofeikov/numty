@@ -1,4 +1,7 @@
-"""_matmul.py — matmul/dot/tensordot. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+"""_matmul.py — matmul/dot/tensordot. (Phase 5, #199). Top-level imports go to
+earlier layers only (order in tests/test_layout.py, _LAYERS). A function-
+local facade import is used only for a monkeypatch seam or for a helper in a
+later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -13,7 +16,8 @@ from ._unknowns import _is_same_unknown
 from ._exprs import _expr_str
 
 from ._types import (
-    _int_value, _dim_eq, _dims_provably_ne, _dim_str, _reshape_total_form, _fold_int, _ndarray_parts, _has_unpack, _ndarray_type
+    _int_value, _dim_eq, _dims_provably_ne, _dim_str, _reshape_total_form, _fold_int,
+    _ndarray_parts, _has_unpack, _ndarray_type,
 )
 from ._reshape import (
     _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
