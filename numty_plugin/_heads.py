@@ -11,6 +11,9 @@ from typing import TYPE_CHECKING, cast
 from ._errors import NUMTY_ANNOTATION, _swallowed
 from ._exprs import _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars, _normalize_ns, _seen_vars
 from ._forms import _LinForm, _form_never_size
+from ._types import (
+    INT_FULLNAME, _dim_value,
+)
 
 
 def _is_fam_int_name(fullname: str) -> bool:
@@ -605,7 +608,6 @@ def _fam_bare(
     already an error by the time we see it: analyze, reuse what it
     denotes, fail clearly on anything else.
     """
-    from numty_plugin import INT_FULLNAME, _dim_value
     if arg.name in ("True", "False", "None", "_", "..."):
         raise _FamFail(
             f'{head} dim "{arg.name}" is not a TypeVar or integer;'

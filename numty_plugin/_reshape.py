@@ -1,4 +1,4 @@
-"""_reshape.py — reshape/transpose/swap/moveaxis. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
+"""_reshape.py — reshape/transpose/swap/moveaxis. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 

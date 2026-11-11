@@ -1,4 +1,4 @@
-"""_reductions.py — reductions/cumsum/diff/average/percentile/ufunc. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
+"""_reductions.py — reductions/cumsum/diff/average/percentile/ufunc. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -14,6 +14,19 @@ from ._types import (
     _int_value, _dim_eq, _dim_add_const, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _distribute_solve, _split_flat, _ndarray_type, _int_shape_from_arg, 
     NDARRAY_FULLNAME
 )
+from ._reshape import (
+    REDUCTION_DTYPES, _all_positionals, _all_positionals_expanded, _construct_datetime_dtype,
+    _datetime_kind, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
+    _is_none_type, _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _promote_all,
+    _promote_dtypes, _scalar_key, _weak_name,
+)
+from ._builders import (
+    _apply_out_dtype, _builder_shape, _construct_dtype, _default_dtype, _dims_fit_intp,
+    _explicit_dtype, _is_plain_int, _named_dtype, _scalar_ret_name, _unknown_axis_parts,
+)
+from ._linalg import (
+    _linalg_real_name, _linalg_tuple,
+)
 
 def _reduction_out_dtype(
     ctx: FunctionContext | MethodContext, op: str, dtype: Type
@@ -25,7 +38,7 @@ def _reduction_out_dtype(
     max/min/median keep the input dtype (median of ints promotes like
     mean). Anything else bails.
     """
-    from numty_plugin import _construct_dtype, _dtype_fullname, _dtype_kind_size, _kind_of, _linalg_real_name
+    from numty_plugin import _kind_of
     name = _dtype_fullname(dtype)
     if name is None:
         ks = _dtype_kind_size(dtype)
@@ -72,7 +85,6 @@ def _solve_reduction(
     force_dtype: Type | None = None,
     op: str = "sum",
 ) -> Type:
-    from numty_plugin import REDUCTION_DTYPES, _dims_str, _dtype_fullname, _normalize_axis, _normalize_axis_0d
     if not isinstance(axis, list) or keepdims is None or has_dtype:
         return ctx.default_return_type
     if force_dtype is None and _dtype_fullname(dtype) not in REDUCTION_DTYPES:
@@ -113,7 +125,6 @@ def _reduction_inputs_bool(
     ctx: FunctionContext | MethodContext, array: Type, op: str = "any"
 ) -> Type:
     """any/all: same axis rules as reductions, but the output is bool."""
-    from numty_plugin import _construct_dtype, _fold_flag, _formal_pair, _is_none_type, _parse_axis_arg
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     keep_pair = _formal_pair(ctx, "keepdims")
     keepdims = False if keep_pair is None else _fold_flag(keep_pair)
@@ -139,7 +150,6 @@ def _reduction_bool_types(
     dtype: Type,
     op: str = "any",
 ) -> Type:
-    from numty_plugin import _unknown_axis_parts
     parts = _parts_or_unpack(array) or _unknown_axis_parts(array)
     if parts is None:
         return ctx.default_return_type
@@ -167,7 +177,6 @@ def allany_method_hook(ctx: MethodContext, op: str) -> Type:
 
 
 def allany_function_hook(ctx: FunctionContext, op: str) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -193,7 +202,6 @@ def _solve_reduction_unpack(
     into *Ts bails out, as do absent/None axes, exactly like the
     fixed-rank path.
     """
-    from numty_plugin import REDUCTION_DTYPES, _dims_str, _dtype_fullname
     # Bailing here must not return the stubs' answer: for *Ts shapes the
     # stubs preserve the input shape (e.g. `var` keeps (*Ts, P)), which
     # is a wrong exact claim when an axis actually reduces. Return Any
@@ -235,7 +243,6 @@ def _solve_reduction_unpack(
 def _reduction_inputs(
     ctx: FunctionContext | MethodContext, array: Type, op: str = "sum"
 ) -> Type:
-    from numty_plugin import _apply_out_dtype, _fold_flag, _formal_pair, _is_none_type, _parse_axis_arg
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     keep_pair = _formal_pair(ctx, "keepdims")
     keepdims = False if keep_pair is None else _fold_flag(keep_pair)
@@ -284,7 +291,6 @@ def _reduction_types(
     has_dtype: bool,
     op: str = "sum",
 ) -> Type:
-    from numty_plugin import _datetime_kind, _dims_str, _normalize_axis, _normalize_axis_0d, _unknown_axis_parts
     parts = _parts_or_unpack(array) or _unknown_axis_parts(array)
     if parts is None:
         return _reduction_dtype_only(ctx, array, has_dtype, op)
@@ -382,7 +388,6 @@ def _ufunc_reduce_types(
 
 
 def _ufunc_reduce_inputs(ctx: MethodContext, array: Type, op: str = "reduce") -> Type:
-    from numty_plugin import _apply_out_dtype, _fold_flag, _formal_pair, _parse_axis_arg
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     if axis == "absent":
         # Unlike ndarray.sum (axis=None), ufunc reduce defaults to axis 0.
@@ -417,7 +422,6 @@ def _ufunc_accumulate_inputs(
     axis=None is a runtime ValueError and a 0-d input has no loop
     ("cannot accumulate on a scalar"), so both stay with the stubs.
     """
-    from numty_plugin import _apply_out_dtype, _dims_str, _formal_pair, _normalize_axis_0d, _parse_axis_arg
     parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
@@ -446,7 +450,6 @@ def _ufunc_accumulate_inputs(
 
 def _ufunc_outer_shape(tp: Type) -> list[int | Type] | None:
     """Operand dims for outer: arrays contribute their shape, scalars []."""
-    from numty_plugin import _scalar_key, _scalar_ret_name
     part = _parts_or_unpack(tp)
     if part is not None:
         dims, _ = part
@@ -470,7 +473,6 @@ def _ufunc_outer_types(
 
 
 def _ufunc_outer_inputs(ctx: MethodContext) -> Type:
-    from numty_plugin import _all_positionals, _apply_out_dtype
     pairs = _all_positionals(ctx)
     if len(pairs) != 2:
         return ctx.default_return_type
@@ -523,7 +525,6 @@ def _ufunc_reduceat_types(
     op: str = "reduceat",
 ) -> Type:
     """ufunc reduceat: the axis dim becomes the indices length (issue #142)."""
-    from numty_plugin import _dims_str, _normalize_axis_0d
     parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
@@ -551,7 +552,6 @@ def _ufunc_reduceat_types(
 def _ufunc_reduceat_inputs(
     ctx: MethodContext, array: Type, op: str = "reduceat"
 ) -> Type:
-    from numty_plugin import _apply_out_dtype, _formal_pair, _parse_axis_arg
     axis = _parse_axis_arg(_formal_pair(ctx, "axis"))
     if axis == "absent":
         axis = [0]
@@ -572,7 +572,6 @@ def ufunc_method_hook(ctx: MethodContext, op: str) -> Type:
     the axis by the indices length. Only the shape is solved here; the
     dtype stays unknown. add.at is unhooked (returns None).
     """
-    from numty_plugin import _all_positionals
     if op == "outer":
         return _ufunc_outer_inputs(ctx)
     pairs = _all_positionals(ctx)
@@ -694,7 +693,6 @@ def _solve_argdrop(
     None) axis flattens, so keepdims gives all ones and the plain form
     stays with the stubs (a scalar). An undecidable keepdims bails.
     """
-    from numty_plugin import _default_dtype, _dims_str, _fold_flag, _formal_pair, _normalize_axis_0d
     keep_pair = _formal_pair(ctx, "keepdims")
     keepdims = False if keep_pair is None else _fold_flag(keep_pair)
     if not isinstance(axis, list):
@@ -745,7 +743,6 @@ def _solve_same_or_flat(
     op: str = "sort",
 ) -> Type:
     """sort/partition (same shape) and argsort/argpartition (integer out)."""
-    from numty_plugin import _default_dtype, _dims_str, _normalize_axis
     if int_out and not dims:
         # argsort/argpartition treat a 0-d array as one element and
         # return (1,); sort and partition reject it (axis out of range).
@@ -785,7 +782,6 @@ def _kth_in_bounds(
     positional-only, so it reads from the first positional there, as
     long as the callee's formals (axis) are visible at all.
     """
-    from numty_plugin import _all_positionals, _dims_str, _formal_pair, _normalize_axis
     pair = _formal_pair(ctx, "kth")
     if pair is None and isinstance(ctx, MethodContext) and "axis" in ctx.callee_arg_names:
         pos = _all_positionals(ctx)
@@ -840,7 +836,6 @@ ARG_SAME = frozenset({"sort", "partition"})
 
 
 def _arg_inputs(ctx: FunctionContext | MethodContext, array: Type, op: str) -> Type:
-    from numty_plugin import _formal_pair, _parse_axis_arg
     parts = _ndarray_parts(array)
     if parts is None:
         return ctx.default_return_type
@@ -858,7 +853,6 @@ def arg_method_hook(ctx: MethodContext, op: str) -> Type:
 
 
 def arg_function_hook(ctx: FunctionContext, op: str) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -870,7 +864,6 @@ RNG_FLOAT_OPS = frozenset({"normal", "random", "standard_normal", "uniform"})
 
 def _parse_size_arg(ctx: MethodContext) -> list[int | Type] | str | None:
     """A sampler's size=: 'absent'/'none' as _parse_axis_arg, else builder dims."""
-    from numty_plugin import _builder_shape, _formal_pair, _is_none_type, _is_plain_int
     pair = _formal_pair(ctx, "size")
     if pair is None:
         return "absent"
@@ -888,7 +881,6 @@ def _parse_size_arg(ctx: MethodContext) -> list[int | Type] | str | None:
 
 
 def rng_method_hook(ctx: MethodContext, op: str) -> Type:
-    from numty_plugin import _all_positionals, _construct_dtype, _dims_str, _dtype_fullname, _explicit_dtype, _formal_pair, _named_dtype, _normalize_axis, _parse_axis_arg
     if op in RNG_FLOAT_OPS:
         size = _parse_size_arg(ctx)
         if not isinstance(size, list):
@@ -990,7 +982,6 @@ def legacy_rand_hook(ctx: FunctionContext | MethodContext) -> Type:
     No args is a scalar (stubs own it). Each positional must fold to a
     non-negative int; anything dynamic bails instead of guessing.
     """
-    from numty_plugin import _all_positionals, _construct_dtype, _dims_fit_intp
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1019,7 +1010,6 @@ def _percentile_q_dims(
     Python/numpy scalars give [] (0-d). Anything else (a bare list
     variable, a dynamic value) stays with the stubs.
     """
-    from numty_plugin import _scalar_key, _weak_name
     if isinstance(expr, (ListExpr, TupleExpr)):
         if not expr.items:
             return [0]
@@ -1055,7 +1045,6 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
     with keepdims). Float inputs keep dtype, ints become float64;
     anything unprovable bails to the stubs instead of guessing.
     """
-    from numty_plugin import _all_positionals, _construct_dtype, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _normalize_axis, _parse_axis_arg, _promote_all, _scalar_key, _weak_name
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -1155,7 +1144,6 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
 
 
 def reduction_function_hook(ctx: FunctionContext, op: str = "sum") -> Type:
-    from numty_plugin import _all_positionals_expanded
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
         return ctx.default_return_type
@@ -1203,7 +1191,6 @@ def _check_average_weights(
     axis, or weights shaped exactly like the input. Anything else is left
     alone: no false positives on shapes we cannot judge.
     """
-    from numty_plugin import _dims_str, _formal_pair, _normalize_axis, _parse_axis_arg
     wparts = _ndarray_parts(weights)
     aparts = _ndarray_parts(array)
     if wparts is None or aparts is None:
@@ -1257,7 +1244,6 @@ def _average_weighted_dtype(
     (complex64 data with float64 weights is complex128), and integer
     or bool data adds float64. Unknown weights bail to the stubs.
     """
-    from numty_plugin import _construct_dtype, _dtype_kind_size, _promote_all
     a_parts = _ndarray_parts(array)
     w_parts = _ndarray_parts(weights)
     if a_parts is None or w_parts is None:
@@ -1282,7 +1268,6 @@ def _average_weighted_dtype(
 
 
 def average_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _fold_flag, _formal_pair, _is_none_type, _linalg_tuple
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1345,7 +1330,6 @@ def _cumsum_solve(
     stay with the stubs. dtype is whatever the stubs claim: only the
     shape is solved here.
     """
-    from numty_plugin import REDUCTION_DTYPES, _construct_dtype, _dims_str, _dtype_fullname, _formal_pair, _is_none_type, _normalize_axis_0d, _parse_axis_arg
     parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
@@ -1427,7 +1411,6 @@ def _cumsum_solve(
 
 
 def cumsum_function_hook(ctx: FunctionContext, op: str = "cumsum") -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1465,7 +1448,6 @@ def flatten_method_hook(ctx: MethodContext) -> Type:
 
 
 def ravel_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1473,7 +1455,6 @@ def ravel_function_hook(ctx: FunctionContext) -> Type:
 
 
 def diff_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _construct_datetime_dtype, _datetime_kind, _dims_str, _formal_pair, _is_none_type, _normalize_axis, _parse_axis_arg
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1554,7 +1535,6 @@ def _promoted_result_type(
     Reuses an input dtype when the promotion matches it, so precision
     (exact bit widths) survives; constructs only genuinely fresh dtypes.
     """
-    from numty_plugin import _construct_dtype, _dtype_fullname, _promote_dtypes
     name = _promote_dtypes(dta, dtb)
     if name is None:
         return None

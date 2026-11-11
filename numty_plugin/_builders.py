@@ -1,4 +1,4 @@
-"""_builders.py — builders/joiners, mixed guards, like-builders, concat/stack. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
+"""_builders.py — builders/joiners, mixed guards, like-builders, concat/stack. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -17,6 +17,10 @@ from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULE
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, _int_shape_from_arg, 
     _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME
+)
+from ._reshape import (
+    _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,
+    _normalize_axis, _promote_all, _scalar_key,
 )
 
 def _operands_have_known_shape(operands: list[Type]) -> bool:
@@ -482,7 +486,6 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
     like = short in ("zeros_like", "ones_like", "empty_like", "full_like")
 
     def keeps(ctx: FunctionContext | MethodContext | AttributeContext) -> bool:
-        from numty_plugin import _formal_pair
         if keeper:
             return True
         if like and isinstance(ctx, FunctionContext):
@@ -577,7 +580,6 @@ INTP_MAX = 2**63 - 1
 
 def _dims_fit_intp(ctx: FunctionContext | MethodContext, dims: list[int | Type]) -> bool:
     """numpy stores dims as intp: a larger literal dim always raises."""
-    from numty_plugin import _dims_str
     for d in dims:
         if isinstance(d, int) and d > INTP_MAX:
             ctx.api.fail(
@@ -591,7 +593,6 @@ def _dims_fit_intp(ctx: FunctionContext | MethodContext, dims: list[int | Type])
 
 
 def zeros_like_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _formal_pair
     shape_arg = _single_shape_arg(ctx)
     shape_expr = _single_shape_expr(ctx)
     if shape_arg is None:
@@ -698,7 +699,6 @@ def _fold_single(pair: tuple[Type, Expression | None]) -> int | None:
 
 
 def _explicit_dtype(ctx: FunctionContext | MethodContext) -> bool:
-    from numty_plugin import _formal_pair, _is_none_type
     pair = _formal_pair(ctx, "dtype")
     return pair is not None and not _is_none_type(pair[0])
 
@@ -781,7 +781,6 @@ def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
     like np.float32, np.dtype(...) results, canonical strings); anything
     else bails out instead of guessing.
     """
-    from numty_plugin import _construct_datetime_dtype, _formal_pair, _is_none_type
     pair = _formal_pair(ctx, "dtype")
     if pair is None or _is_none_type(pair[0]):
         return None
@@ -863,7 +862,6 @@ def _apply_out_dtype(
     out's own type (it carries the requested dtype and shape). A dtype=
     the plugin cannot resolve bails out instead of guessing (issue #52).
     """
-    from numty_plugin import _dims_str, _formal_pair, _is_none_type
     if result is ctx.default_return_type:
         return result
     if _explicit_dtype(ctx):
@@ -909,7 +907,6 @@ def _apply_out_dtype(
 
 
 def like_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -920,7 +917,6 @@ def like_function_hook(ctx: FunctionContext) -> Type:
 
 
 def _like_types(ctx: FunctionContext, tp: Type) -> Type:
-    from numty_plugin import _formal_pair, _is_none_type
     parts = _parts_or_unpack(tp)
     if parts is None:
         return ctx.default_return_type
@@ -945,7 +941,6 @@ def copy_function_hook(ctx: FunctionContext) -> Type:
     Trivial keep-shape twin of the hooked method (m.copy() already
     solved); previously fell back to Any and accepted any annotation.
     """
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -958,7 +953,6 @@ def copy_function_hook(ctx: FunctionContext) -> Type:
 
 def ascontiguousarray_function_hook(ctx: FunctionContext) -> Type:
     """np.ascontiguousarray: same shape, explicit dtype or kept (issue #58)."""
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -978,7 +972,6 @@ def ascontiguousarray_function_hook(ctx: FunctionContext) -> Type:
 
 
 def full_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _formal_pair
     pairs = _all_positionals(ctx)
     shape_pair = _formal_pair(ctx, "shape") or (pairs[0] if pairs else None)
     fill_pair = _formal_pair(ctx, "fill_value")
@@ -1003,7 +996,6 @@ def full_function_hook(ctx: FunctionContext) -> Type:
 
 
 def eye_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _formal_pair, _is_none_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1057,7 +1049,6 @@ def linspace_function_hook(ctx: FunctionContext) -> Type:
     Rank-only stubs reject correct Literal annotations, so solve the
     count exactly. Symbolic counts propagate; anything else bails.
     """
-    from numty_plugin import _all_positionals, _formal_pair, _scalar_key
     # start/stop may be array-likes, and the result is then (num, *shape):
     # only scalar endpoints are solved here.
     for name, index in (("start", 0), ("stop", 1)):
@@ -1101,7 +1092,6 @@ def linspace_function_hook(ctx: FunctionContext) -> Type:
 
 def identity_function_hook(ctx: FunctionContext) -> Type:
     """np.identity: (n, n) with explicit dtype or float64 (issue #58)."""
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1128,7 +1118,6 @@ def identity_function_hook(ctx: FunctionContext) -> Type:
 
 def tri_function_hook(ctx: FunctionContext) -> Type:
     """np.tri: (N, M or N) with explicit dtype or float64 (issue #58)."""
-    from numty_plugin import _all_positionals, _formal_pair, _is_none_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1213,7 +1202,6 @@ def _arange_symbolic_kw(
 
 
 def arange_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _formal_pair
     pairs = _all_positionals(ctx)
     if len(pairs) > 3:
         return ctx.default_return_type
@@ -1383,7 +1371,6 @@ def _is_empty_sequence(tp: Type, expr: Expression | None) -> bool:
 
 
 def _concat_axis(ctx: FunctionContext, pairs: list[tuple[Type, Expression | None]]) -> int | None | str:
-    from numty_plugin import _formal_pair
     pair = _formal_pair(ctx, "axis")
     if pair is None:
         if len(pairs) > 1:
@@ -1396,7 +1383,6 @@ def _concat_axis(ctx: FunctionContext, pairs: list[tuple[Type, Expression | None
 
 
 def _single_axis_value(pair: tuple[Type, Expression | None]) -> int | None | str:
-    from numty_plugin import _is_none_type
     tp, expr = pair
     if _is_none_type(tp):
         return "none"
@@ -1453,7 +1439,6 @@ def _dynamic_sequence_element(
 
 
 def concatenate_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _normalize_axis, _promote_all
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1556,7 +1541,6 @@ def _concat_merge(
     norm: int,
 ) -> Type:
     """Merge rank-checked items along norm; mismatches fail with op."""
-    from numty_plugin import _dims_str
     out = list(items[0][0])
     # Issue #183: fail on any provably-different dim even when an
     # earlier dim is only possibly different (e.g. dstack of (P, 3)
@@ -1597,7 +1581,6 @@ def _stack_solve(
     axis: int,
 ) -> Type:
     """Shared vstack/hstack/dstack/column_stack solver after promotion."""
-    from numty_plugin import _dims_str, _promote_all
     from numty_plugin import _fresh_unknown
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
@@ -1661,7 +1644,6 @@ def _stack_solve(
 
 
 def vstack_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1669,7 +1651,6 @@ def vstack_function_hook(ctx: FunctionContext) -> Type:
 
 
 def hstack_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1677,7 +1658,6 @@ def hstack_function_hook(ctx: FunctionContext) -> Type:
 
 
 def dstack_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1685,7 +1665,6 @@ def dstack_function_hook(ctx: FunctionContext) -> Type:
 
 
 def column_stack_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1711,7 +1690,6 @@ def _concat_dynamic(
 ) -> Type:
     """Concatenate of a homogeneous dynamic sequence: rank is known
     from the element type, only the axis length is unknowable."""
-    from numty_plugin import _dims_str, _normalize_axis
     from numty_plugin import _fresh_unknown
     dims_e, dtype_e = elem
     dtype = _dynamic_explicit_dtype(ctx, dtype_e)
@@ -1743,7 +1721,6 @@ def _stack_dynamic(
 ) -> Type:
     """Stack of a homogeneous dynamic sequence: the new axis holds the
     unknowable sequence length, every other dim rides the element."""
-    from numty_plugin import _dims_str
     from numty_plugin import _fresh_unknown
     dims_e, dtype_e = elem
     dtype = _dynamic_explicit_dtype(ctx, dtype_e)
@@ -1768,7 +1745,6 @@ def _stack_dynamic(
 
 
 def stack_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _promote_all
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
