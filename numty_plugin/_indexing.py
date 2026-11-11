@@ -13,12 +13,12 @@ from ._forms import (
     _LinForm,
 )
 from ._types import (
-    INT_FULLNAME, _dim_eq, _distribute_solve, _fold_int, _has_unpack, _int_value,
+    INT_FULLNAME, _dim_eq, _dims_provably_ne, _distribute_solve, _fold_int, _has_unpack, _int_value,
     _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _formal_pair, _is_none_type, _normalize_axis, _normalize_axis_0d,
-    _parse_axis_arg, _scalar_key,
+    _all_positionals, _dims_str, _formal_pair, _is_none_type, _movable_parts, _normalize_axis,
+    _normalize_axis_0d, _parse_axis_arg, _scalar_key,
 )
 from ._reductions import (
     _enum_member_value, _final_slice_call, _fold_index_bound,
@@ -219,6 +219,20 @@ def _parse_index_item(
     if isinstance(expr, EllipsisExpr):
         return ("ellipsis",)
     part = _ndarray_parts(tp)
+    if part is None:
+        # Issue #226: Bool[int] (and other plain-int shapes) bails in
+        # _ndarray_parts, but the shape is known via _movable_parts.
+        # Masks/fancy indices there keep the dtype instead of Any.
+        movable = _movable_parts(tp)
+        if movable is not None:
+            kind = _dtype_base(movable[1])
+            if kind is None:
+                return None
+            if kind in ("i", "u"):
+                return ("fancy0d",) if not movable[0] else ("fancy", list(movable[0]))
+            if kind == "b":
+                return ("mask", list(movable[0]))
+            return ("badindex",)
     if part is not None:
         kind = _dtype_base(part[1])
         if kind is None:
@@ -230,6 +244,10 @@ def _parse_index_item(
             # one data-dependent count (issue #49).
             return ("mask", list(part[0]))
         return ("badindex",)
+    # Issue #231: x[[-1]] is a fancy index of length 1, not a bail.
+    if isinstance(expr, (ListExpr, TupleExpr)) and expr.items:
+        if all(_fold_int(e) is not None for e in expr.items):
+            return ("fancy", [len(expr.items)])
     if isinstance(expr, SliceExpr):
         begin = _fold_index_bound(ctx, expr.begin_index)
         end = _fold_index_bound(ctx, expr.end_index)
@@ -284,6 +302,15 @@ def _parse_index_item(
     proper_tp = get_proper_type(tp)
     if isinstance(proper_tp, Instance):
         if proper_tp.type.fullname == INT_FULLNAME:
+            return ("int_any",)
+        # Issue #231: numpy integer scalars (np.intp, np.int64, loop vars
+        # like `for t in steps` which reveal as signedinteger[_64Bit])
+        # are valid indices like Python int, not Any.
+        if proper_tp.type.fullname in (
+            "numpy.signedinteger",
+            "numpy.unsignedinteger",
+            "numpy.integer",
+        ):
             return ("int_any",)
         if proper_tp.type.fullname != "builtins.bool":
             key = _scalar_key(tp)
@@ -422,6 +449,17 @@ def _consume_prefix(
                         f"boolean index did not match indexed array along axis {i + off}; "
                         f"size of axis is {pd} but size of corresponding boolean axis is {md} "
                         f"(shape {shape_repr})",
+                        ctx.context,
+                        code=NUMTY_AXIS,
+                    )
+                    return None
+                # Issue #228: symbolic lengths that are provably different
+                # (N-1 vs N) must be reported like literal mismatches.
+                if _dims_provably_ne(md, pd):
+                    ctx.api.fail(
+                        f"boolean index did not match indexed array along axis {i + off}; "
+                        f"size of axis is {_dims_str([pd])} but size of corresponding "
+                        f"boolean axis is {_dims_str([md])} (shape {shape_repr})",
                         ctx.context,
                         code=NUMTY_AXIS,
                     )
@@ -671,6 +709,17 @@ def _solve_getitem(
                             code=NUMTY_AXIS,
                         )
                         return ctx.default_return_type
+                    # Issue #228: symbolic lengths that are provably
+                    # different (N-1 vs N) report like literal mismatches.
+                    if _dims_provably_ne(md, pd):
+                        ctx.api.fail(
+                            f"boolean index did not match indexed array along axis {dim + off}; "
+                            f"size of axis is {_dims_str([pd])} but size of corresponding "
+                            f"boolean axis is {_dims_str([md])} (shape {_dims_str(dims)})",
+                            ctx.context,
+                            code=NUMTY_AXIS,
+                        )
+                        return ctx.default_return_type
                 unk = _fresh_unknown(ctx, "mask", dim)
                 if not adv_block:
                     adv_block = [unk]
@@ -905,6 +954,13 @@ def _getitem_types(
     if parts is not None:
         dims, dtype = parts
         return _solve_getitem(ctx, dims, dtype, pair)
+    # Issue #226: F64[int]/Bool[int] have plain-int dims; _ndarray_parts
+    # bails but the rank is known via _movable_parts. Solve with those
+    # dims (plain ints stay dynamic, masks mint unknowns) instead of Any.
+    movable = _movable_parts(tp)
+    if movable is not None:
+        dims, dtype = movable
+        return _solve_getitem(ctx, list(dims), dtype, pair)
     split = _unpack_shape(tp)
     if split is None:
         return ctx.default_return_type
