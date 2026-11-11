@@ -2,7 +2,8 @@
 
 Module-level singleton STATE; NumtyPlugin.__init__ does
 self.state = STATE (never NumtyState()). No clearing in hooks.
-Phase 1 (B namespacing) and Phase 2 (C pruning) are separate PRs.
+Region B is keyed (ns, fullname) since #209. Region C pruning
+(Phase 2 of #198) is not done.
 """
 from __future__ import annotations
 

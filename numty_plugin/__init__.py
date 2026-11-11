@@ -1,86 +1,9 @@
 """mypy plugin facade (Phase 5, #199): re-exports + plugin() entry. Solvers live in _types/_matmul/_reshape/_reductions/_builders/_ops/_broadcast/_linalg/_indexing/_heads/_hooks; see those modules. No __all__ (explicit re-exports only)."""
 from __future__ import annotations
 
-import ast
-import json
-import keyword
-import os
 import sys
-from collections.abc import Callable, Iterator
-from functools import partial
-from typing import NamedTuple, cast
 
-from mypy.errorcodes import ARG_TYPE, MISC, ErrorCode
-from mypy.nodes import (
-    ARG_NAMED,
-    ARG_NAMED_OPT,
-    ARG_OPT,
-    ARG_POS,
-    ARG_STAR,
-    ARG_STAR2,
-    AssignmentStmt,
-    CallExpr,
-    Context,
-    Decorator,
-    EllipsisExpr,
-    Expression,
-    FuncDef,
-    GeneratorExpr,
-    IntExpr,
-    ListComprehension,
-    ListExpr,
-    MemberExpr,
-    NameExpr,
-    OpExpr,
-    OverloadedFuncDef,
-    SliceExpr,
-    StarExpr,
-    StrExpr,
-    TupleExpr,
-    TypeAlias,
-    TypeInfo,
-    TypeVarExpr,
-    TypeVarLikeExpr,
-    UnaryExpr,
-    Var,
-)
-from mypy.messages import callable_name
-from mypy.operators import op_methods_to_symbols
-from mypy.plugin import (
-    AnalyzeTypeContext,
-    AttributeContext,
-    FunctionContext,
-    FunctionSigContext,
-    MethodContext,
-    MethodSigContext,
-    Plugin,
-)
-from mypy.typeanal import TypeAnalyser
-from mypy.tvar_scope import TypeVarLikeScope
-from mypy.types import (
-    AnyType,
-    CallableType,
-    EllipsisType,
-    Instance,
-    LiteralType,
-    NoneType,
-    Overloaded,
-    RawExpressionType,
-    TupleType,
-    Type,
-    TypeAliasType,
-    TypeOfAny,
-    TypeVarId,
-    TypeVarLikeType,
-    TypeVarTupleType,
-    TypeVarType,
-    UnboundType,
-    UninhabitedType,
-    UnionType,
-    UnpackType,
-    get_proper_type,
-)
-
+from mypy.plugin import Plugin
 
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import _broadcast,_builders,_dtypes,_einsum,_errors,_exprs,_fft,_forms,_heads,_hooks,_indexing,_linalg,_matmul,_ops,_reshape,_reductions,_state,_trace,_types,_unknowns  # noqa: F401

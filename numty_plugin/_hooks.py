@@ -1,82 +1,56 @@
-"""_hooks.py — sole dispatch owner (Plugin + get_* + _method_hook + _numpy_function_hooks). (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (leaf, acyclic).
+"""_hooks.py — sole dispatch owner (Plugin + get_* + _method_hook + _numpy_function_hooks). (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
 """
 from __future__ import annotations
 
-import ast
-import json
-import keyword
-import os
-import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from functools import partial
-from typing import NamedTuple, cast
+from typing import TYPE_CHECKING
 
-from mypy.errorcodes import ARG_TYPE, MISC, ErrorCode
-from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, AssignmentStmt, CallExpr, Context, Decorator, EllipsisExpr, Expression, FuncDef, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr, OpExpr, OverloadedFuncDef, SliceExpr, StarExpr, StrExpr, TupleExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, UnaryExpr, Var
-from mypy.messages import callable_name
-from mypy.operators import op_methods_to_symbols
+from mypy.nodes import ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo, TypeVarLikeExpr, Var
 from mypy.plugin import AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext, Plugin
-from mypy.typeanal import TypeAnalyser
-from mypy.tvar_scope import TypeVarLikeScope
-from mypy.types import AnyType, CallableType, EllipsisType, Instance, LiteralType, NoneType, Overloaded, RawExpressionType, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnboundType, UninhabitedType, UnionType, UnpackType, get_proper_type
+from mypy.types import AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL, NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION, _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning, _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed
+if TYPE_CHECKING:
+    from mypy.tvar_scope import TypeVarLikeScope
+    from mypy.typeanal import TypeAnalyser
+    from mypy.types import RawExpressionType, UnboundType
+
+from ._errors import NUMTY_ANNOTATION, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed
 from ._state import STATE
-from ._trace import _numty_strict, _numty_trace_path, _trace_event
-from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES, _NAME_OF_KIND_SIZE, _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE, _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _WEAK_DEFAULT, _WEAK_SCALARS, _datetime_string_kind, _promote_strong, _promote_weak
-from ._forms import _DivForm, _LinForm, _MonoForm, _UNKNOWN_PREFIX, _canon_div, _coeff_vars_to_form, _eval_form, _form_has_unknown, _form_mul, _form_never_size, _form_to_coeff_vars, _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize
-from ._unknowns import _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names, _unknown_per_line
-from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _expr_var, _form_from_fullname, _form_of, _implicit_scope_vars, _mono_str, _ns_of_ctx, _normalize_ns, _seen_vars, _short_var, _current_scope_vars
+from ._forms import _LinForm, _is_unknown_fullname
+from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
 
-from ._types import (  # noqa: F401
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim, _linear_product, 
-    _reshape_total_form, _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr, _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members, 
-    _distribute_pairings, _union_results, _distribute_solve, _split_flat, _iter_tvarlikes, _shape_tvar_formals, _strip_optional, _sequence_element, _align_pair, _pairs_for_actual, 
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _callsite_expr_bindings, _substitute_return_exprs, _fixed_shape, _shape_note_str, _rank_mismatch_notes, 
-    _reported_as_operator, _mentions_ndarray, _info_mentions_array, _note_rank_mismatches, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, 
-    _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME, _SEQUENCE_FULLNAMES, _OPERATOR_DUNDERS
+from ._types import (
+    _int_value, _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _iter_tvarlikes, _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray, _info_mentions_array, _note_rank_mismatches, _ndarray_type, INT_FULLNAME, TUPLE_FULLNAME, _OPERATOR_DUNDERS
 )
-from ._builders import (  # noqa: F401
-    _operands_have_known_shape, _builder_shape, _ndarrays_in, _has_literal_dim, _has_int_dim, _is_mixed_shape, _is_plain_int, _has_mixed_operand, _movable_parts, 
-    _unknown_axis_parts, _mixed_parts, _literal_positions, _widen_literal_dims, _is_degraded_operand, _undegraded_args, _guard_mixed, _default_float_dtype, _dims_fit_intp, 
-    zeros_like_hook, _exact_element, _construct_dtype, _default_dtype, _fill_dtype_name, _fold_single, _explicit_dtype, _instance_fullname, _scalar_ret_name, _named_dtype, 
-    _apply_out_dtype, like_function_hook, _like_types, copy_function_hook, ascontiguousarray_function_hook, full_function_hook, eye_function_hook, _builder_single_dim, 
-    linspace_function_hook, identity_function_hook, tri_function_hook, _arange_symbolic, _arange_symbolic_kw, arange_function_hook, _comprehension_parts, _sequence_parts, 
-    _is_dynamic_sequence, _is_empty_sequence, _concat_axis, _single_axis_value, _element_expr_type, _dynamic_sequence_element, concatenate_function_hook, _stack_promote, 
-    _concat_merge, _stack_solve, vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook, _dynamic_explicit_dtype, _concat_dynamic, 
-    _stack_dynamic, stack_function_hook, _SHAPE_KEEPERS, INTP_MAX, _BUILTIN_DTYPE, _DTYPE_STRINGS
+from ._builders import (
+    _movable_parts, 
+    _guard_mixed, zeros_like_hook, _named_dtype, 
+    like_function_hook, copy_function_hook, ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook, identity_function_hook, tri_function_hook, arange_function_hook, concatenate_function_hook, vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook, stack_function_hook
 )
-from ._matmul import (  # noqa: F401
-    _matmul_inner, _matmul_result, _matmul_unpack_dims, _matmul_promoted, _operand_parts, _mixed_result, _solve_matmul, _positional_actuals, _matmul_has_dims, matmul_hook, 
-    _two_arrays, _contract_pair, _promoted_scalar, dot_function_hook, dot_method_hook, matmul_method_hook, rmatmul_method_hook, imatmul_method_hook, inner_function_hook, 
-    _total_size, outer_function_hook, kron_function_hook, vdot_function_hook, _tensordot_axes, tensordot_function_hook
+from ._matmul import (
+    _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, 
+    dot_function_hook, dot_method_hook, matmul_method_hook, rmatmul_method_hook, imatmul_method_hook, inner_function_hook, 
+    outer_function_hook, kron_function_hook, vdot_function_hook, tensordot_function_hook
 )
-from ._ops import (  # noqa: F401
-    _positionals_only, _picture_complete, _int_or_none, _check_each_axis, _check_unique_axes, _roll_shift_matches, _same_shape_hook, flip_function_hook, fliplr_function_hook, 
-    flipud_function_hook, _rank_check_hook, trace_function_hook, trace_method_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, corrcoef_function_hook, 
-    cov_function_hook, roll_function_hook, gradient_function_hook, _gradient_result, _parse_int_pair, rot90_function_hook, _string_value, _convolve_solve, _convolve_same_size, 
-    _convolve_valid_size, convolve_function_hook, correlate_function_hook, _hook_pair, _tile_reps, tile_function_hook, _repeat_count, _repeat_display, _repeat_display_size, 
-    repeat_function_hook, repeat_method_hook, _pad_side, _pad_widths, _pad_side_fallback, _pad_side_fallback_single, pad_function_hook, split_function_hook, 
-    array_split_function_hook, _select_index_elem, _nonzero_like, nonzero_function_hook, count_nonzero_function_hook, flatnonzero_function_hook, argwhere_function_hook, 
-    unique_function_hook, isin_function_hook, _search_values_dims, searchsorted_function_hook, sliding_window_view_function_hook, atleast_function_hook
+from ._ops import (
+    flip_function_hook, fliplr_function_hook, 
+    flipud_function_hook, trace_function_hook, trace_method_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, corrcoef_function_hook, 
+    cov_function_hook, roll_function_hook, gradient_function_hook, rot90_function_hook, convolve_function_hook, correlate_function_hook, tile_function_hook, repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook, 
+    array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, flatnonzero_function_hook, argwhere_function_hook, 
+    unique_function_hook, isin_function_hook, searchsorted_function_hook, sliding_window_view_function_hook, atleast_function_hook
 )
-from ._reshape import (  # noqa: F401
-    _dims_str, _reshape_new_dims, _solve_reshape_unpack, _fold_dim_expr, _reshape_fold_arithmetic, _reshape_dynamic_dims, _solve_reshape_dynamic, _solve_reshape, _all_positionals, 
-    _all_positionals_expanded, _formal_pair, _fold_bool, _bool_value, _fold_flag, _is_none_type, _parse_axis_arg, _normalize_axis, _normalize_axis_0d, _nbit_bytes, 
-    _dtype_kind_size, _dtype_fullname, _solve_transpose, _apply_permutation, _solve_transpose_unpack, _datetime_kind, _construct_datetime_dtype, _weak_name, _scalar_key, 
-    _promote_dtypes, _promote_all, _solve_squeeze, _solve_expand_dims, reshape_method_hook, reshape_function_hook, transpose_method_hook, _has_unknown_shape, 
-    transpose_function_hook, _swapaxes_solve, swapaxes_function_hook, swapaxes_method_hook, _moveaxis_permutation, _parse_shape_like, moveaxis_function_hook, 
-    rollaxis_function_hook, _matrix_transpose_solve, matrix_transpose_function_hook, mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook, 
-    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook, REDUCTION_DTYPES
+from ._reshape import (
+    _reshape_new_dims, _all_positionals, 
+    _scalar_key, 
+    reshape_method_hook, reshape_function_hook, transpose_method_hook, transpose_function_hook, swapaxes_function_hook, swapaxes_method_hook, moveaxis_function_hook, 
+    rollaxis_function_hook, matrix_transpose_function_hook, mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook, 
+    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook
 )
-from ._reductions import (  # noqa: F401
-    _reduction_out_dtype, _solve_reduction, _reduction_inputs_bool, _reduction_bool_types, allany_method_hook, allany_function_hook, _solve_reduction_unpack, _reduction_inputs, 
-    _reduction_dtype_only, _reduction_types, reduction_method_hook, _ufunc_reduce_types, _ufunc_reduce_inputs, _ufunc_accumulate_types, _ufunc_accumulate_inputs, 
-    _ufunc_outer_shape, _ufunc_outer_types, _ufunc_outer_inputs, _ufunc_any_dtype, _reduceat_length, _ufunc_reduceat_types, _ufunc_reduceat_inputs, ufunc_method_hook, 
-    _enum_member_value, _fold_index_bound, _final_slice_call, _solve_argdrop, _solve_same_or_flat, _kth_in_bounds, _arg_inputs, arg_method_hook, arg_function_hook, 
-    _parse_size_arg, rng_method_hook, legacy_rand_hook, _percentile_q_dims, percentile_function_hook, reduction_function_hook, _scalar_of_dtype, _maybe_scalar, _same_dims, 
-    _check_average_weights, _average_weighted_dtype, average_function_hook, _flatten_total_dim, _cumsum_solve, cumsum_function_hook, cumsum_method_hook, _ravel_solve, 
-    ravel_method_hook, flatten_method_hook, ravel_function_hook, diff_function_hook, _promoted_result_type, ARG_DROP, ARG_SAME_INT, ARG_SAME, RNG_FLOAT_OPS
+from ._reductions import (
+    allany_method_hook, allany_function_hook, reduction_method_hook, ufunc_method_hook, 
+    arg_method_hook, arg_function_hook, 
+    rng_method_hook, legacy_rand_hook, percentile_function_hook, reduction_function_hook, average_function_hook, cumsum_function_hook, cumsum_method_hook, ravel_method_hook, flatten_method_hook, ravel_function_hook, diff_function_hook
 )
 
 from ._fft import fft2_function_hook, fft_function_hook, fftn_function_hook, fftshift_function_hook, irfft_function_hook, rfft2_function_hook, rfft_function_hook, rfftn_function_hook
@@ -512,25 +486,34 @@ class NumtyPlugin(Plugin):
         return _fam_arg(ctx, head, arg, self._fam_late_bound)
 
     def _fam_string(
-        self, ctx: AnalyzeTypeContext, head: str, text: str, node: Any
+        self, ctx: AnalyzeTypeContext, head: str, text: str, node: RawExpressionType | UnboundType
     ) -> list[int | Type]:
         return _fam_string(ctx, head, text, node, self._fam_late_bound)
 
     def _fam_expr(
-        self, ctx: AnalyzeTypeContext, head: str, word: str, node: Any
+        self, ctx: AnalyzeTypeContext, head: str, word: str, node: RawExpressionType | UnboundType
     ) -> int | Type:
         return _fam_expr(ctx, head, word, node, self._fam_late_bound)
 
-    def _fam_bind_words(self, ctx: AnalyzeTypeContext, words: Any, node: Any) -> Any:
+    def _fam_bind_words(
+        self, ctx: AnalyzeTypeContext, words: list[str], node: RawExpressionType | UnboundType
+    ) -> dict[str, TypeVarLikeType]:
         return _fam_bind_words(ctx, words, node, self._fam_late_bound)
 
-    def _fam_ensure_implicit(self, ctx: AnalyzeTypeContext, analyzer: Any, scope: Any, word: str, node: Any) -> Any:
+    def _fam_ensure_implicit(
+        self,
+        ctx: AnalyzeTypeContext,
+        analyzer: TypeAnalyser,
+        scope: TypeVarLikeScope,
+        word: str,
+        node: RawExpressionType | UnboundType,
+    ) -> TypeVarLikeType:
         return _fam_ensure_implicit(ctx, analyzer, scope, word, node, self._fam_late_bound)
 
-    def _fam_bare(self, ctx: AnalyzeTypeContext, head: str, arg: Any) -> int | Type:
+    def _fam_bare(self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType) -> int | Type:
         return _fam_bare(ctx, head, arg, self._fam_late_bound)
 
-    def _fam_applied(self, ctx: AnalyzeTypeContext, head: str, arg: Any) -> int | Type:
+    def _fam_applied(self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType) -> int | Type:
         return _fam_applied(ctx, head, arg, self._fam_late_bound)
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:

@@ -1,9 +1,9 @@
-"""Indexing hooks (Phase 3, #197). Facade-gated: shared helpers stay in __init__. _fresh_unknown only via facade lazy (never from ._unknowns import) to preserve without_typevars patch. NUMTY/_swallowed from _errors direct."""
+"""Indexing hooks (Phase 3, #197). Shared helpers live in sibling modules and are imported through the facade inside each function (a top-level import would cycle). _fresh_unknown only via facade lazy (never from ._unknowns import) to preserve without_typevars patch. NUMTY/_swallowed from _errors direct."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_ANNOTATION, NUMTY_SHAPE, NUMTY_UNSOLVED, _bail, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
 
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import ARG_POS, EllipsisExpr, Expression, IntExpr, ListExpr, NameExpr, SliceExpr, StarExpr, TupleExpr  # noqa: F401
-from mypy.types import Instance, TupleType, Type, TypeVarTupleType, TypeVarType, UnpackType, get_proper_type  # noqa: F401
+from mypy.nodes import ARG_POS, EllipsisExpr, Expression, IntExpr, ListExpr, NameExpr, SliceExpr, StarExpr, TupleExpr
+from mypy.types import Instance, TupleType, Type, TypeVarType, UnpackType, get_proper_type
 
 def _take_indices(
     pair: tuple[Type, Expression | None],

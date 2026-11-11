@@ -1,5 +1,5 @@
 """Familiar-style heads (Phase 3, #197). Module functions; NumtyPlugin
-delegators in __init__ pass self._fam_late_bound (same object, mutated
+delegators in _hooks pass self._fam_late_bound (same object, mutated
 in place; Plugin-instance lifetime, dmypy-persistent).
 """
 from __future__ import annotations
@@ -9,7 +9,7 @@ import keyword
 from typing import TYPE_CHECKING, cast
 
 from ._errors import NUMTY_ANNOTATION, _swallowed
-from ._exprs import _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars, _normalize_ns, _seen_vars, _LATE_PREFIXES
+from ._exprs import _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars, _normalize_ns, _seen_vars
 from ._forms import _LinForm, _form_never_size
 
 
@@ -24,12 +24,12 @@ def _is_fam_int_name(fullname: str) -> bool:
 
 if TYPE_CHECKING:
     from mypy.plugin import AnalyzeTypeContext
-    from mypy.typeanal import TypeAnalyser
-    from mypy.types import Type
+    from mypy.tvar_scope import TypeVarLikeScope
+    from mypy.types import Type, TypeVarLikeType
 
-from mypy.nodes import Expression, FuncDef, ListExpr, NameExpr, OverloadedFuncDef, TupleExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var  # noqa: F401
-from mypy.typeanal import TypeAnalyser  # noqa: F401
-from mypy.types import AnyType, CallableType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny, TypeVarId, TypeVarTupleType, TypeVarType, UnboundType, UnpackType, get_proper_type  # noqa: F401
+from mypy.nodes import TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var
+from mypy.typeanal import TypeAnalyser
+from mypy.types import AnyType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny, TypeVarId, TypeVarTupleType, TypeVarType, UnboundType, UnpackType, get_proper_type
 
 _FAM_HEAD_DTYPES = {
     "numty.F64": "numpy.float64",
@@ -606,7 +606,6 @@ def _fam_bare(
     denotes, fail clearly on anything else.
     """
     from numty_plugin import INT_FULLNAME, _dim_value
-    from numty_plugin import _dim_value
     if arg.name in ("True", "False", "None", "_", "..."):
         raise _FamFail(
             f'{head} dim "{arg.name}" is not a TypeVar or integer;'

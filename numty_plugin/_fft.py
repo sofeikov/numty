@@ -1,6 +1,6 @@
-"""numpy.fft hooks (Phase 3, #197). Facade-gated: axis/dtype/type helpers
-stay in __init__ until _types lands, so every function lazily imports
-its facade names (top-level would cycle). NUMTY_* from _errors direct.
+"""numpy.fft hooks (Phase 3, #197). Axis/dtype/type helpers live in
+sibling modules, so every function lazily imports its facade names
+(a top-level import would cycle). NUMTY_* from _errors direct.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ if TYPE_CHECKING:
     from mypy.types import TupleType, Type, get_proper_type
 
 # Runtime-only imports for bodies that index node types at runtime.
-from mypy.nodes import Expression, ListExpr, NameExpr, TupleExpr  # noqa: F401
-from mypy.types import TupleType, Type, get_proper_type  # noqa: F401
+from mypy.nodes import Expression, ListExpr, NameExpr, TupleExpr
+from mypy.types import TupleType, Type, get_proper_type
 
 def _fft_pair(
     ctx: FunctionContext, names: tuple[str, str], indices: tuple[int, int]

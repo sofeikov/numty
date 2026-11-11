@@ -1,13 +1,13 @@
-"""numpy.einsum hooks (Phase 3, #197). Facade-gated: shared solver
-helpers stay in __init__ until _types lands; _parse_einsum_term is pure
-(local), NUMTY_* from _errors. Facade names via per-function lazy
-imports (top-level would cycle).
+"""numpy.einsum hooks (Phase 3, #197). Shared solver helpers live in sibling
+modules and are imported through the facade inside each function (a
+top-level import would cycle). _parse_einsum_term is pure (local);
+NUMTY_* come from _errors.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
 
 if TYPE_CHECKING:
     from mypy.nodes import CallExpr, StrExpr
@@ -15,8 +15,8 @@ if TYPE_CHECKING:
     from mypy.types import CallableType, Type
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import ARG_POS, ARG_STAR, CallExpr, StrExpr  # noqa: F401
-from mypy.types import AnyType, CallableType, Type, TypeOfAny  # noqa: F401
+from mypy.nodes import ARG_POS, ARG_STAR, CallExpr, StrExpr
+from mypy.types import AnyType, CallableType, Type, TypeOfAny
 
 def _parse_einsum_term(term: str) -> tuple[list[str], list[str], bool] | None:
     """(leading labels, trailing labels, has_ellipsis) for one operand.

@@ -1,9 +1,9 @@
-"""Broadcast/operator/compare/ufunc hooks (Phase 3, #197). Merged mesh (operators+compare+logical+ufunc+where/clip, one module). Facade-gated: shared helpers stay in __init__. NUMTY/_bail/_swallowed from _errors direct. _fresh_unknown only via facade lazy. _broadcast_result is the monkeypatch seam (test_internal BROKEN_PLUGIN patches facade name; callers resolve via facade global)."""
+"""Broadcast/operator/compare/ufunc hooks (Phase 3, #197). Merged mesh (operators+compare+logical+ufunc+where/clip, one module). Shared helpers live in sibling modules and are imported through the facade inside each function (a top-level import would cycle). NUMTY/_bail/_swallowed from _errors direct. _fresh_unknown only via facade lazy. _broadcast_result is the monkeypatch seam (test_internal BROKEN_PLUGIN patches facade name; callers resolve via facade global)."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_ANNOTATION, NUMTY_SHAPE, NUMTY_UNSOLVED, _bail, _swallowed
+from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE
 
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
@@ -11,8 +11,8 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import Expression, ListExpr, OpExpr, TupleExpr  # noqa: F401
-from mypy.types import AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarTupleType, TypeVarType, UninhabitedType, UnpackType, get_proper_type  # noqa: F401
+from mypy.nodes import Expression, ListExpr, OpExpr, TupleExpr
+from mypy.types import AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarTupleType, UninhabitedType, UnpackType, get_proper_type
 
 def _broadcast_result(
     a: list[int | Type],
@@ -807,7 +807,7 @@ def _dtype_base(dtype: Type) -> str | None:
     (signedinteger[_32Bit | _64Bit]) that _dtype_kind_size cannot resolve;
     the kind alone is enough for index/ufunc classification.
     """
-    from numty_plugin import _DTYPE_INFO, _dtype_kind_size
+    from numty_plugin import _DTYPE_INFO
     proper = get_proper_type(dtype)
     if not isinstance(proper, Instance) or not proper.args:
         return None

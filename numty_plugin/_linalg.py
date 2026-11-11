@@ -1,9 +1,9 @@
-"""numpy.linalg hooks (Phase 3, #197). Facade-gated: shared solver helpers stay in __init__ until _types lands. NUMTY/_bail/_swallowed from _errors direct; other facade names via per-function lazy imports (top-level would cycle). No direct _fresh_unknown (preserves facade patch seam)."""
+"""numpy.linalg hooks (Phase 3, #197). Shared helpers live in sibling modules and are imported through the facade inside each function (a top-level import would cycle). NUMTY/_bail/_swallowed from _errors direct; other facade names via per-function lazy imports (top-level would cycle). No direct _fresh_unknown (preserves facade patch seam)."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_ANNOTATION, NUMTY_SHAPE, NUMTY_UNSOLVED, _bail, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
 
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.types import AnyType, CallableType, TupleType, Type, TypeOfAny, TypeVarTupleType, TypeVarType  # noqa: F401
+from mypy.types import AnyType, CallableType, TupleType, Type, TypeOfAny
 
 def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Type:
     from numty_plugin import TUPLE_FULLNAME
