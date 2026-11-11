@@ -1,4 +1,4 @@
-"""_matmul.py — matmul/dot/tensordot. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
+"""_matmul.py — matmul/dot/tensordot. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -15,6 +15,16 @@ from ._exprs import _expr_str
 from ._types import (
     _int_value, _dim_eq, _dims_provably_ne, _dim_str, _reshape_total_form, _fold_int, _ndarray_parts, _has_unpack, _ndarray_type
 )
+from ._reshape import (
+    _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
+)
+from ._builders import (
+    _construct_dtype, _has_mixed_operand, _is_mixed_shape, _is_plain_int, _literal_positions,
+    _mixed_parts, _ndarrays_in, _widen_literal_dims,
+)
+from ._reductions import (
+    _promoted_result_type, _scalar_of_dtype,
+)
 
 def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
     """(match, error) for inner dims: match on equality, error when both
@@ -22,7 +32,6 @@ def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
     np.diff, N vs N+2 from pad, issue #32), and (False, None) to bail
     on anything unprovable. A plain `int` (dynamic) dim is assumed to
     match: it never reaches the output, and unknown is not an error."""
-    from numty_plugin import _is_plain_int
     if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
     if isinstance(x, int) and isinstance(y, int):
@@ -46,7 +55,6 @@ def _matmul_result(
     serves every comprehension element, so equality would falsely prove
     (3, 3) — bail instead.
     """
-    from numty_plugin import _dims_str
     from numty_plugin import _broadcast_result
     if not a or not b:
         return None, None
@@ -100,7 +108,7 @@ def _matmul_unpack_dims(
     batch. Vectors over *Ts, mixed unpacks, and concrete batches against
     *Ts stay out of scope and bail.
     """
-    from numty_plugin import _dims_str, _merge_unpack_dims, _same_unpack, _unpack_shape
+    from numty_plugin import _merge_unpack_dims, _same_unpack, _unpack_shape
     sa = _unpack_shape(left)
     sb = _unpack_shape(right)
     if sa is None and sb is None:
@@ -168,7 +176,6 @@ def _matmul_promoted(
     dtype_b: Type,
 ) -> Type:
     """Result array for matmul output dims with promoted dtypes."""
-    from numty_plugin import _construct_dtype, _dtype_fullname, _promote_dtypes
     name = _promote_dtypes(dtype_a, dtype_b)
     if name is None:
         return ctx.default_return_type
@@ -192,7 +199,6 @@ def _operand_parts(
     reach the output stay: (n, 3) @ (3, 3) is (int, 3), not the stubs'
     (int, int). Pass the result through _mixed_result.
     """
-    from numty_plugin import _has_mixed_operand, _mixed_parts
     parts_a = _ndarray_parts(left)
     parts_b = _ndarray_parts(right)
     if (parts_a is None or parts_b is None) and _has_mixed_operand(left, right):
@@ -209,7 +215,6 @@ def _mixed_result(result: Type, *operands: Type) -> Type:
     proves k is not 3: that dim goes unknown, as the stubs' answers do
     in _guard_mixed, so x = np.dot(x, w) keeps fitting x.
     """
-    from numty_plugin import _is_mixed_shape, _literal_positions, _ndarrays_in, _widen_literal_dims
     arrays = [a for t in operands for a in _ndarrays_in(t)]
     if not any(_is_mixed_shape(a) for a in arrays):
         return result
@@ -255,7 +260,6 @@ def _matmul_has_dims(ctx: FunctionContext | MethodContext, operands: list[Type])
 
     Only matmul itself: dot treats a 0-d operand as multiplication.
     """
-    from numty_plugin import _scalar_key
     for i, tp in enumerate(operands):
         parts = _ndarray_parts(tp)
         key = _scalar_key(tp)
@@ -315,7 +319,6 @@ def _contract_pair(
     on anything unprovable (N vs M, ?U vs ?U'). Mirrors _matmul_inner
     with an op-specific message.
     """
-    from numty_plugin import _is_plain_int
     if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
     if isinstance(x, int) and isinstance(y, int):
@@ -329,7 +332,6 @@ def _promoted_scalar(
     ctx: FunctionContext | MethodContext, dtype_a: Type, dtype_b: Type
 ) -> Type:
     """Scalar of the promoted dtype, else the default return."""
-    from numty_plugin import _promoted_result_type, _scalar_of_dtype
     promoted = _promoted_result_type(ctx, dtype_a, dtype_b)
     if promoted is None:
         return ctx.default_return_type
@@ -379,7 +381,7 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
 
 def dot_method_hook(ctx: MethodContext) -> Type:
     """ndarray.dot twin of np.dot: same solver on (self, arg) (issue #58)."""
-    from numty_plugin import _all_positionals, _solve_broadcast
+    from numty_plugin import _solve_broadcast
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -421,7 +423,6 @@ def matmul_method_hook(ctx: MethodContext) -> Type:
     Issue #140: `@` used to fall through to numpy's default checking,
     so wrong shapes passed silently and right shapes dissolved to Any.
     """
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -433,7 +434,6 @@ def matmul_method_hook(ctx: MethodContext) -> Type:
 
 def rmatmul_method_hook(ctx: MethodContext) -> Type:
     """ndarray.__rmatmul__: reflected operands, same solver (issue #140)."""
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -450,7 +450,6 @@ def imatmul_method_hook(ctx: MethodContext) -> Type:
     target's; like the other in-place hooks this keeps the default
     return and only adds the [numty-shape] error (issue #140).
     """
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -520,7 +519,6 @@ def kron_function_hook(ctx: FunctionContext) -> Type:
     int dims solve (symbolic products are nonlinear); anything else
     bails to the stubs instead of guessing.
     """
-    from numty_plugin import _promoted_result_type
     pair = _two_arrays(ctx)
     if pair is None:
         return ctx.default_return_type
@@ -626,7 +624,6 @@ def _tensordot_axes(
 
 
 def tensordot_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _formal_pair
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         raw: list[tuple[Type, Expression | None]] = []

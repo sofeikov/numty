@@ -1,4 +1,4 @@
-"""_hooks.py — sole dispatch owner (Plugin + get_* + _method_hook + _numpy_function_hooks). (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
+"""_hooks.py — sole dispatch owner (Plugin + get_* + _method_hook + _numpy_function_hooks). (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -59,6 +59,9 @@ from ._linalg import _linalg_cross_signature_hook, _norm_signature_hook, cross_f
 from ._indexing import getitem_method_hook, setitem_method_hook, take_along_axis_function_hook, take_function_hook, take_method_hook
 from ._broadcast import angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook, clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook, divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook, logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook, truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook
 from ._heads import _FAM_HEAD_DTYPES, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string
+from ._broadcast import (
+    _dtype_base,
+)
 
 class NumtyPlugin(Plugin):
     def __init__(self, options) -> None:
@@ -828,7 +831,6 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
     only the single [numty-broadcast] error remains. All other calls
     keep the default signature.
     """
-    from numty_plugin import _dtype_base
     from numty_plugin import _broadcast_result
     try:
         sig = ctx.default_signature

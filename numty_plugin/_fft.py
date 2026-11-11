@@ -1,12 +1,26 @@
-"""numpy.fft hooks (Phase 3, #197). Axis/dtype/type helpers live in
-sibling modules, so every function lazily imports its facade names
-(a top-level import would cycle). NUMTY_* from _errors direct.
+"""numpy.fft hooks (Phase 3, #197). Top-level imports go to
+earlier layers only (tests/test_layout.py, _LAYERS). NUMTY_* from _errors direct.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
+from ._types import (
+    _dim_div, _dim_value, _fold_int, _int_value, _ndarray_parts, _ndarray_type,
+)
+from ._reshape import (
+    _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _is_none_type, _normalize_axis,
+)
+from ._builders import (
+    _construct_dtype, _default_dtype,
+)
+from ._ops import (
+    _int_or_none, _positionals_only,
+)
+from ._broadcast import (
+    _dtype_base,
+)
 
 if TYPE_CHECKING:
     from mypy.nodes import Expression, ListExpr, NameExpr, TupleExpr
@@ -21,7 +35,6 @@ def _fft_pair(
     ctx: FunctionContext, names: tuple[str, str], indices: tuple[int, int]
 ) -> list[tuple[Type, Expression | None] | None] | None:
     """Two optional actuals: raw positionals when complete, formals when live."""
-    from numty_plugin import _all_positionals, _formal_pair, _positionals_only
     if _positionals_only(ctx):
         pos = _all_positionals(ctx)
         return [pos[i] if i < len(pos) else None for i in indices]
@@ -32,7 +45,6 @@ def _fft_pair(
 
 def _complex_dtype(ctx: FunctionContext, dtype: Type) -> Type:
     """complex64 for float16/float32, else complex128 (issue #61)."""
-    from numty_plugin import _construct_dtype, _default_dtype, _dtype_fullname
     name = _dtype_fullname(dtype)
     if name is None:
         return _default_dtype(ctx)
@@ -43,7 +55,6 @@ def _complex_dtype(ctx: FunctionContext, dtype: Type) -> Type:
 
 
 def fft_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _ndarray_parts, _ndarray_type, _normalize_axis
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -78,7 +89,6 @@ def irfft_function_hook(ctx: FunctionContext) -> Type:
     for float16; everything else is float64. A symbolic axis without n
     stays with the stubs.
     """
-    from numty_plugin import _all_positionals, _construct_dtype, _dims_str, _dtype_fullname, _ndarray_parts, _ndarray_type, _normalize_axis
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -133,7 +143,6 @@ def irfft_function_hook(ctx: FunctionContext) -> Type:
 def _rfft_size(
     ctx: FunctionContext, op: str, index: int, dim: int | Type
 ) -> int | Type:
-    from numty_plugin import _dim_div
     return _dim_div(ctx, op, index, dim, 2, 1)
 
 
@@ -150,7 +159,6 @@ def _rfft_complex_input(ctx: FunctionContext, op: str) -> Type:
 def _rfft_solve(
     ctx: FunctionContext, op: str, arg: Type, axis: int, n: int | None
 ) -> Type:
-    from numty_plugin import _dims_str, _dtype_base, _ndarray_parts, _ndarray_type, _normalize_axis
     parts = _ndarray_parts(arg)
     if parts is None:
         return ctx.default_return_type
@@ -175,7 +183,6 @@ def _rfft_solve(
 
 
 def rfft_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -188,7 +195,6 @@ def rfft_function_hook(ctx: FunctionContext) -> Type:
 
 def _fft_axis_n(ctx: FunctionContext) -> tuple[int | None, int] | None:
     """(n, axis) for fft/rfft: None to bail, axis defaulting to -1."""
-    from numty_plugin import _int_or_none
     found = _fft_pair(ctx, ("n", "axis"), (1, 2))
     if found is None:
         return None
@@ -209,7 +215,6 @@ def _fft_axis_n(ctx: FunctionContext) -> tuple[int | None, int] | None:
 
 def _fft_seq_entry(expr: Expression, tp: Type | None) -> int | None | str:
     """An s/axes entry: int, None for keep, 'bad' when unprovable."""
-    from numty_plugin import _fold_int, _is_none_type
     value = _fold_int(expr)
     if value is not None:
         return value
@@ -224,7 +229,6 @@ def _fft_seq_arg(
     pair: tuple[Type, Expression | None] | None,
 ) -> list[int | None] | None | str:
     """An s/axes argument: None absent, parsed list, 'scalar', or 'bail'."""
-    from numty_plugin import _dim_value, _int_value, _is_none_type
     if pair is None:
         return None
     tp, expr = pair
@@ -289,7 +293,6 @@ def _fftn_solve(
     their size; None entries in s keep too. Duplicate axes bail: the
     runtime result follows application order, which has no static shape.
     """
-    from numty_plugin import _dim_div, _dims_str, _dtype_base, _ndarray_parts, _ndarray_type, _normalize_axis
     parts = _ndarray_parts(arg)
     if parts is None:
         return ctx.default_return_type
@@ -388,7 +391,6 @@ def _fftn_solve(
 
 
 def fftn_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -410,7 +412,6 @@ def fft2_function_hook(ctx: FunctionContext) -> Type:
     there instead of guessing; the common no-s call keeps the shape
     with the fft complex dtype, and bad axes still fail.
     """
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -430,7 +431,6 @@ def rfft2_function_hook(ctx: FunctionContext) -> Type:
 
     Same contract as fft2_function_hook; the last axis halves.
     """
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -449,7 +449,6 @@ def fftshift_function_hook(ctx: FunctionContext) -> Type:
     Axes only select which axes shift; the shape never changes, so no
     axis parsing is needed for precision. Unranked shapes bail.
     """
-    from numty_plugin import _all_positionals, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -461,7 +460,6 @@ def fftshift_function_hook(ctx: FunctionContext) -> Type:
 
 
 def rfftn_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type

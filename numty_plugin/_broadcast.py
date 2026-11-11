@@ -1,10 +1,40 @@
-"""Broadcast/operator/compare/ufunc hooks (Phase 3, #197). Merged mesh (operators+compare+logical+ufunc+where/clip, one module). Shared helpers live in sibling modules and are imported through the facade inside each function (a top-level import would cycle). NUMTY/_bail/_swallowed from _errors direct. _fresh_unknown only via facade lazy. _broadcast_result is the monkeypatch seam (test_internal BROKEN_PLUGIN patches facade name; callers resolve via facade global)."""
+"""Broadcast/operator/compare/ufunc hooks (Phase 3, #197). Merged mesh (operators+compare+logical+ufunc+where/clip, one module). Top-level imports go to earlier layers only (tests/test_layout.py, _LAYERS); a function-local facade import is used only for a monkeypatch seam or a helper in a later layer. NUMTY/_bail/_swallowed from _errors direct. _fresh_unknown only via facade lazy. _broadcast_result is the monkeypatch seam (test_internal BROKEN_PLUGIN patches facade name; callers resolve via facade global)."""
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE
+from ._dtypes import (
+    _DTYPE_INFO, _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE,
+    _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _WEAK_DEFAULT,
+    _promote_strong, _promote_weak,
+)
+from ._types import (
+    DTYPE_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int, _has_unpack,
+    _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _shape_from_arg, _split_flat,
+)
+from ._reshape import (
+    _all_positionals, _all_positionals_expanded, _bool_value, _datetime_kind, _dims_str,
+    _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _promote_dtypes, _scalar_key,
+    _weak_name,
+)
+from ._builders import (
+    _apply_out_dtype, _construct_dtype, _default_dtype, _explicit_dtype, _fold_single, _named_dtype,
+    _scalar_ret_name,
+)
+from ._linalg import (
+    _linalg_dtype, _linalg_real_name, _linalg_tuple,
+)
+from ._reductions import (
+    _maybe_scalar, _scalar_of_dtype,
+)
+from ._matmul import (
+    _matmul_has_dims, _positional_actuals, _solve_matmul, _two_arrays,
+)
+from ._ops import (
+    _nonzero_like,
+)
 
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
@@ -31,7 +61,7 @@ def _broadcast_result(
     Without ctx the old bail is kept (callers without shape
     context); every ctx-bearing caller passes it.
     """
-    from numty_plugin import _dim_eq, _dim_str, _dims_provably_ne, _dims_str, _fresh_unknown
+    from numty_plugin import _fresh_unknown
     out: list[int | Type] = []
     for k, (x, y) in enumerate(zip(reversed(a), reversed(b))):
         if _dim_eq(x, y):
@@ -79,7 +109,6 @@ def _merge_known_pair(
     int clash — or a provably-unequal linear pair (N vs N-1, issue
     #32) — for the caller to fail with.
     """
-    from numty_plugin import _dim_eq, _dim_str, _dims_provably_ne
     if _dim_eq(x, y):
         return x, None
     if isinstance(x, int) and x == 1:
@@ -114,7 +143,6 @@ def _merge_unpack_dims(
     Returns (dims, None), (None, msg) on a provable clash, or
     (None, None) to bail out silently.
     """
-    from numty_plugin import _dims_str
     if not _same_unpack(u1, u2):
         return None, None
     if len(s1) != len(s2):
@@ -144,7 +172,6 @@ def _solve_broadcast_scalar(
     ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, other: Type
 ) -> Type:
     """Array/scalar promotion keeping the array dims, or default."""
-    from numty_plugin import _construct_dtype, _dtype_fullname, _ndarray_type, _promote_strong, _promote_weak, _scalar_key, _scalar_ret_name
     key = _scalar_key(other)
     if key is None:
         # Numpy scalars (np.int64(3), x.max()) are strong (issue #61).
@@ -179,7 +206,7 @@ def _solve_broadcast_unpack(
     b: tuple[list[int | Type], Type] | None,
 ) -> Type:
     """Broadcast where _ndarray_parts bailed on at least one side."""
-    from numty_plugin import _construct_dtype, _dtype_fullname, _ndarray_parts, _ndarray_type, _promote_dtypes, _scalar_key, _unpack_shape
+    from numty_plugin import _unpack_shape
     sa = _unpack_shape(left) if a is None else None
     sb = _unpack_shape(right) if b is None else None
     if sa is None and sb is None:
@@ -234,7 +261,6 @@ def _solve_broadcast_unpack(
 def _solve_broadcast(
     ctx: FunctionContext | MethodContext, left: Type, right: Type, op: str | None = None
 ) -> Type:
-    from numty_plugin import _distribute_solve
     dist = _distribute_solve([left, right], lambda l, r: _broadcast_types(ctx, l, r, op))
     if dist is not None:
         return dist
@@ -244,7 +270,7 @@ def _solve_broadcast(
 def _broadcast_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type, op: str | None = None
 ) -> Type:
-    from numty_plugin import _construct_dtype, _datetime_kind, _default_dtype, _dtype_fullname, _ndarray_parts, _ndarray_type, _promote_dtypes, _broadcast_result
+    from numty_plugin import _broadcast_result
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
     if a is None or b is None:
@@ -308,7 +334,6 @@ def _broadcast_types(
 
 
 def broadcast_method_hook(ctx: MethodContext, op: str | None = None) -> Type:
-    from numty_plugin import _positional_actuals
     # Never replace a stub Never (no loop) with a valid array (issue #61).
     if isinstance(get_proper_type(ctx.default_return_type), UninhabitedType):
         return ctx.default_return_type
@@ -319,7 +344,6 @@ def broadcast_method_hook(ctx: MethodContext, op: str | None = None) -> Type:
 
 
 def _is_bool_operand(tp: Type) -> bool:
-    from numty_plugin import _bool_value, _parts_or_unpack
     part = _parts_or_unpack(tp)
     if part is not None:
         return _dtype_base(part[1]) == "b"
@@ -328,7 +352,6 @@ def _is_bool_operand(tp: Type) -> bool:
 
 def subtract_method_hook(ctx: MethodContext) -> Type:
     """`a - b`: bool subtract has no loop, fail instead of bool (issue #61)."""
-    from numty_plugin import _positional_actuals
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
@@ -344,7 +367,6 @@ def subtract_method_hook(ctx: MethodContext) -> Type:
 
 def floordiv_mod_pow_method_hook(ctx: MethodContext) -> Type:
     """`//`, `%`, `**`: bool+bool is int8, not bool (issue #61)."""
-    from numty_plugin import _all_positionals, _construct_dtype, _int_value, _ndarray_type, _parts_or_unpack, _weak_name
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -383,7 +405,6 @@ def floordiv_mod_pow_method_hook(ctx: MethodContext) -> Type:
 
 def divmod_method_hook(ctx: MethodContext) -> Type:
     """`divmod(a, b)` / `a.__divmod__(b)`: tuple of two broadcasts (issue #54)."""
-    from numty_plugin import _all_positionals, _construct_dtype, _linalg_tuple, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -407,7 +428,6 @@ def divmod_method_hook(ctx: MethodContext) -> Type:
 
 def divmod_function_hook(ctx: FunctionContext) -> Type:
     """Builtin `divmod(a, b)` on arrays: same tuple as the method (issue #54)."""
-    from numty_plugin import _construct_dtype, _linalg_tuple, _ndarray_parts, _ndarray_type, _positional_actuals
     args = _positional_actuals(ctx, 2)
     if args is None:
         return ctx.default_return_type
@@ -435,7 +455,7 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
     Scalars, unpack shapes and unprovable symbolic dims bail silently,
     keeping the stubs' dtype checking and Self return.
     """
-    from numty_plugin import _dim_eq, _dims_str, _ndarray_parts, _positional_actuals, _scalar_key, _broadcast_result
+    from numty_plugin import _broadcast_result
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
@@ -482,7 +502,7 @@ def _broadcast_dims_unpack(
     b: tuple[list[int | Type], Type] | None,
 ) -> list[int | Type] | None:
     """Dims-only broadcast where _ndarray_parts bailed on a side."""
-    from numty_plugin import _ndarray_parts, _scalar_key, _unpack_shape
+    from numty_plugin import _unpack_shape
     sa = _unpack_shape(left) if a is None else None
     sb = _unpack_shape(right) if b is None else None
     if sa is None and sb is None:
@@ -514,7 +534,7 @@ def _broadcast_dims(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> list[int | Type] | None:
     """Broadcast output dims for two operands, else None to bail or fail."""
-    from numty_plugin import _ndarray_parts, _broadcast_result
+    from numty_plugin import _broadcast_result
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
     if a is None or b is None:
@@ -529,7 +549,6 @@ def _broadcast_dims(
 
 
 def compare_method_hook(ctx: MethodContext) -> Type:
-    from numty_plugin import _all_positionals, _distribute_solve
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
@@ -540,7 +559,6 @@ def compare_method_hook(ctx: MethodContext) -> Type:
 
 
 def _compare_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
-    from numty_plugin import _construct_dtype, _ndarray_type
     dims = _broadcast_dims(ctx, left, right)
     if dims is None:
         return ctx.default_return_type
@@ -557,7 +575,6 @@ def logical_method_hook(ctx: MethodContext) -> Type:
     `bool` variables (not just literals) count as bool scalars.
     Anything else bails to the stubs.
     """
-    from numty_plugin import _all_positionals, _distribute_solve
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
@@ -578,7 +595,6 @@ def _is_builtin_int(tp: Type) -> bool:
 
 
 def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
-    from numty_plugin import _bool_value, _construct_dtype, _ndarray_parts, _ndarray_type, _parts_or_unpack, _scalar_key
     parts = _parts_or_unpack(left)
     if parts is None:
         return ctx.default_return_type
@@ -637,7 +653,6 @@ def isclose_function_hook(ctx: FunctionContext) -> Type:
     the first two array operands solve. allclose returns a Python bool
     and stays with the stubs.
     """
-    from numty_plugin import _distribute_solve, _formal_pair, _two_arrays
     pair = _two_arrays(ctx)
     if pair is None:
         a_pair = _formal_pair(ctx, "a")
@@ -657,7 +672,6 @@ def _operand_spec(tp: Type) -> tuple[list[int | Type] | None, str, str] | None:
     dims is None for scalars (broadcast-neutral); kind is "strong" for
     array dtypes and numpy scalars, "weak" for Python scalars.
     """
-    from numty_plugin import _dtype_fullname, _parts_or_unpack, _scalar_key, _scalar_ret_name
     part = _parts_or_unpack(tp)
     if part is not None:
         name = _dtype_fullname(part[1])
@@ -678,7 +692,6 @@ def _combine_specs(
     a: tuple[str, str], b: tuple[str, str]
 ) -> str | None:
     """Promoted dtype name for two (kind, name) operand specs."""
-    from numty_plugin import _WEAK_DEFAULT, _promote_strong, _promote_weak
     (ka, na), (kb, nb) = a, b
     if ka == "strong" and kb == "strong":
         return na if na == nb else _promote_strong(na, nb)
@@ -701,7 +714,6 @@ def _merge_shape_lists(
     shape (0-d, neutral in broadcasting) yields the other side;
     anything else against *Ts is unknowable and bails out silently.
     """
-    from numty_plugin import _has_unpack, _split_flat
     sa = _split_flat(a) if _has_unpack(a) else None
     sb = _split_flat(b) if _has_unpack(b) else None
     if sa is None or sb is None:
@@ -718,7 +730,7 @@ def _broadcast_shapes(
     ctx: FunctionContext | MethodContext, shapes: list[list[int | Type]], op: str
 ) -> list[int | Type] | None:
     """Broadcast known shapes pairwise; None (after failing) on conflict."""
-    from numty_plugin import _dims_str, _has_unpack, _broadcast_result
+    from numty_plugin import _broadcast_result
     # Issue #183: check literal clashes across *all* shapes first. Pairwise
     # merging mints an unknown for an unprovable mismatch (P vs 2, where P
     # could be 2) and loses the literal, hiding a later hard clash (2 vs 3
@@ -788,7 +800,6 @@ def _broadcast_shapes(
 
 
 def _kind_of(name: str) -> str | None:
-    from numty_plugin import _DTYPE_INFO
     info = _DTYPE_INFO.get(name)
     if info is not None:
         return info[0]
@@ -808,7 +819,6 @@ def _dtype_base(dtype: Type) -> str | None:
     (signedinteger[_32Bit | _64Bit]) that _dtype_kind_size cannot resolve;
     the kind alone is enough for index/ufunc classification.
     """
-    from numty_plugin import _DTYPE_INFO
     proper = get_proper_type(dtype)
     if not isinstance(proper, Instance) or not proper.args:
         return None
@@ -832,7 +842,6 @@ def _specs_dtype(
     array_dtypes: list[Type],
 ) -> Type | None:
     """dtype[...] for combined (kind, name) specs, reusing an input dtype."""
-    from numty_plugin import _WEAK_DEFAULT, _construct_dtype, _dtype_fullname
     # result_type promotes the arrays (and numpy scalars) among
     # themselves first and only then lets Python scalars in: bool with
     # 0 and a uint8 array is uint8, not the int64 that bool-with-0
@@ -859,7 +868,6 @@ def _specs_dtype(
 
 
 def _solve_where(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _distribute_solve, _nonzero_like, _positional_actuals
     args = _positional_actuals(ctx, 3)
     if args is None:
         # Single-argument where(cond) returns indices like nonzero.
@@ -874,7 +882,6 @@ def _solve_where(ctx: FunctionContext) -> Type:
 
 
 def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: Type) -> Type:
-    from numty_plugin import _ndarray_type, _parts_or_unpack
     raw_specs = [_operand_spec(tp) for tp in (cond, x, y)]
     specs = [spec for spec in raw_specs if spec is not None]
     if len(specs) != len(raw_specs):
@@ -898,7 +905,6 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
 
 
 def _solve_clip(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals_expanded, _distribute_solve, _formal_pair, _is_none_type
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
         return ctx.default_return_type
@@ -923,7 +929,6 @@ def _solve_clip(ctx: FunctionContext) -> Type:
 
 
 def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type:
-    from numty_plugin import _ndarray_type, _parts_or_unpack
     # NumPy 2 promotes across all operands (like a ufunc).
     raw_specs = [_operand_spec(tp) for tp in types]
     specs = [spec for spec in raw_specs if spec is not None]
@@ -948,7 +953,6 @@ def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type
 
 
 def _solve_broadcast_to(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _distribute_solve, _formal_pair, _shape_from_arg
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -984,7 +988,6 @@ def _broadcast_to_compatible(
     fail loudly; anything involving a symbolic dim that could be 1 bails
     (returns False) instead of guessing.
     """
-    from numty_plugin import _dim_eq, _dims_str
     # A scalar target takes only a 0-d source: numpy refuses even (1,)
     # ("cannot broadcast a non-scalar to a scalar array").
     if not dims and arr_dims:
@@ -1023,7 +1026,6 @@ def _broadcast_to_compatible(
 
 
 def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int | Type]) -> Type:
-    from numty_plugin import _WEAK_DEFAULT, _construct_dtype, _has_unpack, _ndarray_parts, _ndarray_type
     spec = _operand_spec(tp)
     if spec is None:
         return ctx.default_return_type
@@ -1046,7 +1048,6 @@ def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int | Type]) 
 
 def _display_element_kind(tp: Type, expr: Expression | None) -> str | None:
     """weak scalar kind of a flat display element, else None to bail."""
-    from numty_plugin import _fold_int
     value = _fold_int(expr) if expr is not None else None
     if isinstance(value, bool):
         return "builtins.bool"
@@ -1080,7 +1081,6 @@ def _apply_ndmin(
     (or one over a `*Ts` shape) bails instead of guessing; a negative
     one fails loudly.
     """
-    from numty_plugin import _fold_single, _formal_pair, _has_unpack
     pair = _formal_pair(ctx, "ndmin")
     if pair is None:
         return dims
@@ -1105,7 +1105,6 @@ def _asarray_array_type(
     ctx: FunctionContext | MethodContext, tp: Type, named: Type | None
 ) -> Type:
     """asarray over one array operand: same shape, optional new dtype."""
-    from numty_plugin import _ndarray_type, _parts_or_unpack
     part = _parts_or_unpack(tp)
     if part is None:
         return ctx.default_return_type
@@ -1116,7 +1115,6 @@ def _asarray_array_type(
 
 
 def _solve_asarray(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _construct_dtype, _distribute_solve, _explicit_dtype, _named_dtype, _ndarray_type, _parts_or_unpack
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1170,7 +1168,6 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
 
 
 def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
-    from numty_plugin import _all_positionals_expanded, _apply_out_dtype, _distribute_solve, _formal_pair
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
         return ctx.default_return_type
@@ -1190,14 +1187,12 @@ def _smallest_float(name: str) -> str | None:
     `result_type(name, float16)`: 1-byte -> float16, 2-byte -> float32,
     larger -> float64. Floats/complex pass through.
     """
-    from numty_plugin import _promote_strong
     if name.startswith("numpy.float") or name.startswith("numpy.complex"):
         return name
     return _promote_strong(name, "numpy.float16")
 
 
 def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> Type:
-    from numty_plugin import _construct_dtype, _dtype_fullname, _dtype_kind_size, _linalg_dtype, _linalg_real_name, _ndarray_type, _parts_or_unpack, _scalar_key, _scalar_of_dtype, _scalar_ret_name
     part = _parts_or_unpack(tp)
     if part is None:
         # Scalar input (np.sqrt(4.0)): map to the matching numpy scalar
@@ -1292,7 +1287,6 @@ def _solve_round(
     (it cannot cast the scaled values back to bool), so nothing is
     claimed there. numty has no error code for a dtype failure.
     """
-    from numty_plugin import _construct_dtype, _fold_single, _formal_pair, _is_none_type, _ndarray_type, _parts_or_unpack, DTYPE_FULLNAME
     part = _parts_or_unpack(array)
     if part is None:
         return ctx.default_return_type
@@ -1327,7 +1321,6 @@ def round_method_hook(ctx: MethodContext) -> Type:
 
 
 def round_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1341,7 +1334,6 @@ def angle_function_hook(ctx: FunctionContext) -> Type:
     dtype. Integer and bool inputs follow a table of their own (int8
     is float16, bool is float64), so those stay with the stubs.
     """
-    from numty_plugin import _all_positionals, _parts_or_unpack
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
@@ -1370,7 +1362,6 @@ def asarray_function_hook(ctx: FunctionContext) -> Type:
 def _solve_truediv_pair(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    from numty_plugin import _distribute_solve
     dist = _distribute_solve([left, right], lambda l, r: _truediv_types(ctx, l, r))
     if dist is not None:
         return dist
@@ -1380,7 +1371,6 @@ def _solve_truediv_pair(
 def _truediv_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    from numty_plugin import _construct_dtype, _maybe_scalar, _ndarray_parts
     raw_specs = [_operand_spec(left), _operand_spec(right)]
     specs = [spec for spec in raw_specs if spec is not None]
     if len(specs) != len(raw_specs):
@@ -1412,7 +1402,6 @@ def _truediv_types(
 
 
 def truediv_method_hook(ctx: MethodContext) -> Type:
-    from numty_plugin import _positional_actuals
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
@@ -1420,7 +1409,6 @@ def truediv_method_hook(ctx: MethodContext) -> Type:
 
 
 def clip_method_hook(ctx: MethodContext) -> Type:
-    from numty_plugin import _all_positionals_expanded, _distribute_solve, _formal_pair, _is_none_type
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
         return ctx.default_return_type
@@ -1453,12 +1441,10 @@ def _ufunc_name(ctx: MethodContext) -> str | None:
 
 
 def ufunc_call_hook(ctx: MethodContext) -> Type:
-    from numty_plugin import _apply_out_dtype
     return _apply_out_dtype(ctx, _ufunc_call_solve(ctx))
 
 
 def _ufunc_call_solve(ctx: MethodContext) -> Type:
-    from numty_plugin import _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE, _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _all_positionals_expanded, _construct_dtype, _matmul_has_dims, _ndarray_type, _parts_or_unpack, _solve_matmul
     proper = get_proper_type(ctx.type)
     if isinstance(proper, Instance) and "Nout2" in proper.type.fullname:
         # Two-output ufuncs (frexp, modf): the stubs own the tuple.
@@ -1582,7 +1568,6 @@ def _ufunc_call_solve(ctx: MethodContext) -> Type:
 def _solve_ufunc_binary_float(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    from numty_plugin import _distribute_solve
     dist = _distribute_solve([left, right], lambda l, r: _ufunc_float_types(ctx, l, r))
     if dist is not None:
         return dist
@@ -1592,7 +1577,6 @@ def _solve_ufunc_binary_float(
 def _ufunc_float_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    from numty_plugin import _maybe_scalar, _ndarray_parts, _promote_strong
     raw_specs = [_operand_spec(left), _operand_spec(right)]
     specs = [spec for spec in raw_specs if spec is not None]
     if len(specs) != len(raw_specs):
@@ -1636,7 +1620,6 @@ def _ufunc_float_types(
 def _solve_ufunc_binary_bool(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    from numty_plugin import _distribute_solve
     dist = _distribute_solve([left, right], lambda l, r: _ufunc_bool_types(ctx, l, r))
     if dist is not None:
         return dist
@@ -1646,7 +1629,6 @@ def _solve_ufunc_binary_bool(
 def _ufunc_bool_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    from numty_plugin import _construct_dtype, _maybe_scalar
     raw_specs = [_operand_spec(left), _operand_spec(right)]
     specs = [spec for spec in raw_specs if spec is not None]
     if len(specs) != len(raw_specs):

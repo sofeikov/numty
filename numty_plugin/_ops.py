@@ -1,4 +1,4 @@
-"""_ops.py — misc shape ops (flip/trace/diag/tile/repeat/pad/split/nonzero). (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
+"""_ops.py — misc shape ops (flip/trace/diag/tile/repeat/pad/split/nonzero). (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -14,6 +14,19 @@ from ._forms import _LinForm
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg
 )
+from ._reshape import (
+    _all_positionals, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _is_none_type,
+    _normalize_axis, _normalize_axis_0d, _parse_axis_arg,
+)
+from ._builders import (
+    _construct_dtype, _mixed_parts,
+)
+from ._linalg import (
+    _linalg_tuple,
+)
+from ._matmul import (
+    _matmul_promoted,
+)
 
 def _positionals_only(ctx: FunctionContext | MethodContext) -> bool:
     """True when every actual is positional: nothing hides behind keywords."""
@@ -27,7 +40,6 @@ def _picture_complete(ctx: FunctionContext | MethodContext, first: str) -> bool:
     unreadable; a mixed call under erasure bails instead of misreading.
     All-positional calls are always fully visible.
     """
-    from numty_plugin import _formal_pair
     if _positionals_only(ctx):
         return True
     return _formal_pair(ctx, first) is not None
@@ -35,7 +47,6 @@ def _picture_complete(ctx: FunctionContext | MethodContext, first: str) -> bool:
 
 def _int_or_none(pair: tuple[Type, Expression | None] | None) -> int | None | str:
     """A folded int, None when absent/None, 'bail' when unprovable."""
-    from numty_plugin import _is_none_type
     if pair is None:
         return None
     tp, expr = pair
@@ -51,7 +62,6 @@ def _check_each_axis(
     ctx: FunctionContext | MethodContext, dims: list[int | Type], axes: list[int], op: str
 ) -> bool:
     """True when every axis is in range, else a loud error."""
-    from numty_plugin import _dims_str, _normalize_axis
     for ax in axes:
         if _normalize_axis(ax, len(dims)) is None:
             ctx.api.fail(
@@ -68,7 +78,6 @@ def _check_unique_axes(
     ctx: FunctionContext | MethodContext, dims: list[int | Type], axes: list[int], op: str
 ) -> bool:
     """True when the in-range axes name distinct dims, else a loud error."""
-    from numty_plugin import _dims_str, _normalize_axis
     seen: list[int] = []
     for ax in axes:
         norm = _normalize_axis(ax, len(dims))
@@ -94,7 +103,6 @@ def _roll_shift_matches(
     numpy broadcasts shift against axis, so equal lengths or a length of
     one on either side pass; anything else always raises.
     """
-    from numty_plugin import _dims_str
     if not isinstance(axis, list):
         return True
     found = _hook_pair(ctx, "a", "shift", 1)
@@ -128,7 +136,6 @@ def _same_shape_hook(
     to the positional slot when the call is positional-only. unique_axes
     rejects an axis named twice (flip); roll legitimately allows it.
     """
-    from numty_plugin import _all_positionals, _dims_str, _formal_pair, _parse_axis_arg
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -191,7 +198,6 @@ def _rank_check_hook(
     their supported range always raise, so they fail. Anything else
     (unknown rank, working rank) bails to the stubs.
     """
-    from numty_plugin import _dims_str, _mixed_parts
     parts = _parts_or_unpack(array)
     if parts is None:
         parts = _mixed_parts(array, partner=True)
@@ -221,7 +227,6 @@ def _rank_check_hook(
 
 
 def trace_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -237,7 +242,6 @@ def trace_method_hook(ctx: MethodContext) -> Type:
 
 
 def diag_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -247,7 +251,6 @@ def diag_function_hook(ctx: FunctionContext) -> Type:
 
 
 def diagonal_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -263,7 +266,6 @@ def diagonal_method_hook(ctx: MethodContext) -> Type:
 
 
 def corrcoef_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -273,7 +275,6 @@ def corrcoef_function_hook(ctx: FunctionContext) -> Type:
 
 
 def cov_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -294,7 +295,6 @@ def gradient_function_hook(ctx: FunctionContext) -> Type:
     and keeps the shape. Multi-axis tuples bail to the stub type once
     their axes are checked to be in range and distinct.
     """
-    from numty_plugin import _all_positionals, _formal_pair, _mixed_parts, _normalize_axis, _parse_axis_arg
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -338,7 +338,6 @@ def _gradient_result(
     come back float64, floats and complex keep their dtype, and bool
     is rejected by numpy (bail).
     """
-    from numty_plugin import _construct_dtype, _dims_str, _dtype_kind_size
     size = dims[axis]
     if isinstance(size, int) and size < 2:
         ctx.api.fail(
@@ -378,7 +377,6 @@ def _parse_int_pair(
 
 
 def rot90_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _formal_pair, _normalize_axis
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -447,7 +445,6 @@ def _string_value(tp: Type) -> str | None:
 def _convolve_solve(
     ctx: FunctionContext, op: str, a: Type, b: Type, mode: str | None
 ) -> Type:
-    from numty_plugin import _dims_str, _matmul_promoted
     parts_a = _ndarray_parts(a)
     parts_b = _ndarray_parts(b)
     if parts_a is None or parts_b is None:
@@ -542,7 +539,6 @@ def _convolve_valid_size(
 
 
 def convolve_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _formal_pair
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -552,7 +548,6 @@ def convolve_function_hook(ctx: FunctionContext) -> Type:
 
 
 def correlate_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _formal_pair
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -569,7 +564,6 @@ def _hook_pair(
 
     Returns "incomplete" when keywords may hide behind erased formals.
     """
-    from numty_plugin import _all_positionals, _formal_pair
     if not _picture_complete(ctx, first):
         return "incomplete"
     pair = _formal_pair(ctx, name)
@@ -581,7 +575,6 @@ def _hook_pair(
 
 def _tile_reps(pair: tuple[Type, Expression | None]) -> list[int | None] | None:
     """reps entries (None = unknown); None whole when absent or garbage."""
-    from numty_plugin import _is_none_type
     tp, expr = pair
     if _is_none_type(tp):
         return None
@@ -618,7 +611,6 @@ def _tile_reps(pair: tuple[Type, Expression | None]) -> list[int | None] | None:
 
 
 def tile_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -654,7 +646,6 @@ def tile_function_hook(ctx: FunctionContext) -> Type:
 
 def _repeat_count(pair: tuple[Type, Expression | None] | None) -> int | str | None:
     """Scalar repeats, 'bail' for array-form/unprovable, None when absent."""
-    from numty_plugin import _is_none_type
     if pair is None:
         return None
     tp, expr = pair
@@ -692,7 +683,6 @@ def _repeat_display_size(
     needs exactly one per element. Known non-negative counts add up to
     the new size.
     """
-    from numty_plugin import _dims_str, _normalize_axis
     target: int | Type
     if axis is None:
         total = 1
@@ -722,7 +712,6 @@ def _repeat_display_size(
 
 
 def repeat_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _normalize_axis_0d, _parse_axis_arg
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -806,7 +795,6 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
     function hook); displays and dynamic counts use the same helpers,
     anything else bails to the stubs.
     """
-    from numty_plugin import _all_positionals, _dims_str, _formal_pair, _normalize_axis_0d, _parse_axis_arg
     from numty_plugin import _fresh_unknown
     parts = _ndarray_parts(ctx.type)
     if parts is None:
@@ -886,7 +874,6 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
 
 def _pad_side(expr: Expression, tp: Type | None) -> int | None | str:
     """A pad width side: int, None when unknown, 'bad' when garbage."""
-    from numty_plugin import _is_none_type
     value = _fold_int(expr)
     if value is not None:
         return value
@@ -912,7 +899,6 @@ def _pad_widths(
     Returns "mismatch" when the entry count fits neither one axis nor all
     of them, None to bail.
     """
-    from numty_plugin import _is_none_type
     if pair is None:
         return None
     tp, expr = pair
@@ -996,7 +982,6 @@ def _pad_side_fallback(tp: Type) -> tuple[int | None, int | None] | str:
 
 
 def _pad_side_fallback_single(tp: Type) -> int | None | str:
-    from numty_plugin import _is_none_type
     if _is_none_type(tp):
         return "bad"
     dim = _dim_value(tp)
@@ -1013,7 +998,6 @@ def _pad_side_fallback_single(tp: Type) -> int | None | str:
 
 
 def pad_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -1056,7 +1040,7 @@ def pad_function_hook(ctx: FunctionContext) -> Type:
 
 
 def split_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _fft_seq_arg, _normalize_axis
+    from numty_plugin import _fft_seq_arg
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -1138,7 +1122,7 @@ def array_split_function_hook(ctx: FunctionContext) -> Type:
     are unknowable (unequal sections mint an unknown). Otherwise bail
     to the stubs, preserving current silence on working code.
     """
-    from numty_plugin import _all_positionals, _dims_str, _fft_seq_arg, _normalize_axis
+    from numty_plugin import _fft_seq_arg
     from numty_plugin import _fresh_unknown
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -1206,7 +1190,6 @@ def _select_index_elem(
     ctx: FunctionContext, op: str, index: int
 ) -> Type | None:
     """A 1-d int64 ?U index array, else None to bail."""
-    from numty_plugin import _construct_dtype
     from numty_plugin import _fresh_unknown
     dtype = _construct_dtype(ctx, "numpy.int64")
     if dtype is None:
@@ -1216,7 +1199,6 @@ def _select_index_elem(
 
 def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
     """Tuple of 1-d int ?U arrays, one per dim; 0-d fails loudly."""
-    from numty_plugin import _linalg_tuple
     parts = _ndarray_parts(arg)
     if parts is None:
         return ctx.default_return_type
@@ -1238,7 +1220,6 @@ def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
 
 
 def nonzero_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1254,7 +1235,6 @@ def count_nonzero_function_hook(ctx: FunctionContext) -> Type:
     silence on working code. Like reductions, axis 0/-1 on a 0-d array
     is allowed.
     """
-    from numty_plugin import _all_positionals, _dims_str, _formal_pair, _normalize_axis_0d, _parse_axis_arg
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1282,7 +1262,6 @@ def count_nonzero_function_hook(ctx: FunctionContext) -> Type:
 
 
 def flatnonzero_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1296,7 +1275,6 @@ def flatnonzero_function_hook(ctx: FunctionContext) -> Type:
 
 
 def argwhere_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _construct_dtype
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -1312,7 +1290,6 @@ def argwhere_function_hook(ctx: FunctionContext) -> Type:
 
 
 def unique_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _fold_flag, _normalize_axis
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -1363,7 +1340,6 @@ def unique_function_hook(ctx: FunctionContext) -> Type:
 
 
 def isin_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _construct_dtype
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1421,7 +1397,6 @@ def _search_values_dims(
 
 
 def searchsorted_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _construct_dtype, _dims_str
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -1447,7 +1422,7 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
 
 
 def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _fft_seq_arg, _is_none_type, _normalize_axis
+    from numty_plugin import _fft_seq_arg
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1561,7 +1536,6 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
 
 
 def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         # Multi-arg form returns a tuple the stubs own.

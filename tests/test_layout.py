@@ -461,8 +461,9 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
         "_unknowns",
     }
     assert expected.issubset(eager), f"missing eager imports: {expected - eager}"
-    # No submodule may do a top-level facade import (function-level lazy
-    # `from numty_plugin import` is the sanctioned pattern).
+    # No submodule may do a top-level facade import. Function-level
+    # `from numty_plugin import` is limited to the names listed in
+    # _LAZY_SEAMS and _LAZY_UPWARD below.
     for py in _pkg_files():
         if py.name == "__init__.py":
             continue
@@ -478,3 +479,106 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
                 # `from . import X` at top level is a bare facade-style import; ban.
                 if node.level == 1 and node.module is None:
                     raise AssertionError(f"{py.name}: top-level `from . import` banned")
+
+
+# Import layering (follow-up to #192). A module may import at top level
+# only from modules earlier in this list, so the import graph has no
+# cycle. Add a new module at the position its imports permit.
+_LAYERS = (
+    "_state",
+    "_trace",
+    "_errors",
+    "_dtypes",
+    "_forms",
+    "_unknowns",
+    "_exprs",
+    "_types",
+    "_heads",
+    "_reshape",
+    "_builders",
+    "_einsum",
+    "_linalg",
+    "_reductions",
+    "_matmul",
+    "_ops",
+    "_broadcast",
+    "_fft",
+    "_indexing",
+    "_hooks",
+)
+
+# Names that tests replace on the facade. Callers must read them through
+# a function-local `from numty_plugin import`, or the replacement has
+# no effect.
+_LAZY_SEAMS = frozenset(
+    {"_broadcast_result", "_resolve_dim", "_materialize_dim", "_fresh_unknown"}
+)
+
+# Function-local facade imports that are still necessary because the
+# name is in a later layer (or in the facade). This list must only get
+# shorter: move the helper to an earlier layer, then delete its entry.
+_LAZY_UPWARD: dict[str, list[str]] = {'_broadcast': ['_unpack_shape'],
+ '_builders': ['_enum_member_count'],
+ '_exprs': ['_iter_tvarlikes'],
+ '_hooks': ['_warn_startup'],
+ '_linalg': ['_dtype_base', '_kind_of', '_maybe_scalar', '_scalar_of_dtype', '_string_value'],
+ '_matmul': ['_merge_unpack_dims', '_same_unpack', '_solve_broadcast', '_unpack_shape'],
+ '_ops': ['_fft_seq_arg'],
+ '_reductions': ['_kind_of'],
+ '_reshape': ['_check_unique_axes',
+              '_construct_dtype',
+              '_int_or_none',
+              '_is_mixed_shape',
+              '_is_plain_int',
+              '_mixed_result',
+              '_movable_parts',
+              '_picture_complete',
+              '_unknown_axis_parts',
+              '_unpack_shape'],
+ '_types': ['_enum_member_count', '_fold_dim_expr', '_has_unknown_shape', '_unpack_shape']}
+
+
+def _module_trees() -> dict[str, ast.Module]:
+    return {
+        py.stem: ast.parse(py.read_text(encoding="utf-8"))
+        for py in _pkg_files()
+        if py.name != "__init__.py"
+    }
+
+
+def test_layers_list_every_submodule() -> None:
+    assert sorted(_LAYERS) == sorted(_module_trees())
+
+
+def test_top_level_imports_go_to_earlier_layers_only() -> None:
+    pos = {name: i for i, name in enumerate(_LAYERS)}
+    bad = []
+    for name, tree in _module_trees().items():
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+                if pos[node.module] >= pos[name]:
+                    bad.append(f"{name} imports {node.module}")
+    assert not bad, "top-level import from a later layer: " + ", ".join(bad)
+
+
+def test_lazy_facade_imports_are_only_the_listed_ones() -> None:
+    found: dict[str, set[str]] = {}
+    for name, tree in _module_trees().items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for stmt in ast.walk(node):
+                if isinstance(stmt, ast.ImportFrom) and stmt.module == "numty_plugin":
+                    found.setdefault(name, set()).update(a.name for a in stmt.names)
+    extra = {
+        name: sorted(names - _LAZY_SEAMS - set(_LAZY_UPWARD.get(name, [])))
+        for name, names in found.items()
+    }
+    extra = {name: names for name, names in extra.items() if names}
+    assert not extra, f"new function-local facade imports (use a top-level import): {extra}"
+    stale = {
+        name: sorted(set(names) - found.get(name, set()))
+        for name, names in _LAZY_UPWARD.items()
+    }
+    stale = {name: names for name, names in stale.items() if names}
+    assert not stale, f"_LAZY_UPWARD entries that are no longer used: {stale}"

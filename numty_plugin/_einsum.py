@@ -1,6 +1,5 @@
-"""numpy.einsum hooks (Phase 3, #197). Shared solver helpers live in sibling
-modules and are imported through the facade inside each function (a
-top-level import would cycle). _parse_einsum_term is pure (local);
+"""numpy.einsum hooks (Phase 3, #197). Top-level imports go to earlier
+layers only (tests/test_layout.py, _LAYERS). _parse_einsum_term is pure (local);
 NUMTY_* come from _errors.
 """
 from __future__ import annotations
@@ -8,6 +7,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
+from ._errors import (
+    _swallowed,
+)
+from ._types import (
+    _dim_eq, _dim_str, _dims_provably_ne, _ndarray_parts, _ndarray_type,
+)
+from ._reshape import (
+    _all_positionals_expanded, _dims_str, _formal_pair, _promote_all,
+)
 
 if TYPE_CHECKING:
     from mypy.nodes import CallExpr, StrExpr
@@ -41,7 +49,7 @@ def _parse_einsum_term(term: str) -> tuple[list[str], list[str], bool] | None:
 
 
 def einsum_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals_expanded, _broadcast_result, _dim_eq, _dim_str, _dims_provably_ne, _dims_str, _formal_pair, _ndarray_parts, _ndarray_type, _promote_all
+    from numty_plugin import _broadcast_result
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
         return ctx.default_return_type
@@ -227,7 +235,6 @@ def _einsum_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     check succeeds and only the single [numty-shape] error remains.
     All other calls keep the default signature.
     """
-    from numty_plugin import _ndarray_parts, _swallowed
     try:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType):

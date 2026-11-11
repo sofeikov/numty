@@ -1,9 +1,22 @@
-"""numpy.linalg hooks (Phase 3, #197). Shared helpers live in sibling modules and are imported through the facade inside each function (a top-level import would cycle). NUMTY/_bail/_swallowed from _errors direct; other facade names via per-function lazy imports (top-level would cycle). No direct _fresh_unknown (preserves facade patch seam)."""
+"""numpy.linalg hooks (Phase 3, #197). Top-level imports go to earlier layers only (tests/test_layout.py, _LAYERS); a function-local facade import is used only for a monkeypatch seam or a helper in a later layer. NUMTY/_bail/_swallowed from _errors direct. No direct _fresh_unknown (preserves facade patch seam)."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
+from ._dtypes import (
+    _NAME_OF_KIND_SIZE,
+)
+from ._types import (
+    TUPLE_FULLNAME, _check_dim_eq, _dim_str, _has_unpack, _int_value, _ndarray_parts, _ndarray_type,
+)
+from ._reshape import (
+    _all_positionals, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
+    _is_none_type, _normalize_axis, _parse_axis_arg, _promote_all, _promote_dtypes, _weak_name,
+)
+from ._builders import (
+    _construct_dtype, _fold_single,
+)
 
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
@@ -16,7 +29,6 @@ if TYPE_CHECKING:
 from mypy.types import AnyType, CallableType, TupleType, Type, TypeOfAny
 
 def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Type:
-    from numty_plugin import TUPLE_FULLNAME
     fallback = ctx.api.named_generic_type(
         TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
     )
@@ -24,7 +36,6 @@ def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Ty
 
 def _linalg_real_name(kind: str, size: int) -> str | None:
     """Float dtype for real-valued results: int inputs, norm, svd values."""
-    from numty_plugin import _NAME_OF_KIND_SIZE
     if kind == "f":
         return _NAME_OF_KIND_SIZE.get(("f", size))
     if kind == "c":
@@ -35,7 +46,6 @@ def _linalg_real_name(kind: str, size: int) -> str | None:
 
 
 def _linalg_dtype(ctx: FunctionContext | MethodContext, dtype: Type, name: str) -> Type | None:
-    from numty_plugin import _construct_dtype, _dtype_fullname
     if name == _dtype_fullname(dtype):
         return dtype
     return _construct_dtype(ctx, name)
@@ -43,7 +53,6 @@ def _linalg_dtype(ctx: FunctionContext | MethodContext, dtype: Type, name: str) 
 
 def _linalg_eig_names(kind: str, size: int, hermitian: bool) -> tuple[str, str] | None:
     """(values, vectors) dtype names for eig/eigh, else None to bail."""
-    from numty_plugin import _NAME_OF_KIND_SIZE
     if kind == "f" and size in (4, 8):
         if hermitian:
             name = _NAME_OF_KIND_SIZE.get(("f", size))
@@ -69,7 +78,7 @@ def _linalg_eig_names(kind: str, size: int, hermitian: bool) -> tuple[str, str] 
 
 
 def _linalg_solve(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _broadcast_result, _check_dim_eq, _dim_str, _dims_str, _ndarray_parts, _ndarray_type
+    from numty_plugin import _broadcast_result
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -144,7 +153,6 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
 
 def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
     """inv/cholesky: square in, same shape out, ints become float64."""
-    from numty_plugin import _all_positionals, _check_dim_eq, _construct_dtype, _dims_str, _dtype_kind_size, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -187,7 +195,6 @@ def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
 
 def _reject_float16_linalg(ctx: FunctionContext | MethodContext, dtype: Type, op: str) -> bool:
     """Fail for float16 linalg inputs (unsupported), else False."""
-    from numty_plugin import _dtype_fullname
     if _dtype_fullname(dtype) == "numpy.float16":
         ctx.api.fail(
             f"array type float16 is unsupported in linalg.{op}",
@@ -202,7 +209,7 @@ def _linalg_solve_dtype(
     ctx: FunctionContext, dtype_a: Type, dtype_b: Type
 ) -> Type | None:
     """Promotion for solve/lstsq: ints become float64, float16 rejected."""
-    from numty_plugin import _construct_dtype, _dtype_fullname, _kind_of, _promote_dtypes
+    from numty_plugin import _kind_of
     if _reject_float16_linalg(ctx, dtype_a, "solve") or _reject_float16_linalg(
         ctx, dtype_b, "solve"
     ):
@@ -222,7 +229,6 @@ def _linalg_solve_dtype(
 
 def _linalg_pinv(ctx: FunctionContext) -> Type:
     """linalg.pinv: (..., M, N) -> (..., N, M), ints become float64 (issue #58)."""
-    from numty_plugin import _all_positionals, _construct_dtype, _dims_str, _dtype_kind_size, _has_unpack, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -255,7 +261,6 @@ def _linalg_pinv(ctx: FunctionContext) -> Type:
 
 
 def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
-    from numty_plugin import _all_positionals, _check_dim_eq, _dims_str, _dtype_kind_size, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -302,7 +307,6 @@ def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
 
 def _linalg_flag(ctx: FunctionContext, name: str, default: bool) -> bool | None:
     """Value of an optional bool kwarg (default when absent), else None."""
-    from numty_plugin import _fold_flag, _formal_pair
     pair = _formal_pair(ctx, name)
     if pair is None:
         return default
@@ -310,7 +314,6 @@ def _linalg_flag(ctx: FunctionContext, name: str, default: bool) -> bool | None:
 
 
 def _linalg_svd(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _dtype_fullname, _dtype_kind_size, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -373,7 +376,6 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
 
 
 def _linalg_lstsq(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _check_dim_eq, _dim_str, _dims_str, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -441,7 +443,7 @@ def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -
     ('fro', 'nuc') exist only for matrices. An ord of unknown value
     passes.
     """
-    from numty_plugin import _dims_str, _formal_pair, _int_value, _is_none_type, _string_value, _weak_name
+    from numty_plugin import _string_value
     pair = _formal_pair(ctx, "ord")
     if pair is None or _is_none_type(pair[0]):
         return True
@@ -486,7 +488,7 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     then runs the function hook unfiltered, which reports the single
     [numty-axis] error. All other calls keep the default signature.
     """
-    from numty_plugin import _is_none_type, _ndarray_parts, _parse_axis_arg, _string_value, _weak_name
+    from numty_plugin import _string_value
     try:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType):
@@ -580,7 +582,7 @@ def _linalg_cross_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     array formals become Any; the function hook then solves the shape
     and dtype and still reports a vector axis that is not 3.
     """
-    from numty_plugin import _dtype_base, _ndarray_parts
+    from numty_plugin import _dtype_base
     try:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType) or len(sig.arg_types) < 2:
@@ -605,7 +607,7 @@ def _linalg_cross_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
 
 
 def _linalg_norm(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dims_str, _dtype_kind_size, _formal_pair, _ndarray_parts, _ndarray_type, _normalize_axis, _parse_axis_arg, _scalar_of_dtype
+    from numty_plugin import _scalar_of_dtype
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -692,7 +694,7 @@ def linalg_function_hook(ctx: FunctionContext, op: str) -> Type:
 
 def _linalg_det(ctx: FunctionContext) -> Type:
     """linalg.det: square (..., N, N) in, scalar/batch out."""
-    from numty_plugin import _all_positionals, _check_dim_eq, _construct_dtype, _dims_str, _dtype_kind_size, _has_unpack, _maybe_scalar, _ndarray_parts
+    from numty_plugin import _maybe_scalar
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -737,7 +739,7 @@ def _linalg_det(ctx: FunctionContext) -> Type:
 
 def _linalg_slogdet(ctx: FunctionContext) -> Type:
     """linalg.slogdet: square in, (sign, logabsdet) tuple out."""
-    from numty_plugin import _all_positionals, _check_dim_eq, _construct_dtype, _dims_str, _dtype_kind_size, _has_unpack, _maybe_scalar, _ndarray_parts
+    from numty_plugin import _maybe_scalar
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -793,7 +795,7 @@ def _linalg_slogdet(ctx: FunctionContext) -> Type:
 
 def _linalg_qr(ctx: FunctionContext) -> Type:
     """linalg.qr: rank>=2 in, (Q, R) tuple (or R / raw tuple) out."""
-    from numty_plugin import _all_positionals, _construct_dtype, _dims_str, _dtype_kind_size, _formal_pair, _has_unpack, _ndarray_parts, _ndarray_type, _string_value
+    from numty_plugin import _string_value
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -871,7 +873,6 @@ def _linalg_qr(ctx: FunctionContext) -> Type:
 
 def _linalg_matrix_power(ctx: FunctionContext) -> Type:
     """linalg.matrix_power: square (..., N, N) in, same shape out."""
-    from numty_plugin import _all_positionals, _check_dim_eq, _construct_dtype, _dims_str, _dtype_kind_size, _fold_single, _formal_pair, _has_unpack, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -918,7 +919,7 @@ def _linalg_matrix_power(ctx: FunctionContext) -> Type:
 
 def _linalg_cond(ctx: FunctionContext) -> Type:
     """linalg.cond: rank>=2 in, scalar/batch real out (not square)."""
-    from numty_plugin import _all_positionals, _dims_str, _dtype_kind_size, _has_unpack, _maybe_scalar, _ndarray_parts
+    from numty_plugin import _maybe_scalar
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -951,7 +952,6 @@ def _linalg_cond(ctx: FunctionContext) -> Type:
 
 def _linalg_tensorsolve(ctx: FunctionContext) -> Type:
     """linalg.tensorsolve: prod(a[b.ndim:]) == prod(a[:b.ndim]), shape Q out."""
-    from numty_plugin import _all_positionals, _dims_str, _formal_pair, _has_unpack, _is_none_type, _ndarray_parts, _ndarray_type
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -1016,7 +1016,6 @@ def _cross_int_value(
     ctx: FunctionContext, name: str, default: int
 ) -> int | None:
     """Folded int for a cross axis formal (default when absent), None to bail."""
-    from numty_plugin import _fold_single, _formal_pair
     pair = _formal_pair(ctx, name)
     if pair is None:
         return default
@@ -1026,7 +1025,7 @@ def _cross_int_value(
 
 def cross_function_hook(ctx: FunctionContext) -> Type:
     """np.cross: broadcast (arrays of) 3-vectors, 3-vector size checked."""
-    from numty_plugin import _all_positionals, _broadcast_result, _dim_str, _dims_str, _fold_single, _formal_pair, _has_unpack, _is_none_type, _ndarray_parts, _ndarray_type, _normalize_axis, _promote_all
+    from numty_plugin import _broadcast_result
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -1135,7 +1134,7 @@ def cross_function_hook(ctx: FunctionContext) -> Type:
 
 def linalg_cross_function_hook(ctx: FunctionContext) -> Type:
     """np.linalg.cross: single-axis variant of np.cross."""
-    from numty_plugin import _all_positionals, _broadcast_result, _dim_str, _dims_str, _has_unpack, _ndarray_parts, _ndarray_type, _normalize_axis, _promote_all
+    from numty_plugin import _broadcast_result
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type

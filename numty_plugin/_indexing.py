@@ -1,9 +1,29 @@
-"""Indexing hooks (Phase 3, #197). Shared helpers live in sibling modules and are imported through the facade inside each function (a top-level import would cycle). _fresh_unknown only via facade lazy (never from ._unknowns import) to preserve without_typevars patch. NUMTY/_swallowed from _errors direct."""
+"""Indexing hooks (Phase 3, #197). Top-level imports go to earlier layers only (tests/test_layout.py, _LAYERS); a function-local facade import is used only for a monkeypatch seam or a helper in a later layer. _fresh_unknown only via facade lazy (never from ._unknowns import) to preserve without_typevars patch. NUMTY/_swallowed from _errors direct."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
+from ._forms import (
+    _LinForm,
+)
+from ._types import (
+    INT_FULLNAME, NDARRAY_FULLNAME, _dim_eq, _distribute_solve, _fold_int, _has_unpack, _int_value,
+    _ndarray_parts, _ndarray_type, _parts_or_unpack, _shape_dims_unpack, _union_members,
+)
+from ._reshape import (
+    _all_positionals, _dims_str, _formal_pair, _is_none_type, _normalize_axis, _normalize_axis_0d,
+    _parse_axis_arg, _scalar_key,
+)
+from ._reductions import (
+    _enum_member_value, _final_slice_call, _fold_index_bound, _scalar_of_dtype,
+)
+from ._ops import (
+    _string_value,
+)
+from ._broadcast import (
+    _dtype_base, _kind_of,
+)
 
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
@@ -22,7 +42,6 @@ def _take_indices(
     Arrays keep their dims, flat int displays spell [len], and a bare
     int selects one entry (dropping the axis).
     """
-    from numty_plugin import _fold_int, _has_unpack, _int_value, _parts_or_unpack
     tp, expr = pair
     parts = _parts_or_unpack(tp)
     if parts is not None:
@@ -45,7 +64,6 @@ def _take_indices(
 
 def _take_index_values(pair: tuple[Type, Expression | None]) -> list[int] | None:
     """Literal take indices (an int or a flat int display), else None."""
-    from numty_plugin import _fold_int, _int_value
     tp, expr = pair
     if isinstance(expr, (TupleExpr, ListExpr)):
         values = [_fold_int(e) for e in expr.items]
@@ -71,7 +89,6 @@ def _take_in_bounds(
     provably absent (the callee names a mode formal left unbound), is
     checked.
     """
-    from numty_plugin import _dims_str, _formal_pair, _string_value
     if not isinstance(size, int) or "mode" not in ctx.callee_arg_names:
         return True
     mode = _formal_pair(ctx, "mode")
@@ -95,7 +112,6 @@ def _take_solve(
     array: Type,
     pair: tuple[Type, Expression | None] | None,
 ) -> Type:
-    from numty_plugin import _dims_str, _formal_pair, _ndarray_parts, _ndarray_type, _normalize_axis_0d, _parse_axis_arg, _scalar_of_dtype
     if pair is None:
         return ctx.default_return_type
     parts = _ndarray_parts(array)
@@ -170,7 +186,6 @@ def _take_solve(
 
 
 def take_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
@@ -178,7 +193,6 @@ def take_function_hook(ctx: FunctionContext) -> Type:
 
 
 def take_method_hook(ctx: MethodContext) -> Type:
-    from numty_plugin import _all_positionals
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -195,7 +209,6 @@ def _parse_index_item(
     mask consumes n axes for one data-dependent count); other dtypes
     always raise.
     """
-    from numty_plugin import _dtype_base, _enum_member_value, _final_slice_call, _fold_index_bound, _fold_int, _int_value, _is_none_type, _kind_of, _ndarray_parts, _scalar_key, INT_FULLNAME
     if _is_none_type(tp):
         return ("newaxis",)
     if isinstance(expr, EllipsisExpr):
@@ -372,7 +385,7 @@ def _consume_prefix(
     shape_repr: str,
 ) -> tuple[list[int | Type], list[int | Type]] | None:
     """Items before ... consume the known prefix; (kept, unmatched)."""
-    from numty_plugin import _dim_eq, _fresh_unknown
+    from numty_plugin import _fresh_unknown
     out: list[int | Type] = []
     i = 0
     for item in items:
@@ -472,7 +485,6 @@ def _solve_getitem_unpack(
     indices, an integer beside one, or one on the suffix bails, since
     numpy may move their block to the front.
     """
-    from numty_plugin import _ndarray_type
     pairs = _index_pairs(ctx, pair)
     if pairs is None:
         return ctx.default_return_type
@@ -517,7 +529,7 @@ def _solve_getitem(
     dtype: Type,
     pair: tuple[Type, Expression | None],
 ) -> Type:
-    from numty_plugin import _LinForm, _broadcast_result, _dim_eq, _dims_str, _fresh_unknown, _materialize_dim, _ndarray_type, _resolve_dim
+    from numty_plugin import _broadcast_result, _fresh_unknown, _materialize_dim, _resolve_dim
     pairs = _index_pairs(ctx, pair)
     if pairs is None:
         return ctx.default_return_type
@@ -751,7 +763,6 @@ def _solve_getitem(
 
 def _unpack_shape(tp: Type) -> tuple[tuple[list[int | Type], UnpackType, list[int | Type]], Type] | None:
     """A (*prefix, *Ts, *suffix) ndarray shape with its dtype, else None."""
-    from numty_plugin import _shape_dims_unpack, NDARRAY_FULLNAME
     proper = get_proper_type(tp)
     if not isinstance(proper, Instance):
         return None
@@ -764,7 +775,6 @@ def _unpack_shape(tp: Type) -> tuple[tuple[list[int | Type], UnpackType, list[in
 
 
 def getitem_method_hook(ctx: MethodContext) -> Type:
-    from numty_plugin import _all_positionals, _distribute_solve
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
@@ -783,7 +793,6 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
     unpack/unknown/symbolic targets bail. Returns the stub default
     (None) in every case.
     """
-    from numty_plugin import _all_positionals, _dim_eq, _dims_str, _distribute_solve, _ndarray_parts, _scalar_key, _union_members
     pairs = _all_positionals(ctx)
     if len(pairs) != 2:
         return ctx.default_return_type
@@ -858,7 +867,6 @@ def _is_scalar_target(
 
     Only for the fixed-rank path; unpack or unknown bails as non-scalar.
     """
-    from numty_plugin import _ndarray_parts
     parts = _ndarray_parts(tp)
     if parts is None:
         return False
@@ -901,7 +909,6 @@ def _is_scalar_target(
 def _getitem_types(
     ctx: MethodContext, tp: Type, pair: tuple[Type, Expression | None]
 ) -> Type:
-    from numty_plugin import _dims_str, _ndarray_parts
     parts = _ndarray_parts(tp)
     if parts is not None:
         dims, dtype = parts
@@ -915,7 +922,6 @@ def _getitem_types(
 
 
 def take_along_axis_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _all_positionals, _dim_eq, _dims_str, _dtype_base, _formal_pair, _ndarray_parts, _ndarray_type, _normalize_axis, _parse_axis_arg
     pairs = _all_positionals(ctx)
     if len(pairs) < 2 or len(pairs) > 3:
         return ctx.default_return_type
