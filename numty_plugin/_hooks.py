@@ -321,6 +321,21 @@ class NumtyPlugin(Plugin):
             if isinstance(sig, CallableType):
                 class_fullname, _, _ = fullname.rpartition(".")
                 have = {v.fullname for v in sig.variables}
+                # Issue #220: a method of a generic class takes an ndarray
+                # with a method dim K and returns G[P, K]. When the receiver
+                # uses a TypeVar from another scope (G[Q, H]), member access
+                # already expanded the signature to mention caller Q. Adding
+                # Q to variables makes it call-bound with no inference source
+                # -> Never. Only late-bound/FAM vars need adding; receiver
+                # tvars stay free.
+                try:
+                    receiver_names = {
+                        tvar.fullname for tvar in _iter_tvarlikes(ctx.type)
+                    }
+                except Exception:
+                    _swallowed(ctx, "method_signature_hook")
+                    receiver_names = set()
+                have |= receiver_names
                 missing: list[TypeVarLikeType] = []
                 for formal in list(sig.arg_types) + [sig.ret_type]:
                     for tvar in _iter_tvarlikes(formal):
@@ -498,6 +513,18 @@ class NumtyPlugin(Plugin):
         if not info.type_vars:
             return None
         if not _info_mentions_array(info):
+            return None
+        # Issues #219/#221: a generic NamedTuple (e.g. Block[int]) must keep
+        # mypy's default TupleType handling, which carries per-field types for
+        # _replace self-checks and tuple unpacking. Rebuilding via named_type
+        # loses the TupleType and makes _replace reject and unpacking union
+        # all fields. No hook for those: default handles both bare and
+        # parameterized.
+        if (
+            getattr(info, "is_named_tuple", False)
+            or getattr(info, "tuple_type", None) is not None
+            or getattr(info, "typeddict_type", None) is not None
+        ):
             return None
 
         def bare_hook(ctx: AnalyzeTypeContext) -> Type:
