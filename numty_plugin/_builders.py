@@ -388,7 +388,23 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                         code=NUMTY_UNSOLVED,
                     )
             elif _numty_trace_path() is not None:
-                _trace_event(ctx, fullname, "solved", "")
+                # Issue 234: explicit [numty-bail] errors return Any (to
+                # hide downstream assignment noise, keeping a single error)
+                # but must still count as bailed for the report, not solved.
+                try:
+                    proper_res = get_proper_type(result)
+                    is_error_any = isinstance(
+                        proper_res, AnyType
+                    ) and proper_res.type_of_any == TypeOfAny.from_error
+                except Exception:
+                    _swallowed(ctx, fullname)
+                    is_error_any = False
+                if is_error_any:
+                    _trace_event(
+                        ctx, fullname, "bail", "explicit bail (items have no known shape)"
+                    )
+                else:
+                    _trace_event(ctx, fullname, "solved", "")
         # Only a stub answer holding a Literal or plain `int` dim can be
         # widened, so most calls (np.isscalar, .shape, scalar reductions)
         # skip the operands.
@@ -1284,7 +1300,7 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
                 ctx.context,
                 code=NUMTY_BAIL,
             )
-            return ctx.default_return_type
+            return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
@@ -1426,7 +1442,7 @@ def _stack_solve(
                     ctx.context,
                     code=NUMTY_BAIL,
                 )
-                return ctx.default_return_type
+                return AnyType(TypeOfAny.from_error)
             dims_e, dtype_e = elem
             dtype = _dynamic_explicit_dtype(ctx, dtype_e)
             if dtype is None:
@@ -1596,7 +1612,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                 ctx.context,
                 code=NUMTY_BAIL,
             )
-            return ctx.default_return_type
+            return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
