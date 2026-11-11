@@ -24,8 +24,8 @@ from ._types import (
 from ._reshape import (
     REDUCTION_DTYPES, _all_positionals, _all_positionals_expanded, _construct_datetime_dtype,
     _datetime_kind, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
-    _is_none_type, _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _promote_all,
-    _promote_dtypes, _scalar_key, _weak_name,
+    _is_none_type, _movable_int_parts, _normalize_axis, _normalize_axis_0d, _parse_axis_arg,
+    _promote_all, _promote_dtypes, _scalar_key, _weak_name,
 )
 from ._builders import (
     _apply_out_dtype, _builder_shape, _default_dtype, _dims_fit_intp, _explicit_dtype, _named_dtype,
@@ -306,7 +306,7 @@ def _reduction_types(
     has_dtype: bool,
     op: str = "sum",
 ) -> Type:
-    parts = _parts_or_unpack(array) or _unknown_axis_parts(array)
+    parts = _parts_or_unpack(array) or _unknown_axis_parts(array) or _movable_int_parts(array)
     if parts is None:
         return _reduction_dtype_only(ctx, array, has_dtype, op)
     dims, dtype = parts
@@ -851,7 +851,7 @@ ARG_SAME = frozenset({"sort", "partition"})
 
 
 def _arg_inputs(ctx: FunctionContext | MethodContext, array: Type, op: str) -> Type:
-    parts = _ndarray_parts(array)
+    parts = _ndarray_parts(array) or _movable_int_parts(array)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts

@@ -7,26 +7,84 @@ from __future__ import annotations
 
 from mypy.plugin import FunctionContext, MethodContext
 from mypy.types import (
-    Instance, Type, TypeVarTupleType, TypeVarType, UninhabitedType, UnpackType, get_proper_type,
+    AnyType, Instance, Type, TypeOfAny, TypeVarTupleType, TypeVarType, UninhabitedType, UnpackType,
+    get_proper_type,
 )
 
 from ._errors import NUMTY_BROADCAST, _swallowed
 from ._dtypes import _promote_strong, _promote_weak
 from ._types import (
-    NDARRAY_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _ndarray_parts,
-    _ndarray_type, _unpack_shape,
+    DTYPE_FULLNAME, NDARRAY_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve,
+    _ndarray_parts, _ndarray_type, _unpack_shape,
 )
 from ._reshape import (
-    _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _is_plain_int, _movable_parts,
-    _promote_dtypes, _scalar_key,
+    _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _movable_int_parts, _promote_dtypes,
+    _scalar_key,
 )
 from ._builders import _default_dtype, _scalar_ret_name
+
+
+def _keep_dtype(ctx: FunctionContext | MethodContext, *dtypes: Type | None) -> Type:
+    """First dtype[...] among actual dtypes, else a constructed dtype[Any].
+
+    Keep-dims fallbacks used the stub's dtype, which varies per overload
+    trial while the actual dtypes are identical in every trial; identical
+    hook results are used, varying ones fall back to the stub's Any
+    (issues #217, #229). Actual dtypes are trial-invariant, and dtype[Any]
+    matches the stub answer.
+    """
+    for dt in dtypes:
+        if dt is None:
+            continue
+        proper = get_proper_type(dt)
+        if (
+            isinstance(proper, Instance)
+            and proper.type.fullname == DTYPE_FULLNAME
+            and proper.args
+        ):
+            return dt
+    try:
+        return ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.explicit)])
+    except Exception:
+        _swallowed(ctx, "_keep_dtype")
+        for dt in dtypes:
+            if dt is not None:
+                return dt
+        return ctx.default_return_type
+
+
+def _whole_shape_operands(
+    types: list[Type],
+) -> tuple[TypeVarType, list[Type]] | None:
+    """(shared shape var, array-operand dtypes) for whole-shape operands.
+
+    Every ndarray operand must carry the same whole-shape TypeVar
+    (issue #229); scalars are skipped via _scalar_key/_scalar_ret_name.
+    Anything else (regular shapes, mixed vars, non-arrays) bails with
+    None and the caller keeps today's behavior.
+    """
+    var: TypeVarType | None = None
+    dtypes: list[Type] = []
+    for tp in types:
+        if _scalar_key(tp) is not None or _scalar_ret_name(tp) is not None:
+            continue
+        whole = _whole_shape_var(tp)
+        if whole is None:
+            return None
+        if var is None:
+            var = whole[0]
+        elif var.fullname != whole[0].fullname:
+            return None
+        dtypes.append(whole[1])
+    if var is None:
+        return None
+    return var, dtypes
 
 
 def _whole_shape_var(tp: Type) -> tuple[TypeVarType, Type] | None:
     """(shape TypeVar, dtype) for ndarray[_S, ...], else None (issue #229).
 
-    numpy's own "any shape, kept" spelling: the whole shape is one TypeVar
+    Numpy's own "any shape, kept" spelling: the whole shape is one TypeVar
     bound to tuple[int, ...]. Elementwise ops keep _S; two operands with
     the same _S broadcast to _S.
     """
@@ -155,12 +213,12 @@ def _solve_broadcast_scalar(
         else _promote_strong(scalar_name, strong)
     )
     if name is None:
-        return _ndarray_type(ctx, dims, _default_dtype(ctx))
+        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype))
     if name == strong:
         return _ndarray_type(ctx, dims, dtype)
     promoted = _construct_dtype(ctx, name)
     if promoted is None:
-        return _ndarray_type(ctx, dims, _default_dtype(ctx))
+        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype))
     return _ndarray_type(ctx, dims, promoted)
 
 
@@ -246,14 +304,14 @@ def _broadcast_types(
             if wa[0].fullname == wb[0].fullname:
                 name = _promote_dtypes(wa[1], wb[1])
                 if name is None:
-                    return _whole_shape_type(ctx, wa[0], _default_dtype(ctx))
+                    return _whole_shape_type(ctx, wa[0], _keep_dtype(ctx, wa[1], wb[1]))
                 if name == _dtype_fullname(wa[1]):
                     return _whole_shape_type(ctx, wa[0], wa[1])
                 if name == _dtype_fullname(wb[1]):
                     return _whole_shape_type(ctx, wa[0], wb[1])
                 dtype = _construct_dtype(ctx, name)
                 if dtype is None:
-                    return _whole_shape_type(ctx, wa[0], _default_dtype(ctx))
+                    return _whole_shape_type(ctx, wa[0], _keep_dtype(ctx, wa[1], wb[1]))
                 return _whole_shape_type(ctx, wa[0], dtype)
             return ctx.default_return_type
         if wa is not None and wb is None:
@@ -282,56 +340,53 @@ def _broadcast_types(
             else _promote_strong(scalar_name, strong)
         )
         if pname is None:
-            return _whole_shape_type(ctx, var, _default_dtype(ctx))
+            return _whole_shape_type(ctx, var, _keep_dtype(ctx, dtype))
         if pname == strong:
             return _whole_shape_type(ctx, var, dtype)
         promoted = _construct_dtype(ctx, pname)
         if promoted is None:
-            return _whole_shape_type(ctx, var, _default_dtype(ctx))
+            return _whole_shape_type(ctx, var, _keep_dtype(ctx, dtype))
         return _whole_shape_type(ctx, var, promoted)
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
     if a is None or b is None:
-        # Issue #227: plain-int dims (F64[int]) keep rank via _movable_parts.
-        # Pure-int shapes (no Literal mixed in the same operand) solve with
-        # ctx so unprovable pairs mint ?U instead of bailing to Any. Mixed
-        # shapes (Literal + plain int, #34) must keep bailing to preserve
-        # the widening path: only provable literal clashes are reported,
-        # via an error-only check (None ctx mints nothing).
-        ma = _movable_parts(left)
-        mb = _movable_parts(right)
-        if ma is not None and mb is not None:
-            from numty_plugin import _broadcast_result as _br
+        # Issues #227/#229: int dims (F64[int], F64[int, 3]) keep rank via
+        # _movable_int_parts (plain-int dims, no Any): solve with ctx so
+        # unprovable pairs mint ?U instead of bailing to Any, while
+        # provable clashes still fail loudly. Anything without a plain-int
+        # dim (Any shapes, unpacks) keeps today's bail behavior.
+        from numty_plugin import _broadcast_result as _br
 
-            def _is_mixed_dims(dims: list[int | Type]) -> bool:
-                has_lit = any(isinstance(d, int) for d in dims)
-                has_plain = any(_is_plain_int(d) for d in dims)
-                return has_lit and has_plain
-
-            if _is_mixed_dims(list(ma[0])) or _is_mixed_dims(list(mb[0])):
-                _, msg = _br(list(ma[0]), list(mb[0]), None)
-                if msg is not None:
-                    ctx.api.fail(msg, ctx.context, code=NUMTY_BROADCAST)
-                    return ctx.default_return_type
-                return _solve_broadcast_unpack(ctx, left, right, a, b)
-            # Pure-int (or Any/unknown) path: solve with ctx.
-            dims, msg = _br(list(ma[0]), list(mb[0]), ctx)
+        ma = _movable_int_parts(left) if a is None else None
+        mb = _movable_int_parts(right) if b is None else None
+        aa = ma if ma is not None else a
+        bb = mb if mb is not None else b
+        if aa is not None and bb is not None:
+            dims, msg = _br(list(aa[0]), list(bb[0]), ctx)
             if msg is not None:
                 ctx.api.fail(msg, ctx.context, code=NUMTY_BROADCAST)
                 return ctx.default_return_type
             if dims is None:
                 return _solve_broadcast_unpack(ctx, left, right, a, b)
-            name = _promote_dtypes(ma[1], mb[1])
+            name = _promote_dtypes(aa[1], bb[1])
             if name is None:
-                return _ndarray_type(ctx, dims, _default_dtype(ctx))
-            if name == _dtype_fullname(ma[1]):
-                return _ndarray_type(ctx, dims, ma[1])
-            if name == _dtype_fullname(mb[1]):
-                return _ndarray_type(ctx, dims, mb[1])
+                return _ndarray_type(ctx, dims, _keep_dtype(ctx, aa[1], bb[1]))
+            if name == _dtype_fullname(aa[1]):
+                return _ndarray_type(ctx, dims, aa[1])
+            if name == _dtype_fullname(bb[1]):
+                return _ndarray_type(ctx, dims, bb[1])
             dtype = _construct_dtype(ctx, name)
             if dtype is None:
-                return _ndarray_type(ctx, dims, _default_dtype(ctx))
+                return _ndarray_type(ctx, dims, _keep_dtype(ctx, aa[1], bb[1]))
             return _ndarray_type(ctx, dims, dtype)
+        if ma is not None and _scalar_key(right) is not None:
+            return _solve_broadcast_scalar(ctx, list(ma[0]), ma[1], right)
+        if ma is not None and _scalar_ret_name(right) is not None:
+            return _solve_broadcast_scalar(ctx, list(ma[0]), ma[1], right)
+        if mb is not None and _scalar_key(left) is not None:
+            return _solve_broadcast_scalar(ctx, list(mb[0]), mb[1], left)
+        if mb is not None and _scalar_ret_name(left) is not None:
+            return _solve_broadcast_scalar(ctx, list(mb[0]), mb[1], left)
         return _solve_broadcast_unpack(ctx, left, right, a, b)
     dims_a, dtype_a = a
     dims_b, dtype_b = b
@@ -374,7 +429,10 @@ def _broadcast_types(
             ):
                 return ctx.default_return_type
             return _ndarray_type(ctx, dims, _default_dtype(ctx))
-        return _ndarray_type(ctx, dims, _default_dtype(ctx))
+        # Trial-invariant keep-dims dtype (issue #217): the stub's answer
+        # varies per overload trial while the operands do not, so prefer
+        # the actual dtypes (left first) and fall back to dtype[Any].
+        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype_a, dtype_b))
     if name == _dtype_fullname(dtype_a):
         return _ndarray_type(ctx, dims, dtype_a)
     if name == _dtype_fullname(dtype_b):

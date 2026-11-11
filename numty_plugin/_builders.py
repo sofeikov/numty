@@ -33,7 +33,7 @@ from ._types import (
 )
 from ._reshape import (
     _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,
-    _normalize_axis, _promote_all, _scalar_key,
+    _movable_int_parts, _normalize_axis, _promote_all, _scalar_key,
 )
 from ._types import (
     _enum_member_count,
@@ -125,16 +125,19 @@ def _builder_shape(
         return None
     # With shaped_stub, only upgrade a stub answer of the display's own
     # rank. The hook also runs for overloads that end up unused (the 1-d
-    # SupportsIndex ones answer tuple[int], the catch-all tuple[Any, ...]),
-    # and overriding those can win over the stubs' context-solved answer.
+    # SupportsIndex ones answer tuple[int], the catch-all tuple[Any, ...]).
+    # Honest, resolvable actuals still solve below instead of bailing to
+    # the context-solved default: that default silently won over the
+    # honest overloads for inline `return np.zeros(...)` calls while the
+    # same value through a name failed its return-value check (issue #233).
+    # With every matching overload honest, mypy checks the winner like
+    # the named value. Anything unresolvable bails in the loop as before.
     stub_items: list[Type] | None = None
     proper_default = get_proper_type(default)
     if isinstance(proper_default, Instance) and proper_default.args:
         stub_shape = get_proper_type(proper_default.args[0])
         if isinstance(stub_shape, TupleType) and len(stub_shape.items) == len(expr.items):
             stub_items = stub_shape.items
-    if shaped_stub and stub_items is None:
-        return None
     out: list[int | Type] = []
     for i, (item, item_tp) in enumerate(zip(expr.items, proper.items)):
         if isinstance(item, StarExpr):
@@ -1120,24 +1123,15 @@ def _sequence_parts(
         if isinstance(expr, TupleExpr) and len(expr.items) == len(proper.items):
             expr_items = list(expr.items)
         for idx, item in enumerate(proper.items):
-            parts = _ndarray_parts(item)
+            parts = _ndarray_parts(item) or _movable_int_parts(item)
             if parts is None:
                 item_expr = expr_items[idx] if expr_items is not None else None
                 if isinstance(item_expr, ListExpr) and item_expr.items:
-                    if all(isinstance(e, IntExpr) for e in item_expr.items):
-                        dtype = _construct_dtype(ctx, "numpy.int64")
-                        if dtype is None:
-                            return None
-                        items.append(([len(item_expr.items)], dtype))
-                        continue
-                    if all(
-                        isinstance(e, (IntExpr, FloatExpr)) for e in item_expr.items
-                    ):
-                        dtype = _construct_dtype(ctx, "numpy.float64")
-                        if dtype is None:
-                            return None
-                        items.append(([len(item_expr.items)], dtype))
-                        continue
+                    dtype = _display_list_dtype(ctx, item_expr.items)
+                    if dtype is None:
+                        return None
+                    items.append(([len(item_expr.items)], dtype))
+                    continue
                 return None
             dims, dtype = parts
             items.append((list(dims), dtype))
@@ -1148,33 +1142,64 @@ def _sequence_parts(
             item_tp = ctx.api.get_expression_type(item_expr)
             if item_tp is None:
                 return None
-            parts = _ndarray_parts(item_tp)
+            parts = _ndarray_parts(item_tp) or _movable_int_parts(item_tp)
             if parts is None:
                 # Plain Python lists (e.g. [0] in
                 # concatenate([[0], cumsum(lengths)]), the N+1 offsets
                 # idiom from issue #32): numpy reads them as 1-D arrays
                 # of that length. Int lists give int64; float lists (issue
-                # #230: [[0.0], x]) give float64. Only flat lists.
+                # #230: [[0.0], x], ([np.nan], x)) give float64.
+                # Only flat lists.
                 if isinstance(item_expr, ListExpr) and item_expr.items:
-                    if all(isinstance(e, IntExpr) for e in item_expr.items):
-                        dtype = _construct_dtype(ctx, "numpy.int64")
-                        if dtype is None:
-                            return None
-                        items.append(([len(item_expr.items)], dtype))
-                        continue
-                    if all(
-                        isinstance(e, (IntExpr, FloatExpr)) for e in item_expr.items
-                    ):
-                        dtype = _construct_dtype(ctx, "numpy.float64")
-                        if dtype is None:
-                            return None
-                        items.append(([len(item_expr.items)], dtype))
-                        continue
+                    dtype = _display_list_dtype(ctx, item_expr.items)
+                    if dtype is None:
+                        return None
+                    items.append(([len(item_expr.items)], dtype))
+                    continue
                 return None
             dims, dtype = parts
             items.append((list(dims), dtype))
         return items or None
     return None
+
+
+def _display_list_dtype(
+    ctx: FunctionContext | MethodContext, items: list[Expression]
+) -> Type | None:
+    """int64/float64 for an all int / all int-or-float display (issue #230).
+
+    Members are classified by type, not syntax: np.nan/np.inf arrive as
+    MemberExpr with a float type (not FloatExpr literals), and len(x) has
+    an int-bound TypeVar. Bool members bail like before.
+    """
+    has_float = False
+    for e in items:
+        if isinstance(e, IntExpr) and not isinstance(e.value, bool):
+            continue
+        if isinstance(e, FloatExpr):
+            has_float = True
+            continue
+        try:
+            tp = ctx.api.get_expression_type(e)
+        except Exception:
+            _swallowed(ctx, "_display_list_dtype")
+            return None
+        if tp is None:
+            return None
+        key = _scalar_key(tp)
+        if key == ("weak", "builtins.int"):
+            continue
+        if key == ("weak", "builtins.float"):
+            has_float = True
+            continue
+        proper = get_proper_type(tp)
+        if isinstance(proper, TypeVarType):
+            upper = get_proper_type(proper.upper_bound)
+            if isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME:
+                continue
+            return None
+        return None
+    return _construct_dtype(ctx, "numpy.float64" if has_float else "numpy.int64")
 
 
 def _is_dynamic_sequence(tp: Type, expr: Expression | None) -> bool:
@@ -1383,6 +1408,8 @@ def _concat_merge(
     norm: int,
 ) -> Type:
     """Merge rank-checked items along norm; mismatches fail with op."""
+    from numty_plugin import _fresh_unknown
+
     out = list(items[0][0])
     # Issue #183: fail on any provably-different dim even when an
     # earlier dim is only possibly different (e.g. dstack of (P, 3)
@@ -1404,6 +1431,12 @@ def _concat_merge(
     for dims, _ in items[1:]:
         for i, d in enumerate(dims):
             if i != norm and not _dim_eq(out[i], d):
+                # Issue #227: a plain-int (dynamic) axis never proves
+                # equal, but the rank is known. Mint ?U instead of
+                # bailing to Any so the shape stays solved.
+                if _is_plain_int(out[i]) or _is_plain_int(d):
+                    out[i] = _fresh_unknown(ctx, op, i)
+                    continue
                 return ctx.default_return_type
         acc, extra = out[norm], dims[norm]
         if isinstance(acc, int) and isinstance(extra, int):
@@ -1630,7 +1663,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if not isinstance(axis, int):
         return ctx.default_return_type
-    first = items[0][0]
+    first = list(items[0][0])
     for dims, _ in items[1:]:
         if len(dims) != len(first) or not all(_dim_eq(x, y) for x, y in zip(first, dims)):
             provable = len(dims) != len(first) or any(
@@ -1673,6 +1706,19 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                     code=NUMTY_SHAPE,
                 )
                 return ctx.default_return_type
+            # Issue #227: plain-int (dynamic) axes never prove equal but
+            # the rank is known. Mint ?U for the differing axes instead
+            # of bailing to Any.
+            if diff_at is not None:
+                from numty_plugin import _fresh_unknown
+
+                minted = False
+                for i, (x, y) in enumerate(zip(first, dims)):
+                    if not _dim_eq(x, y) and (_is_plain_int(x) or _is_plain_int(y)):
+                        first[i] = _fresh_unknown(ctx, "stack", i)
+                        minted = True
+                if minted:
+                    continue
             return ctx.default_return_type
     ndim = len(first)
     norm = axis + ndim + 1 if axis < 0 else axis
@@ -1734,9 +1780,17 @@ def r_getitem_hook(ctx: MethodContext) -> Type:
                 strong_name = _WEAK_DEFAULT.get(name, name) if kind == "weak" else name
                 scalar_dtype = _construct_dtype(ctx, strong_name)
             else:
-                ret_name = _scalar_ret_name(item_tp)
-                if ret_name is not None:
-                    scalar_dtype = _construct_dtype(ctx, ret_name)
+                # An int-valued TypeVar (e.g. len(x): T) is a 1-element
+                # int64 scalar, like a plain-int expression (issue #230).
+                proper_item = get_proper_type(item_tp)
+                if isinstance(proper_item, TypeVarType):
+                    upper = get_proper_type(proper_item.upper_bound)
+                    if isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME:
+                        scalar_dtype = _construct_dtype(ctx, "numpy.int64")
+                if scalar_dtype is None:
+                    ret_name = _scalar_ret_name(item_tp)
+                    if ret_name is not None:
+                        scalar_dtype = _construct_dtype(ctx, ret_name)
         if scalar_dtype is None:
             return ctx.default_return_type
         items.append(([1], scalar_dtype))

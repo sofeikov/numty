@@ -192,16 +192,20 @@ def _matmul_promoted(
     dtype_b: Type,
 ) -> Type:
     """Result array for matmul output dims with promoted dtypes."""
+    from ._broadcast_core import _keep_dtype
+
     name = _promote_dtypes(dtype_a, dtype_b)
     if name is None:
-        return ctx.default_return_type
+        # Trial-invariant keep-dims (issue #217): prefer the actual
+        # operand dtypes over the trial-varying stub default.
+        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype_a, dtype_b))
     if name == _dtype_fullname(dtype_a):
         return _ndarray_type(ctx, dims, dtype_a)
     if name == _dtype_fullname(dtype_b):
         return _ndarray_type(ctx, dims, dtype_b)
     dtype = _construct_dtype(ctx, name)
     if dtype is None:
-        return ctx.default_return_type
+        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype_a, dtype_b))
     return _ndarray_type(ctx, dims, dtype)
 
 

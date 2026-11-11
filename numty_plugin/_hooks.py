@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
 from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
@@ -35,7 +35,7 @@ from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
 from ._types import (
     _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _conflict_pairs,
     _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray, _info_mentions_array,
-    _note_rank_mismatches, _ndarray_type, INT_FULLNAME, TUPLE_FULLNAME, _OPERATOR_DUNDERS,
+    _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, TUPLE_FULLNAME, _OPERATOR_DUNDERS,
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
@@ -912,6 +912,80 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         if not isinstance(sig, CallableType):
             return ctx.default_signature
         call = ctx.context
+        # Issue #217: the method hook never runs when BOTH operands are
+        # pure array unions, so a provable clash would pass silently.
+        # Emit it here when every member pairing clashes (co-derived
+        # unions share matching pairs, which must stay silent); the
+        # widening below still suppresses the mechanical [operator]
+        # duplicate, and any method-hook duplicate dedupes to one line.
+        # This runs before the part_a bail: a union self has no single
+        # dims list, so the per-operand path below cannot see it.
+        try:
+            from mypy.nodes import CallExpr as _CallExpr0
+            from mypy.nodes import OpExpr as _OpExpr0
+            uu_left: Type | None = None
+            uu_right: Type | None = None
+            if isinstance(call, _OpExpr0):
+                try:
+                    uu_left = ctx.api.get_expression_type(call.left)
+                    uu_right = ctx.api.get_expression_type(call.right)
+                except Exception:
+                    _swallowed(ctx, "_broadcast_signature_hook")
+                    uu_left = uu_right = None
+            elif isinstance(call, _CallExpr0) and call.args:
+                try:
+                    uu_right = ctx.api.get_expression_type(call.args[0])
+                    uu_left = ctx.type
+                except Exception:
+                    _swallowed(ctx, "_broadcast_signature_hook")
+                    uu_left = uu_right = None
+            if (
+                uu_left is not None
+                and uu_right is not None
+                and _union_members(uu_left) is not None
+                and _union_members(uu_right) is not None
+            ):
+                def _uu_dims(tp: Type) -> list[list[int | Type]] | None:
+                    proper = get_proper_type(tp)
+                    if not isinstance(proper, UnionType):
+                        return None
+                    out: list[list[int | Type]] = []
+                    for item in proper.relevant_items():
+                        part = _ndarray_parts(item)
+                        if part is None:
+                            part = _movable_parts(item)
+                        if part is None:
+                            return None
+                        if part[0]:
+                            out.append(list(part[0]))
+                    return out or None
+
+                llist0 = _uu_dims(uu_left)
+                rlist0 = _uu_dims(uu_right)
+                if llist0 is not None and rlist0 is not None:
+                    first_msg: str | None = None
+                    all_bad = True
+                    for _da in llist0:
+                        for _db in rlist0:
+                            _, _m = _broadcast_result(list(_da), list(_db), None)
+                            if _m is None:
+                                all_bad = False
+                                break
+                            if first_msg is None:
+                                first_msg = _m
+                        if not all_bad:
+                            break
+                    if all_bad and first_msg is not None:
+                        try:
+                            ctx.api.fail(first_msg, ctx.context, code=NUMTY_BROADCAST)
+                        except Exception:
+                            _swallowed(ctx, "_broadcast_signature_hook")
+                        return sig.copy_modified(
+                            arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                        )
+        except Exception:
+            _swallowed(ctx, "_broadcast_signature_hook")
+            pass
         if isinstance(call, OpExpr) and call.op in ("//", "%"):
             # No complex loop for floor_divide/remainder: the method
             # hook reports it, so let the call through to reach it
