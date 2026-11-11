@@ -3,7 +3,7 @@ from typing import Literal
 
 import numpy as np
 
-from numty import Array2D, FloatArray, Matrix, Vector, ident, matmul, narrow
+from numty import Array2D, FloatArray, Matrix, Vector, ident, narrow
 
 A2x3 = FloatArray[tuple[Literal[2], Literal[3]]]
 B2x3 = Array2D[Literal[2], Literal[3]]

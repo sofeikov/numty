@@ -1812,7 +1812,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
             )
             if len(dims) != len(first):
                 ctx.api.fail(
-                    f"stack ranks differ: "
+                    "stack ranks differ: "
                     + ", ".join(_dims_str(dims) for dims, _ in items)
                     + f" (axis {axis})",
                     ctx.context,
