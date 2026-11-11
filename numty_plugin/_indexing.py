@@ -1,6 +1,6 @@
 """Indexing hooks (Phase 3, #197). Top-level imports go to earlier layers only
 (tests/test_layout.py, _LAYERS); a function-local facade import is used only
-for a monkeypatch seam or a helper in a later layer. _fresh_unknown only via
+for a monkeypatch seam (_LAZY_SEAMS). _fresh_unknown only via
 facade lazy (never from ._unknowns import) to preserve without_typevars
 patch. NUMTY/_swallowed from _errors direct.
 """
@@ -13,21 +13,15 @@ from ._forms import (
     _LinForm,
 )
 from ._types import (
-    INT_FULLNAME, NDARRAY_FULLNAME, _dim_eq, _distribute_solve, _fold_int, _has_unpack, _int_value,
-    _ndarray_parts, _ndarray_type, _parts_or_unpack, _shape_dims_unpack, _union_members,
+    INT_FULLNAME, _dim_eq, _distribute_solve, _fold_int, _has_unpack, _int_value,
+    _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
 )
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _normalize_axis, _normalize_axis_0d,
     _parse_axis_arg, _scalar_key,
 )
 from ._reductions import (
-    _enum_member_value, _final_slice_call, _fold_index_bound, _scalar_of_dtype,
-)
-from ._ops import (
-    _string_value,
-)
-from ._broadcast import (
-    _dtype_base, _kind_of,
+    _enum_member_value, _final_slice_call, _fold_index_bound,
 )
 
 if TYPE_CHECKING:
@@ -38,6 +32,12 @@ if TYPE_CHECKING:
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import ARG_POS, EllipsisExpr, Expression, IntExpr, ListExpr, NameExpr, SliceExpr, StarExpr, TupleExpr
 from mypy.types import Instance, TupleType, Type, TypeVarType, UnpackType, get_proper_type
+from ._linalg import (
+    _dtype_base, _kind_of, _scalar_of_dtype, _string_value,
+)
+from ._types import (
+    _unpack_shape,
+)
 
 def _take_indices(
     pair: tuple[Type, Expression | None],
@@ -764,19 +764,6 @@ def _solve_getitem(
         # Every axis consumed by integers: a numpy scalar, not an array.
         return ctx.default_return_type
     return _ndarray_type(ctx, out, dtype)
-
-
-def _unpack_shape(tp: Type) -> tuple[tuple[list[int | Type], UnpackType, list[int | Type]], Type] | None:
-    """A (*prefix, *Ts, *suffix) ndarray shape with its dtype, else None."""
-    proper = get_proper_type(tp)
-    if not isinstance(proper, Instance):
-        return None
-    if proper.type.fullname != NDARRAY_FULLNAME or len(proper.args) != 2:
-        return None
-    split = _shape_dims_unpack(proper.args[0])
-    if split is None:
-        return None
-    return split, proper.args[1]
 
 
 def getitem_method_hook(ctx: MethodContext) -> Type:

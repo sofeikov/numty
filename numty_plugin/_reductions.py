@@ -1,7 +1,7 @@
 """_reductions.py — reductions/cumsum/diff/average/percentile/ufunc. (Phase 5,
 #199). Top-level imports go to earlier layers only (order in
 tests/test_layout.py, _LAYERS). A function-local facade import is used only
-for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
@@ -28,11 +28,20 @@ from ._reshape import (
     _promote_dtypes, _scalar_key, _weak_name,
 )
 from ._builders import (
-    _apply_out_dtype, _builder_shape, _construct_dtype, _default_dtype, _dims_fit_intp,
-    _explicit_dtype, _is_plain_int, _named_dtype, _scalar_ret_name, _unknown_axis_parts,
+    _apply_out_dtype, _builder_shape, _default_dtype, _dims_fit_intp, _explicit_dtype, _named_dtype,
+    _scalar_ret_name,
 )
 from ._linalg import (
     _linalg_real_name, _linalg_tuple,
+)
+from ._reshape import (
+    _construct_dtype, _is_plain_int, _unknown_axis_parts,
+)
+from ._linalg import (
+    _kind_of,
+)
+from ._linalg import (
+    _maybe_scalar, _scalar_of_dtype,
 )
 
 def _reduction_out_dtype(
@@ -45,7 +54,6 @@ def _reduction_out_dtype(
     max/min/median keep the input dtype (median of ints promotes like
     mean). Anything else bails.
     """
-    from numty_plugin import _kind_of
     name = _dtype_fullname(dtype)
     if name is None:
         ks = _dtype_kind_size(dtype)
@@ -1149,7 +1157,6 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, [*q_dims, *remaining], out_dtype)
 
 
-
 def reduction_function_hook(ctx: FunctionContext, op: str = "sum") -> Type:
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
@@ -1157,31 +1164,6 @@ def reduction_function_hook(ctx: FunctionContext, op: str = "sum") -> Type:
     if not pairs:
         return ctx.default_return_type
     return _reduction_inputs(ctx, pairs[0][0], op)
-
-
-def _scalar_of_dtype(dtype: Type) -> Type | None:
-    """The numpy scalar Instance carried by a dtype[...], else None."""
-    proper = get_proper_type(dtype)
-    if isinstance(proper, Instance) and proper.args:
-        inner = get_proper_type(proper.args[0])
-        if isinstance(inner, Instance):
-            return inner
-    return None
-
-
-def _maybe_scalar(
-    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
-) -> Type:
-    """An ndarray for the dims, or the numpy scalar when none are left.
-
-    Fully reduced results (and scalar-only ufunc calls) are numpy
-    scalars at runtime, not 0-d arrays, so `total: float = ...` checks
-    (issue #62). Falls back to the stubs when the dtype has no scalar.
-    """
-    if dims:
-        return _ndarray_type(ctx, dims, dtype)
-    scalar = _scalar_of_dtype(dtype)
-    return scalar if scalar is not None else ctx.default_return_type
 
 
 def _same_dims(a: list[int | Type], b: list[int | Type]) -> bool:
@@ -1550,5 +1532,4 @@ def _promoted_result_type(
     if name == _dtype_fullname(dtb):
         return dtb
     return _construct_dtype(ctx, name)
-
 

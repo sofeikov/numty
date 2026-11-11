@@ -1,7 +1,6 @@
 """_matmul.py — matmul/dot/tensordot. (Phase 5, #199). Top-level imports go to
 earlier layers only (order in tests/test_layout.py, _LAYERS). A function-
-local facade import is used only for a monkeypatch seam or for a helper in a
-later layer (_LAZY_UPWARD).
+local facade import is used only for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
@@ -23,11 +22,25 @@ from ._reshape import (
     _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
 )
 from ._builders import (
-    _construct_dtype, _has_mixed_operand, _is_mixed_shape, _is_plain_int, _literal_positions,
-    _mixed_parts, _ndarrays_in, _widen_literal_dims,
+    _has_mixed_operand,
 )
 from ._reductions import (
-    _promoted_result_type, _scalar_of_dtype,
+    _promoted_result_type,
+)
+from ._reshape import (
+    _construct_dtype, _is_plain_int, _mixed_parts,
+)
+from ._linalg import (
+    _scalar_of_dtype,
+)
+from ._types import (
+    _unpack_shape,
+)
+from ._broadcast_core import (
+    _merge_unpack_dims, _same_unpack, _solve_broadcast,
+)
+from ._reshape import (
+    _mixed_result,
 )
 
 def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
@@ -112,7 +125,6 @@ def _matmul_unpack_dims(
     batch. Vectors over *Ts, mixed unpacks, and concrete batches against
     *Ts stay out of scope and bail.
     """
-    from numty_plugin import _merge_unpack_dims, _same_unpack, _unpack_shape
     sa = _unpack_shape(left)
     sb = _unpack_shape(right)
     if sa is None and sb is None:
@@ -208,21 +220,6 @@ def _operand_parts(
     if (parts_a is None or parts_b is None) and _has_mixed_operand(left, right):
         return _mixed_parts(left, partner=True), _mixed_parts(right, partner=True)
     return parts_a, parts_b
-
-
-def _mixed_result(result: Type, *operands: Type) -> Type:
-    """A contraction's result over mixed operands, see _operand_parts.
-
-    Its literal dims are solved and stay. A plain `int` dim lands where a
-    mixed operand of the same rank had a literal only when it is another
-    operand's dynamic size ((n, 3) by (3, k) is (n, k)), and nothing
-    proves k is not 3: that dim goes unknown, as the stubs' answers do
-    in _guard_mixed, so x = np.dot(x, w) keeps fitting x.
-    """
-    arrays = [a for t in operands for a in _ndarrays_in(t)]
-    if not any(_is_mixed_shape(a) for a in arrays):
-        return result
-    return _widen_literal_dims(result, _literal_positions(arrays), literals=False)
 
 
 def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
@@ -346,7 +343,6 @@ def _promoted_scalar(
 
 
 def dot_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _solve_broadcast
     pair = _two_arrays(ctx)
     if pair is None:
         return ctx.default_return_type
@@ -385,7 +381,6 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
 
 def dot_method_hook(ctx: MethodContext) -> Type:
     """ndarray.dot twin of np.dot: same solver on (self, arg) (issue #58)."""
-    from numty_plugin import _solve_broadcast
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -465,7 +460,6 @@ def imatmul_method_hook(ctx: MethodContext) -> Type:
 
 
 def inner_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _solve_broadcast
     pair = _two_arrays(ctx)
     if pair is None:
         return ctx.default_return_type
@@ -715,5 +709,4 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
         d for j, d in enumerate(dims_b) if j not in drop_b
     ]
     return _matmul_promoted(ctx, out, dtype_a, dtype_b)
-
 

@@ -151,3 +151,68 @@ def test_swallowed_reraises_only_in_debug(monkeypatch: pytest.MonkeyPatch) -> No
         raise KeyError("x")
     except Exception:
         numty_plugin._swallowed(None, "unit")  # no context: trace-only, no raise
+
+
+SEEDED_TUPLE_PLUGIN = """\
+import sys
+
+from mypy.types import TupleType
+from numty_plugin import plugin
+
+_original = TupleType.copy_modified
+
+
+def _copy_modified(self, *args, **kwargs):
+    if sys._getframe(1).f_code.co_name == "_substitute_return_exprs":
+        raise RuntimeError("seeded failure")
+    return _original(self, *args, **kwargs)
+
+
+TupleType.copy_modified = _copy_modified
+"""
+
+FORMULA_RETURN_SOURCE = """\
+from typing import TypeVar, reveal_type
+
+import numpy as np
+
+from numty import I64
+
+M = TypeVar("M", bound=int)
+K = TypeVar("K", bound=int)
+
+
+def make_offsets(lengths: I64[M]) -> I64["M+1"]:
+    return np.concatenate([[0], np.cumsum(lengths)])
+
+
+def caller(a: I64[K]) -> None:
+    reveal_type(make_offsets(a))
+"""
+
+
+def test_return_substitution_survives_a_failed_tuple_copy(tmp_path: Path) -> None:
+    # `_substitute_return_exprs` rebuilds the shape tuple by hand when
+    # TupleType.copy_modified raises. That path used `shape.fallback`,
+    # an attribute TupleType does not have (it is `partial_fallback`),
+    # so the rebuild raised too and the call site lost its K+1 shape.
+    # Found by ty (#213).
+    (tmp_path / "seeded_numty.py").write_text(SEEDED_TUPLE_PLUGIN, encoding="utf-8")
+    (tmp_path / "mypy.ini").write_text("[mypy]\nplugins = seeded_numty\n", encoding="utf-8")
+    (tmp_path / "repro.py").write_text(FORMULA_RETURN_SOURCE, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": f"{tmp_path}{os.pathsep}{ROOT}"}
+    env.pop("NUMTY_DEBUG", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "mypy", "--cache-dir", str(tmp_path / "cache"), "repro.py"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    out = result.stdout + result.stderr
+    assert "INTERNAL ERROR" not in out, out
+    # The seeded failure is reported, and the hand-built tuple is used.
+    assert "RuntimeError: seeded failure" in result.stdout, out
+    assert "AttributeError" not in out, out
+    assert 'Revealed type is "numpy.ndarray[tuple[K+1], ' in result.stdout, out

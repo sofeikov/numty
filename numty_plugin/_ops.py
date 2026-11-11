@@ -1,14 +1,14 @@
 """_ops.py — misc shape ops (flip/trace/diag/tile/repeat/pad/split/nonzero).
 (Phase 5, #199). Top-level imports go to earlier layers only (order in
 tests/test_layout.py, _LAYERS). A function-local facade import is used only
-for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
 
-from mypy.nodes import ARG_POS, Expression, ListExpr, StarExpr, TupleExpr
+from mypy.nodes import Expression, ListExpr, StarExpr, TupleExpr
 from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import Instance, LiteralType, TupleType, Type, TypeVarType, get_proper_type
+from mypy.types import Instance, TupleType, Type, TypeVarType, get_proper_type
 
 from ._errors import NUMTY_AXIS, NUMTY_SHAPE
 from ._dtypes import _DTYPE_INFO
@@ -22,44 +22,24 @@ from ._reshape import (
     _all_positionals, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _is_none_type,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg,
 )
-from ._builders import (
-    _construct_dtype, _mixed_parts,
-)
 from ._linalg import (
     _linalg_tuple,
 )
 from ._matmul import (
     _matmul_promoted,
 )
-
-def _positionals_only(ctx: FunctionContext | MethodContext) -> bool:
-    """True when every actual is positional: nothing hides behind keywords."""
-    return all(kind == ARG_POS for kinds in ctx.arg_kinds for kind in kinds)
-
-
-def _picture_complete(ctx: FunctionContext | MethodContext, first: str) -> bool:
-    """True when every actual is visible to the hook.
-
-    Overload fallback erases formal names, so keyword actuals become
-    unreadable; a mixed call under erasure bails instead of misreading.
-    All-positional calls are always fully visible.
-    """
-    if _positionals_only(ctx):
-        return True
-    return _formal_pair(ctx, first) is not None
-
-
-def _int_or_none(pair: tuple[Type, Expression | None] | None) -> int | None | str:
-    """A folded int, None when absent/None, 'bail' when unprovable."""
-    if pair is None:
-        return None
-    tp, expr = pair
-    if _is_none_type(tp):
-        return None
-    value = _int_value(tp)
-    if value is None and expr is not None:
-        value = _fold_int(expr)
-    return value if value is not None else "bail"
+from ._reshape import (
+    _construct_dtype, _mixed_parts,
+)
+from ._reshape import (
+    _check_unique_axes, _int_or_none, _picture_complete, _positionals_only,
+)
+from ._linalg import (
+    _string_value,
+)
+from mypy.nodes import (
+    NameExpr,
+)
 
 
 def _check_each_axis(
@@ -75,27 +55,6 @@ def _check_each_axis(
                 code=NUMTY_AXIS,
             )
             return False
-    return True
-
-
-def _check_unique_axes(
-    ctx: FunctionContext | MethodContext, dims: list[int | Type], axes: list[int], op: str
-) -> bool:
-    """True when the in-range axes name distinct dims, else a loud error."""
-    seen: list[int] = []
-    for ax in axes:
-        norm = _normalize_axis(ax, len(dims))
-        if norm is None:
-            continue
-        if norm in seen:
-            ctx.api.fail(
-                f"{op} has duplicate axis {ax} in {tuple(axes)} "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return False
-        seen.append(norm)
     return True
 
 
@@ -436,16 +395,6 @@ def rot90_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, dtype)
 
 
-def _string_value(tp: Type) -> str | None:
-    """String of a literal mode/kind argument, else None."""
-    proper = get_proper_type(tp)
-    if isinstance(proper, LiteralType) and isinstance(proper.value, str):
-        return proper.value
-    if isinstance(proper, Instance) and proper.last_known_value is not None:
-        return _string_value(proper.last_known_value)
-    return None
-
-
 def _convolve_solve(
     ctx: FunctionContext, op: str, a: Type, b: Type, mode: str | None
 ) -> Type:
@@ -558,7 +507,6 @@ def correlate_function_hook(ctx: FunctionContext) -> Type:
     mode_pair = _formal_pair(ctx, "mode")
     mode = "valid" if mode_pair is None else _string_value(mode_pair[0])
     return _convolve_solve(ctx, "correlate", pairs[0][0], pairs[1][0], mode)
-
 
 
 def _hook_pair(
@@ -1044,7 +992,6 @@ def pad_function_hook(ctx: FunctionContext) -> Type:
 
 
 def split_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _fft_seq_arg
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -1126,7 +1073,6 @@ def array_split_function_hook(ctx: FunctionContext) -> Type:
     are unknowable (unequal sections mint an unknown). Otherwise bail
     to the stubs, preserving current silence on working code.
     """
-    from numty_plugin import _fft_seq_arg
     from numty_plugin import _fresh_unknown
     pairs = _all_positionals(ctx)
     if not pairs:
@@ -1426,7 +1372,6 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
 
 
 def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _fft_seq_arg
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1565,3 +1510,53 @@ def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
     return _ndarray_type(ctx, out, dtype)
 
 
+def _fft_seq_entry(expr: Expression, tp: Type | None) -> int | None | str:
+    """An s/axes entry: int, None for keep, 'bad' when unprovable."""
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+    if tp is not None and _is_none_type(tp):
+        return None
+    if isinstance(expr, NameExpr) and expr.name == "None":
+        return None
+    return "bad"
+
+
+def _fft_seq_arg(
+    pair: tuple[Type, Expression | None] | None,
+) -> list[int | None] | None | str:
+    """An s/axes argument: None absent, parsed list, 'scalar', or 'bail'."""
+    if pair is None:
+        return None
+    tp, expr = pair
+    if _is_none_type(tp):
+        return None
+    if expr is not None and isinstance(expr, (TupleExpr, ListExpr)):
+        proper = get_proper_type(tp)
+        types: list[Type | None]
+        if isinstance(proper, TupleType) and len(proper.items) == len(expr.items):
+            types = list(proper.items)
+        else:
+            types = [None] * len(expr.items)
+        out: list[int | None] = []
+        for e, t in zip(expr.items, types):
+            entry = _fft_seq_entry(e, t)
+            if isinstance(entry, str):
+                return "bail"
+            out.append(entry)
+        return out
+    proper = get_proper_type(tp)
+    if isinstance(proper, TupleType):
+        out2: list[int | None] = []
+        for item in proper.items:
+            if _is_none_type(item):
+                out2.append(None)
+                continue
+            value = _dim_value(item)
+            if not isinstance(value, int) or isinstance(value, bool):
+                return "bail"
+            out2.append(value)
+        return out2
+    if _int_value(tp) is not None:
+        return "scalar"
+    return "bail"

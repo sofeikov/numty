@@ -2,8 +2,18 @@
 
 Module-level singleton STATE; NumtyPlugin.__init__ does
 self.state = STATE (never NumtyState()). No clearing in hooks.
-Region B is keyed (ns, fullname) since #209. Region C pruning
-(Phase 2 of #198) is not done.
+Region B is keyed (ns, fullname) since #209.
+
+Region C is not pruned (Phase 2 of #198), on purpose:
+- An unknown's TypeVarId is minted once per source site. A type that
+  another module already holds can contain that id. If the entry is
+  dropped and minted again, the two ids differ, and overload
+  resolution reads that as a disagreement and falls back to Any.
+- The mypy plugin API has no hook for "a re-check of module M starts",
+  so there is no point in a daemon run where a module's entries are
+  known to be unused.
+- The cost of no pruning is one small dict entry per unknown site per
+  (line, column) seen in the life of a dmypy process.
 """
 from __future__ import annotations
 

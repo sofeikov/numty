@@ -1,11 +1,11 @@
 """_types.py — pure algebra/fold/shape (Phase 5, #199). Owns NDARRAY_FULLNAME
 etc. (Phase 5, #199). Top-level imports go to earlier layers only (order in
 tests/test_layout.py, _LAYERS). A function-local facade import is used only
-for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, cast
 
 from mypy.errorcodes import ARG_TYPE
@@ -17,9 +17,8 @@ from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
 from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import (
-    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType,
-    TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType,
-    get_proper_type,
+    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeOfAny, TypeVarId,
+    TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
@@ -33,6 +32,9 @@ from ._forms import (
 from ._exprs import (
     _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _lookup_ns,
     _ns_of_ctx, _seen_vars, _short_var,
+)
+from ._exprs import (
+    _iter_tvarlikes,
 )
 
 NDARRAY_FULLNAME = "numpy.ndarray"
@@ -421,7 +423,6 @@ def _fold_int(expr: Expression) -> int | None:
 
 def _fold_len_arg(arg: Expression) -> int | None:
     """len() of a Final/param array's first literal dim, or an int enum."""
-    from numty_plugin import _enum_member_count
     if not isinstance(arg, NameExpr):
         return None
     node = arg.node
@@ -471,7 +472,6 @@ def _parts_or_unpack(tp: Type) -> tuple[list[int | Type], Type] | None:
     Same-shape consumers thread the dims through untouched; anything
     rank-sensitive must keep using _ndarray_parts and bail out.
     """
-    from numty_plugin import _unpack_shape
     parts = _ndarray_parts(tp)
     if parts is not None:
         return parts
@@ -571,40 +571,6 @@ def _split_flat(
     item = dims[found[0]]
     assert isinstance(item, UnpackType)
     return dims[: found[0]], item, dims[found[0] + 1 :]
-
-
-def _iter_tvarlikes(
-    tp: Type, _seen: frozenset[TypeAliasType] = frozenset()
-) -> Iterator[TypeVarLikeType]:
-    """Every TypeVar-like nested in an analyzed type (any container).
-
-    A recursive alias (`Json = dict[str, "Json"] | list["Json"]`, or the
-    nested-sequence aliases behind numpy's ArrayLike) expands to a type
-    that mentions itself, so each alias is expanded once per path:
-    without that this recursed until RecursionError, which the
-    call-site hooks used to swallow, dropping their checks for the
-    whole call (issue #164).
-    """
-    if isinstance(tp, TypeAliasType):
-        if tp in _seen:
-            return
-        _seen = _seen | {tp}
-        for a in tp.args:
-            yield from _iter_tvarlikes(a, _seen)
-    tp = get_proper_type(tp)
-    if isinstance(tp, TypeVarLikeType):
-        yield tp
-    elif isinstance(tp, Instance):
-        for a in tp.args:
-            yield from _iter_tvarlikes(a, _seen)
-    elif isinstance(tp, TupleType):
-        for item in tp.items:
-            yield from _iter_tvarlikes(item, _seen)
-    elif isinstance(tp, UnionType):
-        for item in tp.relevant_items():
-            yield from _iter_tvarlikes(item, _seen)
-    elif isinstance(tp, UnpackType):
-        yield from _iter_tvarlikes(tp.type, _seen)
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
@@ -876,7 +842,6 @@ def _callsite_expr_bindings(
     of the result, and `_substitute_return_exprs` makes the return dims
     that need it unknown.
     """
-    from numty_plugin import _has_unknown_shape
     from numty_plugin import _resolve_dim, _fresh_unknown
     bindings: dict[str, int | Type | _LinForm] = {}
     for i, positions in formals:
@@ -1545,7 +1510,6 @@ def _builder_fold_dim_expr(
     `N` (`N@edges` vs `N@trimmed`). Snapshot and restore those two
     registries around the fold.
     """
-    from numty_plugin import _fold_dim_expr
     seen_snapshot = dict(_seen_vars)
     const_snapshot = {k: dict(v) for k, v in _expr_constituents.items()}
     try:
@@ -1557,3 +1521,105 @@ def _builder_fold_dim_expr(
         _expr_constituents.update(const_snapshot)
 
 
+def _enum_member_count(info) -> int | None:
+    """Member count of an int enum, deduped by value (aliases share one).
+
+    Anything non-conforming bails: only all-int-literal members give a
+    provable count, which is exactly the runtime len() of the class.
+    """
+    names = getattr(info, "enum_members", None)
+    if not isinstance(names, list):
+        return None
+    values: set[int] = set()
+    for name in names:
+        node = info.names[name].node if name in info.names else None
+        if not isinstance(node, Var):
+            return None
+        value = _int_value(node.type) if node.type is not None else None
+        if value is None:
+            return None
+        values.add(value)
+    return len(values)
+
+
+def _fold_dim_expr(
+    ctx: FunctionContext | MethodContext, expr: Expression, index: int
+) -> int | Type | None:
+    """A size written as arithmetic over known sizes, else None.
+
+    `a.shape[0] * a.shape[1]`, `n + 1`, `2 * a.shape[0]`, `n // 2`:
+    mypy types all of these `int`, which loses the size. The operands
+    are read from their own types (a literal, or a shape variable) and
+    combined with the dim algebra; what the algebra cannot spell (a
+    sum times a sum) is a fresh unknown, which is still a size.
+    """
+    from numty_plugin import _resolve_dim, _materialize_dim, _fresh_unknown
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+    if isinstance(expr, OpExpr) and expr.op in ("+", "-", "*", "//"):
+        left = _fold_dim_expr(ctx, expr.left, index)
+        right = _fold_dim_expr(ctx, expr.right, index)
+        if left is None or right is None:
+            return None
+        op = "shape-arith"
+        if expr.op == "+":
+            return _dim_add2(ctx, op, index, left, right)
+        if expr.op == "-":
+            if isinstance(right, int):
+                return _dim_add_const(ctx, op, index, left, -right)
+            return _dim_add2(ctx, op, index, left, _dim_mul_const(ctx, op, index, right, -1))
+        if expr.op == "*":
+            if isinstance(right, int):
+                return _dim_mul_const(ctx, op, index, left, right)
+            if isinstance(left, int):
+                return _dim_mul_const(ctx, op, index, right, left)
+            fa, fb = _resolve_dim(left), _resolve_dim(right)
+            if isinstance(fa, (_LinForm, _MonoForm)) and isinstance(fb, (_LinForm, _MonoForm)):
+                product = _form_mul(fa, fb)
+                if product is not None:
+                    return _materialize_dim(ctx, op, index, product)
+            return _fresh_unknown(ctx, op, index)
+        if not isinstance(right, int) or right <= 0:
+            return None
+        if isinstance(left, int):
+            return left // right
+        return _dim_div(ctx, op, index, left, right, 0)
+    lookup = getattr(ctx.api, "lookup_type_or_none", None)
+    tp = lookup(expr) if lookup is not None else None
+    if tp is None:
+        return None
+    dim = _dim_value(tp)
+    return dim if isinstance(dim, (int, TypeVarType)) else None
+
+
+def _has_unknown_shape(tp: Type) -> bool:
+    """An ndarray whose shape is tuple[Any, ...] or Any (NDArray, bare ndarray)."""
+    proper = get_proper_type(tp)
+    if not (
+        isinstance(proper, Instance)
+        and proper.type.fullname == NDARRAY_FULLNAME
+        and len(proper.args) == 2
+    ):
+        return False
+    shape = get_proper_type(proper.args[0])
+    if isinstance(shape, AnyType):
+        return True
+    return (
+        isinstance(shape, Instance)
+        and shape.type.fullname == "builtins.tuple"
+        and isinstance(get_proper_type(shape.args[0]), AnyType)
+    )
+
+
+def _unpack_shape(tp: Type) -> tuple[tuple[list[int | Type], UnpackType, list[int | Type]], Type] | None:
+    """A (*prefix, *Ts, *suffix) ndarray shape with its dtype, else None."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance):
+        return None
+    if proper.type.fullname != NDARRAY_FULLNAME or len(proper.args) != 2:
+        return None
+    split = _shape_dims_unpack(proper.args[0])
+    if split is None:
+        return None
+    return split, proper.args[1]
