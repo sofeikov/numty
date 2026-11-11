@@ -63,7 +63,7 @@ from ._linalg import (
     _dtype_base, _kind_of,
 )
 from ._broadcast_core import (
-    _keep_dtype, _merge_unpack_dims, _solve_broadcast, _whole_shape_operands, _whole_shape_type,
+    _fallback_dtype, _merge_unpack_dims, _solve_broadcast, _whole_shape_operands, _whole_shape_type,
     _whole_shape_var,
 )
 
@@ -685,7 +685,7 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
         if branch_specs:
             dtype_w = _specs_dtype(ctx, branch_specs, branch_dtypes)
         if dtype_w is None:
-            return _whole_shape_type(ctx, var, _keep_dtype(ctx, *branch_dtypes))
+            return _whole_shape_type(ctx, var, _fallback_dtype(ctx, [x, y]))
         return _whole_shape_type(ctx, var, dtype_w)
     # Issue #217: broadcast first, even when a dtype is abstract.
     shapes = _shapes_for_broadcast([cond, x, y])
@@ -700,19 +700,10 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
     specs = [spec for spec in raw_specs if spec is not None]
     if len(specs) != len(raw_specs):
         # Keep the solved shape with a deterministic dtype (issue #217):
-        # the first branch operand's dtype, else dtype[Any]. Never the
-        # trial-varying stub default, and never a bare Any (which would
-        # display as plain Any and drop the shape).
-        xdtype = None
-        ydtype = None
-        for tp, slot in ((x, "x"), (y, "y")):
-            part = _parts_or_unpack(tp) or _movable_int_parts(tp)
-            if part is not None:
-                if slot == "x":
-                    xdtype = part[1]
-                else:
-                    ydtype = part[1]
-        return _ndarray_type(ctx, dims, _keep_dtype(ctx, xdtype, ydtype))
+        # the promotion of the two branch kinds (issue #248), else
+        # dtype[Any]. Never the trial-varying stub default, and never a
+        # bare Any (which would display as plain Any and drop the shape).
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [x, y]))
     branches = [(specs[1][1], specs[1][2]), (specs[2][1], specs[2][2])]
     array_dtypes = []
     for tp in (x, y):
@@ -721,7 +712,7 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, branches, array_dtypes)
     if dtype is None:
-        return _ndarray_type(ctx, dims, _keep_dtype(ctx, *array_dtypes))
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [x, y]))
     return _ndarray_type(ctx, dims, dtype)
 
 
@@ -763,13 +754,10 @@ def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type
     raw_specs = [_operand_spec(tp) for tp in types]
     specs = [spec for spec in raw_specs if spec is not None]
     if len(specs) != len(raw_specs):
-        # Trial-invariant keep-dims (issue #217): actual dtypes, never the
-        # trial-varying stub default and never bare Any.
-        dts: list[Type | None] = []
-        for tp in types:
-            p = _parts_or_unpack(tp) or _movable_int_parts(tp)
-            dts.append(p[1] if p is not None else None)
-        return _ndarray_type(ctx, dims, _keep_dtype(ctx, *dts))
+        # Trial-invariant keep-dims (issue #217): the promotion of the
+        # operand kinds (issue #248), never the trial-varying stub
+        # default and never bare Any.
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, types))
     branches = [(kind, name) for _, kind, name in specs]
     array_dtypes = []
     for tp in types:
@@ -778,11 +766,7 @@ def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, branches, array_dtypes)
     if dtype is None:
-        dts2: list[Type | None] = []
-        for tp in types:
-            p2 = _parts_or_unpack(tp) or _movable_int_parts(tp)
-            dts2.append(p2[1] if p2 is not None else None)
-        return _ndarray_type(ctx, dims, _keep_dtype(ctx, *dts2))
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, types))
     return _ndarray_type(ctx, dims, dtype)
 
 
@@ -1301,17 +1285,9 @@ def _truediv_types(
                 dw = _specs_dtype(ctx, [(kl, nl), (kr, nr)], arr_w)
                 if dw is not None:
                     return _whole_shape_type(ctx, var, dw)
-        # Unpromotable: keep _S with a deterministic float-ish dtype.
-        if not wdtypes:
-            return _whole_shape_type(ctx, var, _keep_dtype(ctx))
-        # Prefer an actual float dtype when one side already has it.
-        for d in wdtypes:
-            if _kind_of(_dtype_fullname(d) or "") in ("f", "c"):
-                return _whole_shape_type(ctx, var, d)
-        fd2 = _construct_dtype(ctx, "numpy.float64")
-        if fd2 is not None:
-            return _whole_shape_type(ctx, var, fd2)
-        return _whole_shape_type(ctx, var, _keep_dtype(ctx, *wdtypes))
+        # Unpromotable: keep _S; the dtype follows the operand kinds
+        # (issue #248: floating / float keeps the floating dtype).
+        return _whole_shape_type(ctx, var, _fallback_dtype(ctx, [left, right], true_div=True))
     # Issue #217: broadcast first, even when a dtype is abstract.
     shapes = _shapes_for_broadcast([left, right])
     if shapes is None:
@@ -1322,21 +1298,12 @@ def _truediv_types(
     raw_specs = [_operand_spec(left), _operand_spec(right)]
     specs = [spec for spec in raw_specs if spec is not None]
     if len(specs) != len(raw_specs):
-        dts: list[Type | None] = []
-        bases: list[str | None] = []
-        for tp in (left, right):
-            p = _parts_or_unpack(tp) or _movable_int_parts(tp)
-            dts.append(p[1] if p is not None else None)
-            bases.append(_dtype_base(p[1]) if p is not None else None)
-        # Division of ints still yields float64 even when the dtype is
-        # abstract (arange's signedinteger[_32Bit|_64Bit] has no fullname
-        # so _operand_spec bails). Check bases, not names.
-        if bases and all(b in ("i", "u", "b") for b in bases):
-            fd = _construct_dtype(ctx, "numpy.float64")
-            if fd is not None:
-                return _maybe_scalar(ctx, dims, fd)
-        # Otherwise keep an actual dtype so the solved shape is not lost.
-        return _maybe_scalar(ctx, dims, _keep_dtype(ctx, *dts))
+        # Division of ints yields float64 even when the dtype is abstract
+        # (arange's signedinteger[_32Bit|_64Bit] has no fullname so
+        # _operand_spec bails), also with a Python scalar on one side
+        # (issue #248). Otherwise the dtype follows the operand kinds, so
+        # the solved shape is not lost.
+        return _maybe_scalar(ctx, dims, _fallback_dtype(ctx, [left, right], true_div=True))
     (_, kind_l, name_l), (_, kind_r, name_r) = specs
     names = {name_l, name_r}
     array_dtypes: list[Type] = []
@@ -1351,11 +1318,11 @@ def _truediv_types(
         if any(_kind_of(name) in ("i", "u", "b") for name in names):
             dtype = _construct_dtype(ctx, "numpy.float64")
             if dtype is None:
-                return _maybe_scalar(ctx, dims, _keep_dtype(ctx, *array_dtypes))
+                return _maybe_scalar(ctx, dims, _fallback_dtype(ctx, [left, right], true_div=True))
             return _maybe_scalar(ctx, dims, dtype)
     dtype = _specs_dtype(ctx, [(kind_l, name_l), (kind_r, name_r)], array_dtypes)
     if dtype is None:
-        return _maybe_scalar(ctx, dims, _keep_dtype(ctx, *array_dtypes))
+        return _maybe_scalar(ctx, dims, _fallback_dtype(ctx, [left, right], true_div=True))
     return _maybe_scalar(ctx, dims, dtype)
 
 

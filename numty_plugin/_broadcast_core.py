@@ -10,6 +10,7 @@ from mypy.types import (
     AnyType, Instance, Type, TypeOfAny, TypeVarTupleType, TypeVarType, UninhabitedType, UnpackType,
     get_proper_type,
 )
+from mypy.subtypes import is_same_type
 
 from ._errors import NUMTY_BROADCAST, _swallowed
 from ._dtypes import _promote_strong, _promote_weak
@@ -24,33 +25,199 @@ from ._reshape import (
 from ._builders import _default_dtype, _scalar_ret_name
 
 
-def _keep_dtype(ctx: FunctionContext | MethodContext, *dtypes: Type | None) -> Type:
-    """First dtype[...] among actual dtypes, else a constructed dtype[Any].
+_KIND_RANK = {"b": 0, "i": 1, "u": 1, "f": 2, "c": 3}
+_WEAK_KIND = {
+    "builtins.bool": "b",
+    "builtins.int": "i",
+    "builtins.float": "f",
+    "builtins.complex": "c",
+}
 
-    Keep-dims fallbacks used the stub's dtype, which varies per overload
-    trial while the actual dtypes are identical in every trial; identical
-    hook results are used, varying ones fall back to the stub's Any
-    (issues #217, #229). Actual dtypes are trial-invariant, and dtype[Any]
-    matches the stub answer.
-    """
-    for dt in dtypes:
-        if dt is None:
-            continue
-        proper = get_proper_type(dt)
-        if (
-            isinstance(proper, Instance)
-            and proper.type.fullname == DTYPE_FULLNAME
-            and proper.args
-        ):
-            return dt
+
+def _loose_dtype_name(dtype: Type) -> str | None:
+    """Canonical dtype name; np.intp reads as its 64-bit member (issue #223)."""
+    name = _dtype_fullname(dtype)
+    if name is not None:
+        return name
+    proper = get_proper_type(dtype)
+    if (
+        isinstance(proper, Instance)
+        and proper.type.fullname == DTYPE_FULLNAME
+        and proper.args
+    ):
+        return _scalar_ret_name(proper.args[0])
+    return None
+
+
+def _array_dtype(tp: Type) -> Type | None:
+    """The dtype of an ndarray type (whatever its shape), or a dtype[...] itself."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance):
+        return None
+    if proper.type.fullname == NDARRAY_FULLNAME and len(proper.args) == 2:
+        return proper.args[1]
+    if proper.type.fullname == DTYPE_FULLNAME:
+        return tp
+    return None
+
+
+def _is_abstract_floating(dtype: Type) -> bool:
+    """dtype[floating[Any]]: a float dtype with no known width."""
+    proper = get_proper_type(dtype)
+    if not isinstance(proper, Instance) or not proper.args:
+        return False
+    element = get_proper_type(proper.args[0])
+    return (
+        isinstance(element, Instance)
+        and element.type.fullname == "numpy.floating"
+        and _loose_dtype_name(dtype) is None
+    )
+
+
+def _abstract_floating(ctx: FunctionContext | MethodContext) -> Type | None:
+    """dtype[floating[Any]], else None when it cannot be built."""
     try:
-        return ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.explicit)])
+        element = ctx.api.named_generic_type("numpy.floating", [AnyType(TypeOfAny.explicit)])
+        return ctx.api.named_generic_type(DTYPE_FULLNAME, [element])
     except Exception:
-        _swallowed(ctx, "_keep_dtype")
-        for dt in dtypes:
-            if dt is not None:
-                return dt
+        _swallowed(ctx, "_abstract_floating")
+        return None
+
+
+def _fallback_dtype(
+    ctx: FunctionContext | MethodContext,
+    operands: list[Type],
+    *,
+    true_div: bool = False,
+) -> Type:
+    """Result dtype when an operand dtype is abstract (issue #248).
+
+    `operands` are the operand types: arrays (or their dtype[...]),
+    numpy scalars and Python scalars. The answer follows numpy promotion on the dtype kinds
+    (bool < integer < floating < complex) and is dtype[Any] when the
+    kinds do not decide it. It never returns an operand dtype that numpy
+    does not give: `intp / 2` is float64, `integer + float64` is float64,
+    `bool * floating` is floating.
+
+    The answer depends on the operand types only, so it is the same in
+    every overload trial (issues #217, #229).
+    """
+    from ._linalg import _dtype_base, _kind_of
+    from ._broadcast import _combine_specs
+
+    try:
+        any_dtype: Type = ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.explicit)])
+    except Exception:
+        _swallowed(ctx, "_fallback_dtype")
         return ctx.default_return_type
+
+    # (kind, name or None, dtype type or None) per array / numpy scalar.
+    strong: list[tuple[str, str | None, Type | None]] = []
+    weak: list[tuple[str, str]] = []
+    for tp in operands:
+        dtype = _array_dtype(tp)
+        if dtype is not None:
+            base = _dtype_base(dtype)
+            if base is None:
+                return any_dtype
+            strong.append((base, _loose_dtype_name(dtype), dtype))
+            continue
+        key = _scalar_key(tp)
+        if key is None:
+            ret_name = _scalar_ret_name(tp)
+            if ret_name is None:
+                return any_dtype
+            key = ("strong", ret_name)
+        if key[0] == "weak":
+            weak_kind = _WEAK_KIND.get(key[1])
+            if weak_kind is None:
+                return any_dtype
+            weak.append((weak_kind, key[1]))
+        else:
+            strong_kind = _kind_of(key[1])
+            if strong_kind is None:
+                return any_dtype
+            strong.append((strong_kind, key[1], None))
+    if not strong:
+        return any_dtype
+    for kind, _, _ in strong:
+        if kind not in _KIND_RANK:
+            return any_dtype
+
+    def _named(name: str) -> Type:
+        # Reuse an operand dtype (exact name first, then np.intp for
+        # int64) so the result keeps the operand's own spelling.
+        for exact in (True, False):
+            for _, _, dtype in strong:
+                if dtype is None:
+                    continue
+                got = _dtype_fullname(dtype) if exact else _loose_dtype_name(dtype)
+                if got == name:
+                    return dtype
+        built = _construct_dtype(ctx, name)
+        return built if built is not None else any_dtype
+
+    strong_top = max(_KIND_RANK[kind] for kind, _, _ in strong)
+    weak_top = max((_KIND_RANK[kind] for kind, _ in weak), default=-1)
+    # True division of bool/integer operands is float64 for every width.
+    if true_div and max(strong_top, weak_top) <= 1:
+        return _named("numpy.float64")
+
+    if all(name is not None for _, name, _ in strong):
+        # Every array dtype is known: normal numpy promotion, arrays and
+        # numpy scalars first, Python scalars last.
+        current: tuple[str, str] | None = None
+        for spec in [("strong", name) for _, name, _ in strong if name is not None] + [
+            ("weak", name) for _, name in weak
+        ]:
+            if current is None:
+                current = spec
+                continue
+            combined = _combine_specs(current, spec)
+            if combined is None:
+                return any_dtype
+            current = ("strong", combined)
+        if current is None:
+            return any_dtype
+        return _named(current[1])
+
+    # At least one abstract dtype (np.integer, np.floating): decide on kinds.
+    if weak_top > strong_top:
+        # A Python float with bool/integer arrays is float64.
+        if weak_top == 2:
+            return _named("numpy.float64")
+        return any_dtype
+    tops = [(name, dtype) for kind, name, dtype in strong if _KIND_RANK[kind] == strong_top]
+    lower_integer = any(_KIND_RANK[kind] == 1 for kind, _, _ in strong) and strong_top > 1
+    lower_floating = any(_KIND_RANK[kind] == 2 for kind, _, _ in strong) and strong_top > 2
+    top_dtypes = [dtype for _, dtype in tops if dtype is not None]
+    same = (
+        len(top_dtypes) == len(tops)
+        and all(is_same_type(top_dtypes[0], dtype) for dtype in top_dtypes[1:])
+    )
+    if strong_top == 2:
+        # An integer operand can widen a float16/float32 result, but
+        # never a float64 one.
+        if all(name == "numpy.float64" for name, _ in tops):
+            return _named("numpy.float64")
+        if same and not lower_integer:
+            return top_dtypes[0]
+        for _, dtype in tops:
+            if dtype is not None and _is_abstract_floating(dtype):
+                return dtype
+        floating = _abstract_floating(ctx)
+        return floating if floating is not None else any_dtype
+    if strong_top == 3:
+        if all(name == "numpy.complex128" for name, _ in tops):
+            return _named("numpy.complex128")
+        if same and not lower_integer and not lower_floating:
+            return top_dtypes[0]
+        return any_dtype
+    # Integer (signedness may be unknown) or bool on top: only identical
+    # dtypes have a known result.
+    if same:
+        return top_dtypes[0]
+    return any_dtype
 
 
 def _whole_shape_operands(
@@ -204,8 +371,9 @@ def _solve_broadcast_scalar(
     if strong is None:
         # Issue #217: an abstract dtype (floating, Any, TypeVar, union)
         # is not a reason to drop the shape. A scalar is neutral for
-        # broadcasting, so keep the array dims and dtype.
-        return _ndarray_type(ctx, dims, dtype)
+        # broadcasting, so keep the array dims. Issue #248: the dtype
+        # follows the kinds (integer * 0.5 is float64), not the array.
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [dtype, other]))
     kind, scalar_name = key
     name = (
         _promote_weak(scalar_name, strong)
@@ -213,12 +381,12 @@ def _solve_broadcast_scalar(
         else _promote_strong(scalar_name, strong)
     )
     if name is None:
-        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype))
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [dtype, other]))
     if name == strong:
         return _ndarray_type(ctx, dims, dtype)
     promoted = _construct_dtype(ctx, name)
     if promoted is None:
-        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype))
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [dtype, other]))
     return _ndarray_type(ctx, dims, promoted)
 
 
@@ -304,14 +472,14 @@ def _broadcast_types(
             if wa[0].fullname == wb[0].fullname:
                 name = _promote_dtypes(wa[1], wb[1])
                 if name is None:
-                    return _whole_shape_type(ctx, wa[0], _keep_dtype(ctx, wa[1], wb[1]))
+                    return _whole_shape_type(ctx, wa[0], _fallback_dtype(ctx, [left, right]))
                 if name == _dtype_fullname(wa[1]):
                     return _whole_shape_type(ctx, wa[0], wa[1])
                 if name == _dtype_fullname(wb[1]):
                     return _whole_shape_type(ctx, wa[0], wb[1])
                 dtype = _construct_dtype(ctx, name)
                 if dtype is None:
-                    return _whole_shape_type(ctx, wa[0], _keep_dtype(ctx, wa[1], wb[1]))
+                    return _whole_shape_type(ctx, wa[0], _fallback_dtype(ctx, [left, right]))
                 return _whole_shape_type(ctx, wa[0], dtype)
             return ctx.default_return_type
         if wa is not None and wb is None:
@@ -332,7 +500,7 @@ def _broadcast_types(
             key = ("strong", name)
         strong = _dtype_fullname(dtype)
         if strong is None:
-            return _whole_shape_type(ctx, var, dtype)
+            return _whole_shape_type(ctx, var, _fallback_dtype(ctx, [left, right]))
         kind, scalar_name = key
         pname = (
             _promote_weak(scalar_name, strong)
@@ -340,12 +508,12 @@ def _broadcast_types(
             else _promote_strong(scalar_name, strong)
         )
         if pname is None:
-            return _whole_shape_type(ctx, var, _keep_dtype(ctx, dtype))
+            return _whole_shape_type(ctx, var, _fallback_dtype(ctx, [left, right]))
         if pname == strong:
             return _whole_shape_type(ctx, var, dtype)
         promoted = _construct_dtype(ctx, pname)
         if promoted is None:
-            return _whole_shape_type(ctx, var, _keep_dtype(ctx, dtype))
+            return _whole_shape_type(ctx, var, _fallback_dtype(ctx, [left, right]))
         return _whole_shape_type(ctx, var, promoted)
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
@@ -370,14 +538,14 @@ def _broadcast_types(
                 return _solve_broadcast_unpack(ctx, left, right, a, b)
             name = _promote_dtypes(aa[1], bb[1])
             if name is None:
-                return _ndarray_type(ctx, dims, _keep_dtype(ctx, aa[1], bb[1]))
+                return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [left, right]))
             if name == _dtype_fullname(aa[1]):
                 return _ndarray_type(ctx, dims, aa[1])
             if name == _dtype_fullname(bb[1]):
                 return _ndarray_type(ctx, dims, bb[1])
             dtype = _construct_dtype(ctx, name)
             if dtype is None:
-                return _ndarray_type(ctx, dims, _keep_dtype(ctx, aa[1], bb[1]))
+                return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [left, right]))
             return _ndarray_type(ctx, dims, dtype)
         if ma is not None and _scalar_key(right) is not None:
             return _solve_broadcast_scalar(ctx, list(ma[0]), ma[1], right)
@@ -430,9 +598,9 @@ def _broadcast_types(
                 return ctx.default_return_type
             return _ndarray_type(ctx, dims, _default_dtype(ctx))
         # Trial-invariant keep-dims dtype (issue #217): the stub's answer
-        # varies per overload trial while the operands do not, so prefer
-        # the actual dtypes (left first) and fall back to dtype[Any].
-        return _ndarray_type(ctx, dims, _keep_dtype(ctx, dtype_a, dtype_b))
+        # varies per overload trial while the operands do not, so derive
+        # the dtype from the operand kinds (issue #248), else dtype[Any].
+        return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [left, right]))
     if name == _dtype_fullname(dtype_a):
         return _ndarray_type(ctx, dims, dtype_a)
     if name == _dtype_fullname(dtype_b):

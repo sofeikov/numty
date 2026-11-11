@@ -1215,6 +1215,38 @@ def test_builder_int_tuple_return_checked() -> None:
         assert "tuple[R, A]" in line, result.stdout
 
 
+def test_abstract_dtype_promotion() -> None:
+    # Issue 248: with an abstract dtype (np.integer, np.intp, np.floating)
+    # the result dtype follows numpy promotion on the kinds. It is not the
+    # dtype of the first operand.
+    result = run_mypy(FIXTURES / "abstract_dtype_promotion_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    f64 = "numpy.dtype[numpy.float64]"
+    floating = "numpy.dtype[numpy.floating[Any]]"
+    for line in (20, 21, 22, 23, 24, 25, 26, 27):
+        assert notes[line] == f'"numpy.ndarray[tuple[N], {f64}]"', result.stdout
+    for line in (28, 29, 30, 31, 32, 39):
+        assert notes[line] == f'"numpy.ndarray[tuple[N], {floating}]"', result.stdout
+    assert notes[33] == f'"numpy.ndarray[_S, {floating}]"', result.stdout
+    assert notes[34] == f'"numpy.ndarray[_S, {f64}]"', result.stdout
+    assert notes[35] == f'"numpy.ndarray[_S, {f64}]"', result.stdout
+    assert "signedinteger[numpy._typing._nbit_base._64Bit]" in notes[36], result.stdout
+    assert "_32Bit | numpy._typing._nbit_base._64Bit" in notes[37], result.stdout
+    assert "numpy.integer[Any]" in notes[38], result.stdout
+
+
+def test_abstract_dtype_promotion_errors() -> None:
+    # Issue 248: `intp / 2` is float64 and `floating / float` keeps the
+    # floating dtype, so both wrong return dtypes are reported.
+    result = run_mypy(FIXTURES / "bad_abstract_dtype_promotion.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert ":13:" in errors[0] and "dtype[float64]" in errors[0], result.stdout
+    assert ":17:" in errors[1] and "dtype[floating[Any]]" in errors[1], result.stdout
+
+
 def test_column_stack_bare_names_items() -> None:
     # Issue 234: the bail names the item type, not the sequence length.
     result = run_mypy(FIXTURES / "bad_column_stack_bare.py")
@@ -3329,8 +3361,10 @@ def test_bundle_b_broadcast_int_whole_r() -> None:
     notes = {line: re.sub(r"\?U@\d+[a-z]?", "?U", n) for line, n in raw.items()}
     # #217: (N, 3) op (3,) keeps both dims with the floating dtype.
     assert notes[25] == '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.floating[Any]]]"', result.stdout
-    assert notes[26] == '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.floating[Any]]]"', result.stdout
-    assert notes[27] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.floating[Any]]]"', result.stdout
+    # Issue 248: with a dtype[Any] operand the result dtype is not known
+    # (the operand can be complex), so it is dtype[Any]. The dims stay.
+    assert notes[26] == '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[Any]]"', result.stdout
+    assert notes[27] == '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"', result.stdout
     # #227: int dims keep rank; unprovable axes mint ?U.
     assert "tuple[int]" in notes[33] and "float64" in notes[33], result.stdout
     assert "tuple[?U]" in notes[34] and "bool" in notes[34], result.stdout
