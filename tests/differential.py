@@ -46,6 +46,7 @@ import itertools
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -277,6 +278,7 @@ class Gen:
 
     def __init__(self, rng: random.Random) -> None:
         self.rng = rng
+        self.current_family: str = ""
 
     # -- operands ---------------------------------------------------------
 
@@ -770,7 +772,11 @@ class Gen:
     )
 
     def expression(self) -> str:
-        return self.rng.choice(self.FAMILIES)(self)
+        family_fn = self.rng.choice(self.FAMILIES)
+        # Single choice (same rng draw as before): the expr stream for a
+        # seed is unchanged. No extra draw for the family record.
+        self.current_family = family_fn.__name__
+        return family_fn(self)
 
 
 class SymGen(Gen):
@@ -974,6 +980,77 @@ class SymGen(Gen):
     def pad(self) -> str:
         a = self.operand()
         return f"np.pad({a.text}, {self.rng.choice(('1', '(1, 2)'))})"
+
+    def bool_operator(self) -> str:
+        r = self.rng
+        a = self.operand(self.shape(r.choice((1, 2, 2, 3))), r.choice(("bool", "np.int64")))
+        if r.random() < 0.8:
+            b = self.operand(a.shape, r.choice(("bool", "np.int64")))
+        else:
+            b = self.operand(self.shape(), r.choice(("bool", "np.int64")))
+        return f"{a.text} {r.choice('&|^')} {b.text}"
+
+    def broadcast_to(self) -> str:
+        r = self.rng
+        a = self.operand()
+        roll = r.random()
+        if roll < 0.35:
+            target = f"{a.text}.shape"
+        elif roll < 0.55:
+            b = self.operand()
+            target = f"{b.text}.shape"
+        elif roll < 0.75:
+            target = f"(1, *{a.text}.shape)"
+        else:
+            target = r.choice(("1", "(1,)", "(2,)", "(1, 2)", "(2, 2)"))
+        return f"np.broadcast_to({a.text}, {target})"
+
+    def linalg(self) -> str:
+        r = self.rng
+        if r.random() < 0.6:
+            n = r.choice(("N", "M", "K"))
+            shape = (n, n)
+        else:
+            shape = self.shape(r.choice((2, 3)))
+        a = self.operand(shape, "")
+        name = r.choice(
+            ("inv", "det", "cholesky", "eigvals", "svd", "qr", "eigh",
+             "slogdet", "matrix_rank", "eig", "eigvalsh", "norm", "cond",
+             "matrix_transpose")
+        )
+        return f"np.linalg.{name}({a.text})"
+
+    def linalg_solve(self) -> str:
+        r = self.rng
+        s = r.choice(("N", "M", "K", "P"))
+        fn = r.choice(("solve", "lstsq"))
+        if r.random() < 0.2:
+            m = r.choice(("N", "M"))
+            a = self.operand((m, s, s), "")
+            # numpy >=2 treats (m, s) as a stack of matrices, not a
+            # vector stack: a batched RHS must be (m, s, 1) to solve.
+            b = self.operand((m, s, 1), "")
+            return f"np.linalg.{fn}({a.text}, {b.text})"
+        a = self.operand((s, s), "")
+        if r.random() < 0.5:
+            b = self.operand((s,), "")
+        else:
+            b = self.operand((s, r.choice(("N", "M", "K", "P"))), "")
+        return f"np.linalg.{fn}({a.text}, {b.text})"
+
+    def lookup(self) -> str:
+        r = self.rng
+        name = r.choice(("searchsorted", "isin", "percentile", "quantile"))
+        if name == "searchsorted":
+            a = self.operand(self.shape(1))
+            b = self.operand()
+        elif name in ("percentile", "quantile"):
+            a = self.operand()
+            b = self.operand(self.shape(1))
+        else:
+            a = self.operand()
+            b = self.operand()
+        return f"np.{name}({a.text}, {b.text})"
 
     # -- *Ts operands (issue #185) ----------------------------------------
     # A variadic prefix, e.g. `F64[*Ts, N, M]`, instantiated at runtime
@@ -1335,7 +1412,7 @@ class SymGen(Gen):
         self.params = []
         self.helpers = []
         expr = self.expression()
-        return Case(expr, list(self.params), list(self.helpers))
+        return Case(expr, list(self.params), list(self.helpers), family=self.current_family)
 
 
 def _names_in(dim: object) -> list[str]:
@@ -1528,6 +1605,7 @@ class Case:
     expr: str
     params: list[tuple[str, str, tuple[object, ...]]] = field(default_factory=list)
     helpers: list["Helper"] = field(default_factory=list)
+    family: str = ""
 
     @property
     def symbolic(self) -> bool:
@@ -1596,7 +1674,11 @@ def generate(seed: int, count: int, symbolic: bool) -> list[Case]:
         gen = SymGen(rng)
         return [gen.case() for _ in range(count)]
     plain = Gen(rng)
-    return [Case(plain.expression()) for _ in range(count)]
+    concrete: list[Case] = []
+    for _ in range(count):
+        expr = plain.expression()
+        concrete.append(Case(expr, family=plain.current_family))
+    return concrete
 
 
 def render(cases: list[Case]) -> tuple[str, list[int]]:
@@ -1885,9 +1967,38 @@ def evaluate(
                 return exc
 
 
-def run_mypy(source: str, workdir: Path) -> tuple[dict[int, str], dict[int, list[str]], str]:
-    """Reveals and errors by line for `source`, plus the raw output."""
+INTERNAL_MARK = "[numty-internal]"
+
+
+def _internal_failures(
+    errors: dict[int, list[str]], line_to_case: dict[int, "Case"]
+) -> list[tuple[int, str, str]]:
+    """(line, case.expr, err) for each [numty-internal] on a reveal line."""
+    hits: list[tuple[int, str, str]] = []
+    for line in sorted(errors):
+        case = line_to_case.get(line)
+        if case is None:
+            continue
+        for err in errors[line]:
+            if INTERNAL_MARK in err:
+                hits.append((line, case.expr, err))
+    return hits
+
+
+def run_mypy(
+    source: str, workdir: Path, *, reuse_cache: bool = False
+) -> tuple[dict[int, str], dict[int, list[str]], str]:
+    """Reveals and errors by line for `source`, plus the raw output.
+
+    Cold by default: the cache is wiped first, so every call is
+    independent of whatever a previous call in this workdir left
+    behind. `reuse_cache=True` keeps it (only for an immediate rerun
+    of the same `source`, e.g. the warm leg of a parity check).
+    """
     workdir.mkdir(parents=True, exist_ok=True)
+    cache = workdir / "cache"
+    if not reuse_cache:
+        shutil.rmtree(cache, ignore_errors=True)
     path = workdir / "cases.py"
     path.write_text(source, encoding="utf-8")
     (workdir / "mypy.ini").write_text("[mypy]\nplugins = numty_plugin\n", encoding="utf-8")
@@ -1895,7 +2006,7 @@ def run_mypy(source: str, workdir: Path) -> tuple[dict[int, str], dict[int, list
     result = subprocess.run(
         [
             sys.executable, "-m", "mypy", "--config-file", "mypy.ini",
-            "--cache-dir", str(workdir / "cache"), "--no-error-summary",
+            "--cache-dir", str(cache), "--no-error-summary",
             "--show-traceback", "cases.py",
         ],
         cwd=workdir,
@@ -1923,17 +2034,51 @@ def check(
     cases: list[Case],
     workdir: Path,
     assignments: tuple[dict[str, int], ...] = SIZE_ASSIGNMENTS,
+    *,
+    warm_parity: bool = False,
 ) -> tuple[list[Finding], dict[str, int]]:
     """Findings and outcome counts for `cases`.
 
     mypy runs once. A symbolic case is then evaluated under every size
     assignment and counted once per assignment; a concrete case has no
     sizes to vary and is counted once.
+
+    With `warm_parity`, mypy runs twice on the same `source` and workdir
+    (second run served from `workdir/cache`); the parsed answers and raw
+    output must match exactly before any case is judged against numpy.
     """
     source, lines = render(cases)
     reveals, errors, raw = run_mypy(source, workdir)
     if "INTERNAL ERROR" in raw or "Traceback (most recent call last)" in raw:
         raise AssertionError("mypy crashed on generated cases:\n" + raw[-4000:])
+    if warm_parity:
+        warm_reveals, warm_errors, warm_raw = run_mypy(source, workdir, reuse_cache=True)
+        if "INTERNAL ERROR" in warm_raw or "Traceback (most recent call last)" in warm_raw:
+            raise AssertionError("mypy crashed on warm rerun:\n" + warm_raw[-4000:])
+        if reveals != warm_reveals:
+            for n in sorted(set(reveals) | set(warm_reveals)):
+                if reveals.get(n) != warm_reveals.get(n):
+                    raise AssertionError(
+                        f"warm/cold reveal mismatch at line {n}:\n"
+                        f"  cold: {reveals.get(n)}\n  warm: {warm_reveals.get(n)}"
+                    )
+        if errors != warm_errors:
+            for n in sorted(set(errors) | set(warm_errors)):
+                if errors.get(n) != warm_errors.get(n):
+                    raise AssertionError(
+                        f"warm/cold error mismatch at line {n}:\n"
+                        f"  cold: {errors.get(n)}\n  warm: {warm_errors.get(n)}"
+                    )
+        if raw != warm_raw:
+            cold_lines, warm_lines = raw.splitlines(), warm_raw.splitlines()
+            for i, (x, y) in enumerate(zip(cold_lines, warm_lines)):
+                if x != y:
+                    raise AssertionError(
+                        f"warm/cold raw mismatch at line {i + 1}:\n  cold: {x}\n  warm: {y}"
+                    )
+            raise AssertionError(
+                f"warm/cold raw length mismatch: {len(cold_lines)} vs {len(warm_lines)}"
+            )
     stray = sorted(set(errors) - set(lines))
     if stray:
         # A helper signature or a `def` line: the generator's mistake,
@@ -1942,11 +2087,39 @@ def check(
             f"{source.splitlines()[n - 1]}\n    {errors[n][0]}" for n in stray[:5]
         )
         raise AssertionError("generated scaffolding does not type-check:\n" + shown)
+    # Tripwire: fail closed on any [numty-internal] on a reveal line,
+    # before judge(). judge() would bury a crash three ways:
+    # _DATA_ERRORS early-return, "numpy raises, flagged" for any errs,
+    # and exact/partial scoring when the reveal is unchecked (internal
+    # is not in _ASSERTING_CODES). Deliberately no Finding kind and no
+    # report()/KNOWN_GAPS path: a crash is never a "known gap".
+    # Scaffolding internals stay stray (already fail above).
+    line_to_case = {line: case for case, line in zip(cases, lines)}
+    hits = _internal_failures(errors, line_to_case)
+    if hits or INTERNAL_MARK in raw:
+        examples = "\n".join(
+            f"line {line}: {expr!r}\n    {err}" for line, expr, err in hits[:5]
+        )
+        total = len(hits) or raw.count(INTERNAL_MARK)
+        raise AssertionError(
+            f"{total} {INTERNAL_MARK} error(s) on generated cases "
+            f"(plugin bug, see numty_plugin._swallowed); check() aborts "
+            f"before scoring — fix the plugin, do not count as a gap:\n"
+            + (examples or f"raw tail:\n{raw[-2000:]}")
+        )
     findings: list[Finding] = []
     stats: dict[str, int] = {}
+    current_family = ""
 
     def count(key: str) -> None:
         stats[key] = stats.get(key, 0) + 1
+        # Additive per-family keys "family|<global-key>"; "|" cannot
+        # occur in global keys or family names. Each judge() call does
+        # exactly one count(), so family totals sum to the family's
+        # outcome count. Hand-made Cases (family=="") skip family keys.
+        if current_family:
+            family_key = f"{current_family}|{key}"
+            stats[family_key] = stats.get(family_key, 0) + 1
 
     def report(
         kind: str,
@@ -2036,6 +2209,7 @@ def check(
             count("agree: partial or no claim")
 
     for case, line in zip(cases, lines):
+        current_family = case.family
         if not case.symbolic:
             used: list[tuple[dict[str, int], tuple[int, ...]]] = [(assignments[0], ())]
         elif case.has_ts:

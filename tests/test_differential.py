@@ -12,6 +12,7 @@ repeatable. For a longer hunt:
 """
 
 import os
+import random
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,85 @@ def test_generation_is_deterministic() -> None:
     again = [c.expr for c in d.generate(7, 50, symbolic=False)]
     assert first == again
     assert first != [c.expr for c in d.generate(8, 50, symbolic=False)]
+
+
+def test_warm_cache_matches_cold(tmp_path: Path) -> None:
+    # Oracle warm-cache parity (#195): the second mypy run on the same
+    # source, served from workdir/cache, reveals exactly what the cold
+    # run did. Seed 7 / 50 symbolic is representative (symbolic exprs,
+    # *Ts, formula dims, generic helpers) and fast.
+    cases = d.generate(7, 50, symbolic=True)
+    assert any(c.has_ts for c in cases)
+    assert any(c.helpers for c in cases)
+    findings, stats = d.check(cases, tmp_path, warm_parity=True)
+    # Non-vacuity: reveals parsed and the plugin actually solved shapes.
+    assert stats.get("agree: exact shape", 0) >= len(cases), stats
+    # Agreement-with-numpy stays the job of test_numty_agrees_with_numpy;
+    # this test must not fail just because the oracle finds a real bug.
+    assert findings is not None
+
+
+@pytest.mark.parametrize(
+    "family",
+    [
+        "bool_operator",
+        "tensordot_axes",
+        "linalg",
+        "linalg_solve",
+        "broadcast_to",
+        "average",
+        "lookup",
+    ],
+)
+def test_new_symbolic_families_agree_with_numpy(family: str, tmp_path: Path) -> None:
+    # Symbolic gap (#195): these families had no symbolic coverage.
+    # Generated in isolation so the main FAMILIES stream (and its fixed
+    # seeds) is untouched - mixing them into SymGen.FAMILIES would
+    # reshuffle every later pick and expose latent plugin bugs outside
+    # this PR's scope. Each family gets a small fixed sample and must
+    # agree with numpy like the main oracle.
+    count = 30
+    gen = d.SymGen(random.Random(11))
+    cases: list[d.Case] = []
+    for _ in range(count):
+        gen.params = []
+        gen.helpers = []
+        expr = getattr(gen, family)()
+        cases.append(
+            d.Case(expr, list(gen.params), list(gen.helpers), family=family)
+        )
+    findings, stats = d.check(cases, tmp_path)
+    assert not findings, (
+        f"{len(findings)} disagreement(s) with numpy (symbolic {family}):\n"
+        + "\n".join(str(f) for f in findings)
+    )
+    assert stats.get("agree: exact shape", 0) >= 1, (family, stats)
+
+
+def test_broken_plugin_trips_internal_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #195 acceptance: a deliberately broken plugin (ImportError in a
+    # submodule, or a raising solver helper) must make the oracle fail,
+    # not degrade to Any and pass. Simulates BROKEN_PLUGIN from
+    # test_internal.py by injecting [numty-internal] into one reveal
+    # line; check() must abort before scoring.
+    cases = d.generate(7, 5, symbolic=True)
+    original_run = d.run_mypy
+
+    def breaking_run(source: str, workdir: Path, *, reuse_cache: bool = False):  # type: ignore[no-untyped-def]
+        reveals, errors, raw = original_run(
+            source, workdir, reuse_cache=reuse_cache
+        )
+        # Inject the crash marker production would emit (_swallowed).
+        line = next(iter(reveals))
+        errors.setdefault(line, []).append(
+            f"numty internal error in matmul {cases[0].expr} [numty-internal]"
+        )
+        raw = raw + f"\ncases.py:{line}: error: numty internal error [numty-internal]"
+        return reveals, errors, raw
+
+    monkeypatch.setattr(d, "run_mypy", breaking_run)
+    with pytest.raises(AssertionError, match=r"\[numty-internal\]"):
+        d.check(cases, tmp_path)
 
 
 ARRAY = "numpy.ndarray[tuple[{}], numpy.dtype[{}]]"
