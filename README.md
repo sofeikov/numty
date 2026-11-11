@@ -997,7 +997,7 @@ can be silenced or selected on its own:
 | `numty-broadcast` | elementwise operands (arithmetic, comparisons, ufuncs, `where`, `broadcast_*`, index arrays) that do not broadcast | `broadcast shapes disagree at trailing axis 0: 3 vs 4` |
 | `numty-callsite` | one shape variable bound to two sizes by the arguments of a call | `call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)` |
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
-| `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack needs a sequence of known length (built dynamically; preallocate or ignore)` |
+| `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
@@ -1027,7 +1027,7 @@ codes.py:10: error: matmul inner dimensions disagree: 3 vs 2  [numty-shape]
 codes.py:11: error: call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)  [numty-callsite]
 codes.py:12: error: where shapes disagree: broadcast shapes disagree at trailing axis 0: 3 vs 4 (shapes (4, 3) vs (4,))  [numty-broadcast]
 codes.py:13: error: axis 2 is out of range for 2 dimensions (shape (4, 3))  [numty-axis]
-codes.py:14: error: stack needs a sequence of known length (built dynamically; preallocate or ignore)  [numty-bail]
+codes.py:14: error: stack: the items have no known shape; annotate the items or ignore  [numty-bail]
 ```
 
 Code that stacks or concatenates lists built at runtime can turn the

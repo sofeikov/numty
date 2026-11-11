@@ -24,6 +24,14 @@ b = np.zeros((n, 3))
 reveal_type(np.linalg.eigvals(a))
 """
 
+BAIL_SOURCE = """\
+import numpy as np
+
+
+def stack_bare(columns: list[np.ndarray]) -> None:
+    np.column_stack([c for c in columns])
+"""
+
 BROKEN_PLUGIN = """\
 import numty_plugin
 from numty_plugin import plugin
@@ -77,14 +85,28 @@ def test_report_counts_solved_bailed_unhooked(tmp_path: Path) -> None:
     )
     solved, bailed, unhooked, crashed, total = (int(x) for x in row.split()[1:6])
     assert solved >= 1, row
-    assert bailed >= 1, row  # np.zeros((n, 3)) with dynamic n
-    assert unhooked >= 1, row  # np.linalg.eigvals has no hook
-    assert crashed == 0, row
+    # MIXED_SOURCE has no numpy bail (zeros solved, eigvals unhooked;
+    # non-numpy SupportsIndex bails are hidden); total is deduped sites.
     assert total == solved + bailed + unhooked + crashed, row
-    assert "top bail reasons" in result.stdout, out
-    assert "numpy._core.multiarray.zeros" in result.stdout, out
+    assert total <= 5, row  # deduped: 2 zeros + eigvals, not 18 events
     assert "top unhooked ops" in result.stdout, out
     assert "numpy.linalg._linalg.eigvals" in result.stdout, out
+
+
+def test_report_counts_numpy_bail(tmp_path: Path) -> None:
+    _write_project(tmp_path, BAIL_SOURCE)
+    result = _run_report(tmp_path, "--top", "5", "repro.py")
+    out = result.stdout + result.stderr
+    assert result.returncode == 1, out  # column_stack bare bails loudly
+    assert "numty report:" in result.stdout, out
+    row = next(
+        line for line in result.stdout.splitlines() if line.startswith("repro.py ")
+    )
+    solved, bailed, unhooked, crashed, total = (int(x) for x in row.split()[1:6])
+    assert bailed >= 1, row
+    assert "top bail reasons" in result.stdout, out
+    assert "column_stack" in result.stdout, out
+    assert "items have no known shape" in result.stdout, out
 
 
 def test_bails_stay_silent_by_default(tmp_path: Path) -> None:
