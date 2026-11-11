@@ -1,4 +1,7 @@
-"""_reshape.py — reshape/transpose/swap/moveaxis. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+"""_reshape.py — reshape/transpose/swap/moveaxis. (Phase 5, #199). Top-level
+imports go to earlier layers only (order in tests/test_layout.py, _LAYERS).
+A function-local facade import is used only for a monkeypatch seam or for a
+helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -6,7 +9,10 @@ from collections.abc import Sequence
 
 from mypy.nodes import ARG_POS, ARG_STAR, ARG_STAR2, Expression, ListExpr, NameExpr, OpExpr, StarExpr, TupleExpr
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
-from mypy.types import AnyType, Instance, LiteralType, NoneType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
+from mypy.types import (
+    AnyType, Instance, LiteralType, NoneType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType,
+    get_proper_type,
+)
 
 from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
 from ._dtypes import _DTYPE_INFO, _NAME_OF_KIND_SIZE, _WEAK_SCALARS, _promote_strong
@@ -14,9 +20,10 @@ from ._forms import _DivForm, _LinForm, _MonoForm, _canon_div, _form_mul, _forms
 from ._exprs import _expr_str
 
 from ._types import (
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _is_bare_name_dim, _linear_product, 
-    _reshape_total_form, _fold_int, _ndarray_parts, _ndarray_type, _shape_from_arg, _int_shape_from_arg, 
-    NDARRAY_FULLNAME, INT_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2,
+    _dim_mul_const, _dim_div, _is_bare_name_dim, _linear_product, _reshape_total_form, _fold_int,
+    _ndarray_parts, _ndarray_type, _shape_from_arg, _int_shape_from_arg, NDARRAY_FULLNAME,
+    INT_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME,
 )
 
 def _dims_str(dims: Sequence[int | Type]) -> str:
@@ -769,7 +776,10 @@ REDUCTION_DTYPES = frozenset(
 
 
 def _solve_transpose(
-    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, rest: list[tuple[Type, Expression | None]]
+    ctx: FunctionContext | MethodContext,
+    dims: list[int | Type],
+    dtype: Type,
+    rest: list[tuple[Type, Expression | None]],
 ) -> Type:
     ndim = len(dims)
     axes: list[int] | None = None

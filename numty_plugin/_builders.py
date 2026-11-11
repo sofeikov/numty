@@ -1,22 +1,36 @@
-"""_builders.py — builders/joiners, mixed guards, like-builders, concat/stack. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+"""_builders.py — builders/joiners, mixed guards, like-builders, concat/stack.
+(Phase 5, #199). Top-level imports go to earlier layers only (order in
+tests/test_layout.py, _LAYERS). A function-local facade import is used only
+for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from typing import cast
 
-from mypy.nodes import CallExpr, Expression, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, StrExpr, TupleExpr, TypeInfo
+from mypy.nodes import (
+    CallExpr, Expression, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr,
+    OpExpr, StarExpr, StrExpr, TupleExpr, TypeInfo,
+)
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
-from mypy.types import AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarType, UnionType, get_proper_type
+from mypy.types import (
+    AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeAliasType,
+    TypeOfAny, TypeVarType, UnionType, get_proper_type,
+)
 
 from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, NUMTY_UNSOLVED, _swallowed
 from ._state import STATE
 from ._trace import _numty_strict, _numty_trace_path, _trace_event
-from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES, _datetime_string_kind
+from ._dtypes import (
+    _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES,
+    _datetime_string_kind,
+)
 
 from ._types import (
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, _int_shape_from_arg, 
-    _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
+    _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
+    _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr,
+    NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._reshape import (
     _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,

@@ -1,4 +1,9 @@
-"""Indexing hooks (Phase 3, #197). Top-level imports go to earlier layers only (tests/test_layout.py, _LAYERS); a function-local facade import is used only for a monkeypatch seam or a helper in a later layer. _fresh_unknown only via facade lazy (never from ._unknowns import) to preserve without_typevars patch. NUMTY/_swallowed from _errors direct."""
+"""Indexing hooks (Phase 3, #197). Top-level imports go to earlier layers only
+(tests/test_layout.py, _LAYERS); a function-local facade import is used only
+for a monkeypatch seam or a helper in a later layer. _fresh_unknown only via
+facade lazy (never from ._unknowns import) to preserve without_typevars
+patch. NUMTY/_swallowed from _errors direct.
+"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

@@ -9,7 +9,7 @@ imported lazily through the facade (a top-level import would cycle)
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING
 
 from mypy.types import AnyType, Type, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType
@@ -59,6 +59,25 @@ def _ns_of_ctx(ctx: object) -> str:
     except Exception:
         _swallowed(ctx, "_ns_of_ctx")
     return ""
+
+def _lookup_ns(
+    table: Mapping[tuple[str, str], TypeVarType], ns: str, fullname: str
+) -> TypeVarType | None:
+    """The object for `fullname` in a table keyed (namespace, fullname).
+
+    The entry of namespace `ns` wins. Without one, the result is the
+    first entry of any namespace in insertion order: a stale entry or a
+    namespace that did not normalize to the same string must still
+    resolve (#198). None when no namespace has the name.
+    """
+    found = table.get((ns, fullname))
+    if found is not None:
+        return found
+    for (_, full), obj in table.items():
+        if full == fullname:
+            return obj
+    return None
+
 
 # Singletons live in STATE (Phase 4 Phase 0, #198); module attrs alias
 # them (same objects, tests/test_layout.py identity + mutation probes).
@@ -335,30 +354,21 @@ def _materialize_dim(
             for tv in current.values():
                 if isinstance(tv, TypeVarType):
                     consts = _expr_constituents.get(tv.fullname)
-                    if consts is not None and (ns, want) in consts:
-                        return consts[(ns, want)]
                     if consts is not None:
-                        # Stale/normalization-miss survival: any-ns scan.
-                        for (n, full), obj in consts.items():
-                            if full == want:
-                                return obj
+                        found = _lookup_ns(consts, ns, want)
+                        if found is not None:
+                            return found
         except Exception:
             _swallowed(ctx, "_materialize_dim")
             pass
         # 2) diff(M+1)->M: the input expr knows its own scope's M.
         if isinstance(prefer, TypeVarType):
             consts = _expr_constituents.get(prefer.fullname)
-            if consts is not None and (_ns_of_ctx(ctx), want) in consts:
-                return consts[(_ns_of_ctx(ctx), want)]
             if consts is not None:
-                for (n, full), obj in consts.items():
-                    if full == want:
-                        return obj
-        seen = _seen_vars.get((_ns_of_ctx(ctx), want))
+                found = _lookup_ns(consts, _ns_of_ctx(ctx), want)
+                if found is not None:
+                    return found
+        seen = _lookup_ns(_seen_vars, _ns_of_ctx(ctx), want)
         if seen is not None:
             return seen
-        # Stale fallback: any-ns scan (never shadows current above).
-        for (n, full), obj in _seen_vars.items():
-            if full == want:
-                return obj
     return _expr_var(ctx, op, index, form)

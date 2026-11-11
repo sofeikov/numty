@@ -20,11 +20,11 @@ jobs:
           enable-cache: true
       - name: Run ruff
         run: uv run ruff check .
-      - name: Type-check the plugin with ty
+      - name: Type-check with ty (excludes in pyproject.toml)
         # The plugin had 95 ty errors and no check. Three of them were
         # real defects (a method that does not exist on UnionType, a
         # wrong attribute on TupleType, a string compared as an object).
-        run: uv run ty check numty_plugin
+        run: uv run ty check
 
   test:
     # Issue #164 step 2: hooks key on private numpy module paths, so the

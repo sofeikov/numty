@@ -1,4 +1,8 @@
-"""_hooks.py — sole dispatch owner (Plugin + get_* + _method_hook + _numpy_function_hooks). (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+"""_hooks.py — sole dispatch owner (Plugin + get_* + _method_hook +
+_numpy_function_hooks). (Phase 5, #199). Top-level imports go to earlier
+layers only (order in tests/test_layout.py, _LAYERS). A function-local
+facade import is used only for a monkeypatch seam or for a helper in a later
+layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -6,9 +10,18 @@ from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING
 
-from mypy.nodes import ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo, TypeVarLikeExpr, Var
-from mypy.plugin import AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext, Plugin
-from mypy.types import AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type
+from mypy.nodes import (
+    ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo,
+    TypeVarLikeExpr, Var,
+)
+from mypy.plugin import (
+    AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
+    MethodSigContext, Plugin,
+)
+from mypy.types import (
+    AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
+    TypeOfAny, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
+)
 
 if TYPE_CHECKING:
     from mypy.tvar_scope import TypeVarLikeScope
@@ -21,44 +34,72 @@ from ._forms import _LinForm, _is_unknown_fullname
 from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
 
 from ._types import (
-    _int_value, _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _iter_tvarlikes, _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray, _info_mentions_array, _note_rank_mismatches, _ndarray_type, INT_FULLNAME, TUPLE_FULLNAME, _OPERATOR_DUNDERS
+    _int_value, _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _iter_tvarlikes,
+    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray,
+    _info_mentions_array, _note_rank_mismatches, _ndarray_type, INT_FULLNAME, TUPLE_FULLNAME,
+    _OPERATOR_DUNDERS,
 )
 from ._builders import (
-    _movable_parts, 
-    _guard_mixed, zeros_like_hook, _named_dtype, 
-    like_function_hook, copy_function_hook, ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook, identity_function_hook, tri_function_hook, arange_function_hook, concatenate_function_hook, vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook, stack_function_hook
+    _movable_parts, _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook,
+    copy_function_hook, ascontiguousarray_function_hook, full_function_hook, eye_function_hook,
+    linspace_function_hook, identity_function_hook, tri_function_hook, arange_function_hook,
+    concatenate_function_hook, vstack_function_hook, hstack_function_hook, dstack_function_hook,
+    column_stack_function_hook, stack_function_hook,
 )
 from ._matmul import (
-    _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, 
-    dot_function_hook, dot_method_hook, matmul_method_hook, rmatmul_method_hook, imatmul_method_hook, inner_function_hook, 
-    outer_function_hook, kron_function_hook, vdot_function_hook, tensordot_function_hook
+    _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, dot_function_hook,
+    dot_method_hook, matmul_method_hook, rmatmul_method_hook, imatmul_method_hook,
+    inner_function_hook, outer_function_hook, kron_function_hook, vdot_function_hook,
+    tensordot_function_hook,
 )
 from ._ops import (
-    flip_function_hook, fliplr_function_hook, 
-    flipud_function_hook, trace_function_hook, trace_method_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, corrcoef_function_hook, 
-    cov_function_hook, roll_function_hook, gradient_function_hook, rot90_function_hook, convolve_function_hook, correlate_function_hook, tile_function_hook, repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook, 
-    array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, flatnonzero_function_hook, argwhere_function_hook, 
-    unique_function_hook, isin_function_hook, searchsorted_function_hook, sliding_window_view_function_hook, atleast_function_hook
+    flip_function_hook, fliplr_function_hook, flipud_function_hook, trace_function_hook,
+    trace_method_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook,
+    corrcoef_function_hook, cov_function_hook, roll_function_hook, gradient_function_hook,
+    rot90_function_hook, convolve_function_hook, correlate_function_hook, tile_function_hook,
+    repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook,
+    array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook,
+    flatnonzero_function_hook, argwhere_function_hook, unique_function_hook, isin_function_hook,
+    searchsorted_function_hook, sliding_window_view_function_hook, atleast_function_hook,
 )
 from ._reshape import (
-    _reshape_new_dims, _all_positionals, 
-    _scalar_key, 
-    reshape_method_hook, reshape_function_hook, transpose_method_hook, transpose_function_hook, swapaxes_function_hook, swapaxes_method_hook, moveaxis_function_hook, 
-    rollaxis_function_hook, matrix_transpose_function_hook, mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook, 
-    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook
+    _reshape_new_dims, _all_positionals, _scalar_key, reshape_method_hook, reshape_function_hook,
+    transpose_method_hook, transpose_function_hook, swapaxes_function_hook, swapaxes_method_hook,
+    moveaxis_function_hook, rollaxis_function_hook, matrix_transpose_function_hook,
+    mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook,
+    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook,
 )
 from ._reductions import (
-    allany_method_hook, allany_function_hook, reduction_method_hook, ufunc_method_hook, 
-    arg_method_hook, arg_function_hook, 
-    rng_method_hook, legacy_rand_hook, percentile_function_hook, reduction_function_hook, average_function_hook, cumsum_function_hook, cumsum_method_hook, ravel_method_hook, flatten_method_hook, ravel_function_hook, diff_function_hook
+    allany_method_hook, allany_function_hook, reduction_method_hook, ufunc_method_hook,
+    arg_method_hook, arg_function_hook, rng_method_hook, legacy_rand_hook, percentile_function_hook,
+    reduction_function_hook, average_function_hook, cumsum_function_hook, cumsum_method_hook,
+    ravel_method_hook, flatten_method_hook, ravel_function_hook, diff_function_hook,
 )
 
-from ._fft import fft2_function_hook, fft_function_hook, fftn_function_hook, fftshift_function_hook, irfft_function_hook, rfft2_function_hook, rfft_function_hook, rfftn_function_hook
+from ._fft import (
+    fft2_function_hook, fft_function_hook, fftn_function_hook, fftshift_function_hook,
+    irfft_function_hook, rfft2_function_hook, rfft_function_hook, rfftn_function_hook,
+)
 from ._einsum import _einsum_signature_hook, einsum_function_hook
-from ._linalg import _linalg_cross_signature_hook, _norm_signature_hook, cross_function_hook, linalg_cross_function_hook, linalg_function_hook
-from ._indexing import getitem_method_hook, setitem_method_hook, take_along_axis_function_hook, take_function_hook, take_method_hook
-from ._broadcast import angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook, clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook, divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook, logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook, truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook
-from ._heads import _FAM_HEAD_DTYPES, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string
+from ._linalg import (
+    _linalg_cross_signature_hook, _norm_signature_hook, cross_function_hook,
+    linalg_cross_function_hook, linalg_function_hook,
+)
+from ._indexing import (
+    getitem_method_hook, setitem_method_hook, take_along_axis_function_hook, take_function_hook,
+    take_method_hook,
+)
+from ._broadcast import (
+    angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook,
+    clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook,
+    divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook,
+    logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,
+    truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
+)
+from ._heads import (
+    _FAM_HEAD_DTYPES, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
+    _fam_expr, _fam_head, _fam_string,
+)
 from ._broadcast import (
     _dtype_base,
 )

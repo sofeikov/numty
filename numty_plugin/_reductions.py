@@ -1,18 +1,25 @@
-"""_reductions.py — reductions/cumsum/diff/average/percentile/ufunc. (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+"""_reductions.py — reductions/cumsum/diff/average/percentile/ufunc. (Phase 5,
+#199). Top-level imports go to earlier layers only (order in
+tests/test_layout.py, _LAYERS). A function-local facade import is used only
+for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
 
 from mypy.nodes import AssignmentStmt, CallExpr, Expression, ListExpr, MemberExpr, NameExpr, StarExpr, TupleExpr, Var
 from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
+from mypy.types import (
+    AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType,
+    get_proper_type,
+)
 
 from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
 from ._forms import _DivForm, _form_has_unknown, _is_unknown_fullname
 
 from ._types import (
-    _int_value, _dim_eq, _dim_add_const, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _distribute_solve, _split_flat, _ndarray_type, _int_shape_from_arg, 
-    NDARRAY_FULLNAME
+    _int_value, _dim_eq, _dim_add_const, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack,
+    _has_unpack, _distribute_solve, _split_flat, _ndarray_type, _int_shape_from_arg,
+    NDARRAY_FULLNAME,
 )
 from ._reshape import (
     REDUCTION_DTYPES, _all_positionals, _all_positionals_expanded, _construct_datetime_dtype,

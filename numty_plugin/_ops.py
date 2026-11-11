@@ -1,4 +1,7 @@
-"""_ops.py — misc shape ops (flip/trace/diag/tile/repeat/pad/split/nonzero). (Phase 5, #199). Top-level imports go to earlier layers only (order in tests/test_layout.py, _LAYERS). A function-local facade import is used only for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
+"""_ops.py — misc shape ops (flip/trace/diag/tile/repeat/pad/split/nonzero).
+(Phase 5, #199). Top-level imports go to earlier layers only (order in
+tests/test_layout.py, _LAYERS). A function-local facade import is used only
+for a monkeypatch seam or for a helper in a later layer (_LAZY_UPWARD).
 """
 from __future__ import annotations
 
@@ -12,7 +15,8 @@ from ._dtypes import _DTYPE_INFO
 from ._forms import _LinForm
 
 from ._types import (
-    _int_value, _dim_value, _dim_eq, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg
+    _int_value, _dim_value, _dim_eq, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims,
+    _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg,
 )
 from ._reshape import (
     _all_positionals, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _is_none_type,
