@@ -90,7 +90,9 @@ def _is_project_file(file: str) -> bool:
     A fresh-cache mypy run also evaluates hooks inside third-party
     stubs (attribute defaults, overload candidates), which would
     drown the per-file table. Those live in site-packages, typeshed,
-    or `.pyi` files; project code is `.py` everywhere else.
+    or `.pyi` files; project code is `.py` everywhere else. The numty
+    package itself (issue 235: 76 events for numty/__init__.py from a
+    2-op file) is library noise like stubs, hidden unless asked.
     """
     lowered = file.replace("\\", "/").lower()
     if lowered.endswith(".pyi"):
@@ -98,13 +100,54 @@ def _is_project_file(file: str) -> bool:
     for marker in ("site-packages/", "dist-packages/", "/typeshed/", "typeshed/"):
         if marker in lowered:
             return False
+    # Issue 235: numty's own package is not user code.
+    if "/numty/__init__.py" in lowered or "/numty_plugin/" in lowered:
+        return False
     return True
+
+
+def _is_numpy_op(op: str) -> bool:
+    """Whether an op is a numpy operation (issue 235).
+
+    Trace includes non-numpy ops (SupportsIndex.__index__, builtins.len,
+    polars methods) with bail outcome; those are not numpy calls and
+    drown the report (1,741 non-numpy sites on omnisync). Only numpy.*
+    counts in the main table; the rest are hidden unless --all-files.
+    """
+    return op.startswith("numpy.")
 
 
 def _print_report(events: list[dict], top: int, show_all: bool) -> None:
     hidden = sum(1 for e in events if not _is_project_file(str(e.get("file", ""))))
     if not show_all:
         events = [e for e in events if _is_project_file(str(e.get("file", "")))]
+    # Issue 235: dedup by (file, line, col, op); a site is solved if any
+    # event there is solved (mypy visits each site several times: overload
+    # candidates, re-inference). Non-numpy ops are hidden unless asked.
+    # Crash beats solved (plugin bug must show), solved beats bail (trial
+    # bails from non-selected overloads hide), bail beats unhooked.
+    if not show_all:
+        events = [e for e in events if _is_numpy_op(str(e.get("op", "")))]
+    # Priority: crash first, then solved, bail, unhooked.
+    rank = {"crash": 0, "solved": 1, "bail": 2, "unhooked": 3}
+    best: dict[tuple[str, int, int, str], dict] = {}
+    for event in events:
+        outcome = event.get("outcome")
+        if outcome not in OUTCOMES:
+            continue
+        try:
+            line = int(event.get("line", 0))
+        except (TypeError, ValueError):
+            line = 0
+        try:
+            col = int(event.get("col", event.get("column", 0)))
+        except (TypeError, ValueError):
+            col = 0
+        key = (str(event.get("file", "")), line, col, str(event.get("op", "")))
+        prev = best.get(key)
+        if prev is None or rank.get(str(outcome), 9) < rank.get(str(prev.get("outcome")), 9):
+            best[key] = event
+    events = list(best.values())
     per_file: dict[str, Counter] = {}
     bail_reasons: Counter[tuple[str, str]] = Counter()
     unhooked_ops: Counter[str] = Counter()

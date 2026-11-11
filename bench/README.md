@@ -22,7 +22,7 @@ PYTHONPATH=. uv run mypy bench/ml.py bench/mathlib.py bench/bugs.py
 Scorecard:
 
 - Clean files: **one diagnostic each**, both false positives on code that
-  runs: the loud `stack needs a sequence of known length` bail on an
+  runs: the loud `stack: the items have no known shape` bail on an
   `np.stack` over a list comprehension (`ml.py:115`, `mathlib.py:147`),
   tracked in [#30](https://github.com/sofeikov/numty/issues/30).
   Everything else stays silent, because unknown shapes bail instead of

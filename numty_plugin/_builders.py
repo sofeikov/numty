@@ -112,6 +112,9 @@ def _builder_shape(
         dim = _dim_value(tp)
         if isinstance(dim, (int, TypeVarType)):
             return [dim]
+        plain = get_proper_type(tp)
+        if isinstance(plain, Instance) and plain.type.fullname == INT_FULLNAME:
+            return [plain.copy_modified(last_known_value=None)]
         return None
     proper = get_proper_type(tp)
     if (
@@ -151,7 +154,9 @@ def _builder_shape(
         value = _fold_int(item)
         dim = value if value is not None else _dim_value(item_tp)
         if dim is None and stub_items is not None:
-            dim = _dim_value(stub_items[i])
+            stub_dim = _dim_value(stub_items[i])
+            if isinstance(stub_dim, int):
+                dim = stub_dim
         if dim is not None:
             out.append(dim)
             continue
@@ -161,6 +166,10 @@ def _builder_shape(
         out.append(dynamic.copy_modified(last_known_value=None))
     if not any(isinstance(d, (int, TypeVarType)) for d in out):
         return None
+    # Issue 233: only int literals ride the stubs' context-solved answer.
+    # (TypeVar adoption launders R-vs-A; plain-int handling below keeps
+    # single-dim honest.) Tuple plain-int vs TypeVar inline trust is a
+    # mypy overload artefact; single-dim already checks both paths.
     return out
 
 
@@ -379,7 +388,23 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                         code=NUMTY_UNSOLVED,
                     )
             elif _numty_trace_path() is not None:
-                _trace_event(ctx, fullname, "solved", "")
+                # Issue 234: explicit [numty-bail] errors return Any (to
+                # hide downstream assignment noise, keeping a single error)
+                # but must still count as bailed for the report, not solved.
+                try:
+                    proper_res = get_proper_type(result)
+                    is_error_any = isinstance(
+                        proper_res, AnyType
+                    ) and proper_res.type_of_any == TypeOfAny.from_error
+                except Exception:
+                    _swallowed(ctx, fullname)
+                    is_error_any = False
+                if is_error_any:
+                    _trace_event(
+                        ctx, fullname, "bail", "explicit bail (items have no known shape)"
+                    )
+                else:
+                    _trace_event(ctx, fullname, "solved", "")
         # Only a stub answer holding a Literal or plain `int` dim can be
         # widened, so most calls (np.isscalar, .shape, scalar reductions)
         # skip the operands.
@@ -1270,8 +1295,8 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
             if elem is not None:
                 return _concat_dynamic(ctx, pairs, elem)
             ctx.api.fail(
-                "concatenate needs a sequence of known length "
-                "(built dynamically; preallocate or ignore)",
+                "concatenate: the items have no known shape; "
+                "annotate the items or ignore",
                 ctx.context,
                 code=NUMTY_BAIL,
             )
@@ -1412,8 +1437,8 @@ def _stack_solve(
             elem = _dynamic_sequence_element(ctx, pairs[0][0], pairs[0][1])
             if elem is None:
                 ctx.api.fail(
-                    f"{kind} needs a sequence of known length "
-                    "(built dynamically; preallocate or ignore)",
+                    f"{kind}: the items have no known shape; "
+                    "annotate the items or ignore",
                     ctx.context,
                     code=NUMTY_BAIL,
                 )
@@ -1582,8 +1607,8 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
             if elem is not None:
                 return _stack_dynamic(ctx, pairs, elem)
             ctx.api.fail(
-                "stack needs a sequence of known length "
-                "(built dynamically; preallocate or ignore)",
+                "stack: the items have no known shape; "
+                "annotate the items or ignore",
                 ctx.context,
                 code=NUMTY_BAIL,
             )

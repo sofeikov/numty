@@ -1157,6 +1157,27 @@ def test_generic_namedtuple_context_kept() -> None:
     assert "error:" not in result.stdout
 
 
+def test_builder_int_return_checked() -> None:
+    # Issue 233: a plain-int builder size checks like the named value.
+    # Single-dim inline and named both fail ([int] vs [R]).
+    result = run_mypy(FIXTURES / "bad_builder_int_return.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    for line in errors:
+        assert "[return-value]" in line, result.stdout
+
+
+def test_column_stack_bare_names_items() -> None:
+    # Issue 234: the bail names the item type, not the sequence length.
+    result = run_mypy(FIXTURES / "bad_column_stack_bare.py")
+    assert result.returncode == 1, result.stdout
+    assert "the items have no known shape" in result.stdout, result.stdout
+    assert "annotate the items or ignore" in result.stdout, result.stdout
+    assert "known length" not in result.stdout, result.stdout
+    assert "preallocate" not in result.stdout, result.stdout
+
+
 def test_permutation_of_a_0d_array() -> None:
     # numpy raises; numty used to reveal shape () for it.
     result = run_mypy(FIXTURES / "bad_permutation_0d.py")
@@ -2259,7 +2280,7 @@ def test_sklearn_gnb_stack_dynamic_length() -> None:
     result = run_mypy(FIXTURES / "sklearn_gnb.py")
     assert_single_error(
         result,
-        "stack needs a sequence of known length",
+        "stack: the items have no known shape",
     )
     run = subprocess.run(
         [sys.executable, str(FIXTURES / "sklearn_gnb.py")],
@@ -4159,5 +4180,5 @@ def test_sklearn_clean_under_allow_redefinition() -> None:
     result = run_mypy(FIXTURES / "sklearn_gnb.py", flags=("--allow-redefinition",))
     assert_single_error(
         result,
-        "stack needs a sequence of known length",
+        "stack: the items have no known shape",
     )
