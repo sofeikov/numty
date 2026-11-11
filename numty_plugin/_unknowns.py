@@ -1,8 +1,7 @@
 """Fresh-unknown minting (Phase 3, #197). Leaf: _forms + mypy only.
 
-Owns _unknown_ids/_unknown_names/_unknown_per_line (moved from
-_exprs so _exprs -> _unknowns -> _forms DAG, one owner per
-singleton). _fake_unknown via facade patch in tests still works:
+Aliases STATE.unknown_* (Phase 4 Phase 0 verbatim bundle; _state owns
+the singletons). _fresh_unknown via facade patch in tests still works:
 facade callers (_dim_*) resolve _fresh_unknown through the facade
 global; _unknowns must never be called directly from _fft etc.
 """
@@ -13,17 +12,18 @@ from typing import TYPE_CHECKING
 from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
 
 from ._forms import _is_unknown_fullname
+from ._state import STATE
 
 if TYPE_CHECKING:
     from mypy.plugin import AttributeContext, FunctionContext, MethodContext
     from mypy.types import Type
 
 
-_unknown_ids: dict[str, TypeVarId] = {}
+_unknown_ids = STATE.unknown_ids
 # Display names of unknowns by fullname, and how many distinct unknowns
 # each (module, line) has minted. Names only: identity stays the id.
-_unknown_names: dict[str, str] = {}
-_unknown_per_line: dict[tuple[str, int], int] = {}
+_unknown_names = STATE.unknown_names
+_unknown_per_line = STATE.unknown_per_line
 
 
 def _is_same_unknown(a: int | Type, b: int | Type) -> bool:

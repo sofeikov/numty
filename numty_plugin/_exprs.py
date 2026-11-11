@@ -1,11 +1,10 @@
 """Expr registries + TypeVar minting (Phase 2, #196).
 
-Depends on ._forms + ._unknowns + mypy types. Owns the expr
-singletons (_expr_forms/_expr_ids/_seen_vars/_implicit_scope_vars/
-_expr_constituents); _unknown_* singletons live in _unknowns.
-Lazy-imports _iter_tvarlikes from the facade to avoid cycles while
-__init__ still holds the caller (_swallowed comes directly from
-._errors, no cycle).
+Depends on ._forms + ._unknowns + ._state + mypy types. Singletons
+alias STATE (Phase 4 Phase 0 verbatim bundle); _unknown_* singletons
+live in _state via _unknowns. Lazy-imports _iter_tvarlikes from the
+facade to avoid cycles while __init__ still holds the caller
+(_swallowed comes directly from ._errors, no cycle).
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ from mypy.types import AnyType, Type, TypeOfAny, TypeVarId, TypeVarLikeType, Typ
 
 from ._errors import _swallowed
 from ._forms import _DivForm, _LinForm, _MonoForm, _eval_form
+from ._state import STATE
 from ._unknowns import _unknown_ids, _unknown_names, _unknown_per_line
 
 if TYPE_CHECKING:
@@ -28,9 +28,11 @@ def _iter_tvarlikes_lazy(tp: Type) -> Iterator[TypeVarLikeType]:
 
     return _iter_tvarlikes(tp)
 
-_expr_forms: dict[str, _LinForm | _DivForm | _MonoForm] = {}
-_expr_ids: dict[str, TypeVarId] = {}
-_seen_vars: dict[str, TypeVarType] = {}
+# Singletons live in STATE (Phase 4 Phase 0, #198); module attrs alias
+# them (same objects, tests/test_layout.py identity + mutation probes).
+_expr_forms = STATE.expr_forms
+_expr_ids = STATE.expr_ids
+_seen_vars = STATE.seen_vars
 # Implicit dims by defining function (issue #145): (namespace, word) ->
 # the TypeVarType minted for the signature. A local `r: F64["batch out"]`
 # is analyzed in a scope that does not see the signature's bindings, so a
@@ -38,13 +40,13 @@ _seen_vars: dict[str, TypeVarType] = {}
 # subtype checking fails on identical shapes. Reusing the signature's
 # object (via bind_existing) keeps one word one dim per function, like
 # declared TypeVars, while different functions keep independent vars.
-_implicit_scope_vars: dict[tuple[str, str], TypeVarLikeType] = {}
+_implicit_scope_vars = STATE.implicit_scope_vars
 # Per-expr constituent objects by scope (issue #32 finish): expr fullname
 # -> {constituent fullname -> TypeVarType object from the defining scope}.
 # Lets diff(M+1) -> M return the *current* function's M instead of the
 # process-wide _seen_vars entry (which caused N@first vs N@second in
 # issue #43).
-_expr_constituents: dict[str, dict[str, TypeVarType]] = {}
+_expr_constituents = STATE.expr_constituents
 
 # Synthetic tvar namespaces the plugin mints (issue #42): implicit dims
 # for undeclared string-spec words, and formula-named expression dims.
