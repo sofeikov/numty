@@ -440,6 +440,7 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
                 eager.add(a.name)
     expected = {
         "_broadcast",
+        "_broadcast_core",
         "_builders",
         "_dtypes",
         "_einsum",
@@ -499,6 +500,7 @@ _LAYERS = (
     "_einsum",
     "_linalg",
     "_reductions",
+    "_broadcast_core",
     "_matmul",
     "_ops",
     "_broadcast",
@@ -514,28 +516,10 @@ _LAZY_SEAMS = frozenset(
     {"_broadcast_result", "_resolve_dim", "_materialize_dim", "_fresh_unknown"}
 )
 
-# Function-local facade imports that are still necessary because the
-# name is in a later layer (or in the facade). This list must only get
-# shorter: move the helper to an earlier layer, then delete its entry.
-_LAZY_UPWARD: dict[str, list[str]] = {'_broadcast': ['_unpack_shape'],
- '_builders': ['_enum_member_count'],
- '_exprs': ['_iter_tvarlikes'],
- '_hooks': ['_warn_startup'],
- '_linalg': ['_dtype_base', '_kind_of', '_maybe_scalar', '_scalar_of_dtype', '_string_value'],
- '_matmul': ['_merge_unpack_dims', '_same_unpack', '_solve_broadcast', '_unpack_shape'],
- '_ops': ['_fft_seq_arg'],
- '_reductions': ['_kind_of'],
- '_reshape': ['_check_unique_axes',
-              '_construct_dtype',
-              '_int_or_none',
-              '_is_mixed_shape',
-              '_is_plain_int',
-              '_mixed_result',
-              '_movable_parts',
-              '_picture_complete',
-              '_unknown_axis_parts',
-              '_unpack_shape'],
- '_types': ['_enum_member_count', '_fold_dim_expr', '_has_unknown_shape', '_unpack_shape']}
+# Function-local facade imports of a name in a later layer (or in the
+# facade). The list is empty and must stay empty: put a shared helper
+# in a layer that is earlier than all its callers.
+_LAZY_UPWARD: dict[str, list[str]] = {}
 
 
 def _module_trees() -> dict[str, ast.Module]:

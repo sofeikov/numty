@@ -1,8 +1,7 @@
 """_hooks.py — sole dispatch owner (Plugin + get_* + _method_hook +
 _numpy_function_hooks). (Phase 5, #199). Top-level imports go to earlier
 layers only (order in tests/test_layout.py, _LAYERS). A function-local
-facade import is used only for a monkeypatch seam or for a helper in a later
-layer (_LAZY_UPWARD).
+facade import is used only for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from mypy.nodes import (
     ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo,
-    TypeVarLikeExpr, Var,
+    TypeVarLikeExpr,
 )
 from mypy.plugin import (
     AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
@@ -28,23 +27,22 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed
+from ._errors import NUMTY_ANNOTATION, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
 from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
 
 from ._types import (
-    _int_value, _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _iter_tvarlikes,
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray,
-    _info_mentions_array, _note_rank_mismatches, _ndarray_type, INT_FULLNAME, TUPLE_FULLNAME,
-    _OPERATOR_DUNDERS,
+    _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _conflict_pairs,
+    _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray, _info_mentions_array,
+    _note_rank_mismatches, _ndarray_type, INT_FULLNAME, TUPLE_FULLNAME, _OPERATOR_DUNDERS,
 )
 from ._builders import (
-    _movable_parts, _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook,
-    copy_function_hook, ascontiguousarray_function_hook, full_function_hook, eye_function_hook,
-    linspace_function_hook, identity_function_hook, tri_function_hook, arange_function_hook,
-    concatenate_function_hook, vstack_function_hook, hstack_function_hook, dstack_function_hook,
-    column_stack_function_hook, stack_function_hook,
+    _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
+    ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook,
+    identity_function_hook, tri_function_hook, arange_function_hook, concatenate_function_hook,
+    vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook,
+    stack_function_hook,
 )
 from ._matmul import (
     _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, dot_function_hook,
@@ -100,8 +98,17 @@ from ._heads import (
     _FAM_HEAD_DTYPES, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string,
 )
-from ._broadcast import (
+from ._exprs import (
+    _iter_tvarlikes,
+)
+from ._reshape import (
+    _movable_parts,
+)
+from ._linalg import (
     _dtype_base,
+)
+from ._types import (
+    _enum_member_count,
 )
 
 class NumtyPlugin(Plugin):
@@ -132,8 +139,6 @@ class NumtyPlugin(Plugin):
         run during semantic analysis, when modules are still loading,
         so they do not run this check.)
         """
-        from numty_plugin import _warn_startup
-
         if not fullname.startswith("numpy."):
             return
         try:
@@ -1292,27 +1297,6 @@ def _t_type(ctx: AttributeContext, tp: Type) -> Type:
         dims, dtype = parts
         return _ndarray_type(ctx, list(reversed(dims)), dtype)
     return ctx.default_attr_type
-
-
-def _enum_member_count(info) -> int | None:
-    """Member count of an int enum, deduped by value (aliases share one).
-
-    Anything non-conforming bails: only all-int-literal members give a
-    provable count, which is exactly the runtime len() of the class.
-    """
-    names = getattr(info, "enum_members", None)
-    if not isinstance(names, list):
-        return None
-    values: set[int] = set()
-    for name in names:
-        node = info.names[name].node if name in info.names else None
-        if not isinstance(node, Var):
-            return None
-        value = _int_value(node.type) if node.type is not None else None
-        if value is None:
-            return None
-        values.add(value)
-    return len(values)
 
 
 def len_function_hook(ctx: FunctionContext) -> Type:

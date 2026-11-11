@@ -7,29 +7,32 @@ from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
 from ._types import (
-    _dim_div, _dim_value, _fold_int, _int_value, _ndarray_parts, _ndarray_type,
+    _dim_div, _ndarray_parts, _ndarray_type,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _is_none_type, _normalize_axis,
+    _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _normalize_axis,
 )
 from ._builders import (
-    _construct_dtype, _default_dtype,
-)
-from ._ops import (
-    _int_or_none, _positionals_only,
-)
-from ._broadcast import (
-    _dtype_base,
+    _default_dtype,
 )
 
 if TYPE_CHECKING:
-    from mypy.nodes import Expression, ListExpr, NameExpr, TupleExpr
+    from mypy.nodes import Expression
     from mypy.plugin import FunctionContext
-    from mypy.types import TupleType, Type, get_proper_type
+    from mypy.types import Type
 
 # Runtime-only imports for bodies that index node types at runtime.
-from mypy.nodes import Expression, ListExpr, NameExpr, TupleExpr
-from mypy.types import TupleType, Type, get_proper_type
+from mypy.nodes import Expression
+from mypy.types import Type
+from ._reshape import (
+    _construct_dtype, _int_or_none, _positionals_only,
+)
+from ._linalg import (
+    _dtype_base,
+)
+from ._ops import (
+    _fft_seq_arg,
+)
 
 def _fft_pair(
     ctx: FunctionContext, names: tuple[str, str], indices: tuple[int, int]
@@ -211,58 +214,6 @@ def _fft_axis_n(ctx: FunctionContext) -> tuple[int | None, int] | None:
         )
         return None
     return (n, -1 if axis is None else axis)
-
-
-def _fft_seq_entry(expr: Expression, tp: Type | None) -> int | None | str:
-    """An s/axes entry: int, None for keep, 'bad' when unprovable."""
-    value = _fold_int(expr)
-    if value is not None:
-        return value
-    if tp is not None and _is_none_type(tp):
-        return None
-    if isinstance(expr, NameExpr) and expr.name == "None":
-        return None
-    return "bad"
-
-
-def _fft_seq_arg(
-    pair: tuple[Type, Expression | None] | None,
-) -> list[int | None] | None | str:
-    """An s/axes argument: None absent, parsed list, 'scalar', or 'bail'."""
-    if pair is None:
-        return None
-    tp, expr = pair
-    if _is_none_type(tp):
-        return None
-    if expr is not None and isinstance(expr, (TupleExpr, ListExpr)):
-        proper = get_proper_type(tp)
-        types: list[Type | None]
-        if isinstance(proper, TupleType) and len(proper.items) == len(expr.items):
-            types = list(proper.items)
-        else:
-            types = [None] * len(expr.items)
-        out: list[int | None] = []
-        for e, t in zip(expr.items, types):
-            entry = _fft_seq_entry(e, t)
-            if isinstance(entry, str):
-                return "bail"
-            out.append(entry)
-        return out
-    proper = get_proper_type(tp)
-    if isinstance(proper, TupleType):
-        out2: list[int | None] = []
-        for item in proper.items:
-            if _is_none_type(item):
-                out2.append(None)
-                continue
-            value = _dim_value(item)
-            if not isinstance(value, int) or isinstance(value, bool):
-                return "bail"
-            out2.append(value)
-        return out2
-    if _int_value(tp) is not None:
-        return "scalar"
-    return "bail"
 
 
 def _fft_s_axes(

@@ -208,3 +208,10 @@ def _bail(
             code=NUMTY_UNSOLVED,
         )
     return ctx.default_return_type
+
+
+def _warn_startup(message: str) -> None:
+    try:
+        print(message, file=sys.stderr)
+    except Exception:  # reporting must never be the thing that crashes
+        pass

@@ -18,13 +18,15 @@ from ._errors import _swallowed
 from ._forms import _DivForm, _LinForm, _MonoForm, _eval_form
 from ._state import STATE
 from ._unknowns import _unknown_names
+from mypy.types import (
+    Instance, TupleType, TypeAliasType, UnionType, UnpackType, get_proper_type,
+)
 
 if TYPE_CHECKING:
     from mypy.plugin import AttributeContext, FunctionContext, MethodContext
 
 def _iter_tvarlikes_lazy(tp: Type) -> Iterator[TypeVarLikeType]:
     # lazy: _iter_tvarlikes lives in _types; a top-level import would cycle.
-    from numty_plugin import _iter_tvarlikes
 
     return _iter_tvarlikes(tp)
 
@@ -372,3 +374,37 @@ def _materialize_dim(
         if seen is not None:
             return seen
     return _expr_var(ctx, op, index, form)
+
+
+def _iter_tvarlikes(
+    tp: Type, _seen: frozenset[TypeAliasType] = frozenset()
+) -> Iterator[TypeVarLikeType]:
+    """Every TypeVar-like nested in an analyzed type (any container).
+
+    A recursive alias (`Json = dict[str, "Json"] | list["Json"]`, or the
+    nested-sequence aliases behind numpy's ArrayLike) expands to a type
+    that mentions itself, so each alias is expanded once per path:
+    without that this recursed until RecursionError, which the
+    call-site hooks used to swallow, dropping their checks for the
+    whole call (issue #164).
+    """
+    if isinstance(tp, TypeAliasType):
+        if tp in _seen:
+            return
+        _seen = _seen | {tp}
+        for a in tp.args:
+            yield from _iter_tvarlikes(a, _seen)
+    tp = get_proper_type(tp)
+    if isinstance(tp, TypeVarLikeType):
+        yield tp
+    elif isinstance(tp, Instance):
+        for a in tp.args:
+            yield from _iter_tvarlikes(a, _seen)
+    elif isinstance(tp, TupleType):
+        for item in tp.items:
+            yield from _iter_tvarlikes(item, _seen)
+    elif isinstance(tp, UnionType):
+        for item in tp.relevant_items():
+            yield from _iter_tvarlikes(item, _seen)
+    elif isinstance(tp, UnpackType):
+        yield from _iter_tvarlikes(tp.type, _seen)

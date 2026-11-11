@@ -1,6 +1,6 @@
 """numpy.linalg hooks (Phase 3, #197). Top-level imports go to earlier layers
 only (tests/test_layout.py, _LAYERS); a function-local facade import is used
-only for a monkeypatch seam or a helper in a later layer.
+only for a monkeypatch seam (_LAZY_SEAMS).
 NUMTY/_bail/_swallowed from _errors direct. No direct _fresh_unknown
 (preserves facade patch seam).
 """
@@ -20,7 +20,7 @@ from ._reshape import (
     _is_none_type, _normalize_axis, _parse_axis_arg, _promote_all, _promote_dtypes, _weak_name,
 )
 from ._builders import (
-    _construct_dtype, _fold_single,
+    _fold_single,
 )
 
 if TYPE_CHECKING:
@@ -32,6 +32,15 @@ if TYPE_CHECKING:
 
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.types import AnyType, CallableType, TupleType, Type, TypeOfAny
+from ._reshape import (
+    _construct_dtype,
+)
+from ._dtypes import (
+    _DTYPE_INFO,
+)
+from mypy.types import (
+    Instance, LiteralType, get_proper_type,
+)
 
 def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Type:
     fallback = ctx.api.named_generic_type(
@@ -214,7 +223,6 @@ def _linalg_solve_dtype(
     ctx: FunctionContext, dtype_a: Type, dtype_b: Type
 ) -> Type | None:
     """Promotion for solve/lstsq: ints become float64, float16 rejected."""
-    from numty_plugin import _kind_of
     if _reject_float16_linalg(ctx, dtype_a, "solve") or _reject_float16_linalg(
         ctx, dtype_b, "solve"
     ):
@@ -448,7 +456,6 @@ def _norm_ord_fits(ctx: FunctionContext, dims: list[int | Type], reduced: int) -
     ('fro', 'nuc') exist only for matrices. An ord of unknown value
     passes.
     """
-    from numty_plugin import _string_value
     pair = _formal_pair(ctx, "ord")
     if pair is None or _is_none_type(pair[0]):
         return True
@@ -493,7 +500,6 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     then runs the function hook unfiltered, which reports the single
     [numty-axis] error. All other calls keep the default signature.
     """
-    from numty_plugin import _string_value
     try:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType):
@@ -587,7 +593,6 @@ def _linalg_cross_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
     array formals become Any; the function hook then solves the shape
     and dtype and still reports a vector axis that is not 3.
     """
-    from numty_plugin import _dtype_base
     try:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType) or len(sig.arg_types) < 2:
@@ -612,7 +617,6 @@ def _linalg_cross_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
 
 
 def _linalg_norm(ctx: FunctionContext) -> Type:
-    from numty_plugin import _scalar_of_dtype
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -699,7 +703,6 @@ def linalg_function_hook(ctx: FunctionContext, op: str) -> Type:
 
 def _linalg_det(ctx: FunctionContext) -> Type:
     """linalg.det: square (..., N, N) in, scalar/batch out."""
-    from numty_plugin import _maybe_scalar
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -744,7 +747,6 @@ def _linalg_det(ctx: FunctionContext) -> Type:
 
 def _linalg_slogdet(ctx: FunctionContext) -> Type:
     """linalg.slogdet: square in, (sign, logabsdet) tuple out."""
-    from numty_plugin import _maybe_scalar
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -800,7 +802,6 @@ def _linalg_slogdet(ctx: FunctionContext) -> Type:
 
 def _linalg_qr(ctx: FunctionContext) -> Type:
     """linalg.qr: rank>=2 in, (Q, R) tuple (or R / raw tuple) out."""
-    from numty_plugin import _string_value
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -924,7 +925,6 @@ def _linalg_matrix_power(ctx: FunctionContext) -> Type:
 
 def _linalg_cond(ctx: FunctionContext) -> Type:
     """linalg.cond: rank>=2 in, scalar/batch real out (not square)."""
-    from numty_plugin import _maybe_scalar
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1214,3 +1214,75 @@ def linalg_cross_function_hook(ctx: FunctionContext) -> Type:
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, out, dtype)
+
+
+def _kind_of(name: str) -> str | None:
+    info = _DTYPE_INFO.get(name)
+    if info is not None:
+        return info[0]
+    if name in ("builtins.bool", "builtins.int"):
+        return "i"
+    if name == "builtins.float":
+        return "f"
+    if name == "builtins.complex":
+        return "c"
+    return None
+
+
+def _dtype_base(dtype: Type) -> str | None:
+    """i/u/f/c/b kind from a dtype's base class, ignoring bit width.
+
+    Constructors like arange produce platform-dependent unions
+    (signedinteger[_32Bit | _64Bit]) that _dtype_kind_size cannot resolve;
+    the kind alone is enough for index/ufunc classification.
+    """
+    proper = get_proper_type(dtype)
+    if not isinstance(proper, Instance) or not proper.args:
+        return None
+    element = get_proper_type(proper.args[0])
+    if not isinstance(element, Instance):
+        return None
+    direct = _DTYPE_INFO.get(element.type.fullname)
+    if direct is not None:
+        return direct[0]
+    return {
+        "numpy.floating": "f",
+        "numpy.complexfloating": "c",
+        "numpy.signedinteger": "i",
+        "numpy.unsignedinteger": "u",
+    }.get(element.type.fullname)
+
+
+def _string_value(tp: Type) -> str | None:
+    """String of a literal mode/kind argument, else None."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType) and isinstance(proper.value, str):
+        return proper.value
+    if isinstance(proper, Instance) and proper.last_known_value is not None:
+        return _string_value(proper.last_known_value)
+    return None
+
+
+def _scalar_of_dtype(dtype: Type) -> Type | None:
+    """The numpy scalar Instance carried by a dtype[...], else None."""
+    proper = get_proper_type(dtype)
+    if isinstance(proper, Instance) and proper.args:
+        inner = get_proper_type(proper.args[0])
+        if isinstance(inner, Instance):
+            return inner
+    return None
+
+
+def _maybe_scalar(
+    ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type
+) -> Type:
+    """An ndarray for the dims, or the numpy scalar when none are left.
+
+    Fully reduced results (and scalar-only ufunc calls) are numpy
+    scalars at runtime, not 0-d arrays, so `total: float = ...` checks
+    (issue #62). Falls back to the stubs when the dtype has no scalar.
+    """
+    if dims:
+        return _ndarray_type(ctx, dims, dtype)
+    scalar = _scalar_of_dtype(dtype)
+    return scalar if scalar is not None else ctx.default_return_type
