@@ -153,6 +153,7 @@ from mypy.types import (
 # Monkeypatch seam: _installed_numpy_version stays defined here so
 # tests/test_startup.py + test_layout.py facade patches propagate to
 # plugin().
+from ._state import STATE  # noqa: F401
 from ._errors import (  # noqa: F401
     NUMTY_ANNOTATION,
     NUMTY_AXIS,
@@ -411,6 +412,17 @@ def _installed_numpy_version() -> str | None:
         return None
 
 
+def __getattr__(name: str) -> int:
+    # Phase 4 (#198): _recheck_depth lives in STATE (int field).
+    if name == "_recheck_depth":
+        return STATE.recheck_depth
+    raise AttributeError(f"module 'numty_plugin' has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted([*globals(), "_recheck_depth"])
+
+
 def _installed_numpy_warning() -> str | None:
     """Loud warning when the installed numpy leaves the supported range."""
     try:
@@ -467,6 +479,8 @@ def plugin(version: str) -> type[Plugin]:
 class NumtyPlugin(Plugin):
     def __init__(self, options) -> None:
         super().__init__(options)
+        # Phase 4 (#198): process-global bundle; never NumtyState() here.
+        self.state = STATE
         # Fullnames of TypeVars first bound from inside a string dim spec
         # (see _fam_bind_words). The pre-pass never saw them, so they are
         # missing from the analyzed function's variables; the call-site
@@ -474,6 +488,9 @@ class NumtyPlugin(Plugin):
         self._fam_late_bound: set[str] = set()
         # Issue #164 step 2: stub canary state, once per module per run.
         self._startup_canary_checked: set[str] = set()
+        # Bundle fields mirror the owning plugin's set objects (identity).
+        self.state.fam_late_bound = self._fam_late_bound
+        self.state.startup_canary_checked = self._startup_canary_checked
 
     def _ensure_startup_check(self, fullname: str) -> None:
         """Warn once about hooked names missing from the loaded stubs.
@@ -2948,8 +2965,9 @@ _SHAPE_KEEPERS = frozenset({
     "cumulative_prod",
 })
 
-
-_recheck_depth = 0
+# _recheck_depth lives in STATE (Phase 4 #198); module __getattr__
+# below serves numty_plugin._recheck_depth reads (tests/test_layout.py).
+STATE.recheck_depth = 0
 
 
 def _is_degraded_operand(tp: Type) -> bool:
@@ -3000,22 +3018,21 @@ def _undegraded_args(
     re-inferred. Nested re-inference is capped, since each level
     re-checks the subexpression.
     """
-    global _recheck_depth
-    if _recheck_depth >= 2:
+    if STATE.recheck_depth >= 2:
         return ctx
     new_types: list[list[Type]] | None = None
     for i, (exprs, types) in enumerate(zip(ctx.args, ctx.arg_types)):
         for j, (expr, tp) in enumerate(zip(exprs, types)):
             if not isinstance(expr, (CallExpr, OpExpr)) or not _is_degraded_operand(tp):
                 continue
-            _recheck_depth += 1
+            STATE.recheck_depth += 1
             try:
                 fresh = ctx.api.get_expression_type(expr)
             except Exception:
                 _swallowed(ctx, "_undegraded_args")
                 continue
             finally:
-                _recheck_depth -= 1
+                STATE.recheck_depth -= 1
             if _is_degraded_operand(fresh) or _ndarray_parts(fresh) is None:
                 continue
             if new_types is None:
