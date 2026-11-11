@@ -19,6 +19,7 @@ dev = [
     "mypy==2.4.1",
     "pytest>=8",
     "pytest-xdist>=3.8.0",
+    "ruff==0.17.4",
     "ty==0.0.97",
 ]
 
@@ -43,3 +44,15 @@ packages = ["numty", "numty_plugin", "numty_convert", "numty_codmod", "numty_rep
 # suite is fully parallel-safe (per-worker mypy caches + tmp_path isolation).
 # -n 4 beats -n auto here: 20 workers each redo the session mypy batch.
 addopts = "-n 4"
+
+[tool.ruff]
+# The fixtures are inputs for mypy and ty. Many of them are wrong on
+# purpose, so the linter does not read them.
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+# Pyflakes only: unused imports, undefined names, unused variables.
+# F722 is off because string dims (`F64["batch features"]`) are not
+# Python expressions.
+select = ["F"]
+ignore = ["F722"]

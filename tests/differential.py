@@ -746,9 +746,9 @@ class Gen:
                 f".choice(5, size={size})",
                 f".choice({a.text}.ravel(), {size})",
                 f".permutation({a.text})",
-                f".permutation(4)",
-                f".normal(size=3)",
-                f".normal()",
+                ".permutation(4)",
+                ".normal(size=3)",
+                ".normal()",
             )
         )
 
@@ -868,7 +868,7 @@ class SymGen(Gen):
             f"({dim(0)}, {dim(0)})",
             f"({dim(0)} // 2, -1)",
             f"(2, -1, {dim(-1)})",
-            f"(-1, 2, 3)",
+            "(-1, 2, 3)",
             f"({dim(0)}, 2, -1)",
         ]
         if rank >= 2:

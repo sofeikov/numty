@@ -2258,7 +2258,7 @@ def test_reduce_keepdims_ok_clean_and_runs() -> None:
         42: f'"{f64.format("Literal[1], Literal[1]")}"',
         43: f'"{f64.format("Literal[1], Literal[1]")}"',
         44: f'"{f64.format("Literal[1], Literal[1]")}"',
-        45: f'"numpy.ndarray[tuple[Literal[1], Literal[1]], numpy.dtype[numpy.bool[bool]]]"',
+        45: '"numpy.ndarray[tuple[Literal[1], Literal[1]], numpy.dtype[numpy.bool[bool]]]"',
         46: f'"{iu.format("Literal[1], Literal[1]")}"',
         47: f'"{f64.format("Literal[1], Literal[1]")}"',
         48: f'"{f64.format("Literal[3]")}"',

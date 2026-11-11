@@ -5,6 +5,22 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    # Pyflakes rules through ruff (config in pyproject.toml). The split
+    # of numty_plugin (#192) added 967 findings because no check ran.
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Run ruff
+        run: uv run ruff check .
+
   test:
     # Issue #164 step 2: hooks key on private numpy module paths, so the
     # oldest supported numpy (2.5, the `numpy>=2.5` floor) and the latest

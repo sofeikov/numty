@@ -483,7 +483,7 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
     then runs the function hook unfiltered, which reports the single
     [numty-axis] error. All other calls keep the default signature.
     """
-    from numty_plugin import _int_value, _is_none_type, _ndarray_parts, _parse_axis_arg, _string_value, _weak_name
+    from numty_plugin import _is_none_type, _ndarray_parts, _parse_axis_arg, _string_value, _weak_name
     try:
         sig = ctx.default_signature
         if not isinstance(sig, CallableType):
@@ -526,7 +526,6 @@ def _norm_signature_hook(ctx: FunctionSigContext) -> Type:
         order = _string_value(ord_tp)
         if order is None and _weak_name(ord_tp) not in ("builtins.int", "builtins.float"):
             return ctx.default_signature
-        number = _int_value(ord_tp)
         # axis: absent/none reduces all dims; otherwise parse the list.
         axis_exprs = ctx.args[axis_idx]
         if not axis_exprs:
