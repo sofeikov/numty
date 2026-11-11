@@ -1,9 +1,10 @@
 """Broadcast/operator/compare/ufunc hooks (Phase 3, #197). Merged mesh
 (operators+compare+logical+ufunc+where/clip, one module). Top-level imports
 go to earlier layers only (tests/test_layout.py, _LAYERS); a function-local
-facade import is used only for a monkeypatch seam (_LAZY_SEAMS). NUMTY/_bail/_swallowed from _errors direct. _fresh_unknown only via
-facade lazy. _broadcast_result is the monkeypatch seam (test_internal
-BROKEN_PLUGIN patches facade name; callers resolve via facade global).
+facade import is used only for a monkeypatch seam (_LAZY_SEAMS).
+NUMTY/_bail/_swallowed from _errors direct. _fresh_unknown only via facade
+lazy. _broadcast_result is the monkeypatch seam (test_internal BROKEN_PLUGIN
+patches facade name; callers resolve via facade global).
 """
 from __future__ import annotations
 
