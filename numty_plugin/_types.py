@@ -842,7 +842,7 @@ def _callsite_expr_bindings(
     of the result, and `_substitute_return_exprs` makes the return dims
     that need it unknown.
     """
-    from numty_plugin import _resolve_dim, _fresh_unknown
+    from numty_plugin import _resolve_dim
     bindings: dict[str, int | Type | _LinForm] = {}
     for i, positions in formals:
         if i >= len(ctx.args):
@@ -928,8 +928,10 @@ def _callsite_expr_bindings(
                 _swallowed(ctx, "_callsite_expr_bindings")
                 continue
     # Unknown-rank actuals (plain NDArray) never infer: bind the
-    # formal's still-unbound tvars to a fresh unknown so the result
-    # keeps its rank instead of collapsing to Never (issue #62).
+    # formal's still-unbound tvars to Any so the result keeps its rank
+    # instead of collapsing to Never (issue #62) and stays compatible
+    # with declared dims in returns (issue #218: ?U is rigid and fails
+    # [return-value] against int/TypeVar, Any is compatible).
     for i, positions in formals:
         if i >= len(ctx.args):
             continue
@@ -959,10 +961,27 @@ def _callsite_expr_bindings(
         for dim, tvar in positions:
             if tvar.fullname not in bindings:
                 try:
-                    bindings[tvar.fullname] = _fresh_unknown(ctx, "callsite", dim)
+                    bindings[tvar.fullname] = AnyType(TypeOfAny.explicit)
                 except Exception:
                     _swallowed(ctx, "_callsite_expr_bindings")
                     continue
+        # Issue 218 (Floating with _S): positions misses TypeVars nested
+        # inside a whole-shape alias (Floating[tuple[T]]). For unknown
+        # actuals, bind any other formal TypeVar still unbound to Any so
+        # tuple/Box returns do not collapse to Never/[var-annotated].
+        try:
+            formal_tp = sig.arg_types[i] if i < len(sig.arg_types) else None
+            if formal_tp is not None:
+                for tv in _iter_tvarlikes(formal_tp):
+                    if isinstance(tv, TypeVarType) and tv.fullname not in bindings:
+                        try:
+                            bindings[tv.fullname] = AnyType(TypeOfAny.explicit)
+                        except Exception:
+                            _swallowed(ctx, "_callsite_expr_bindings")
+                            continue
+        except Exception:
+            _swallowed(ctx, "_callsite_expr_bindings")
+            continue
     return bindings
 
 
@@ -1003,6 +1022,150 @@ def _substitute_return_exprs(
         _swallowed(ctx, "_substitute_return_exprs")
         return None
     if ret_parts is None:
+        # Issues 218/222: tuple/Optional/generic returns recurse per leaf
+        # instead of bailing with Never/[var-annotated]. Each ndarray leaf
+        # reuses this same function via a sig copy so formula solving,
+        # Any-compat for unknown actuals, and ?U minting stay identical.
+        try:
+            proper_ret = get_proper_type(sig.ret_type)
+        except Exception:
+            _swallowed(ctx, "_substitute_return_exprs")
+            return None
+        if isinstance(proper_ret, TupleType):
+            new_items = []
+            changed_t = False
+            for item in proper_ret.items:
+                try:
+                    sub_sig = sig.copy_modified(ret_type=item)
+                except Exception:
+                    _swallowed(ctx, "_substitute_return_exprs")
+                    return None
+                sub = _substitute_return_exprs(sub_sig, bindings, ctx)
+                if sub is None:
+                    new_items.append(item)
+                else:
+                    new_items.append(sub)
+                    changed_t = True
+            if not changed_t:
+                return None
+            try:
+                return proper_ret.copy_modified(items=new_items)
+            except Exception:
+                _swallowed(ctx, "_substitute_return_exprs")
+                return TupleType(
+                    new_items, proper_ret.partial_fallback,
+                    line=proper_ret.line, column=proper_ret.column,
+                )
+        if isinstance(proper_ret, UnionType):
+            # Optional[X] / X | Y: substitute each member, keep Nones.
+            members = list(proper_ret.items)
+            new_members = []
+            changed_u = False
+            for item in members:
+                if isinstance(get_proper_type(item), NoneType):
+                    new_members.append(item)
+                    continue
+                try:
+                    sub_sig_u = sig.copy_modified(ret_type=item)
+                except Exception:
+                    _swallowed(ctx, "_substitute_return_exprs")
+                    return None
+                sub_u = _substitute_return_exprs(sub_sig_u, bindings, ctx)
+                if sub_u is None:
+                    new_members.append(item)
+                else:
+                    new_members.append(sub_u)
+                    changed_u = True
+            if not changed_u:
+                return None
+            try:
+                return UnionType.make_union(new_members)
+            except Exception:
+                _swallowed(ctx, "_substitute_return_exprs")
+                return None
+        if isinstance(proper_ret, Instance) and proper_ret.type.fullname != NDARRAY_FULLNAME:
+            # Issue 224: generic NamedTuple/TypedDict construction takes its
+            # dim from the return context (Frames[int]), not the argument.
+            # Leave those for mypy; substituting would force Frames[N].
+            # Exception: unknown (Any) actuals (issue 218) must still
+            # substitute to Any to avoid Never/[var-annotated].
+            try:
+                info_nt = proper_ret.type
+                is_nt = getattr(info_nt, "is_named_tuple", False)
+                has_tt = getattr(info_nt, "tuple_type", None) is not None
+                has_td = getattr(info_nt, "typeddict_type", None) is not None
+                if is_nt or has_tt or has_td:
+                    needs_any = False
+                    for arg in proper_ret.args:
+                        ap_nt = get_proper_type(arg)
+                        if isinstance(ap_nt, TypeVarType) and ap_nt.fullname in bindings:
+                            b_nt = bindings[ap_nt.fullname]
+                            if isinstance(b_nt, AnyType):
+                                needs_any = True
+                                break
+                            if isinstance(b_nt, Type):
+                                try:
+                                    if isinstance(get_proper_type(b_nt), AnyType):
+                                        needs_any = True
+                                        break
+                                except Exception:
+                                    _swallowed(ctx, "_substitute_return_exprs")
+                                    pass
+                    if not needs_any:
+                        return None
+            except Exception:
+                _swallowed(ctx, "_substitute_return_exprs")
+                pass
+            # Generic class e.g. Box[T]: substitute args via bindings.
+            # Unknown actuals give Any (compatible), ints become Literals.
+            if not proper_ret.args:
+                return None
+            try:
+                int_fb = ctx.api.named_generic_type(INT_FULLNAME, [])
+            except Exception:
+                _swallowed(ctx, "_substitute_return_exprs")
+                int_fb = None
+            new_args = []
+            changed_a = False
+            for arg in proper_ret.args:
+                ap = get_proper_type(arg)
+                if isinstance(ap, TypeVarType) and ap.fullname in bindings:
+                    b = bindings[ap.fullname]
+                    if isinstance(b, int):
+                        if int_fb is None:
+                            return None
+                        new_args.append(LiteralType(b, int_fb, line=ap.line, column=ap.column))
+                        changed_a = True
+                        continue
+                    if isinstance(b, _LinForm):
+                        new_args.append(AnyType(TypeOfAny.explicit))
+                        changed_a = True
+                        continue
+                    if b is arg:
+                        new_args.append(arg)
+                    else:
+                        new_args.append(b)
+                        changed_a = True
+                    continue
+                # Nested ndarray inside generic arg: recurse.
+                try:
+                    sub_sig_a = sig.copy_modified(ret_type=arg)
+                except Exception:
+                    _swallowed(ctx, "_substitute_return_exprs")
+                    return None
+                sub_a = _substitute_return_exprs(sub_sig_a, bindings, ctx)
+                if sub_a is None:
+                    new_args.append(arg)
+                else:
+                    new_args.append(sub_a)
+                    changed_a = True
+            if not changed_a:
+                return None
+            try:
+                return proper_ret.copy_modified(args=new_args)
+            except Exception:
+                _swallowed(ctx, "_substitute_return_exprs")
+                return Instance(proper_ret.type, new_args, line=proper_ret.line, column=proper_ret.column)
         return None
     rdims, _dtype = ret_parts
     new_dims: list[int | Type] = []

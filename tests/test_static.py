@@ -650,7 +650,7 @@ def test_everyday_ok() -> None:
         64: '"numpy.ndarray[tuple[Literal[2]], numpy.dtype[numpy.float64]]"',
         65: '"numpy.ndarray[tuple[()], numpy.dtype[numpy.float64]]"',
         85: '"numpy.ndarray[tuple[Literal[2], Literal[3]], numpy.dtype[numpy.float64]]"',
-        86: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.float64]]"',
+        86: '"numpy.ndarray[tuple[Any], numpy.dtype[numpy.float64]]"',
         87: '"numpy.ndarray[tuple[int], numpy.dtype[numpy.float64]]"',
     }, result.stdout
     assert _run_fixture("everyday_ok.py") == ["ok"]
@@ -1117,6 +1117,44 @@ def test_callsite_formula_returns_through_methods() -> None:
     assert _run_fixture("callsite_formula_methods_ok.py") == [
         "(7, 8)", "(10, 5)", "(4,)", "(3, 6)", "(4, 5)", "(3,)",
     ]
+
+
+def test_callsite_unknown_return_compatible() -> None:
+    # Issue 218: unknown-shape actuals give Any dims, not rigid ?U, so a
+    # caller returning the result against declared TypeVars stays clean.
+    result = run_mypy(FIXTURES / "callsite_unknown_return_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+
+
+def test_callsite_unknown_tuple_and_box() -> None:
+    # Issue 218: tuple/Box returns with unknown args do not need
+    # annotations; they match the direct (Any-dim) result.
+    result = run_mypy(FIXTURES / "callsite_unknown_tuple_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "tuple[Any]" in notes[29], result.stdout
+    assert "tuple[Any]" in notes[31], result.stdout
+    assert "float64" not in notes[33] or "Any" in notes[33] or "Never" in notes[33], result.stdout
+
+
+def test_callsite_tuple_formula_solved() -> None:
+    # Issue 222: formula dims inside tuple returns solve like top-level.
+    result = run_mypy(FIXTURES / "callsite_tuple_formula_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "Literal[5]" in notes[21], result.stdout
+    assert "Literal[5]" in notes[22] and "Literal[4]" in notes[22], result.stdout
+    assert "Never" not in result.stdout, result.stdout
+    assert "var-annotated" not in result.stdout, result.stdout
+
+
+def test_generic_namedtuple_context_kept() -> None:
+    # Issue 224: Frames(rows) in Frames[int] context takes int from the
+    # context, not N from the argument.
+    result = run_mypy(FIXTURES / "generic_namedtuple_context_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
 
 
 def test_permutation_of_a_0d_array() -> None:
