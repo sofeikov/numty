@@ -9,19 +9,20 @@ from collections.abc import Callable
 from typing import cast
 
 from mypy.nodes import (
-    CallExpr, Expression, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr,
+    CallExpr, Expression, FloatExpr, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr,
     OpExpr, StarExpr, StrExpr, TupleExpr, TypeInfo,
 )
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
 from mypy.types import (
-    AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarType, get_proper_type,
+    AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarType,
+    UnionType, get_proper_type,
 )
 
 from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, NUMTY_UNSOLVED, _swallowed
 from ._state import STATE
 from ._trace import _numty_strict, _numty_trace_path, _trace_event
 from ._dtypes import (
-    _DATETIME_FULLNAMES, _DTYPE_INFO, _datetime_string_kind,
+    _DATETIME_FULLNAMES, _DTYPE_INFO, _WEAK_DEFAULT, _datetime_string_kind,
 )
 
 from ._types import (
@@ -532,6 +533,23 @@ def _scalar_ret_name(ret: Type) -> str | None:
     if table is None or len(proper.args) != 1:
         return None
     bit = get_proper_type(proper.args[0])
+    # Issue #223: np.intp is signedinteger[_32Bit | _64Bit] (and uintp
+    # likewise). Map the platform union to the 64-bit entry (linux x64
+    # CI; the 32-bit member would also be valid but less precise).
+    if isinstance(bit, UnionType):
+        bits: list[int] = []
+        for item in bit.relevant_items():
+            item_proper = get_proper_type(item)
+            if not isinstance(item_proper, Instance):
+                return None
+            try:
+                b = int(item_proper.type.fullname.rsplit("_", 1)[-1].removesuffix("Bit"))
+            except ValueError:
+                return None
+            bits.append(b)
+        if not bits:
+            return None
+        return table.get(max(bits))
     if not isinstance(bit, Instance):
         return None
     try:
@@ -1070,9 +1088,31 @@ def _sequence_parts(
     proper = get_proper_type(tp)
     if isinstance(proper, TupleType):
         items: list[tuple[list[int | Type], Type]] = []
-        for item in proper.items:
+        # expr may mirror the TupleType (e.g. ([0.0], x) outer tuple with
+        # inner list display). Use it for plain-list fallbacks like the
+        # ListExpr path below (issue #230).
+        expr_items: list[Expression | None] | None = None
+        if isinstance(expr, TupleExpr) and len(expr.items) == len(proper.items):
+            expr_items = list(expr.items)
+        for idx, item in enumerate(proper.items):
             parts = _ndarray_parts(item)
             if parts is None:
+                item_expr = expr_items[idx] if expr_items is not None else None
+                if isinstance(item_expr, ListExpr) and item_expr.items:
+                    if all(isinstance(e, IntExpr) for e in item_expr.items):
+                        dtype = _construct_dtype(ctx, "numpy.int64")
+                        if dtype is None:
+                            return None
+                        items.append(([len(item_expr.items)], dtype))
+                        continue
+                    if all(
+                        isinstance(e, (IntExpr, FloatExpr)) for e in item_expr.items
+                    ):
+                        dtype = _construct_dtype(ctx, "numpy.float64")
+                        if dtype is None:
+                            return None
+                        items.append(([len(item_expr.items)], dtype))
+                        continue
                 return None
             dims, dtype = parts
             items.append((list(dims), dtype))
@@ -1085,18 +1125,26 @@ def _sequence_parts(
                 return None
             parts = _ndarray_parts(item_tp)
             if parts is None:
-                # Plain Python list-of-ints (e.g. [0] in
+                # Plain Python lists (e.g. [0] in
                 # concatenate([[0], cumsum(lengths)]), the N+1 offsets
-                # idiom from issue #32): numpy reads it as a 1-D array
-                # of that length. Only flat int lists; nested bails.
-                if isinstance(item_expr, ListExpr) and all(
-                    isinstance(e, IntExpr) for e in item_expr.items
-                ):
-                    dtype = _construct_dtype(ctx, "numpy.int64")
-                    if dtype is None:
-                        return None
-                    items.append(([len(item_expr.items)], dtype))
-                    continue
+                # idiom from issue #32): numpy reads them as 1-D arrays
+                # of that length. Int lists give int64; float lists (issue
+                # #230: [[0.0], x]) give float64. Only flat lists.
+                if isinstance(item_expr, ListExpr) and item_expr.items:
+                    if all(isinstance(e, IntExpr) for e in item_expr.items):
+                        dtype = _construct_dtype(ctx, "numpy.int64")
+                        if dtype is None:
+                            return None
+                        items.append(([len(item_expr.items)], dtype))
+                        continue
+                    if all(
+                        isinstance(e, (IntExpr, FloatExpr)) for e in item_expr.items
+                    ):
+                        dtype = _construct_dtype(ctx, "numpy.float64")
+                        if dtype is None:
+                            return None
+                        items.append(([len(item_expr.items)], dtype))
+                        continue
                 return None
             dims, dtype = parts
             items.append((list(dims), dtype))
@@ -1236,7 +1284,10 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     else:
         dtype = _promote_all(ctx, [dtype for _, dtype in items])
         if dtype is None:
-            return ctx.default_return_type
+            # Issue #232: dtype[Any] items have no promotable dtype but the
+            # shapes are known. Keep the stub dtype (Any) and continue with
+            # rank/shape checks instead of bailing silently.
+            dtype = _default_dtype(ctx)
     axis = _concat_axis(ctx, pairs)
     if axis is None:
         return ctx.default_return_type
@@ -1300,7 +1351,7 @@ def _stack_promote(dims: list[int | Type], kind: str) -> list[int | Type]:
 
 
 def _concat_merge(
-    ctx: FunctionContext,
+    ctx: FunctionContext | MethodContext,
     op: str,
     items: list[tuple[list[int | Type], Type]],
     dtype: Type,
@@ -1388,7 +1439,10 @@ def _stack_solve(
     else:
         dtype = _promote_all(ctx, [dtype for _, dtype in items])
         if dtype is None:
-            return ctx.default_return_type
+            # Issue #232: dtype[Any] items have no promotable dtype but the
+            # shapes are known. Keep the stub dtype (Any) and continue with
+            # rank/shape checks instead of bailing silently.
+            dtype = _default_dtype(ctx)
     promoted = [_stack_promote(dims, kind) for dims, _ in items]
     ranks = {len(dims) for dims in promoted}
     if len(ranks) != 1:
@@ -1542,7 +1596,10 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     else:
         dtype = _promote_all(ctx, [dtype for _, dtype in items])
         if dtype is None:
-            return ctx.default_return_type
+            # Issue #232: dtype[Any] items have no promotable dtype but the
+            # shapes are known. Keep the stub dtype (Any) and continue with
+            # rank/shape checks instead of bailing silently.
+            dtype = _default_dtype(ctx)
     axis = _concat_axis(ctx, pairs)
     if axis is None or axis == "none":
         return ctx.default_return_type
@@ -1605,4 +1662,63 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     out = list(first)
     out.insert(norm, len(items))
     return _ndarray_type(ctx, out, dtype)
+
+
+def r_getitem_hook(ctx: MethodContext) -> Type:
+    """np.r_[...]: concatenate scalars/arrays along axis 0 (issue #230).
+
+    Minimal solver for the common cases (np.r_[0.0, x], run boundaries
+    np.r_[True, x[1:] != x[:-1]]). Each item is an array (dims kept) or
+    a Python/numpy scalar (1-D [1] with the weak dtype). Items promote
+    like concatenate and merge along axis 0.
+    """
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    tp, expr = pairs[0]
+    proper = get_proper_type(tp)
+    if not isinstance(proper, TupleType):
+        return ctx.default_return_type
+    # expr should mirror the TupleType; if not, fall back to types alone.
+    expr_items: list[Expression | None]
+    if isinstance(expr, TupleExpr) and len(expr.items) == len(proper.items):
+        expr_items = list(expr.items)
+    else:
+        expr_items = [None] * len(proper.items)
+    items: list[tuple[list[int | Type], Type]] = []
+    for item_tp, item_expr in zip(proper.items, expr_items):
+        parts = _ndarray_parts(item_tp)
+        if parts is not None:
+            dims, dtype = parts
+            items.append((list(dims), dtype))
+            continue
+        # Scalar -> 1-D [1] with weak dtype (Python) or strong (numpy).
+        scalar_dtype: Type | None = None
+        # Python literals via expression.
+        if item_expr is not None:
+            if isinstance(item_expr, IntExpr) and not isinstance(item_expr.value, bool):
+                scalar_dtype = _construct_dtype(ctx, "numpy.int64")
+            elif isinstance(item_expr, FloatExpr):
+                scalar_dtype = _construct_dtype(ctx, "numpy.float64")
+            elif isinstance(item_expr, NameExpr) and item_expr.name in ("True", "False"):
+                scalar_dtype = _construct_dtype(ctx, "numpy.bool")
+        if scalar_dtype is None:
+            key = _scalar_key(item_tp)
+            if key is not None:
+                kind, name = key
+                strong_name = _WEAK_DEFAULT.get(name, name) if kind == "weak" else name
+                scalar_dtype = _construct_dtype(ctx, strong_name)
+            else:
+                ret_name = _scalar_ret_name(item_tp)
+                if ret_name is not None:
+                    scalar_dtype = _construct_dtype(ctx, ret_name)
+        if scalar_dtype is None:
+            return ctx.default_return_type
+        items.append(([1], scalar_dtype))
+    if not items:
+        return ctx.default_return_type
+    dtype = _promote_all(ctx, [dtype for _, dtype in items])
+    if dtype is None:
+        dtype = _default_dtype(ctx)
+    return _concat_merge(ctx, "r_", items, dtype, 0)
 
