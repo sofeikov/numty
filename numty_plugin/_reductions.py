@@ -1,40 +1,18 @@
-"""_reductions.py — reductions/cumsum/diff/average/percentile/ufunc. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (leaf, acyclic).
+"""_reductions.py — reductions/cumsum/diff/average/percentile/ufunc. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
 """
 from __future__ import annotations
 
-import ast
-import json
-import keyword
-import os
-import sys
-from collections.abc import Callable, Iterator
-from functools import partial
-from typing import NamedTuple, cast
 
-from mypy.errorcodes import ARG_TYPE, MISC, ErrorCode
-from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, AssignmentStmt, CallExpr, Context, Decorator, EllipsisExpr, Expression, FuncDef, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr, OpExpr, OverloadedFuncDef, SliceExpr, StarExpr, StrExpr, TupleExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, UnaryExpr, Var
-from mypy.messages import callable_name
-from mypy.operators import op_methods_to_symbols
-from mypy.plugin import AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext, Plugin
-from mypy.typeanal import TypeAnalyser
-from mypy.tvar_scope import TypeVarLikeScope
-from mypy.types import AnyType, CallableType, EllipsisType, Instance, LiteralType, NoneType, Overloaded, RawExpressionType, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnboundType, UninhabitedType, UnionType, UnpackType, get_proper_type
+from mypy.nodes import AssignmentStmt, CallExpr, Expression, ListExpr, MemberExpr, NameExpr, StarExpr, TupleExpr, Var
+from mypy.plugin import FunctionContext, MethodContext
+from mypy.types import AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL, NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION, _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning, _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed
-from ._state import STATE
-from ._trace import _numty_strict, _numty_trace_path, _trace_event
-from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES, _NAME_OF_KIND_SIZE, _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE, _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _WEAK_DEFAULT, _WEAK_SCALARS, _datetime_string_kind, _promote_strong, _promote_weak
-from ._forms import _DivForm, _LinForm, _MonoForm, _UNKNOWN_PREFIX, _canon_div, _coeff_vars_to_form, _eval_form, _form_has_unknown, _form_mul, _form_never_size, _form_to_coeff_vars, _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize
-from ._unknowns import _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names, _unknown_per_line
-from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _expr_var, _form_from_fullname, _form_of, _implicit_scope_vars, _mono_str, _ns_of_ctx, _normalize_ns, _seen_vars, _short_var, _current_scope_vars
+from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
+from ._forms import _DivForm, _form_has_unknown, _is_unknown_fullname
 
-from ._types import (  # noqa: F401
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim, _linear_product, 
-    _reshape_total_form, _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr, _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members, 
-    _distribute_pairings, _union_results, _distribute_solve, _split_flat, _iter_tvarlikes, _shape_tvar_formals, _strip_optional, _sequence_element, _align_pair, _pairs_for_actual, 
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _callsite_expr_bindings, _substitute_return_exprs, _fixed_shape, _shape_note_str, _rank_mismatch_notes, 
-    _reported_as_operator, _mentions_ndarray, _info_mentions_array, _note_rank_mismatches, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, 
-    _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME, _SEQUENCE_FULLNAMES, _OPERATOR_DUNDERS
+from ._types import (
+    _int_value, _dim_eq, _dim_add_const, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _distribute_solve, _split_flat, _ndarray_type, _shape_from_arg, 
+    NDARRAY_FULLNAME
 )
 
 def _reduction_out_dtype(
@@ -892,7 +870,7 @@ RNG_FLOAT_OPS = frozenset({"normal", "random", "standard_normal", "uniform"})
 
 def _parse_size_arg(ctx: MethodContext) -> list[int | Type] | str | None:
     """A sampler's size=: 'absent'/'none' as _parse_axis_arg, else builder dims."""
-    from numty_plugin import _builder_shape, _formal_pair, _is_none_type, _is_plain_int, _parse_axis_arg
+    from numty_plugin import _builder_shape, _formal_pair, _is_none_type, _is_plain_int
     pair = _formal_pair(ctx, "size")
     if pair is None:
         return "absent"

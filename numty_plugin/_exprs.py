@@ -2,8 +2,8 @@
 
 Depends on ._forms + ._unknowns + ._state + mypy types. Singletons
 alias STATE (Phase 4 Phase 0 verbatim bundle); _unknown_* singletons
-live in _state via _unknowns. Lazy-imports _iter_tvarlikes from the
-facade to avoid cycles while __init__ still holds the caller
+live in _state via _unknowns. _iter_tvarlikes lives in _types and is
+imported lazily through the facade (a top-level import would cycle)
 (_swallowed comes directly from ._errors, no cycle).
 """
 from __future__ import annotations
@@ -17,13 +17,13 @@ from mypy.types import AnyType, Type, TypeOfAny, TypeVarId, TypeVarLikeType, Typ
 from ._errors import _swallowed
 from ._forms import _DivForm, _LinForm, _MonoForm, _eval_form
 from ._state import STATE
-from ._unknowns import _unknown_ids, _unknown_names, _unknown_per_line
+from ._unknowns import _unknown_names
 
 if TYPE_CHECKING:
     from mypy.plugin import AttributeContext, FunctionContext, MethodContext
 
 def _iter_tvarlikes_lazy(tp: Type) -> Iterator[TypeVarLikeType]:
-    # lazy: _iter_tvarlikes stays in __init__ until Phase 3.
+    # lazy: _iter_tvarlikes lives in _types; a top-level import would cycle.
     from numty_plugin import _iter_tvarlikes
 
     return _iter_tvarlikes(tp)

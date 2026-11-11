@@ -1,32 +1,19 @@
-"""_types.py — pure algebra/fold/shape (Phase 5, #199). Owns NDARRAY_FULLNAME etc. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (leaf, acyclic).
+"""_types.py — pure algebra/fold/shape (Phase 5, #199). Owns NDARRAY_FULLNAME etc. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
 """
 from __future__ import annotations
 
-import ast
-import json
-import keyword
-import os
-import sys
 from collections.abc import Callable, Iterator
-from functools import partial
-from typing import NamedTuple, cast
 
-from mypy.errorcodes import ARG_TYPE, MISC, ErrorCode
-from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, AssignmentStmt, CallExpr, Context, Decorator, EllipsisExpr, Expression, FuncDef, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr, OpExpr, OverloadedFuncDef, SliceExpr, StarExpr, StrExpr, TupleExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, UnaryExpr, Var
+from mypy.errorcodes import ARG_TYPE
+from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, CallExpr, Context, Expression, IntExpr, ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var
 from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
-from mypy.plugin import AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext, Plugin
-from mypy.typeanal import TypeAnalyser
-from mypy.tvar_scope import TypeVarLikeScope
-from mypy.types import AnyType, CallableType, EllipsisType, Instance, LiteralType, NoneType, Overloaded, RawExpressionType, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnboundType, UninhabitedType, UnionType, UnpackType, get_proper_type
+from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
+from mypy.types import AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL, NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION, _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning, _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed
-from ._state import STATE
-from ._trace import _numty_strict, _numty_trace_path, _trace_event
-from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES, _NAME_OF_KIND_SIZE, _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE, _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _WEAK_DEFAULT, _WEAK_SCALARS, _datetime_string_kind, _promote_strong, _promote_weak
-from ._forms import _DivForm, _LinForm, _MonoForm, _UNKNOWN_PREFIX, _canon_div, _coeff_vars_to_form, _eval_form, _form_has_unknown, _form_mul, _form_never_size, _form_to_coeff_vars, _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize
-from ._unknowns import _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names, _unknown_per_line
-from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _expr_var, _form_from_fullname, _form_of, _implicit_scope_vars, _mono_str, _ns_of_ctx, _normalize_ns, _seen_vars, _short_var, _current_scope_vars
+from ._errors import NUMTY_CALLSITE, NUMTY_SHAPE, _swallowed
+from ._forms import _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul, _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize
+from ._exprs import _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _ns_of_ctx, _seen_vars, _short_var
 
 NDARRAY_FULLNAME = "numpy.ndarray"
 INT_FULLNAME = "builtins.int"
@@ -1463,7 +1450,6 @@ def _ndarray_type(
     dims: list[int | Type],
     dtype: Type,
 ) -> Instance:
-    from numty_plugin import _builder_shape
     checker = ctx.api
     int_instance = checker.named_generic_type(INT_FULLNAME, [])
     items: list[Type] = [

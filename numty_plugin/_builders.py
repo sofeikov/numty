@@ -1,40 +1,22 @@
-"""_builders.py — builders/joiners, mixed guards, like-builders, concat/stack. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (leaf, acyclic).
+"""_builders.py — builders/joiners, mixed guards, like-builders, concat/stack. (Phase 5, #199). Leaf-style: top imports only stdlib/mypy + _errors/_state/_trace/_dtypes/_forms/_unknowns/_exprs. Cross-module helpers via facade lazy per-function; _types helpers via direct import where needed (acyclic at import time only; the lazy facade imports make the call-time graph cyclic).
 """
 from __future__ import annotations
 
-import ast
-import json
-import keyword
-import os
-import sys
 from collections.abc import Callable, Iterator
-from functools import partial
-from typing import NamedTuple, cast
+from typing import cast
 
-from mypy.errorcodes import ARG_TYPE, MISC, ErrorCode
-from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, AssignmentStmt, CallExpr, Context, Decorator, EllipsisExpr, Expression, FuncDef, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr, OpExpr, OverloadedFuncDef, SliceExpr, StarExpr, StrExpr, TupleExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, UnaryExpr, Var
-from mypy.messages import callable_name
-from mypy.operators import op_methods_to_symbols
-from mypy.plugin import AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext, Plugin
-from mypy.typeanal import TypeAnalyser
-from mypy.tvar_scope import TypeVarLikeScope
-from mypy.types import AnyType, CallableType, EllipsisType, Instance, LiteralType, NoneType, Overloaded, RawExpressionType, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnboundType, UninhabitedType, UnionType, UnpackType, get_proper_type
+from mypy.nodes import CallExpr, Expression, GeneratorExpr, IntExpr, ListComprehension, ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, StrExpr, TupleExpr, TypeInfo
+from mypy.plugin import AttributeContext, FunctionContext, MethodContext
+from mypy.types import AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeAliasType, TypeOfAny, TypeVarType, UnionType, get_proper_type
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL, NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION, _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning, _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, NUMTY_UNSOLVED, _swallowed
 from ._state import STATE
 from ._trace import _numty_strict, _numty_trace_path, _trace_event
-from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES, _NAME_OF_KIND_SIZE, _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE, _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _WEAK_DEFAULT, _WEAK_SCALARS, _datetime_string_kind, _promote_strong, _promote_weak
-from ._forms import _DivForm, _LinForm, _MonoForm, _UNKNOWN_PREFIX, _canon_div, _coeff_vars_to_form, _eval_form, _form_has_unknown, _form_mul, _form_never_size, _form_to_coeff_vars, _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize
-from ._unknowns import _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names, _unknown_per_line
-from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _expr_var, _form_from_fullname, _form_of, _implicit_scope_vars, _mono_str, _ns_of_ctx, _normalize_ns, _seen_vars, _short_var, _current_scope_vars
+from ._dtypes import _DATETIME_FULLNAMES, _DTYPE_BASE, _DTYPE_INFO, _NBIT_MODULES, _NBIT_TAG_BY_BYTES, _datetime_string_kind
 
-from ._types import (  # noqa: F401
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim, _linear_product, 
-    _reshape_total_form, _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr, _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members, 
-    _distribute_pairings, _union_results, _distribute_solve, _split_flat, _iter_tvarlikes, _shape_tvar_formals, _strip_optional, _sequence_element, _align_pair, _pairs_for_actual, 
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _callsite_expr_bindings, _substitute_return_exprs, _fixed_shape, _shape_note_str, _rank_mismatch_notes, 
-    _reported_as_operator, _mentions_ndarray, _info_mentions_array, _note_rank_mismatches, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, 
-    _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME, _SEQUENCE_FULLNAMES, _OPERATOR_DUNDERS
+from ._types import (
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg, 
+    _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME
 )
 
 def _operands_have_known_shape(operands: list[Type]) -> bool:
@@ -286,7 +268,6 @@ def _mixed_parts(tp: Type, partner: bool = False) -> tuple[list[int | Type], Typ
     keeps bailing on int dims via _ndarray_parts. partner also accepts
     a shape with no Literal dim, for the other operand of a mixed one.
     """
-    from numty_plugin import _matmul_inner
     proper = get_proper_type(tp)
     if not (
         isinstance(proper, Instance)
@@ -342,7 +323,6 @@ def _widen_literal_dims(
     would not terminate. literals=False widens only those int dims, for
     a result the plugin solved itself (_mixed_result).
     """
-    from numty_plugin import _mixed_result
     if isinstance(tp, TypeAliasType) and tp.is_recursive:
         return tp
     proper = get_proper_type(tp)
@@ -491,7 +471,6 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
     shape (np.resize), and int would not fit back where the literal is
     expected. A result the plugin built itself is never touched.
     """
-    from numty_plugin import _formal_pair
     if hook is None and not fullname.startswith("numpy."):
         return None
     short = fullname.rsplit(".", 1)[-1]
