@@ -2322,15 +2322,17 @@ def test_unknown_formula_in_error_is_readable() -> None:
 
 
 def test_sklearn_gnb_stack_dynamic_length() -> None:
-    # Correct code hitting a solver gap (see #1 triage → #12): np.stack
-    # over a loop-built list has no statically known length, so the hook
-    # fails once at the call instead of poisoning downstream.
+    # A loop-built list of (n_samples,) arrays stacks to an unknown length.
+    # The new axis mints ?U (issue #227): the length is unknowable, but the
+    # element rank is kept instead of bailing the whole result to Any.
+    # Downstream the ?U then mismatches the annotated shapes.
     pytest.importorskip("sklearn")
     result = run_mypy(FIXTURES / "sklearn_gnb.py")
-    assert_single_error(
-        result,
-        "stack: the items have no known shape",
-    )
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert "tuple[n_samples, ?U" in errors[0] and "[assignment]" in errors[0], result.stdout
+    assert "tuple[n_samples, ?U" in errors[1] and "[return-value]" in errors[1], result.stdout
     run = subprocess.run(
         [sys.executable, str(FIXTURES / "sklearn_gnb.py")],
         capture_output=True,
@@ -4251,13 +4253,14 @@ def test_ok_fixtures_clean_under_allow_redefinition() -> None:
 
 def test_sklearn_clean_under_allow_redefinition() -> None:
     # Issue #162: sklearn dogfood stays precise with the flag; gnb keeps
-    # its single [numty-bail] (the rebind split from #163 is flag-proof).
+    # its ?U length (the rebind split from #163 is flag-proof).
     pytest.importorskip("sklearn")
     for name in ("sklearn_ridge.py", "sklearn_nmf.py", "sklearn_normalize.py"):
         result = run_mypy(FIXTURES / name, flags=("--allow-redefinition",))
         assert result.returncode == 0, result.stdout
     result = run_mypy(FIXTURES / "sklearn_gnb.py", flags=("--allow-redefinition",))
-    assert_single_error(
-        result,
-        "stack: the items have no known shape",
-    )
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    assert "tuple[n_samples, ?U" in errors[0], result.stdout
+    assert "tuple[n_samples, ?U" in errors[1], result.stdout
