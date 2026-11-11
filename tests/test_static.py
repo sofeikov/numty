@@ -2812,6 +2812,27 @@ def test_parameterized_shape_generic_stays_clean() -> None:
     assert _run_fixture("bare_generic_ok.py") == ["ok"]
 
 
+def test_generic_namedtuple_replace_and_unpack() -> None:
+    # Issues #219/#221: a generic NamedTuple keeps mypy's TupleType handling,
+    # so _replace checks and tuple unpacking stay per-field.
+    for name in ("generic_replace_ok.py", "generic_unpack_ok.py"):
+        result = run_mypy(FIXTURES / name)
+        assert result.returncode == 0, result.stdout
+    assert reveals_by_line(run_mypy(FIXTURES / "generic_unpack_ok.py")) == {
+        22: '"numpy.ndarray[tuple[int], numpy.dtype[numpy.float64]]"',
+    }
+
+
+def test_generic_method_keeps_receiver_tvars() -> None:
+    # Issue #220: G[Q, H].take(typed: K) is G[Q, K], not G[Never, K].
+    result = run_mypy(FIXTURES / "generic_method_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "G[Q, K]" in notes[23], result.stdout
+    assert "G[P, K]" in notes[24], result.stdout
+    assert "Never" not in result.stdout, result.stdout
+
+
 def test_star_kwargs_ok() -> None:
     # Issue #52: *tuple stars expand, shape=/axes=/min=/max= fall back
     # from keywords, and out=/dtype= select the result. All match runtime.
