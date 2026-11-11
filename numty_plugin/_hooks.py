@@ -42,7 +42,7 @@ from ._builders import (
     ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook,
     identity_function_hook, tri_function_hook, arange_function_hook, concatenate_function_hook,
     vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook,
-    stack_function_hook,
+    stack_function_hook, r_getitem_hook,
 )
 from ._matmul import (
     _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, dot_function_hook,
@@ -744,6 +744,8 @@ class NumtyPlugin(Plugin):
             return getitem_method_hook
         if fullname == "numpy.ndarray.__setitem__":
             return setitem_method_hook
+        if fullname == "numpy.lib._index_tricks_impl.RClass.__getitem__":
+            return r_getitem_hook
         short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.ndarray.") and short in {
             "__eq__",
@@ -1575,6 +1577,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
         "numpy.lib._type_check_impl": {
             "imag": partial(ufunc_function_hook, group="real"),
             "real": partial(ufunc_function_hook, group="real"),
+            "nan_to_num": copy_function_hook,
         },
         "numpy.lib._ufunclike_impl": {
             "isneginf": partial(ufunc_function_hook, group="bool"),

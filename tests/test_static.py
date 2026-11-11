@@ -3143,6 +3143,36 @@ def test_stack_ok_clean() -> None:
     assert "error:" not in result.stdout
 
 
+def test_builders_intp_keeps_typevar() -> None:
+    # Issue #223: np.full(len(x), v, dtype=np.intp) is (T,) like the tuple
+    # shape and like np.int64, not (int,).
+    result = run_mypy(FIXTURES / "builders_intp_ok.py")
+    assert result.returncode == 0, result.stdout
+
+
+def test_builders_r_nan_concat_float() -> None:
+    # Issue #230: float list items, np.r_ and nan_to_num are solved.
+    result = run_mypy(FIXTURES / "builders_r_nan_concat_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "tuple[N+1]" in notes[11], result.stdout
+    assert "tuple[N+1]" in notes[12] and "float64" in notes[12], result.stdout
+    assert "tuple[N+1]" in notes[13] and "float64" in notes[13], result.stdout
+    assert "tuple[N+1]" in notes[14] and "float64" in notes[14], result.stdout
+    assert "tuple[N]" in notes[15] and "bool" in notes[15], result.stdout
+    assert "tuple[N]" in notes[16] and "float64" in notes[16], result.stdout
+    assert "tuple[N]" in notes[17], result.stdout
+
+
+def test_stack_any_static_keeps_shape() -> None:
+    # Issue #232: static-length stack with dtype[Any] items is solved.
+    result = run_mypy(FIXTURES / "stack_any_static_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "tuple[R, A, Literal[2]]" in notes[28], result.stdout
+    assert "tuple[R, A, Literal[3]]" in notes[29], result.stdout
+
+
 def test_construct_shapes_ok_clean_and_runs() -> None:
     # Issue #46: hooked ops used to claim precise-but-wrong literal
     # shapes (a wrong concrete shape is worse than Any). Each reveal is
