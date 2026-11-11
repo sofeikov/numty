@@ -17,8 +17,8 @@ from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
 from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import (
-    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeOfAny, TypeVarId,
-    TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type,
+    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,
+    TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
@@ -989,6 +989,7 @@ def _substitute_return_exprs(
     sig: CallableType,
     bindings: dict[str, int | Type | _LinForm],
     ctx: FunctionSigContext | MethodSigContext,
+    _seen: frozenset[TypeAliasType] = frozenset(),
 ) -> Type | None:
     """Return type with callee expr vars substituted by call bindings.
 
@@ -1003,8 +1004,23 @@ def _substitute_return_exprs(
     `-> F64["N+M"]` with only M bound is not the caller's `N` plus
     anything. The exception is a dim that is itself a formal dim
     (`x: F64["N+1"]) -> F64["N+1"]`), which mypy infers on its own.
+
+    A recursive alias (issue 243) expands forever via get_proper_type,
+    so each alias is expanded once per path (cf. _iter_tvarlikes, #164).
     """
     from numty_plugin import _resolve_dim, _fresh_unknown
+    # Issue 243: `-> JSON` with a recursive alias recursed until
+    # RecursionError ([numty-internal] on calls that involve no array).
+    # Each alias is unwrapped once per path; anything already seen stops.
+    try:
+        rt = sig.ret_type
+        if isinstance(rt, TypeAliasType):
+            if rt in _seen:
+                return None
+            _seen = _seen | {rt}
+    except Exception:
+        _swallowed(ctx, "_substitute_return_exprs")
+        pass
     # Dims mypy infers by itself: every variable a formal mentions,
     # wherever it sits (`x: F64["N+1"]`, `xs: dict[str, F64[N, M]]`).
     inferred: set[str] = set()
@@ -1032,6 +1048,83 @@ def _substitute_return_exprs(
             _swallowed(ctx, "_substitute_return_exprs")
             return None
         if isinstance(proper_ret, TupleType):
+            # Issues 244/220: a generic NamedTuple value is a TupleType
+            # whose fallback is the NamedTuple Instance. Substituting field
+            # dims while leaving the fallback breaks identity (Block[int,F]
+            # vs Block[int,F]). Pre-PR241 bailed here (mypy default,
+            # correct); only unknown-shape actuals (issue 218, bindings to
+            # Any) still substitute, with items AND fallback kept consistent
+            # (issue 245: Box[Any], not Box[Never]).
+            try:
+                fb = get_proper_type(getattr(proper_ret, "partial_fallback", None))
+                fb_info = fb.type if isinstance(fb, Instance) else None
+                is_nt_tuple = fb_info is not None and (
+                    getattr(fb_info, "is_named_tuple", False)
+                    or getattr(fb_info, "tuple_type", None) is not None
+                    or getattr(fb_info, "typeddict_type", None) is not None
+                )
+            except Exception:
+                _swallowed(ctx, "_substitute_return_exprs")
+                is_nt_tuple = False
+            if is_nt_tuple:
+                try:
+                    fb_args = list(fb.args) if isinstance(fb, Instance) else []
+                except Exception:
+                    _swallowed(ctx, "_substitute_return_exprs")
+                    fb_args = []
+                needs_any = False
+                for farg in fb_args:
+                    fap = get_proper_type(farg)
+                    if isinstance(fap, TypeVarType) and fap.fullname in bindings:
+                        fb_b = bindings[fap.fullname]
+                        if isinstance(fb_b, AnyType):
+                            needs_any = True
+                            break
+                        if isinstance(fb_b, Type):
+                            try:
+                                if isinstance(get_proper_type(fb_b), AnyType):
+                                    needs_any = True
+                                    break
+                            except Exception:
+                                _swallowed(ctx, "_substitute_return_exprs")
+                                pass
+                if not needs_any:
+                    return None
+                new_items_nt: list[Type] = []
+                changed_nt = False
+                for item in proper_ret.items:
+                    try:
+                        sub_sig_nt = sig.copy_modified(ret_type=item)
+                    except Exception:
+                        _swallowed(ctx, "_substitute_return_exprs")
+                        return None
+                    sub_nt = _substitute_return_exprs(sub_sig_nt, bindings, ctx, _seen)
+                    if sub_nt is None:
+                        new_items_nt.append(item)
+                    else:
+                        new_items_nt.append(sub_nt)
+                        changed_nt = True
+                try:
+                    sub_fb_sig = sig.copy_modified(ret_type=fb)
+                except Exception:
+                    _swallowed(ctx, "_substitute_return_exprs")
+                    return None
+                new_fb = _substitute_return_exprs(sub_fb_sig, bindings, ctx, _seen)
+                if new_fb is None:
+                    return None
+                new_fb_inst = get_proper_type(new_fb)
+                if not isinstance(new_fb_inst, Instance):
+                    return None
+                if not changed_nt and new_fb_inst == fb:
+                    return None
+                try:
+                    return TupleType(
+                        new_items_nt, new_fb_inst, line=proper_ret.line,
+                        column=proper_ret.column, implicit=proper_ret.implicit,
+                    )
+                except Exception:
+                    _swallowed(ctx, "_substitute_return_exprs")
+                    return None
             new_items = []
             changed_t = False
             for item in proper_ret.items:
@@ -1040,7 +1133,7 @@ def _substitute_return_exprs(
                 except Exception:
                     _swallowed(ctx, "_substitute_return_exprs")
                     return None
-                sub = _substitute_return_exprs(sub_sig, bindings, ctx)
+                sub = _substitute_return_exprs(sub_sig, bindings, ctx, _seen)
                 if sub is None:
                     new_items.append(item)
                 else:
@@ -1070,7 +1163,7 @@ def _substitute_return_exprs(
                 except Exception:
                     _swallowed(ctx, "_substitute_return_exprs")
                     return None
-                sub_u = _substitute_return_exprs(sub_sig_u, bindings, ctx)
+                sub_u = _substitute_return_exprs(sub_sig_u, bindings, ctx, _seen)
                 if sub_u is None:
                     new_members.append(item)
                 else:
@@ -1153,7 +1246,7 @@ def _substitute_return_exprs(
                 except Exception:
                     _swallowed(ctx, "_substitute_return_exprs")
                     return None
-                sub_a = _substitute_return_exprs(sub_sig_a, bindings, ctx)
+                sub_a = _substitute_return_exprs(sub_sig_a, bindings, ctx, _seen)
                 if sub_a is None:
                     new_args.append(arg)
                 else:

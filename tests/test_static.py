@@ -1157,6 +1157,40 @@ def test_generic_namedtuple_context_kept() -> None:
     assert "error:" not in result.stdout
 
 
+def test_recursive_alias_return_ok() -> None:
+    # Issue 243: a call returning a recursive alias stays clean (no
+    # RecursionError -> [numty-internal]).
+    result = run_mypy(FIXTURES / "recursive_alias_return_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    assert "internal" not in result.stdout, result.stdout
+
+
+def test_generic_namedtuple_method_keeps_receiver() -> None:
+    # Issue 244 (+220 for NamedTuple): methods of a generic NamedTuple
+    # keep receiver TypeVars; field dims are not minted as ?U.
+    result = run_mypy(FIXTURES / "generic_namedtuple_method_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "Block[int, F]" in notes[27], result.stdout
+    assert "?U" not in notes[27], result.stdout
+    assert "Block[Q, K]" in notes[31], result.stdout
+    assert "Never" not in result.stdout, result.stdout
+
+
+def test_generic_namedtuple_box_unknown_arg() -> None:
+    # Issue 245: Box built from an unknown-shape argument is Box[Any];
+    # item access and attribute access agree (no Never fallback).
+    result = run_mypy(FIXTURES / "generic_namedtuple_box_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert "Box[Any]" in notes[25], result.stdout
+    assert "tuple[Any]" in notes[26], result.stdout
+    assert "tuple[Any]" in notes[27], result.stdout
+    assert "Never" not in result.stdout, result.stdout
+    assert "var-annotated" not in result.stdout, result.stdout
+
+
 def test_builder_int_return_checked() -> None:
     # Issue 233: a plain-int builder size checks like the named value.
     # Single-dim inline and named both fail ([int] vs [R]).
