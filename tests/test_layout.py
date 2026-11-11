@@ -347,7 +347,10 @@ def test_every_fail_site_has_code() -> None:
                 if not any(k.arg == "code" for k in node.keywords):
                     missing.append(f"{py.relative_to(plugin_dir)}:{node.lineno}")
     assert total > 100, total
-    assert total >= 233, f"fail-site total dropped: {total} < 233"
+    # Floor 232 (was 233 on the monolith): issue #217 moved the broadcast
+    # check before dtype promotion, so the datetime path no longer needs
+    # its own duplicate broadcast fail.
+    assert total >= 232, f"fail-site total dropped: {total} < 232"
     assert not missing, f"ctx.api.fail without code= at {missing}"
 
 
