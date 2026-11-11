@@ -3722,21 +3722,37 @@ def test_targeted_ignores() -> None:
 def test_every_plugin_fail_site_passes_an_error_code() -> None:
     # Static guard: fixtures only reach some fail sites, so check them all
     # in the source. A new ctx.api.fail without code= would print [misc].
+    # Scan every .py under numty_plugin/ so Phase 2 leaf moves (_*.py)
+    # never silently drop coverage. Floor pinned at 233 (verified count
+    # on the monolith) so a lost site or missed file fails loudly.
     import ast
 
-    tree = ast.parse((ROOT / "numty_plugin" / "__init__.py").read_text())
-    sites = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "fail"
-        and isinstance(node.func.value, ast.Attribute)
-        and node.func.value.attr == "api"
-    ]
+    plugin_dir = ROOT / "numty_plugin"
+    files = sorted(
+        p for p in plugin_dir.rglob("*.py") if "__pycache__" not in p.parts
+    )
+    assert files, f"no .py files found under {plugin_dir} - glob broken?"
+    assert plugin_dir / "__init__.py" in files, "scan must include __init__.py"
+    sites: list[tuple[Path, ast.Call]] = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        sites += [
+            (path, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "fail"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "api"
+        ]
     assert len(sites) > 100, len(sites)
-    missing = [n.lineno for n in sites if not any(k.arg == "code" for k in n.keywords)]
-    assert not missing, f"ctx.api.fail without code= at numty_plugin lines {missing}"
+    assert len(sites) >= 233, f"fail-site total dropped: {len(sites)} < 233"
+    missing = [
+        f"{path.relative_to(plugin_dir)}:{n.lineno}"
+        for path, n in sites
+        if not any(k.arg == "code" for k in n.keywords)
+    ]
+    assert not missing, f"ctx.api.fail without code= at {missing}"
 
 
 def test_flexarray_portable_fixture_under_mypy() -> None:
