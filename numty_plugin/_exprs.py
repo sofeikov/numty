@@ -1,11 +1,11 @@
 """Expr registries + TypeVar minting (Phase 2, #196).
 
-Depends on ._forms + mypy types. Owns the process singletons
-(_expr_forms/_expr_ids/_seen_vars/_implicit_scope_vars/
-_expr_constituents/_unknown_ids/_unknown_names/_unknown_per_line).
-Lazy-imports _iter_tvarlikes from the facade to avoid
-cycles while __init__ still holds the caller (_swallowed comes
-directly from ._errors, no cycle).
+Depends on ._forms + ._unknowns + mypy types. Owns the expr
+singletons (_expr_forms/_expr_ids/_seen_vars/_implicit_scope_vars/
+_expr_constituents); _unknown_* singletons live in _unknowns.
+Lazy-imports _iter_tvarlikes from the facade to avoid cycles while
+__init__ still holds the caller (_swallowed comes directly from
+._errors, no cycle).
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from mypy.types import AnyType, Type, TypeOfAny, TypeVarId, TypeVarLikeType, Typ
 
 from ._errors import _swallowed
 from ._forms import _DivForm, _LinForm, _MonoForm, _eval_form
+from ._unknowns import _unknown_ids, _unknown_names, _unknown_per_line
 
 if TYPE_CHECKING:
     from mypy.plugin import AttributeContext, FunctionContext, MethodContext
@@ -52,13 +53,8 @@ _expr_constituents: dict[str, dict[str, TypeVarType]] = {}
 # (which a module loaded from mypy's incremental cache never fills).
 _LATE_PREFIXES = ("__numty_implicit__.", "__numty_expr__.")
 _EXPR_PREFIX = "__numty_expr__."
-
-
-_unknown_ids: dict[str, TypeVarId] = {}
-# Display names of unknowns by fullname, and how many distinct unknowns
-# each (module, line) has minted. Names only: identity stays the id.
-_unknown_names: dict[str, str] = {}
-_unknown_per_line: dict[tuple[str, int], int] = {}
+# _unknown_ids/_unknown_names/_unknown_per_line live in _unknowns.py
+# (single owner; imported above so _exprs helpers read the same objects).
 # Unknowns minted inside a comprehension (issue #63): one site is
 # evaluated once per element at runtime, so every element shares the
 # same ?U even when sizes differ. Never prove such an unknown equal,
