@@ -1234,6 +1234,19 @@ def test_abstract_dtype_promotion() -> None:
     assert "signedinteger[numpy._typing._nbit_base._64Bit]" in notes[36], result.stdout
     assert "_32Bit | numpy._typing._nbit_base._64Bit" in notes[37], result.stdout
     assert "numpy.integer[Any]" in notes[38], result.stdout
+    # A TypeVar dtype: kept with Python scalars and with itself.
+    assert notes[66] == '"numpy.ndarray[tuple[N], numpy.dtype[ST]]"', result.stdout
+    assert notes[67] == '"numpy.ndarray[tuple[N], numpy.dtype[ST]]"', result.stdout
+    # timedelta64 and object_ decide the result with a numeric operand, in
+    # each operand order.
+    td = '"numpy.ndarray[tuple[N], numpy.dtype[numpy.timedelta64[Any]]]"'
+    for line in (72, 73, 74, 75):
+        assert notes[line] == td, result.stdout
+    assert notes[76] == '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"', result.stdout
+    for line in (77, 78, 79):
+        assert notes[line] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.object_]]"', result.stdout
+    assert notes[80] == '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"', result.stdout
+    assert notes[81] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.complex128]]"', result.stdout
 
 
 def test_abstract_dtype_promotion_errors() -> None:

@@ -52,6 +52,12 @@ def _loose_dtype_name(dtype: Type) -> str | None:
 def _array_dtype(tp: Type) -> Type | None:
     """The dtype of an ndarray type (whatever its shape), or a dtype[...] itself."""
     proper = get_proper_type(tp)
+    if isinstance(proper, TypeVarType):
+        # A dtype that is a TypeVar as a whole: ndarray[S, DT].
+        bound = get_proper_type(proper.upper_bound)
+        if isinstance(bound, Instance) and bound.type.fullname == DTYPE_FULLNAME:
+            return tp
+        return None
     if not isinstance(proper, Instance):
         return None
     if proper.type.fullname == NDARRAY_FULLNAME and len(proper.args) == 2:
@@ -59,6 +65,28 @@ def _array_dtype(tp: Type) -> Type | None:
     if proper.type.fullname == DTYPE_FULLNAME:
         return tp
     return None
+
+
+def _bound_dtype(dtype: Type) -> Type:
+    """dtype[T] with a TypeVar T replaced by its upper bound, else dtype.
+
+    `dtype[ST]` with `ST` bound to np.floating has the floating kind, so
+    the kind rules apply to it and the result can stay `dtype[ST]`.
+    """
+    proper = get_proper_type(dtype)
+    if isinstance(proper, Instance) and len(proper.args) == 1:
+        element = get_proper_type(proper.args[0])
+        if isinstance(element, TypeVarType):
+            return proper.copy_modified(args=[element.upper_bound])
+    return dtype
+
+
+def _is_object_dtype(dtype: Type) -> bool:
+    proper = get_proper_type(dtype)
+    if not isinstance(proper, Instance) or not proper.args:
+        return False
+    element = get_proper_type(proper.args[0])
+    return isinstance(element, Instance) and element.type.fullname == "numpy.object_"
 
 
 def _is_abstract_floating(dtype: Type) -> bool:
@@ -114,13 +142,17 @@ def _fallback_dtype(
     # (kind, name or None, dtype type or None) per array / numpy scalar.
     strong: list[tuple[str, str | None, Type | None]] = []
     weak: list[tuple[str, str]] = []
+    # Array dtypes with no numeric kind: a TypeVar, object_, str_,
+    # datetime64, timedelta64, np.number, a union.
+    other: list[Type] = []
     for tp in operands:
         dtype = _array_dtype(tp)
         if dtype is not None:
-            base = _dtype_base(dtype)
-            if base is None:
-                return any_dtype
-            strong.append((base, _loose_dtype_name(dtype), dtype))
+            base = _dtype_base(_bound_dtype(dtype))
+            if base is None or base not in _KIND_RANK:
+                other.append(dtype)
+            else:
+                strong.append((base, _loose_dtype_name(dtype), dtype))
             continue
         key = _scalar_key(tp)
         if key is None:
@@ -138,11 +170,32 @@ def _fallback_dtype(
             if strong_kind is None:
                 return any_dtype
             strong.append((strong_kind, key[1], None))
-    if not strong:
-        return any_dtype
     for kind, _, _ in strong:
         if kind not in _KIND_RANK:
             return any_dtype
+    if other:
+        # An object array gives an object array with every other operand.
+        for dtype in other:
+            if _is_object_dtype(dtype):
+                return dtype
+        if not all(is_same_type(other[0], dtype) for dtype in other[1:]):
+            return any_dtype
+        if _datetime_kind(other[0]) is not None:
+            # timedelta64 with numbers stays timedelta64 (td * 2, td / 2.0,
+            # td * f64), and datetime64 + int stays datetime64. Two
+            # timedelta64 operands divide to float64.
+            if true_div and len(other) > 1:
+                return any_dtype
+            if all(_KIND_RANK[kind] <= 2 for kind, _, _ in strong):
+                return other[0]
+            return any_dtype
+        # A TypeVar dtype, str_, np.number: only with itself and Python
+        # scalars, and not for a true division (an integer dtype would
+        # become float64). This keeps `def f(x: ndarray[S, DT]) ->
+        # ndarray[S, DT]: return x * k` valid.
+        return other[0] if not strong and not true_div else any_dtype
+    if not strong:
+        return any_dtype
 
     def _named(name: str) -> Type:
         # Reuse an operand dtype (exact name first, then np.intp for
@@ -208,7 +261,13 @@ def _fallback_dtype(
         floating = _abstract_floating(ctx)
         return floating if floating is not None else any_dtype
     if strong_top == 3:
-        if all(name == "numpy.complex128" for name, _ in tops):
+        # A float of unknown width or a longdouble can widen complex128.
+        narrow_floats = all(
+            name in ("numpy.float16", "numpy.float32", "numpy.float64")
+            for kind, name, _ in strong
+            if _KIND_RANK[kind] == 2
+        )
+        if narrow_floats and all(name == "numpy.complex128" for name, _ in tops):
             return _named("numpy.complex128")
         if same and not lower_integer and not lower_floating:
             return top_dtypes[0]
