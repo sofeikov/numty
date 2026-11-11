@@ -9,7 +9,7 @@ import keyword
 from typing import TYPE_CHECKING, cast
 
 from ._errors import NUMTY_ANNOTATION, _swallowed
-from ._exprs import _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars, _seen_vars, _LATE_PREFIXES
+from ._exprs import _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars, _normalize_ns, _seen_vars, _LATE_PREFIXES
 from ._forms import _LinForm, _form_never_size
 
 
@@ -423,19 +423,21 @@ def _fam_expr(
     # Remember constituent vars so later simplifications (e.g.
     # diff(N+1) -> N) return the scope's own object, not a stale one.
     # Last-wins (issue #43): each scope's binding refreshes this.
+    # Phase 4 Phase 1: namespaced (ns, fullname) keys.
+    _ns = _normalize_ns(getattr(scope, "namespace", "") or "")
     for name in names:
         v = resolved[name]
         if isinstance(v, TypeVarType):
-            _seen_vars[v.fullname] = v
+            _seen_vars[(_ns, v.fullname)] = v
     # Per-scope constituents for #32 finish: diff(M+1)->M looks up M
     # in the defining scope via the expr's fullname, dodging the
     # global _seen_vars leak (#43).
     try:
-        _expr_constituents[fullname] = {
-            v.fullname: v
+        _expr_constituents.setdefault(fullname, {}).update({
+            (_ns, v.fullname): v
             for v in resolved.values()
             if isinstance(v, TypeVarType)
-        }
+        })
     except Exception:
         _swallowed(ctx, "_fam_expr")
         pass
@@ -550,7 +552,7 @@ def _fam_ensure_implicit(
     marker still matches.
     """
     try:
-        ns = scope.namespace
+        ns = _normalize_ns(scope.namespace)
     except Exception:
         _swallowed(ctx, "_fam_ensure_implicit")
         ns = ""

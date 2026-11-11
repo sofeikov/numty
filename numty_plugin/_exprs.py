@@ -28,6 +28,38 @@ def _iter_tvarlikes_lazy(tp: Type) -> Iterator[TypeVarLikeType]:
 
     return _iter_tvarlikes(tp)
 
+
+def _normalize_ns(ns: str) -> str:
+    return (ns or "").split("#", 1)[0]
+
+
+def _ns_of_ctx(ctx: object) -> str:
+    """Caller/defining function fullname for namespaced B keys."""
+    try:
+        api = getattr(ctx, "api", None)
+        tscope = getattr(api, "tscope", None) if api is not None else None
+        if tscope is not None:
+            try:
+                ns = tscope.current_target()
+                if ns:
+                    return _normalize_ns(ns)
+            except Exception:
+                _swallowed(ctx, "_ns_of_ctx")
+        scope = getattr(api, "scope", None) if api is not None else None
+        if scope is not None:
+            try:
+                fn = scope.current_function()
+                if fn is not None and getattr(fn, "fullname", None):
+                    return _normalize_ns(fn.fullname)
+            except Exception:
+                _swallowed(ctx, "_ns_of_ctx")
+        tree = getattr(api, "tree", None) if api is not None else None
+        if tree is not None and getattr(tree, "fullname", None):
+            return _normalize_ns(tree.fullname)
+    except Exception:
+        _swallowed(ctx, "_ns_of_ctx")
+    return ""
+
 # Singletons live in STATE (Phase 4 Phase 0, #198); module attrs alias
 # them (same objects, tests/test_layout.py identity + mutation probes).
 _expr_forms = STATE.expr_forms
@@ -155,15 +187,13 @@ def _mono_str(form: _MonoForm) -> str:
     return f"{form.coeff}*{body}"
 
 
-def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
+def _resolve_dim(d: int | Type, ns: str | None = None) -> _LinForm | _DivForm | _MonoForm | None:
     """Canonical form of a dim: ints and TypeVars (expressions included).
 
     Plain TypeVars read as single-term linears, so N and N*1 compare
     equal; anything else is unresolvable. Seen variables are remembered
-    by fullname so materialization can return the real object. Last-wins,
-    not first-wins (issue #43): sequential checking refreshes this to the
-    current function's object (its inner call resolves before any outer
-    call in the same body materializes).
+    namespaced ((ns, fullname)) so materialization can return the real
+    object for the current function; last-wins, not first-wins (#43).
     """
     if isinstance(d, int):
         return _LinForm((), d)
@@ -171,7 +201,8 @@ def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
         form = _form_of(d)
         if form is not None:
             return form
-        _seen_vars[d.fullname] = d
+        key_ns = ns if ns is not None else _normalize_ns(getattr(getattr(d, "id", None), "namespace", "") or "")
+        _seen_vars[(key_ns, d.fullname)] = d
         return _LinForm(((d.fullname, 1),), 0)
     return None
 
@@ -247,7 +278,7 @@ def _expr_var(
         try:
             current = _current_scope_vars(ctx)
             consts = {
-                fullname_c: current[fullname_c]
+                (_ns_of_ctx(ctx), fullname_c): current[fullname_c]
                 for fullname_c, _ in form.coeffs
                 if fullname_c in current
             }
@@ -299,22 +330,35 @@ def _materialize_dim(
             # expr (e.g. repeat's N*2 feeding reshape's -1), not the bare
             # var. That expr's constituents were just recorded by the
             # inner call in this same body, so they are the current
-            # function's objects; the global registry below still holds
-            # whichever function was checked first.
+            # function's objects; namespaces keep them apart (#43/#146).
+            ns = _ns_of_ctx(ctx)
             for tv in current.values():
                 if isinstance(tv, TypeVarType):
                     consts = _expr_constituents.get(tv.fullname)
-                    if consts is not None and want in consts:
-                        return consts[want]
+                    if consts is not None and (ns, want) in consts:
+                        return consts[(ns, want)]
+                    if consts is not None:
+                        # Stale/normalization-miss survival: any-ns scan.
+                        for (n, full), obj in consts.items():
+                            if full == want:
+                                return obj
         except Exception:
             _swallowed(ctx, "_materialize_dim")
             pass
         # 2) diff(M+1)->M: the input expr knows its own scope's M.
         if isinstance(prefer, TypeVarType):
             consts = _expr_constituents.get(prefer.fullname)
-            if consts is not None and want in consts:
-                return consts[want]
-        seen = _seen_vars.get(want)
+            if consts is not None and (_ns_of_ctx(ctx), want) in consts:
+                return consts[(_ns_of_ctx(ctx), want)]
+            if consts is not None:
+                for (n, full), obj in consts.items():
+                    if full == want:
+                        return obj
+        seen = _seen_vars.get((_ns_of_ctx(ctx), want))
         if seen is not None:
             return seen
+        # Stale fallback: any-ns scan (never shadows current above).
+        for (n, full), obj in _seen_vars.items():
+            if full == want:
+                return obj
     return _expr_var(ctx, op, index, form)

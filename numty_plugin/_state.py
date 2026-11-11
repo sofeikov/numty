@@ -20,10 +20,10 @@ class NumtyState:
     # Region A - content-addressed, process-stable, never cleared.
     expr_forms: dict[str, _LinForm | _DivForm | _MonoForm] = field(default_factory=dict)
     expr_ids: dict[str, TypeVarId] = field(default_factory=dict)
-    # Region B - scope-bound objects (keys still bare-fullname in Phase 0;
-    # namespacing is Phase 1). Values are live TypeVarType objects.
-    seen_vars: dict[str, TypeVarType] = field(default_factory=dict)
-    expr_constituents: dict[str, dict[str, TypeVarType]] = field(default_factory=dict)
+    # Region B (Phase 1 #198): scope-bound, keyed (ns, fullname).
+    # Outer expr key stays global (expr vars are namespace="").
+    seen_vars: dict[tuple[str, str], TypeVarType] = field(default_factory=dict)
+    expr_constituents: dict[str, dict[tuple[str, str], TypeVarType]] = field(default_factory=dict)
     implicit_scope_vars: dict[tuple[str, str], TypeVarLikeType] = field(default_factory=dict)
     # Region C - ephemeral display/debug (never cleared in Phase 0).
     unknown_ids: dict[str, TypeVarId] = field(default_factory=dict)
