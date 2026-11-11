@@ -2332,7 +2332,9 @@ def test_sklearn_gnb_stack_dynamic_length() -> None:
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 2, result.stdout
     assert "tuple[n_samples, ?U" in errors[0] and "[assignment]" in errors[0], result.stdout
-    assert "tuple[n_samples, ?U" in errors[1] and "[return-value]" in errors[1], result.stdout
+    # Without allow-redefinition the rebind fails, so the return still
+    # sees the list type rather than the stacked ?U array.
+    assert "list[ndarray" in errors[1] and "[return-value]" in errors[1], result.stdout
     run = subprocess.run(
         [sys.executable, str(FIXTURES / "sklearn_gnb.py")],
         capture_output=True,
@@ -4261,6 +4263,5 @@ def test_sklearn_clean_under_allow_redefinition() -> None:
     result = run_mypy(FIXTURES / "sklearn_gnb.py", flags=("--allow-redefinition",))
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    assert len(errors) == 2, result.stdout
-    assert "tuple[n_samples, ?U" in errors[0], result.stdout
-    assert "tuple[n_samples, ?U" in errors[1], result.stdout
+    assert len(errors) == 1, result.stdout
+    assert "tuple[n_samples, ?U" in errors[0] and "[return-value]" in errors[0], result.stdout
