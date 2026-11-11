@@ -3173,6 +3173,40 @@ def test_stack_any_static_keeps_shape() -> None:
     assert "tuple[R, A, Literal[3]]" in notes[29], result.stdout
 
 
+def test_head_int_matches_spelled() -> None:
+    # Issue #225: F64[int] has the same result types as the spelled ndarray.
+    result = run_mypy(FIXTURES / "head_int_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = {line: re.sub(r"\?U@\d+[a-z]?", "?U", n) for line, n in reveals_by_line(result).items()}
+    assert notes[10] == notes[17], result.stdout
+    assert notes[11] == notes[18], result.stdout
+    assert notes[12] == notes[19], result.stdout
+    assert notes[13] == notes[20], result.stdout
+    assert "float64" in notes[10], result.stdout
+
+
+def test_int_dim_keeps_rank_and_checks() -> None:
+    # Issue #227: an int dim is one unknown axis, not a whole-shape bail.
+    # The rank and the literal axis survive, and 3 vs 4 is reported.
+    result = run_mypy(FIXTURES / "bad_int_dim_broadcast.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    for line in errors:
+        assert "broadcast shapes disagree at trailing axis 0: 3 vs 4" in line, result.stdout
+        assert "[numty-broadcast]" in line, result.stdout
+    assert "tuple[N]" in result.stdout and "?U" in result.stdout, result.stdout
+
+
+def test_whole_shape_typevar_kept() -> None:
+    # Issue #229: elementwise ops on ndarray[_S, ...] keep _S.
+    result = run_mypy(FIXTURES / "whole_shape_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    for line in (10, 11, 12):
+        assert notes[line] == '"numpy.ndarray[_S, numpy.dtype[numpy.float64]]"', result.stdout
+
+
 def test_construct_shapes_ok_clean_and_runs() -> None:
     # Issue #46: hooked ops used to claim precise-but-wrong literal
     # shapes (a wrong concrete shape is worse than Any). Each reveal is
