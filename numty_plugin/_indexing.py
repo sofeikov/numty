@@ -17,8 +17,8 @@ from ._types import (
     _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _formal_pair, _is_none_type, _movable_parts, _normalize_axis,
-    _normalize_axis_0d, _parse_axis_arg, _scalar_key,
+    _all_positionals, _dims_str, _formal_pair, _is_none_type, _movable_int_parts, _movable_parts,
+    _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
 )
 from ._reductions import (
     _enum_member_value, _final_slice_call, _fold_index_bound,
@@ -119,7 +119,7 @@ def _take_solve(
 ) -> Type:
     if pair is None:
         return ctx.default_return_type
-    parts = _ndarray_parts(array)
+    parts = _ndarray_parts(array) or _movable_int_parts(array)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -811,7 +811,10 @@ def _solve_getitem(
         out = [*kept_before, *adv_block, *kept_after, *dims[dim:]]
     if not out:
         # Every axis consumed by integers: a numpy scalar, not an array.
-        return ctx.default_return_type
+        # The dtype is known even when the bound is not (issue #230:
+        # np.r_[x[0], x] needs the float64 scalar, not Any).
+        scalar = _scalar_of_dtype(dtype)
+        return scalar if scalar is not None else ctx.default_return_type
     return _ndarray_type(ctx, out, dtype)
 
 

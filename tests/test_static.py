@@ -1202,6 +1202,19 @@ def test_builder_int_return_checked() -> None:
         assert "[return-value]" in line, result.stdout
 
 
+def test_builder_int_tuple_return_checked() -> None:
+    # Issue 233: a tuple with one plain-int size reports the R-vs-A swap
+    # both inline and through a name (same [return-value] twice).
+    result = run_mypy(FIXTURES / "bad_builder_int_tuple.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 2, result.stdout
+    for line in errors:
+        assert "[return-value]" in line, result.stdout
+        assert "tuple[int, R]" in line, result.stdout
+        assert "tuple[R, A]" in line, result.stdout
+
+
 def test_column_stack_bare_names_items() -> None:
     # Issue 234: the bail names the item type, not the sequence length.
     result = run_mypy(FIXTURES / "bad_column_stack_bare.py")
@@ -1791,7 +1804,9 @@ def test_mixed_builders_keep_literals() -> None:
         widened,  # swapaxes
         widened,  # pad
         widened,  # diff
-        widened,  # keepdims sum
+        # keepdims sum over the literal axis keeps (int, 1): the reduction
+        # axis is known to be 1, not widened (issue #227 movable dims).
+        '"numpy.ndarray[tuple[int, Literal[1]], numpy.dtype[numpy.float64]]"',  # keepdims sum
     ], result.stdout
     run = subprocess.run(
         [sys.executable, str(FIXTURES / "mixed_builders_ok.py")],
@@ -3298,6 +3313,36 @@ def test_whole_shape_typevar_kept() -> None:
     notes = reveals_by_line(result)
     for line in (10, 11, 12):
         assert notes[line] == '"numpy.ndarray[_S, numpy.dtype[numpy.float64]]"', result.stdout
+
+
+def test_bundle_b_broadcast_int_whole_r() -> None:
+    # Bundle B (#217 #227 #229 #230): abstract dtypes keep shape,
+    # plain-int dims keep rank (?U for unprovable axes), whole-shape _S
+    # survives truediv/round, and r_/concat float lists solve.
+    result = run_mypy(FIXTURES / "bundle_b_217_227_229_230_ok.py")
+    assert result.returncode == 0, result.stdout
+    raw = reveals_by_line(result)
+    notes = {line: re.sub(r"\?U@\d+[a-z]?", "?U", n) for line, n in raw.items()}
+    # #217: (N, 3) op (3,) keeps both dims with the floating dtype.
+    assert notes[25] == '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.floating[Any]]]"', result.stdout
+    assert notes[26] == '"numpy.ndarray[tuple[N, Literal[3]], numpy.dtype[numpy.floating[Any]]]"', result.stdout
+    assert notes[27] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.floating[Any]]]"', result.stdout
+    # #227: int dims keep rank; unprovable axes mint ?U.
+    assert "tuple[int]" in notes[33] and "float64" in notes[33], result.stdout
+    assert "tuple[?U]" in notes[34] and "bool" in notes[34], result.stdout
+    assert "tuple[int, Literal[3]]" in notes[40], result.stdout
+    assert "tuple[?U]" in notes[41], result.stdout
+    assert "tuple[?U, Literal[2]]" in notes[44], result.stdout
+    assert "tuple[int, int, Literal[3]]" in notes[46], result.stdout
+    # #229: every elementwise op keeps _S, including truediv and round.
+    for line in (50, 51, 52, 54, 55, 56):
+        assert notes[line] == '"numpy.ndarray[_S, numpy.dtype[numpy.float64]]"', result.stdout
+    assert "bool" in notes[53], result.stdout
+    # #230: int-TypeVar scalars and nan float lists solve.
+    assert "tuple[T+1]" in notes[61], result.stdout
+    assert "tuple[T+2]" in notes[63], result.stdout
+    assert "tuple[T+1]" in notes[64] and "float64" in notes[64], result.stdout
+    assert "tuple[T+1]" in notes[65] and "float64" in notes[65], result.stdout
 
 
 def test_construct_shapes_ok_clean_and_runs() -> None:

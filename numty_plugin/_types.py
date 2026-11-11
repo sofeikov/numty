@@ -371,8 +371,16 @@ def _fold_int(expr: Expression) -> int | None:
             return None
         if expr.op in ("//", "%") and right == 0:
             return None
-        if expr.op == "**" and (right < 0 or right > 32):
-            return None
+        if expr.op == "**":
+            # Huge powers would hang or OOM the type checker, but sizes up
+            # to 2**64 are cheap (at most 64 multiplications of small
+            # numbers) and real: np.zeros((2**40, 0)) must keep its literal
+            # so a Literal-demanding formal still matches (issue #233).
+            # Larger results fail loudly downstream via _dims_fit_intp.
+            if right < 0 or right > 64:
+                return None
+            if abs(left) > 1 << 64:
+                return None
         try:
             if expr.op == "+":
                 return left + right

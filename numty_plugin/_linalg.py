@@ -1250,6 +1250,9 @@ def _dtype_base(dtype: Type) -> str | None:
         "numpy.complexfloating": "c",
         "numpy.signedinteger": "i",
         "numpy.unsignedinteger": "u",
+        # Bare `numpy.integer` carries no width for _dtype_kind_size,
+        # but the kind alone classifies index/ufunc/logical operands.
+        "numpy.integer": "i",
     }.get(element.type.fullname)
 
 
