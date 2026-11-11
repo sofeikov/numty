@@ -108,15 +108,34 @@ def test_suite_runs_in_debug_mode() -> None:
 
 
 def test_every_broad_except_goes_through_the_policy() -> None:
-    lines = Path(numty_plugin.__file__).read_text(encoding="utf-8").splitlines()
+    # Every `except Exception:` must route through _swallowed() on the
+    # very next line, except the reporting helpers themselves (those
+    # lines carry "reporting must never"). Scans every .py under
+    # numty_plugin/ so Phase 2 leaves (_*.py) are covered.
+    # NOTE: the floor is 76, not 77. grep -c "except Exception" gives 77
+    # because it also matches docstring prose ("every `except Exception:`
+    # block"). This test only counts lines STARTING with "except
+    # Exception", so 76 is correct. Do not raise to 77.
+    plugin_dir = ROOT / "numty_plugin"
+    files = sorted(
+        p for p in plugin_dir.rglob("*.py") if "__pycache__" not in p.parts
+    )
+    assert files, f"no .py files found under {plugin_dir} - glob broken?"
+    assert plugin_dir / "__init__.py" in files, "scan must include __init__.py"
     stray = []
-    for i, line in enumerate(lines):
-        if line.strip().startswith("except Exception"):
-            nxt = lines[i + 1].strip()
-            inside_helper = "reporting must never" in line
-            if not nxt.startswith("_swallowed(") and not inside_helper:
-                stray.append(f"{i + 1}: {line.strip()} -> {nxt}")
+    total = 0
+    for path in files:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        rel = path.relative_to(plugin_dir)
+        for i, line in enumerate(lines):
+            if line.strip().startswith("except Exception"):
+                total += 1
+                nxt = lines[i + 1].strip() if i + 1 < len(lines) else "<EOF>"
+                inside_helper = "reporting must never" in line
+                if not nxt.startswith("_swallowed(") and not inside_helper:
+                    stray.append(f"{rel}:{i + 1}: {line.strip()} -> {nxt}")
     assert not stray, "broad except without _swallowed():\n" + "\n".join(stray)
+    assert total >= 76, f"broad-except total dropped: {total} < 76"
 
 
 def test_swallowed_reraises_only_in_debug(monkeypatch: pytest.MonkeyPatch) -> None:
