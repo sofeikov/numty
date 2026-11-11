@@ -372,3 +372,109 @@ def test_every_broad_except_goes_through_policy_across_package() -> None:
     # Floor 75 (was 76 on the monolith): Phase 2 removed a dead
     # _swallowed-guarded try in _forms_provably_ne (see test_internal).
     assert total >= 75, f"broad-except total dropped: {total} < 75"
+
+
+# Phase 5 (#199): thin facade + sole dispatch owner guards.
+
+
+def _pkg_files() -> list[Path]:
+    return sorted((ROOT / "numty_plugin").glob("*.py"))
+
+
+def test_init_is_thin_facade() -> None:
+    init = ROOT / "numty_plugin" / "__init__.py"
+    lines = init.read_text(encoding="utf-8").splitlines()
+    assert len(lines) < 300, f"__init__.py {len(lines)} lines >= 300"
+    assert lines[0].startswith('"""'), "facade must keep docstring"
+    tree = ast.parse(init.read_text(encoding="utf-8"))
+    n_defs = sum(1 for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    assert n_defs < 20, f"facade has {n_defs} defs >= 20 (must be <20)"
+
+
+def test_submodules_under_2000() -> None:
+    for py in _pkg_files():
+        if py.name == "__init__.py":
+            continue
+        lines = py.read_text(encoding="utf-8").splitlines()
+        assert len(lines) < 2000, f"{py.name} {len(lines)} lines >= 2000"
+    assert (ROOT / "numty_plugin" / "_hooks.py").exists()
+
+
+def test_hooks_is_sole_dispatch_owner() -> None:
+    import ast as _ast
+
+    owners: dict[str, list[str]] = {}
+    for py in _pkg_files():
+        tree = _ast.parse(py.read_text(encoding="utf-8"))
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and node.name == "NumtyPlugin":
+                owners.setdefault("NumtyPlugin", []).append(py.name)
+            if isinstance(node, _ast.FunctionDef) and node.name in {
+                "get_function_hook",
+                "get_method_hook",
+                "get_attribute_hook",
+                "get_type_analyze_hook",
+                "get_function_signature_hook",
+                "get_method_signature_hook",
+            }:
+                owners.setdefault(node.name, []).append(py.name)
+    for name, files in owners.items():
+        assert files == ["_hooks.py"], f"{name} defined in {files}, must be only _hooks.py"
+    assert numty_plugin.NumtyPlugin is __import__(
+        "numty_plugin._hooks", fromlist=["NumtyPlugin"]
+    ).NumtyPlugin
+    import numty_plugin._hooks as hooks
+
+    assert numty_plugin._NUMPY_FUNCTION_HOOKS is hooks._NUMPY_FUNCTION_HOOKS
+    assert isinstance(numty_plugin._NUMPY_FUNCTION_HOOKS, dict)
+    assert len(numty_plugin._NUMPY_FUNCTION_HOOKS) > 100
+
+
+def test_eager_submodule_imports_and_no_top_level_facade() -> None:
+    init = (ROOT / "numty_plugin" / "__init__.py").read_text(encoding="utf-8")
+    tree = ast.parse(init)
+    eager: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is None:
+            for a in node.names:
+                eager.add(a.name)
+    expected = {
+        "_broadcast",
+        "_builders",
+        "_dtypes",
+        "_einsum",
+        "_errors",
+        "_exprs",
+        "_fft",
+        "_forms",
+        "_heads",
+        "_hooks",
+        "_indexing",
+        "_linalg",
+        "_matmul",
+        "_ops",
+        "_reshape",
+        "_reductions",
+        "_state",
+        "_trace",
+        "_types",
+        "_unknowns",
+    }
+    assert expected.issubset(eager), f"missing eager imports: {expected - eager}"
+    # No submodule may do a top-level facade import (function-level lazy
+    # `from numty_plugin import` is the sanctioned pattern).
+    for py in _pkg_files():
+        if py.name == "__init__.py":
+            continue
+        tree2 = ast.parse(py.read_text(encoding="utf-8"))
+        for node in tree2.body:
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    assert not a.name.startswith("numty_plugin"), py.name
+            if isinstance(node, ast.ImportFrom):
+                if node.level == 0:
+                    assert node.module not in (None, "numty_plugin"), py.name
+                    assert (node.module or "").split(".")[0] != "numty_plugin", py.name
+                # `from . import X` at top level is a bare facade-style import; ban.
+                if node.level == 1 and node.module is None:
+                    raise AssertionError(f"{py.name}: top-level `from . import` banned")
