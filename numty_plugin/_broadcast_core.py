@@ -6,7 +6,7 @@ Split from _broadcast so that _matmul can import it at top level.
 from __future__ import annotations
 
 from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import AnyType, Type, TypeVarTupleType, UninhabitedType, UnpackType, get_proper_type
+from mypy.types import Type, TypeVarTupleType, UninhabitedType, UnpackType, get_proper_type
 
 from ._errors import NUMTY_BROADCAST
 from ._dtypes import _promote_strong, _promote_weak
@@ -112,7 +112,10 @@ def _solve_broadcast_scalar(
         key = ("strong", name)
     strong = _dtype_fullname(dtype)
     if strong is None:
-        return ctx.default_return_type
+        # Issue #217: an abstract dtype (floating, Any, TypeVar, union)
+        # is not a reason to drop the shape. A scalar is neutral for
+        # broadcasting, so keep the array dims and dtype.
+        return _ndarray_type(ctx, dims, dtype)
     kind, scalar_name = key
     name = (
         _promote_weak(scalar_name, strong)
@@ -120,12 +123,12 @@ def _solve_broadcast_scalar(
         else _promote_strong(scalar_name, strong)
     )
     if name is None:
-        return ctx.default_return_type
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     if name == strong:
         return _ndarray_type(ctx, dims, dtype)
     promoted = _construct_dtype(ctx, name)
     if promoted is None:
-        return ctx.default_return_type
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     return _ndarray_type(ctx, dims, promoted)
 
 
@@ -158,14 +161,14 @@ def _solve_broadcast_unpack(
             return ctx.default_return_type
         name = _promote_dtypes(dtype_a, dtype_b)
         if name is None:
-            return ctx.default_return_type
+            return _ndarray_type(ctx, dims, _default_dtype(ctx))
         if name == _dtype_fullname(dtype_a):
             return _ndarray_type(ctx, dims, dtype_a)
         if name == _dtype_fullname(dtype_b):
             return _ndarray_type(ctx, dims, dtype_b)
         dtype = _construct_dtype(ctx, name)
         if dtype is None:
-            return ctx.default_return_type
+            return _ndarray_type(ctx, dims, _default_dtype(ctx))
         return _ndarray_type(ctx, dims, dtype)
     sel, other = (sa, right) if sa is not None else (sb, left)
     assert sel is not None
@@ -176,14 +179,14 @@ def _solve_broadcast_unpack(
     if ob is not None and ob[0] == []:
         name = _promote_dtypes(dtype_u, ob[1])
         if name is None:
-            return ctx.default_return_type
+            return _ndarray_type(ctx, prefix + [unpack] + suffix, _default_dtype(ctx))
         if name == _dtype_fullname(dtype_u):
             return _ndarray_type(ctx, prefix + [unpack] + suffix, dtype_u)
         if name == _dtype_fullname(ob[1]):
             return _ndarray_type(ctx, prefix + [unpack] + suffix, ob[1])
         dtype = _construct_dtype(ctx, name)
         if dtype is None:
-            return ctx.default_return_type
+            return _ndarray_type(ctx, prefix + [unpack] + suffix, _default_dtype(ctx))
         return _ndarray_type(ctx, prefix + [unpack] + suffix, dtype)
     return ctx.default_return_type
 
@@ -207,7 +210,15 @@ def _broadcast_types(
         return _solve_broadcast_unpack(ctx, left, right, a, b)
     dims_a, dtype_a = a
     dims_b, dtype_b = b
-    dims_b, dtype_b = b
+    # Issue #217: the broadcast check does not depend on the dtype, so
+    # solve the shape first. A promotion failure keeps the solved shape
+    # with the stub dtype instead of dropping both.
+    dims, message = _broadcast_result(dims_a, dims_b, ctx)
+    if message is not None:
+        ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
+        return ctx.default_return_type
+    if dims is None:
+        return ctx.default_return_type
     name = _promote_dtypes(dtype_a, dtype_b)
     if name is None:
         # Datetime family add/subtract (issue #144): promotion has no
@@ -237,27 +248,13 @@ def _broadcast_types(
                 get_proper_type(ctx.default_return_type), UninhabitedType
             ):
                 return ctx.default_return_type
-            default_dtype = _default_dtype(ctx)
-            if not isinstance(get_proper_type(default_dtype), AnyType):
-                dims, message = _broadcast_result(dims_a, dims_b, ctx)
-                if message is not None:
-                    ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
-                    return ctx.default_return_type
-                if dims is None:
-                    return ctx.default_return_type
-                return _ndarray_type(ctx, dims, default_dtype)
-        return ctx.default_return_type
-    dims, message = _broadcast_result(dims_a, dims_b, ctx)
-    if message is not None:
-        ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
-        return ctx.default_return_type
-    if dims is None:
-        return ctx.default_return_type
+            return _ndarray_type(ctx, dims, _default_dtype(ctx))
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     if name == _dtype_fullname(dtype_a):
         return _ndarray_type(ctx, dims, dtype_a)
     if name == _dtype_fullname(dtype_b):
         return _ndarray_type(ctx, dims, dtype_b)
     dtype = _construct_dtype(ctx, name)
     if dtype is None:
-        return ctx.default_return_type
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     return _ndarray_type(ctx, dims, dtype)

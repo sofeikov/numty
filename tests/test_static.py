@@ -269,6 +269,21 @@ def test_broadcast_mismatch() -> None:
     )
 
 
+def test_broadcast_abstract_dtype_mismatch() -> None:
+    # Issue #217: the broadcast check does not depend on the dtype.
+    # Non-concrete dtypes (floating, Any, intp) used to skip the check
+    # and keep the left shape or dissolve to Any.
+    result = run_mypy(FIXTURES / "bad_broadcast_abstract_dtype.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 4, result.stdout
+    for line in errors:
+        assert "broadcast shapes disagree at trailing axis 0" in line, result.stdout
+        assert "[numty-broadcast]" in line, result.stdout
+    assert "3 vs 4" in errors[0] and "3 vs 4" in errors[1], result.stdout
+    assert "N-1 vs N" in errors[2] and "N-1 vs N" in errors[3], result.stdout
+
+
 def test_unknown_broadcast_keeps_rank_and_dtype() -> None:
     # Issue #56: one unprovable axis used to dissolve the whole result
     # into Any; now the axis is a fresh unknown and rank, known dims
@@ -3767,8 +3782,11 @@ def test_every_plugin_fail_site_passes_an_error_code() -> None:
     # Static guard: fixtures only reach some fail sites, so check them all
     # in the source. A new ctx.api.fail without code= would print [misc].
     # Scan every .py under numty_plugin/ so Phase 2 leaf moves (_*.py)
-    # never silently drop coverage. Floor pinned at 233 (verified count
-    # on the monolith) so a lost site or missed file fails loudly.
+    # never silently drop coverage. Floor pinned at 232 (233 on the
+    # monolith, minus one for issue #217: the broadcast check moved
+    # before dtype promotion, so the datetime path no longer needs its
+    # own duplicate broadcast fail) so a lost site or missed file fails
+    # loudly.
     import ast
 
     plugin_dir = ROOT / "numty_plugin"
@@ -3790,7 +3808,7 @@ def test_every_plugin_fail_site_passes_an_error_code() -> None:
             and node.func.value.attr == "api"
         ]
     assert len(sites) > 100, len(sites)
-    assert len(sites) >= 233, f"fail-site total dropped: {len(sites)} < 233"
+    assert len(sites) >= 232, f"fail-site total dropped: {len(sites)} < 232"
     missing = [
         f"{path.relative_to(plugin_dir)}:{n.lineno}"
         for path, n in sites

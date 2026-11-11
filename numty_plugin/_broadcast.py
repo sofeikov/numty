@@ -27,7 +27,7 @@ from ._reshape import (
     _weak_name,
 )
 from ._builders import (
-    _apply_out_dtype, _explicit_dtype, _fold_single, _named_dtype, _scalar_ret_name,
+    _apply_out_dtype, _default_dtype, _explicit_dtype, _fold_single, _named_dtype, _scalar_ret_name,
 )
 from ._linalg import (
     _linalg_dtype, _linalg_real_name, _linalg_tuple,
@@ -481,6 +481,25 @@ def _combine_specs(
     return _promote_weak(weak, strong)
 
 
+def _shapes_for_broadcast(types: list[Type]) -> list[list[int | Type]] | None:
+    """Dims for each array operand, scalars skipped, else None to bail.
+
+    Issue #217: an abstract dtype (floating, Any, TypeVar, union member
+    handled by distribution) must not hide the shape. _operand_spec
+    returns None there, so shapes are read via _parts_or_unpack directly.
+    """
+    shapes: list[list[int | Type]] = []
+    for tp in types:
+        part = _parts_or_unpack(tp)
+        if part is not None:
+            shapes.append(part[0])
+            continue
+        if _scalar_key(tp) is not None or _scalar_ret_name(tp) is not None:
+            continue
+        return None
+    return shapes
+
+
 def _merge_shape_lists(
     a: list[int | Type], b: list[int | Type]
 ) -> tuple[list[int | Type] | None, str | None]:
@@ -621,16 +640,19 @@ def _solve_where(ctx: FunctionContext) -> Type:
 
 
 def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: Type) -> Type:
-    raw_specs = [_operand_spec(tp) for tp in (cond, x, y)]
-    specs = [spec for spec in raw_specs if spec is not None]
-    if len(specs) != len(raw_specs):
+    # Issue #217: broadcast first, even when a dtype is abstract.
+    shapes = _shapes_for_broadcast([cond, x, y])
+    if shapes is None:
         return ctx.default_return_type
-    shapes = [dims for dims, _, _ in specs if dims is not None]
     if not shapes:
         return ctx.default_return_type
     dims = _broadcast_shapes(ctx, shapes, "where")
     if dims is None:
         return ctx.default_return_type
+    raw_specs = [_operand_spec(tp) for tp in (cond, x, y)]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     branches = [(specs[1][1], specs[1][2]), (specs[2][1], specs[2][2])]
     array_dtypes = []
     for tp in (x, y):
@@ -639,7 +661,7 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, branches, array_dtypes)
     if dtype is None:
-        return ctx.default_return_type
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     return _ndarray_type(ctx, dims, dtype)
 
 
@@ -669,16 +691,19 @@ def _solve_clip(ctx: FunctionContext) -> Type:
 
 def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type:
     # NumPy 2 promotes across all operands (like a ufunc).
-    raw_specs = [_operand_spec(tp) for tp in types]
-    specs = [spec for spec in raw_specs if spec is not None]
-    if len(specs) != len(raw_specs):
+    # Issue #217: broadcast first, even when a dtype is abstract.
+    shapes = _shapes_for_broadcast(types)
+    if shapes is None:
         return ctx.default_return_type
-    shapes = [dims for dims, _, _ in specs if dims is not None]
     if not shapes:
         return ctx.default_return_type
     dims = _broadcast_shapes(ctx, shapes, "clip")
     if dims is None:
         return ctx.default_return_type
+    raw_specs = [_operand_spec(tp) for tp in types]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     branches = [(kind, name) for _, kind, name in specs]
     array_dtypes = []
     for tp in types:
@@ -687,7 +712,7 @@ def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, branches, array_dtypes)
     if dtype is None:
-        return ctx.default_return_type
+        return _ndarray_type(ctx, dims, _default_dtype(ctx))
     return _ndarray_type(ctx, dims, dtype)
 
 
@@ -767,7 +792,19 @@ def _broadcast_to_compatible(
 def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int | Type]) -> Type:
     spec = _operand_spec(tp)
     if spec is None:
-        return ctx.default_return_type
+        # Issue #217: an abstract dtype must not hide a provable
+        # incompatibility with the target shape.
+        part = _parts_or_unpack(tp)
+        if part is None:
+            return ctx.default_return_type
+        arr_dims, dtype = part
+        if _has_unpack(arr_dims):
+            return ctx.default_return_type
+        if _ndarray_parts(tp) is None:
+            return ctx.default_return_type
+        if not _broadcast_to_compatible(ctx, arr_dims, dims):
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, dtype)
     arr_dims, kind, name = spec
     if arr_dims is not None:
         if _has_unpack(arr_dims):
@@ -1110,14 +1147,17 @@ def _solve_truediv_pair(
 def _truediv_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    raw_specs = [_operand_spec(left), _operand_spec(right)]
-    specs = [spec for spec in raw_specs if spec is not None]
-    if len(specs) != len(raw_specs):
+    # Issue #217: broadcast first, even when a dtype is abstract.
+    shapes = _shapes_for_broadcast([left, right])
+    if shapes is None:
         return ctx.default_return_type
-    shapes = [dims for dims, _, _ in specs if dims is not None]
     dims = _broadcast_shapes(ctx, shapes, "true_divide") if shapes else []
     if dims is None:
         return ctx.default_return_type
+    raw_specs = [_operand_spec(left), _operand_spec(right)]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
+        return _maybe_scalar(ctx, dims, _default_dtype(ctx))
     (_, kind_l, name_l), (_, kind_r, name_r) = specs
     names = {name_l, name_r}
     array_dtypes: list[Type] = []
@@ -1132,11 +1172,11 @@ def _truediv_types(
         if any(_kind_of(name) in ("i", "u", "b") for name in names):
             dtype = _construct_dtype(ctx, "numpy.float64")
             if dtype is None:
-                return ctx.default_return_type
+                return _maybe_scalar(ctx, dims, _default_dtype(ctx))
             return _maybe_scalar(ctx, dims, dtype)
     dtype = _specs_dtype(ctx, [(kind_l, name_l), (kind_r, name_r)], array_dtypes)
     if dtype is None:
-        return ctx.default_return_type
+        return _maybe_scalar(ctx, dims, _default_dtype(ctx))
     return _maybe_scalar(ctx, dims, dtype)
 
 
@@ -1316,18 +1356,21 @@ def _solve_ufunc_binary_float(
 def _ufunc_float_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    raw_specs = [_operand_spec(left), _operand_spec(right)]
-    specs = [spec for spec in raw_specs if spec is not None]
-    if len(specs) != len(raw_specs):
+    # Issue #217: broadcast first, even when a dtype is abstract.
+    shapes = _shapes_for_broadcast([left, right])
+    if shapes is None:
         return ctx.default_return_type
-    shapes = [dims for dims, _, _ in specs if dims is not None]
     dims = _broadcast_shapes(ctx, shapes, "ufunc") if shapes else []
     if dims is None:
         return ctx.default_return_type
+    raw_specs = [_operand_spec(left), _operand_spec(right)]
+    specs = [spec for spec in raw_specs if spec is not None]
+    if len(specs) != len(raw_specs):
+        return _maybe_scalar(ctx, dims, _default_dtype(ctx))
     (_, kind_l, name_l), (_, kind_r, name_r) = specs
     combined = _combine_specs((kind_l, name_l), (kind_r, name_r))
     if combined is None:
-        return ctx.default_return_type
+        return _maybe_scalar(ctx, dims, _default_dtype(ctx))
     kind = _kind_of(combined)
     if kind in ("f", "c"):
         out_name = combined
@@ -1341,10 +1384,10 @@ def _ufunc_float_types(
             fl, fr = _smallest_float(name_l), _smallest_float(name_r)
             out = _promote_strong(fl, fr) if fl and fr and fl != fr else fl
         if out is None:
-            return ctx.default_return_type
+            return _maybe_scalar(ctx, dims, _default_dtype(ctx))
         out_name = out
     else:
-        return ctx.default_return_type
+        return _maybe_scalar(ctx, dims, _default_dtype(ctx))
     array_dtypes = []
     for tp in (left, right):
         part = _ndarray_parts(tp)
@@ -1352,7 +1395,7 @@ def _ufunc_float_types(
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, [("strong", out_name)], array_dtypes)
     if dtype is None:
-        return ctx.default_return_type
+        return _maybe_scalar(ctx, dims, _default_dtype(ctx))
     return _maybe_scalar(ctx, dims, dtype)
 
 
@@ -1368,11 +1411,11 @@ def _solve_ufunc_binary_bool(
 def _ufunc_bool_types(
     ctx: FunctionContext | MethodContext, left: Type, right: Type
 ) -> Type:
-    raw_specs = [_operand_spec(left), _operand_spec(right)]
-    specs = [spec for spec in raw_specs if spec is not None]
-    if len(specs) != len(raw_specs):
+    # Issue #217: broadcast first, even when a dtype is abstract. The
+    # result is always bool, so no promotion can fail afterwards.
+    shapes = _shapes_for_broadcast([left, right])
+    if shapes is None:
         return ctx.default_return_type
-    shapes = [dims for dims, _, _ in specs if dims is not None]
     if not shapes:
         return ctx.default_return_type
     dims = _broadcast_shapes(ctx, shapes, "ufunc")

@@ -905,6 +905,42 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         from mypy.nodes import CallExpr as _CallExpr
         from mypy.nodes import OpExpr as _OpExpr
 
+        def _member_dims(tp: Type) -> list[list[int | Type]] | None:
+            """Array dims per union member, else None.
+
+            Issue #217: a union argument (e.g. F64[N] | F32[N]) must not
+            hide a provable mismatch. Only pure array unions are handled
+            (mirroring _union_members distribution); mixed unions bail.
+            """
+            proper = get_proper_type(tp)
+            if isinstance(proper, UnionType):
+                out: list[list[int | Type]] = []
+                for item in proper.relevant_items():
+                    part = _ndarray_parts(item)
+                    if part is None:
+                        return None
+                    dims, _ = part
+                    if dims:
+                        out.append(list(dims))
+                return out or None
+            part = _ndarray_parts(tp)
+            if part is None:
+                return None
+            dims, _ = part
+            if not dims:
+                return None
+            return [list(dims)]
+
+        def _any_mismatch(
+            a_list: list[list[int | Type]], b_list: list[list[int | Type]]
+        ) -> bool:
+            for da in a_list:
+                for db in b_list:
+                    _, msg = _broadcast_result(list(da), list(db), None)
+                    if msg is not None:
+                        return True
+            return False
+
         other_expr = None
         call = ctx.context
         if isinstance(call, _OpExpr):
@@ -921,29 +957,21 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             # otherwise try left. Simplest: check both, if either mismatches with self, trigger.
             try:
                 right_tp = ctx.api.get_expression_type(call.right)
-                right_part = _ndarray_parts(right_tp)
-                if right_part is not None:
-                    dims_b, _ = right_part
-                    if dims_b:
-                        _, msg = _broadcast_result(list(dims_a), list(dims_b), None)
-                        if msg is not None:
-                            return sig.copy_modified(
-                                arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
-                            )
+                right_list = _member_dims(right_tp)
+                if right_list is not None and _any_mismatch([list(dims_a)], right_list):
+                    return sig.copy_modified(
+                        arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                    )
             except Exception:
                 _swallowed(ctx, "_broadcast_signature_hook")
                 pass
             try:
                 left_tp = ctx.api.get_expression_type(call.left)
-                left_part = _ndarray_parts(left_tp)
-                if left_part is not None:
-                    dims_b, _ = left_part
-                    if dims_b:
-                        _, msg = _broadcast_result(list(dims_a), list(dims_b), None)
-                        if msg is not None:
-                            return sig.copy_modified(
-                                arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
-                            )
+                left_list = _member_dims(left_tp)
+                if left_list is not None and _any_mismatch([list(dims_a)], left_list):
+                    return sig.copy_modified(
+                        arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
+                    )
             except Exception:
                 _swallowed(ctx, "_broadcast_signature_hook")
                 pass
@@ -960,14 +988,10 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         except Exception:
             _swallowed(ctx, "_broadcast_signature_hook")
             return ctx.default_signature
-        part_b = _ndarray_parts(other_tp)
-        if part_b is None:
+        other_list = _member_dims(other_tp)
+        if other_list is None:
             return ctx.default_signature
-        dims_b, _ = part_b
-        if not dims_b:
-            return ctx.default_signature
-        _, msg = _broadcast_result(list(dims_a), list(dims_b), None)
-        if msg is None:
+        if not _any_mismatch([list(dims_a)], other_list):
             return ctx.default_signature
         return sig.copy_modified(
             arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
