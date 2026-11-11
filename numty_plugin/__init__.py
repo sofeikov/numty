@@ -149,180 +149,94 @@ from mypy.types import (
 )
 
 
-# Error codes, one per kind of diagnostic a user may want to silence or
-# select on its own (`# type: ignore[numty-bail]`,
-# `disable_error_code = numty-bail`). All are sub-codes of misc, so an
-# existing `ignore[misc]` or `disable_error_code = misc` still covers them.
-NUMTY_SHAPE = ErrorCode(
-    "numty-shape",
-    "Array dimensions, ranks or size arguments do not fit the operation",
-    "numty",
-    sub_code_of=MISC,
+# Phase 2 facade re-exports (#196): errors/trace live in _errors/_trace.
+# Monkeypatch seam: _installed_numpy_version stays defined here so
+# tests/test_startup.py + test_layout.py facade patches propagate to
+# plugin().
+from ._errors import (  # noqa: F401
+    NUMTY_ANNOTATION,
+    NUMTY_AXIS,
+    NUMTY_BAIL,
+    NUMTY_BROADCAST,
+    NUMTY_CALLSITE,
+    NUMTY_INTERNAL,
+    NUMTY_SHAPE,
+    NUMTY_UNSOLVED,
+    _CANARY_BY_MODULE,
+    _CANARY_FULLNAMES,
+    _MIN_NUMPY_VERSION,
+    _TESTED_MYPY_MAJOR,
+    _TESTED_MYPY_MINOR,
+    _TESTED_MYPY_VERSION,
+    _bail,
+    _mypy_version_warning,
+    _numpy_version_warning,
+    _numty_debug,
+    _parse_version_tuple,
+    _swallowed,
 )
-NUMTY_BROADCAST = ErrorCode(
-    "numty-broadcast", "Array shapes do not broadcast together", "numty", sub_code_of=MISC
+from ._trace import _numty_strict, _numty_trace_path, _trace_event  # noqa: F401
+from ._dtypes import (  # noqa: F401
+    _DATETIME_FULLNAMES,
+    _DTYPE_BASE,
+    _DTYPE_INFO,
+    _NBIT_MODULES,
+    _NBIT_TAG_BY_BYTES,
+    _NAME_OF_KIND_SIZE,
+    _UFUNC_ABS,
+    _UFUNC_BINARY_BOOL,
+    _UFUNC_BINARY_FLOAT,
+    _UFUNC_BINARY_PROMOTE,
+    _UFUNC_BOOL,
+    _UFUNC_FLOAT,
+    _UFUNC_KEEP,
+    _UFUNC_NO_COMPLEX,
+    _UFUNC_REAL,
+    _WEAK_DEFAULT,
+    _WEAK_SCALARS,
+    _datetime_string_kind,
+    _promote_strong,
+    _promote_weak,
 )
-NUMTY_CALLSITE = ErrorCode(
-    "numty-callsite",
-    "Shape variable bound to conflicting sizes at a call",
-    "numty",
-    sub_code_of=MISC,
+from ._forms import (  # noqa: F401
+    _DivForm,
+    _LinForm,
+    _MonoForm,
+    _UNKNOWN_PREFIX,
+    _canon_div,
+    _coeff_vars_to_form,
+    _eval_form,
+    _form_has_unknown,
+    _form_mul,
+    _form_never_size,
+    _form_to_coeff_vars,
+    _forms_provably_ne,
+    _is_unknown_fullname,
+    _lin_add,
+    _lin_scale,
+    _mono_normalize,
 )
-NUMTY_AXIS = ErrorCode(
-    "numty-axis", "Axis or index argument out of range or invalid", "numty", sub_code_of=MISC
+from ._exprs import (  # noqa: F401
+    _EXPR_PREFIX,
+    _LATE_PREFIXES,
+    _expr_constituents,
+    _expr_forms,
+    _expr_ids,
+    _expr_str,
+    _expr_var,
+    _form_from_fullname,
+    _form_of,
+    _implicit_scope_vars,
+    _materialize_dim,
+    _mono_str,
+    _resolve_dim,
+    _seen_vars,
+    _short_var,
+    _unknown_ids,
+    _unknown_names,
+    _unknown_per_line,
+    _current_scope_vars,
 )
-NUMTY_BAIL = ErrorCode(
-    "numty-bail", "numty cannot check this expression", "numty", sub_code_of=MISC
-)
-NUMTY_ANNOTATION = ErrorCode(
-    "numty-annotation", "Invalid numty shape annotation", "numty", sub_code_of=MISC
-)
-NUMTY_UNSOLVED = ErrorCode(
-    "numty-unsolved",
-    "numty could not prove this shape; the result is unchecked",
-    "numty",
-    sub_code_of=MISC,
-)
-NUMTY_INTERNAL = ErrorCode(
-    "numty-internal",
-    "numty itself failed on this expression; the result is unchecked",
-    "numty",
-    sub_code_of=MISC,
-)
-
-
-def _numty_debug() -> bool:
-    """Whether NUMTY_DEBUG=1 asks plugin exceptions to propagate."""
-    return os.environ.get("NUMTY_DEBUG") == "1"
-
-
-def _swallowed(ctx: object, where: str) -> None:
-    """The one policy for an exception caught inside the plugin (issue #164).
-
-    Call it first in every `except Exception:` block. A plugin bug must
-    never abort the mypy run, but it must not pass for a clean result
-    either:
-
-    - NUMTY_DEBUG=1 re-raises the exception being handled, so the test
-      suite (which sets it) fails on any swallowed exception and
-      developers get the traceback;
-    - otherwise the failure is recorded in NUMTY_TRACE with outcome
-      `crash` and reported at the call site as [numty-internal]. mypy
-      drops repeated identical messages on a line, so no dedup state is
-      kept here (process-lifetime dedup hid errors under dmypy, #44).
-
-    `ctx` is any hook context (or None where none is in reach: those
-    sites are trace-only outside debug mode). Conditions that are
-    expected in normal operation should be caught by a narrower
-    `except` instead of coming through here.
-    """
-    exc = sys.exception()
-    if _numty_debug() and exc is not None:
-        raise exc
-    detail = f"{type(exc).__name__}: {exc}" if exc is not None else "unknown error"
-    api = getattr(ctx, "api", None)
-    context = getattr(ctx, "context", None)
-    if ctx is not None:
-        _trace_event(ctx, where, "crash", detail)  # type: ignore[arg-type]
-    fail = getattr(api, "fail", None)
-    if fail is None or context is None:
-        return
-    try:
-        fail(
-            f"numty internal error in {where}: {detail} "
-            "(result is unchecked; please report this)",
-            context,
-            code=NUMTY_INTERNAL,
-        )
-    except Exception:  # reporting must never be the thing that crashes
-        if _numty_debug():
-            raise
-
-
-def _numty_trace_path() -> str | None:
-    """JSONL trace sink from NUMTY_TRACE, or None when tracing is off."""
-    path = os.environ.get("NUMTY_TRACE")
-    return path if path else None
-
-
-def _numty_strict() -> bool:
-    """Whether NUMTY_STRICT=1 asks for a loud error on every lost shape."""
-    return os.environ.get("NUMTY_STRICT") == "1"
-
-
-# Startup gates (issue #164 step 2): hooks key on private numpy module
-# paths and on mypy internals, so a version drift can silently unhook
-# everything (#67: constructor hooks never fired on numpy 2.2-2.4).
-# Tested versions are pinned in pyproject.toml (mypy==2.4.1,
-# numpy>=2.5); warn loudly outside them.
-_TESTED_MYPY_VERSION = "2.4.1"
-_TESTED_MYPY_MAJOR = 2
-_TESTED_MYPY_MINOR = 4
-_MIN_NUMPY_VERSION: tuple[int, ...] = (2, 5)
-
-# Hooked fullnames that must resolve in the loaded stubs. If any is
-# missing, hooks for that module silently never fire, so the first
-# hook lookup warns naming them.
-_CANARY_FULLNAMES: tuple[str, ...] = (
-    "numpy._core.multiarray.zeros",
-    "numpy._core.multiarray.asarray",
-    "numpy._core.fromnumeric.reshape",
-    "numpy._core.einsumfunc.einsum",
-    "numpy.linalg._linalg.norm",
-    "numpy.ndarray.reshape",
-    "numpy.ndarray.__matmul__",
-    "numpy.ufunc.__call__",
-)
-
-_CANARY_BY_MODULE: dict[str, tuple[str, ...]] = {}
-for _canary in _CANARY_FULLNAMES:
-    _module, _, _ = _canary.rpartition(".")
-    _CANARY_BY_MODULE[_module] = _CANARY_BY_MODULE.get(_module, ()) + (_canary,)
-del _canary, _module
-
-
-def _parse_version_tuple(version: str) -> tuple[int, ...]:
-    """Leading numeric components of a version string ("2.4.1" -> (2, 4, 1))."""
-    parts: list[int] = []
-    for piece in version.strip().split("."):
-        num = ""
-        for ch in piece:
-            if ch.isdigit():
-                num += ch
-            else:
-                break
-        if not num:
-            break
-        parts.append(int(num))
-    return tuple(parts)
-
-
-def _mypy_version_warning(version: str) -> str | None:
-    """Loud warning when `version` leaves the tested mypy range, else None."""
-    got = _parse_version_tuple(version)
-    if len(got) < 2 or got[0] != _TESTED_MYPY_MAJOR or got[1] != _TESTED_MYPY_MINOR:
-        return (
-            f"numty: warning: untested mypy version {version} "
-            f"(tested with {_TESTED_MYPY_VERSION}); "
-            "hooks may silently not fire (see issue #164)"
-        )
-    return None
-
-
-def _numpy_version_warning(version: str) -> str | None:
-    """Loud warning when `version` is below the minimum numpy, else None."""
-    got = _parse_version_tuple(version)
-    if not got:
-        return None
-    if got < _MIN_NUMPY_VERSION:
-        want = ".".join(str(p) for p in _MIN_NUMPY_VERSION)
-        return (
-            f"numty: warning: untested numpy version {version} "
-            f"(minimum supported is {want}); "
-            "hooks may silently not fire (see issue #164)"
-        )
-    return None
-
 
 def _installed_numpy_version() -> str | None:
     """Installed numpy version, or None when it cannot be determined."""
@@ -354,45 +268,6 @@ def _warn_startup(message: str) -> None:
         pass
 
 
-def _trace_event(
-    ctx: FunctionContext | MethodContext | AttributeContext,
-    op: str,
-    outcome: str,
-    reason: str,
-) -> None:
-    """Append one {file, line, col, op, outcome, reason} record to NUMTY_TRACE.
-
-    Only modules that are actually re-checked emit events, so run mypy
-    with a fresh --cache-dir when collecting a trace. Failures to write
-    never break checking.
-    """
-    path = _numty_trace_path()
-    if path is None:
-        return
-    try:
-        api: object = getattr(ctx, "api", None)
-        file = str(getattr(api, "path", "") or "")
-        context = getattr(ctx, "context", None)
-        line = int(getattr(context, "line", 0) or 0)
-        col = int(getattr(context, "column", 0) or 0)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps(
-                    {
-                        "file": file,
-                        "line": line,
-                        "col": col,
-                        "op": op,
-                        "outcome": outcome,
-                        "reason": reason,
-                    }
-                )
-                + "\n"
-            )
-    except OSError:
-        return
-
-
 def _operands_have_known_shape(operands: list[Type]) -> bool:
     """Whether any operand is a known-rank ndarray (unhooked trace gate).
 
@@ -409,33 +284,6 @@ def _operands_have_known_shape(operands: list[Type]) -> bool:
         _swallowed(None, "_operands_have_known_shape")
         return False
     return False
-
-
-def _bail(
-    ctx: FunctionContext | MethodContext,
-    op: str,
-    reason: str,
-) -> Type:
-    """Give up on one call: trace it, optionally fail loudly, keep stubs.
-
-    Central helper for the 506 `return ctx.default_return_type` sites:
-    it records {op, bail, reason} to NUMTY_TRACE and, under
-    NUMTY_STRICT=1, reports [numty-unsolved]. Strict fails for every
-    bail, even scalar-only ones like np.sqrt(8): the Any born there
-    poisons the known-shape truediv whose hook mypy then skips, so a
-    known-shape gate would leave that loss silent. New hooks should
-    call this instead of returning the default directly so the reason
-    stays specific; _guard_mixed already applies the same policy
-    generically to every hook that returns the default.
-    """
-    _trace_event(ctx, op, "bail", reason)
-    if _numty_strict():
-        ctx.api.fail(
-            f"numty could not prove {op}: {reason} (result is unchecked)",
-            ctx.context,
-            code=NUMTY_UNSOLVED,
-        )
-    return ctx.default_return_type
 
 
 NDARRAY_FULLNAME = "numpy.ndarray"
@@ -1864,63 +1712,6 @@ def _dims_provably_ne(a: int | Type, b: int | Type, nonzero: bool = False) -> bo
     return _forms_provably_ne(fa, fb, nonzero)
 
 
-def _forms_provably_ne(fa: object, fb: object, nonzero: bool = False) -> bool:
-    """Provably-unequal forms: same linear vars, different consts.
-
-    `N+1` vs `N` and `N+2` vs `N` can never be equal, and neither can
-    same-division plus diffs (`N//2+1` vs `N//2`). Different vars,
-    divs vs linears or unknowns stay unprovable (issue #56).
-
-    Coefficient diffs are different: `2*N` vs `N` and `2*M*N` vs `M*N`
-    are equal exactly when a variable is 0, and an empty axis is a
-    legal size, so numpy accepts `np.vdot` of `(2, M)` and `(M,)` at
-    `M == 0`. They count only under `nonzero=True`, which reshape
-    passes because its literal-factor check already reads totals up
-    to a zero factor (issues #63, #137). Every other caller keeps to
-    what holds for all sizes.
-    """
-    if fa is None or fb is None:
-        return False
-    if fa == fb:
-        return False
-    try:
-        if _form_has_unknown(fa) or _form_has_unknown(fb):
-            return False
-    except Exception:
-        _swallowed(None, "_forms_provably_ne")
-        pass
-    if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
-        if fa.coeffs == fb.coeffs and fa.const != fb.const:
-            return True
-        if (
-            nonzero
-            and len(fa.coeffs) == 1
-            and len(fb.coeffs) == 1
-            and fa.coeffs[0][0] == fb.coeffs[0][0]
-            and fa.const == fb.const
-            and fa.coeffs[0][1] != fb.coeffs[0][1]
-        ):
-            return True
-        return False
-    if isinstance(fa, _MonoForm) and isinstance(fb, _MonoForm):
-        return nonzero and fa.vars == fb.vars and fa.coeff != fb.coeff
-    if isinstance(fa, _DivForm) and isinstance(fb, _DivForm):
-        return fa.inner == fb.inner and fa.div == fb.div and fa.plus != fb.plus
-    return False
-
-
-def _form_never_size(form: object) -> bool:
-    """A form below 0 whatever its variables are: no array has that size.
-
-    Variables are sizes, so never negative: a linear form with no
-    positive coefficient is at most its constant. `-N-1` and `-3`
-    qualify; `-N` (0 on an empty axis) and `N-1` do not.
-    """
-    if isinstance(form, _LinForm):
-        return form.const < 0 and all(c < 0 for _, c in form.coeffs)
-    return False
-
-
 def _dim_str(d: int | Type) -> str:
     if isinstance(d, int):
         return str(d)
@@ -1934,466 +1725,6 @@ def _dim_str(d: int | Type) -> str:
             return _expr_str(form)
     name = getattr(d, "name", None)
     return str(name) if isinstance(name, str) else "?"
-
-
-class _LinForm(NamedTuple):
-    """Canonical linear dim: sum(coeff * var) + const, coeffs sorted by var."""
-
-    coeffs: tuple[tuple[str, int], ...]
-    const: int
-
-
-class _DivForm(NamedTuple):
-    """Floored division of a linear dim: inner // div + plus."""
-
-    inner: _LinForm
-    div: int
-    plus: int
-
-
-class _MonoForm(NamedTuple):
-    """Opaque product term: coeff * prod(vars), vars sorted (repeats kept).
-
-    Stepping stone for issue #40 (no Z3): single monomials only, no sums
-    of products. Always holds >= 2 vars; single-var/const cases stay
-    _LinForm so equality and existing paths are untouched. Zero normalizes
-    to coeff 0 with no vars.
-    """
-
-    coeff: int
-    vars: tuple[str, ...]
-
-
-_expr_forms: dict[str, _LinForm | _DivForm | _MonoForm] = {}
-_expr_ids: dict[str, TypeVarId] = {}
-_seen_vars: dict[str, TypeVarType] = {}
-# Implicit dims by defining function (issue #145): (namespace, word) ->
-# the TypeVarType minted for the signature. A local `r: F64["batch out"]`
-# is analyzed in a scope that does not see the signature's bindings, so a
-# fresh mint there has the same display name but a different id and native
-# subtype checking fails on identical shapes. Reusing the signature's
-# object (via bind_existing) keeps one word one dim per function, like
-# declared TypeVars, while different functions keep independent vars.
-_implicit_scope_vars: dict[tuple[str, str], TypeVarLikeType] = {}
-# Per-expr constituent objects by scope (issue #32 finish): expr fullname
-# -> {constituent fullname -> TypeVarType object from the defining scope}.
-# Lets diff(M+1) -> M return the *current* function's M instead of the
-# process-wide _seen_vars entry (which caused N@first vs N@second in
-# issue #43).
-_expr_constituents: dict[str, dict[str, TypeVarType]] = {}
-
-# Synthetic tvar namespaces the plugin mints (issue #42): implicit dims
-# for undeclared string-spec words, and formula-named expression dims.
-# Anything under these markers in a signature is late-bound by
-# construction, with or without the process-local `_fam_late_bound` set
-# (which a module loaded from mypy's incremental cache never fills).
-_LATE_PREFIXES = ("__numty_implicit__.", "__numty_expr__.")
-_EXPR_PREFIX = "__numty_expr__."
-
-
-def _eval_form(node: ast.AST) -> _LinForm | _DivForm | _MonoForm:
-    """Rebuild a canonical form from its repr AST (issue #42).
-
-    Expr fullnames embed `{form!r}`, a NamedTuple repr, so a type loaded
-    from the incremental cache carries its own form. Only the three
-    canonical shapes with int/str/tuple structure are accepted; anything
-    else raises and the caller falls back to the registry.
-    """
-
-    def num(n: ast.AST) -> int:
-        if type(n) is ast.Constant and type(n.value) is int:
-            return n.value
-        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
-            v = num(n.operand)
-            return v if isinstance(n.op, ast.UAdd) else -v
-        raise ValueError("not an int")
-
-    def strs(n: ast.AST) -> tuple[str, ...]:
-        if not isinstance(n, ast.Tuple):
-            raise ValueError("not a tuple")
-        out = []
-        for e in n.elts:
-            if type(e) is not ast.Constant or type(e.value) is not str:
-                raise ValueError("not a str")
-            out.append(e.value)
-        return tuple(out)
-
-    def coeffs(n: ast.AST) -> tuple[tuple[str, int], ...]:
-        if not isinstance(n, ast.Tuple):
-            raise ValueError("not a tuple")
-        out = []
-        for e in n.elts:
-            if not isinstance(e, ast.Tuple) or len(e.elts) != 2:
-                raise ValueError("not a pair")
-            name, coeff = e.elts
-            if type(name) is not ast.Constant or type(name.value) is not str:
-                raise ValueError("not a name")
-            out.append((name.value, num(coeff)))
-        return tuple(out)
-
-    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-        raise ValueError("not a form")
-    if node.args:
-        raise ValueError("positional args")
-    kw = {k.arg: k.value for k in node.keywords if k.arg is not None}
-    if set(kw) != set() and any(k.arg is None for k in node.keywords):
-        raise ValueError("star kwargs")
-    kind = node.func.id
-    if kind == "_LinForm" and set(kw) == {"coeffs", "const"}:
-        return _LinForm(coeffs(kw["coeffs"]), num(kw["const"]))
-    if kind == "_DivForm" and set(kw) == {"inner", "div", "plus"}:
-        return _DivForm(_eval_form(kw["inner"]), num(kw["div"]), num(kw["plus"]))
-    if kind == "_MonoForm" and set(kw) == {"coeff", "vars"}:
-        return _MonoForm(num(kw["coeff"]), strs(kw["vars"]))
-    raise ValueError("unknown form")
-
-
-def _form_from_fullname(fullname: str) -> _LinForm | _DivForm | _MonoForm | None:
-    """Parse the canonical form embedded in an expr fullname (issue #42).
-
-    A type deserialized from mypy's cache has no entry in the
-    process-local `_expr_forms` registry; its fullname still spells the
-    form, so read it back instead of degrading to Any.
-    """
-    if not fullname.startswith(_EXPR_PREFIX):
-        return None
-    src = fullname[len(_EXPR_PREFIX):]
-    if len(src) > 4000:
-        return None
-    try:
-        tree = ast.parse(src, mode="eval")
-    except (SyntaxError, ValueError):
-        return None
-    try:
-        form = _eval_form(tree.body)
-    except Exception:
-        _swallowed(None, "_form_from_fullname")
-        return None
-    _expr_forms[fullname] = form
-    return form
-
-
-def _form_of(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
-    """Canonical form of a dim var: registry first, fullname fallback."""
-    if not isinstance(d, TypeVarType):
-        return None
-    form = _expr_forms.get(d.fullname)
-    if form is not None:
-        return form
-    return _form_from_fullname(d.fullname)
-
-
-def _current_scope_vars(
-    ctx: FunctionContext | MethodContext,
-) -> dict[str, TypeVarType]:
-    """TypeVars visible in the current call's actual types, by fullname.
-
-    Walks all positional actual types (and self for method hooks) so
-    materialization prefers the caller's own objects over the process-wide
-    _seen_vars fallback (issue #43 leak scoped to #32's diff path).
-    """
-    found: dict[str, TypeVarType] = {}
-    try:
-        nested: list[Type] = []
-        for group in getattr(ctx, "arg_types", []):
-            # mypy passes groups of overload-candidate types; flatten.
-            if isinstance(group, list):
-                nested.extend(group)
-            else:
-                nested.append(group)
-        self_tp = getattr(ctx, "type", None)
-        if self_tp is not None:
-            nested.append(self_tp)
-        for tp in nested:
-            try:
-                for tv in _iter_tvarlikes(tp):
-                    if isinstance(tv, TypeVarType):
-                        found.setdefault(tv.fullname, tv)
-            except Exception:
-                _swallowed(ctx, "_current_scope_vars")
-                continue
-    except Exception:
-        _swallowed(ctx, "_current_scope_vars")
-        pass
-    return found
-
-
-def _short_var(fullname: str) -> str:
-    """Display name for a var: ?U name when unknown, else the short name."""
-    return _unknown_names.get(fullname) or fullname.rsplit(".", 1)[-1]
-
-
-def _mono_str(form: _MonoForm) -> str:
-    """Readable product: H*D, 2*M*N, 6, 0."""
-    if form.coeff == 0:
-        return "0"
-    if not form.vars:
-        return str(form.coeff)
-    body = "*".join(_short_var(v) for v in form.vars)
-    if form.coeff == 1:
-        return body
-    if form.coeff == -1:
-        return f"-{body}"
-    return f"{form.coeff}*{body}"
-
-
-def _resolve_dim(d: int | Type) -> _LinForm | _DivForm | _MonoForm | None:
-    """Canonical form of a dim: ints and TypeVars (expressions included).
-
-    Plain TypeVars read as single-term linears, so N and N*1 compare
-    equal; anything else is unresolvable. Seen variables are remembered
-    by fullname so materialization can return the real object. Last-wins,
-    not first-wins (issue #43): sequential checking refreshes this to the
-    current function's object (its inner call resolves before any outer
-    call in the same body materializes).
-    """
-    if isinstance(d, int):
-        return _LinForm((), d)
-    if isinstance(d, TypeVarType):
-        form = _form_of(d)
-        if form is not None:
-            return form
-        _seen_vars[d.fullname] = d
-        return _LinForm(((d.fullname, 1),), 0)
-    return None
-
-
-def _expr_str(form: _LinForm | _DivForm | _MonoForm) -> str:
-    """Readable dim formula: 2*N+3, N-1, (N+1)//2, N//2+1, H*D."""
-    if isinstance(form, _MonoForm):
-        return _mono_str(form)
-    if isinstance(form, _DivForm):
-        inner = _expr_str(form.inner)
-        compound = len(form.inner.coeffs) + (form.inner.const != 0) > 1
-        out = f"({inner})" if compound else inner
-        out += f"//{form.div}"
-        if form.plus:
-            out += f"{form.plus:+d}"
-        return out
-    parts = []
-    for fullname, coeff in form.coeffs:
-        # Unknowns carry a display name (?U@line); their fullname is an
-        # internal site key that must never reach a message.
-        short = _unknown_names.get(fullname) or fullname.rsplit(".", 1)[-1]
-        if coeff == 1:
-            parts.append(short)
-        elif coeff == -1:
-            parts.append(f"-{short}")
-        else:
-            parts.append(f"{coeff}*{short}")
-    if form.const or not parts:
-        parts.append(str(form.const))
-    return "+".join(parts).replace("+-", "-")
-
-
-def _expr_var(
-    ctx: FunctionContext | MethodContext | AttributeContext, op: str, index: int, form: _LinForm | _DivForm | _MonoForm
-) -> TypeVarType:
-    """Mint (or reuse) the variable denoting a dim expression (issue #32).
-
-    Form-keyed (not site-keyed): the same canonical form reuses one
-    variable id everywhere, so an inferred `N+1` is the same variable as
-    an annotated `I64["N+1"]` with the same form and native subtype
-    checking accepts it. Different forms never collide. Re-checks and
-    overload candidates with the same form still mint identically, and
-    `?U`-containing forms stay per-site via the unknown's own site key.
-    The registry maps the fullname back to the canonical form.
-    """
-    # `op`/`index` only disambiguate the call site for debugging; identity
-    # comes from the form itself.
-    _ = op, index
-    tree = getattr(ctx.api, "tree", None)
-    _ = getattr(tree, "fullname", "") or ""
-    line = ctx.context.line
-    column = ctx.context.column
-    fullname = f"__numty_expr__.{form!r}"
-    vid = _expr_ids.get(fullname)
-    if vid is None:
-        vid = TypeVarId.new(0)
-        _expr_ids[fullname] = vid
-    _expr_forms[fullname] = form
-    upper = ctx.api.named_generic_type("builtins.int", [])
-    obj = TypeVarType(
-        name=_expr_str(form),
-        fullname=fullname,
-        id=vid,
-        values=[],
-        upper_bound=upper,
-        default=AnyType(TypeOfAny.from_omitted_generics),
-        line=line,
-        column=column,
-    )
-    # Remember current-scope constituents so a later diff of this inferred
-    # expr finds its own M (concat N -> N+1 -> diff -> N roundtrip).
-    if isinstance(form, _LinForm) and form.coeffs:
-        try:
-            current = _current_scope_vars(ctx)
-            consts = {
-                fullname_c: current[fullname_c]
-                for fullname_c, _ in form.coeffs
-                if fullname_c in current
-            }
-            if consts:
-                _expr_constituents.setdefault(fullname, {}).update(consts)
-        except Exception:
-            _swallowed(ctx, "_expr_var")
-            pass
-    return obj
-
-
-def _lin_add(a: _LinForm, b: _LinForm) -> _LinForm:
-    merged: dict[str, int] = {}
-    for name, coeff in a.coeffs + b.coeffs:
-        merged[name] = merged.get(name, 0) + coeff
-    return _LinForm(
-        tuple(sorted((n, c) for n, c in merged.items() if c != 0)),
-        a.const + b.const,
-    )
-
-
-def _lin_scale(form: _LinForm, c: int) -> _LinForm:
-    if c == 0:
-        return _LinForm((), 0)
-    return _LinForm(tuple((n, k * c) for n, k in form.coeffs), form.const * c)
-
-
-def _mono_normalize(coeff: int, vars: tuple[str, ...]) -> _MonoForm:
-    """Canonical monomial: sorted vars, zero collapsed."""
-    if coeff == 0:
-        return _MonoForm(0, ())
-    return _MonoForm(coeff, tuple(sorted(vars)))
-
-
-def _form_to_coeff_vars(
-    form: _LinForm | _MonoForm,
-) -> tuple[int, tuple[str, ...]] | None:
-    """Pure-product view: (coeff, vars) or None for sums.
-
-    Linear single-terms (c, c*N) and monos map directly; multi-term
-    linears (N+M, N+2 with a var) are polynomial sums — out of scope,
-    bail with None.
-    """
-    if isinstance(form, _MonoForm):
-        return form.coeff, form.vars
-    if not form.coeffs:
-        return form.const, ()
-    if len(form.coeffs) == 1 and form.const == 0:
-        name, c = form.coeffs[0]
-        return c, (name,)
-    return None
-
-
-def _coeff_vars_to_form(coeff: int, vars: tuple[str, ...]) -> _LinForm | _MonoForm:
-    """Form for a pure product: linear for <= 1 var, else monomial."""
-    if coeff == 0:
-        return _LinForm((), 0)
-    if len(vars) <= 1:
-        if not vars:
-            return _LinForm((), coeff)
-        return _LinForm(((vars[0], coeff),), 0)
-    return _mono_normalize(coeff, vars)
-
-
-def _form_mul(
-    a: _LinForm | _MonoForm, b: _LinForm | _MonoForm
-) -> _LinForm | _MonoForm | None:
-    """Product of pure-product forms, else None (sums/Div out of scope)."""
-    pa = _form_to_coeff_vars(a)
-    pb = _form_to_coeff_vars(b)
-    if pa is None or pb is None:
-        return None
-    ca, va = pa
-    cb, vb = pb
-    return _coeff_vars_to_form(ca * cb, tuple(sorted(va + vb)))
-
-
-def _canon_div(
-    numer: _LinForm | _MonoForm, denom: _LinForm | _MonoForm
-) -> _LinForm | _MonoForm | None:
-    """Exact quotient numer/denom for pure products, else None.
-
-    Covers int division (N*2/2) and variable cancellation (N*K/N,
-    B*C*H*W/B). Sums and Divs bail.
-    """
-    pn = _form_to_coeff_vars(numer)
-    pd = _form_to_coeff_vars(denom)
-    if pn is None or pd is None:
-        return None
-    cn, vn = pn
-    cd, vd = pd
-    if cd == 0:
-        return None
-    if cn % cd != 0:
-        return None
-    # Multiset subtraction of divisor vars from numerator vars.
-    rest = list(vn)
-    for v in vd:
-        try:
-            rest.remove(v)
-        except ValueError:
-            return None
-    return _coeff_vars_to_form(cn // cd, tuple(sorted(rest)))
-
-
-def _materialize_dim(
-    ctx: FunctionContext | MethodContext,
-    op: str,
-    index: int,
-    form: _LinForm | _DivForm | _MonoForm,
-    prefer: int | Type | None = None,
-) -> int | Type:
-    """A dim for a canonical form: int, the real variable, or a fresh var.
-
-    A form that is just one known variable returns that variable's own
-    object (so N*2/2 checks as F64[N], not as a lookalike); anything else
-    mints a formula-named variable.
-    """
-    if isinstance(form, _LinForm) and not form.coeffs:
-        return form.const
-    if prefer is not None and _resolve_dim(prefer) == form:
-        return prefer
-    if (
-        isinstance(form, _LinForm)
-        and len(form.coeffs) == 1
-        and form.coeffs[0][1] == 1
-        and form.const == 0
-    ):
-        want = form.coeffs[0][0]
-        # Issue #146: the process-wide `_expr_constituents`/`_seen_vars`
-        # registries hold whichever module was checked first, so a stale
-        # entry (another scope's object for the same fullname) must never
-        # shadow the current call's own object. Check the current call
-        # first, then the input expr's constituents, then the registry.
-        # 1) Current call's own object (reshape/split second-function
-        # leak, #146 cold-vs-warm): prefer it over the process-wide
-        # registry.
-        try:
-            current = _current_scope_vars(ctx)
-            if want in current:
-                return current[want]
-            # 1b) Transitive (issue #43): the current call's args hold an
-            # expr (e.g. repeat's N*2 feeding reshape's -1), not the bare
-            # var. That expr's constituents were just recorded by the
-            # inner call in this same body, so they are the current
-            # function's objects; the global registry below still holds
-            # whichever function was checked first.
-            for tv in current.values():
-                if isinstance(tv, TypeVarType):
-                    consts = _expr_constituents.get(tv.fullname)
-                    if consts is not None and want in consts:
-                        return consts[want]
-        except Exception:
-            _swallowed(ctx, "_materialize_dim")
-            pass
-        # 2) diff(M+1)->M: the input expr knows its own scope's M.
-        if isinstance(prefer, TypeVarType):
-            consts = _expr_constituents.get(prefer.fullname)
-            if consts is not None and want in consts:
-                return consts[want]
-        seen = _seen_vars.get(want)
-        if seen is not None:
-            return seen
-    return _expr_var(ctx, op, index, form)
 
 
 def _dim_add_const(
@@ -7638,32 +6969,6 @@ def _reshape_new_dims(
     return dims or None
 
 
-_unknown_ids: dict[str, TypeVarId] = {}
-# Display names of unknowns by fullname, and how many distinct unknowns
-# each (module, line) has minted. Names only: identity stays the id.
-_unknown_names: dict[str, str] = {}
-_unknown_per_line: dict[tuple[str, int], int] = {}
-# Unknowns minted inside a comprehension (issue #63): one site is
-# evaluated once per element at runtime, so every element shares the
-# same ?U even when sizes differ. Never prove such an unknown equal,
-# not even to itself — the result bails instead of claiming (3, 3).
-# In practice every shared ?U is treated this way (not just
-# comprehensions): same-array uses bail to a fresh ?U instead of a
-# false proof, which is safe and never a false error.
-_UNKNOWN_PREFIX = "__numty_unknown__."
-
-
-def _is_unknown_fullname(name: str) -> bool:
-    return name.startswith(_UNKNOWN_PREFIX)
-
-
-def _form_has_unknown(form: object) -> bool:
-    """Whether a canonical form mentions any ?U unknown."""
-    if isinstance(form, _LinForm):
-        return any(_is_unknown_fullname(name) for name, _ in form.coeffs)
-    if isinstance(form, _MonoForm):
-        return any(_is_unknown_fullname(v) for v in form.vars)
-    return False
 
 
 def _is_same_unknown(a: int | Type, b: int | Type) -> bool:
@@ -8511,39 +7816,6 @@ def _solve_transpose_unpack(
     return AnyType(TypeOfAny.from_omitted_generics)
 
 
-_DTYPE_INFO: dict[str, tuple[str, int]] = {
-    "numpy.bool": ("b", 1),
-    "numpy.int8": ("i", 1),
-    "numpy.int16": ("i", 2),
-    "numpy.int32": ("i", 4),
-    "numpy.int64": ("i", 8),
-    "numpy.uint8": ("u", 1),
-    "numpy.uint16": ("u", 2),
-    "numpy.uint32": ("u", 4),
-    "numpy.uint64": ("u", 8),
-    "numpy.float16": ("f", 2),
-    "numpy.float32": ("f", 4),
-    "numpy.float64": ("f", 8),
-    "numpy.complex64": ("c", 8),
-    "numpy.complex128": ("c", 16),
-}
-
-_NAME_OF_KIND_SIZE = {v: k for k, v in _DTYPE_INFO.items()}
-
-_DATETIME_FULLNAMES = frozenset({"numpy.datetime64", "numpy.timedelta64"})
-
-
-def _datetime_string_kind(value: str) -> str | None:
-    """'M'/'m' for datetime64/timedelta64 strings with any unit, else None."""
-    text = value.strip()
-    if text in ("datetime64", "timedelta64"):
-        return "M" if text == "datetime64" else "m"
-    for base, kind in (("datetime64", "M"), ("timedelta64", "m")):
-        if text.startswith(base + "[") and text.endswith("]"):
-            return kind
-    return None
-
-
 def _datetime_kind(dtype: Type) -> str | None:
     """'M' for datetime64, 'm' for timedelta64, else None (issue #144).
 
@@ -8576,68 +7848,6 @@ def _construct_datetime_dtype(
     except Exception:
         _swallowed(ctx, "_construct_datetime_dtype")
         return None
-
-_WEAK_SCALARS = frozenset(
-    {"builtins.int", "builtins.float", "builtins.complex", "builtins.bool"}
-)
-
-
-def _promote_strong(a: str, b: str) -> str | None:
-    """numpy.result_type for two array dtypes, else None to bail."""
-    if a == b:
-        return a
-    info_a = _DTYPE_INFO.get(a)
-    info_b = _DTYPE_INFO.get(b)
-    if info_a is None or info_b is None:
-        return None
-    (ka, sa), (kb, sb) = info_a, info_b
-    if ka == "b":
-        return b
-    if kb == "b":
-        return a
-    if ka == kb:
-        return _NAME_OF_KIND_SIZE[(ka, max(sa, sb))]
-    if {ka, kb} == {"i", "u"}:
-        si, su = (sa, sb) if ka == "i" else (sb, sa)
-        if si > su:
-            return _NAME_OF_KIND_SIZE[("i", si)]
-        big = 2 * su
-        return _NAME_OF_KIND_SIZE[("i", big)] if big <= 8 else "numpy.float64"
-    if "c" in (ka, kb):
-        c = sb if ka != "c" else sa
-        if "f" in (ka, kb):
-            f = sa if ka == "f" else sb
-            result = c if f <= c // 2 else min(2 * c, 16)
-        else:
-            s = sa if ka != "c" else sb
-            result = c if c // 2 > s else min(2 * c, 16)
-        return _NAME_OF_KIND_SIZE[("c", result)]
-    f = sa if ka == "f" else sb
-    s = sb if ka == "f" else sa
-    full = max(f, min(2 * s, 8))
-    return _NAME_OF_KIND_SIZE[("f", full)]
-
-
-def _promote_weak(scalar: str, strong: str) -> str | None:
-    """numpy.result_type for a Python scalar and an array dtype."""
-    info = _DTYPE_INFO.get(strong)
-    if info is None:
-        return None
-    kind, size = info
-    if scalar == "builtins.bool":
-        return strong
-    if scalar == "builtins.int":
-        return "numpy.int64" if kind == "b" else strong
-    if scalar == "builtins.float":
-        return strong if kind in ("f", "c") else "numpy.float64"
-    if scalar == "builtins.complex":
-        if kind == "c":
-            return strong
-        if kind == "f" and size <= 4:
-            return "numpy.complex64"
-        return "numpy.complex128"
-    return None
-
 
 def _weak_name(tp: Type) -> str | None:
     """builtins scalar name for a Python scalar type, else None."""
@@ -8931,31 +8141,6 @@ def allany_function_hook(ctx: FunctionContext, op: str) -> Type:
     if not pairs:
         return ctx.default_return_type
     return _reduction_inputs_bool(ctx, pairs[0][0], op)
-
-
-_DTYPE_BASE = {
-    "numpy.float16": "numpy.floating",
-    "numpy.float32": "numpy.floating",
-    "numpy.complex64": "numpy.complexfloating",
-    "numpy.int8": "numpy.signedinteger",
-    "numpy.int16": "numpy.signedinteger",
-    "numpy.int32": "numpy.signedinteger",
-    "numpy.int64": "numpy.signedinteger",
-    "numpy.uint8": "numpy.unsignedinteger",
-    "numpy.uint16": "numpy.unsignedinteger",
-    "numpy.uint32": "numpy.unsignedinteger",
-    "numpy.uint64": "numpy.unsignedinteger",
-}
-
-
-_NBIT_TAG_BY_BYTES = {
-    1: "_8Bit",
-    2: "_16Bit",
-    4: "_32Bit",
-    8: "_64Bit",
-    16: "_128Bit",
-}
-_NBIT_MODULES = ("numpy._typing._nbit_base", "numpy._typing._nbit")
 
 
 def _exact_element(
@@ -14709,70 +13894,6 @@ def linalg_cross_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, dtype)
 
 
-_UFUNC_KEEP = frozenset(
-    {
-        "square",
-        "reciprocal",
-        "floor",
-        "ceil",
-        "trunc",
-        "sign",
-        "conjugate",
-        "conj",
-        "positive",
-        "negative",
-        "invert",
-        "bitwise_not",
-    }
-)
-_UFUNC_ABS = frozenset({"absolute", "abs"})
-# Ufuncs with no complex loop (numpy raises TypeError for complex input).
-_UFUNC_NO_COMPLEX = frozenset(
-    {
-        "cbrt", "floor", "ceil", "trunc", "fabs", "arctan2", "hypot", "fmod",
-        "copysign", "floor_divide", "remainder", "mod", "logaddexp",
-        "logaddexp2", "signbit", "deg2rad", "rad2deg", "degrees", "radians",
-        "nextafter", "spacing", "heaviside",
-    }
-)
-_UFUNC_FLOAT = frozenset(
-    {
-        "sqrt",
-        "cbrt",
-        "exp",
-        "exp2",
-        "expm1",
-        "log",
-        "log2",
-        "log10",
-        "log1p",
-        "sin",
-        "cos",
-        "tan",
-        "arcsin",
-        "arccos",
-        "arctan",
-        "sinh",
-        "cosh",
-        "tanh",
-        "rint",
-        "sinc",
-    }
-)
-_UFUNC_REAL = frozenset({"real", "imag"})
-_UFUNC_BOOL = frozenset(
-    {
-        "isfinite",
-        "isinf",
-        "isnan",
-        "isneginf",
-        "isposinf",
-        "signbit",
-        "logical_not",
-    }
-)
-
-
 def _operand_spec(tp: Type) -> tuple[list[int | Type] | None, str, str] | None:
     """(dims, kind, name) for an array or scalar operand, else None to bail.
 
@@ -14793,14 +13914,6 @@ def _operand_spec(tp: Type) -> tuple[list[int | Type] | None, str, str] | None:
     if name is not None:
         return (None, "strong", name)
     return None
-
-
-_WEAK_DEFAULT = {
-    "builtins.bool": "numpy.bool",
-    "builtins.int": "numpy.int64",
-    "builtins.float": "numpy.float64",
-    "builtins.complex": "numpy.complex128",
-}
 
 
 def _combine_specs(
@@ -15914,37 +15027,6 @@ def clip_method_hook(ctx: MethodContext) -> Type:
     if dist is not None:
         return dist
     return _clip_types(ctx, types)
-
-
-_UFUNC_BINARY_PROMOTE = frozenset(
-    {
-        "add",
-        "subtract",
-        "multiply",
-        "power",
-        "floor_divide",
-        "remainder",
-        "fmod",
-        "minimum",
-        "maximum",
-        "fmin",
-        "fmax",
-    }
-)
-_UFUNC_BINARY_FLOAT = frozenset({"hypot", "arctan2", "logaddexp", "logaddexp2"})
-_UFUNC_BINARY_BOOL = frozenset(
-    {
-        "equal",
-        "not_equal",
-        "less",
-        "less_equal",
-        "greater",
-        "greater_equal",
-        "logical_and",
-        "logical_or",
-        "logical_xor",
-    }
-)
 
 
 def _ufunc_name(ctx: FunctionContext | MethodContext) -> str | None:

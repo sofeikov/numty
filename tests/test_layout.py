@@ -369,4 +369,6 @@ def test_every_broad_except_goes_through_policy_across_package() -> None:
                 if not nxt.startswith("_swallowed(") and not inside_helper:
                     stray.append(f"{rel}:{i + 1}: {line.strip()} -> {nxt}")
     assert not stray, "broad except without _swallowed():\n" + "\n".join(stray)
-    assert total >= 76, f"broad-except total dropped: {total} < 76"
+    # Floor 75 (was 76 on the monolith): Phase 2 removed a dead
+    # _swallowed-guarded try in _forms_provably_ne (see test_internal).
+    assert total >= 75, f"broad-except total dropped: {total} < 75"
