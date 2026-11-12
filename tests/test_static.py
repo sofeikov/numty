@@ -4693,3 +4693,51 @@ def test_polars_to_numpy() -> None:
         "(3, 2) (3,)",
         "(3, 2)",
     ]
+def test_mask_count_reuses_one_unknown_per_variable() -> None:
+    # Issue #288 (1): the same mask variable gives the same unknown, so
+    # ids[keep] and d[0, keep] share ?U and their sum stays clean. Index
+    # arrays keep reusing their named size (K). Different masks, a
+    # rebinding, different scopes and inline masks all mint fresh.
+    result = run_mypy(FIXTURES / "mask_count_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
+    f64 = "numpy.dtype[numpy.float64]"
+    assert notes[11] == f'"numpy.ndarray[tuple[K], {i64}]"', result.stdout
+    assert notes[12] == f'"numpy.ndarray[tuple[P, K], {f64}]"', result.stdout
+    assert notes[13] == f'"numpy.ndarray[tuple[K], {i64}]"', result.stdout
+    # Line 14 pairs (N,) against (K,): silent by default.
+    assert notes[14] == f'"numpy.ndarray[tuple[?U@14], {f64}]"', result.stdout
+    # Lines 15-16 share one count for `keep`; line 17 keeps it.
+    assert notes[15] == f'"numpy.ndarray[tuple[?U@15], {i64}]"', result.stdout
+    assert notes[16] == f'"numpy.ndarray[tuple[?U@15], {f64}]"', result.stdout
+    assert notes[17] == f'"numpy.ndarray[tuple[?U@17], {f64}]"', result.stdout
+    assert _run_fixture("mask_count_ok.py") == ["ok"]
+    # Under the opt-in only line 14 reports (N vs K); line 17 stays clean.
+    on = run_mypy(FIXTURES / "mask_count_ok.py", flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [14], on.stdout
+    assert "N and K are different names" in errors[14][0], on.stdout
+    assert errors[14][0].endswith("[numty-names]"), on.stdout
+
+
+def test_mask_count_optin_reports_selection_counts() -> None:
+    # Issue #288 (2): under the opt-in `numty-names` code a selection
+    # count is a size of its own. A mask count against a named size, two
+    # different masks' counts, and a call-site binding of a count against
+    # a name are errors; the same mask variable stays clean. By default
+    # all of it is silent (unknown is not an error).
+    fixture = FIXTURES / "bad_mask_count_optin.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    assert "error:" not in off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [28, 29, 31, 32], on.stdout
+    assert "N and ?U@28 are different names" in errors[28][0], on.stdout
+    assert "?U@28 and ?U@29 are different names" in errors[29][0], on.stdout
+    assert "N and P are different names" in errors[31][0], on.stdout
+    assert "?U@28 and N are different names" in errors[32][0], on.stdout
+    for line in (28, 29, 31, 32):
+        assert len(errors[line]) == 1, on.stdout
+        assert errors[line][0].endswith("[numty-names]"), on.stdout

@@ -614,6 +614,22 @@ same line gets a letter: `a, b = x[x > 0.0], x[x > 1.5]` on line 7
 of a file gives `?U@7` and `?U@7b` (numpy: `(4,)` and `(3,)` for
 `x = [1., 2., 2., 3.]`).
 
+One count per mask variable (issue #288): the same mask variable in
+the same function reuses one unknown, so `ids[keep]` and `d[0, keep]`
+share `?U` and their sum stays clean
+(`tests/fixtures/mask_count_ok.py`). Different variables mint
+different unknowns; a variable rebound between uses, a mask from a
+different scope, and an inline mask (`x[x > 0]`, `flatnonzero`, chained
+selections) mint fresh each time — best-effort flow-insensitive
+tracking (same `Name` in the same function, bail on reassignment).
+Under the opt-in `numty-names` code a selection count is a size of its
+own: against a named size or another mask's count it is reported where
+the sizes must be equal
+(`tests/fixtures/bad_mask_count_optin.py`), while a generic unknown
+against a name stays silent. A selection that keeps everything still
+has an unknown count, so narrowing is needed where the full size is
+required.
+
 The boundary is principled: unknowns flow through bodies but cannot be
 named in signatures — there is no spelling for "somebody else's count".
 Reduce them, or leave the position to inference.
@@ -1062,7 +1078,7 @@ your `mypy.ini`) to have the solver check them too.
 
 ## Error codes
 
-Every numty diagnostic carries one of eight mypy error codes, so each kind
+Every numty diagnostic carries one of nine mypy error codes, so each kind
 can be silenced or selected on its own:
 
 | Code | Covers | Example message |
@@ -1073,6 +1089,7 @@ can be silenced or selected on its own:
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
+| `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a generic function (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
 
@@ -1114,12 +1131,26 @@ disable_error_code = numty-bail
 ```
 
 or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
-reports a shape error on that line. All eight are sub-codes of `misc`, so
+reports a shape error on that line. All but `numty-names` are sub-codes of `misc`, so
 an existing `# type: ignore[misc]` or `disable_error_code = misc` keeps
 covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
 then asks for the narrower code (`Unused "type: ignore" comment, use
 narrower [numty-shape] instead of [misc] code`), so switch those
 comments to the `numty-*` code when upgrading.
+
+### Different names: the opt-in `numty-names` code
+
+`F64[N] + F64[M]` runs when `N == M`, so it is not provably wrong, and
+by default numty says nothing about it. A function generic in `N` and
+`M` has to work when they differ, though, and most plausible mistakes
+in such a body pair two different names. Turn the check on to have them
+reported (issue #280), including selection counts (issue #288):
+
+```ini
+[mypy]
+plugins = numty_plugin
+enable_error_code = numty-names
+```
 
 ### Give-up trace and strict mode
 

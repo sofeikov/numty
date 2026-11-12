@@ -22,6 +22,7 @@ from ._types import (
     _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _shape_from_arg, _split_flat,
     _union_members,
 )
+from ._names import _report_mask_names, _report_names
 from ._reshape import (
     _all_positionals, _all_positionals_expanded, _bool_value, _datetime_kind, _dims_str,
     _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _known_rank_parts,
@@ -106,6 +107,12 @@ def _broadcast_result(
         elif ctx is None:
             return None, None
         else:
+            _report_names(
+                ctx, x, y, f"broadcast at trailing axis {k} (shapes {_dims_str(a)} vs {_dims_str(b)})"
+            )
+            _report_mask_names(
+                ctx, x, y, f"broadcast at trailing axis {k} (shapes {_dims_str(a)} vs {_dims_str(b)})"
+            )
             out.append(_fresh_unknown(ctx, "bcast", k))
     shared = min(len(a), len(b))
     prefix = a[: len(a) - shared] + b[: len(b) - shared]
