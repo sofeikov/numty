@@ -455,13 +455,17 @@ def _is_builtin_int(tp: Type) -> bool:
 
 
 def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
-    parts = _parts_or_unpack(left)
+    # A shape with an `int` or `Any` size is read too (issue 270): the
+    # rank is known, and `_broadcast_dims` makes those axes unknown, as
+    # it does for a comparison. Without it `(dyn >= lo) & (dyn < hi)`
+    # lost the shape of both sides.
+    parts = _parts_or_unpack(left) or _known_rank_parts(left)
     if parts is None:
         return ctx.default_return_type
     base = _dtype_base(parts[1])
     if base not in ("b", "i", "u"):
         return ctx.default_return_type
-    other = _parts_or_unpack(right)
+    other = _parts_or_unpack(right) or _known_rank_parts(right)
     if other is not None:
         if _dtype_base(other[1]) not in ("b", "i", "u"):
             return ctx.default_return_type
@@ -480,7 +484,7 @@ def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type
     if _bool_value(right) is not None or _is_plain_bool(right):
         if base != "b":
             # int & bool variable: a scalar always fits — keep left dims.
-            left_parts = _ndarray_parts(left)
+            left_parts = _ndarray_parts(left) or _known_rank_parts(left)
             if left_parts is None:
                 return ctx.default_return_type
             return _ndarray_type(ctx, left_parts[0], left_parts[1])
@@ -488,7 +492,7 @@ def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type
         if dims is None:
             # Plain bool scalar: _broadcast_dims bails on non-literal,
             # but a scalar always fits — keep the left dims.
-            left_parts = _ndarray_parts(left)
+            left_parts = _ndarray_parts(left) or _known_rank_parts(left)
             if left_parts is None:
                 return ctx.default_return_type
             dims = left_parts[0]
@@ -501,7 +505,7 @@ def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type
         return _solve_broadcast(ctx, left, right)
     if _is_builtin_int(right):
         # Plain int variable: a scalar always fits — keep left dims/dtype.
-        left_parts = _ndarray_parts(left)
+        left_parts = _ndarray_parts(left) or _known_rank_parts(left)
         if left_parts is None:
             return ctx.default_return_type
         return _ndarray_type(ctx, left_parts[0], left_parts[1])

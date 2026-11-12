@@ -615,6 +615,26 @@ where concrete sizes are visible. Apply the alias explicitly at each use (`A[N, 
 for a dataclass holding shapes: `list[Box]` with `Box(Generic[N])`
 holding `F64[N, 3]` is an error (`Box used bare ... [numty-annotation]`,
 issue #38) — write `list[Box[T_ctx]]` so the field checks end to end.
+A generic `NamedTuple` of arrays is reported the same way, a bare
+parameter (`def f(box: Box)`) included.
+
+`int` in a size position of such a container means "not followed", as
+it does in an array. At a call, a parameter `box: Box[int]` accepts a
+`Box[N]` and a `Box[Literal[1]]`, although mypy itself treats a class as
+invariant in its parameters. This holds for a `NamedTuple`, a dataclass
+or any generic class of arrays, also as `Box[int] | None` and inside
+`list[...]`. It holds at calls only: an assignment or a `return` of a
+`Box[N]` where `Box[int]` is declared is still mypy's `[assignment]` or
+`[return-value]` error. An array argument whose size is `int` does not
+bind a name that a container argument binds too: `pair(flags: F64[int,
+S], box: Box[S])` called with `np.zeros((n, n))` and a `Box[S]` takes
+`S` from the container (`tests/fixtures/bad_container_int_sizes.py`).
+
+A size that only the return of a property or of a method names (`def
+rows(self) -> I64[E]` in a class that is not generic in `E`) is unknown
+at each read: `c.rows` is `tuple[?U@line]`, and adding it to a caller's
+`F64[E]` does not check as two arrays of one size
+(`tests/fixtures/property_own_size.py`).
 
 ## Coming from jaxtyping? Convert once, check forever
 
@@ -717,7 +737,11 @@ Indexed assignment checks the write: the target solves like a read
 (out-of-range and mask-length errors fire), and the value must
 broadcast one-directionally into it (`m[:, 0] = col` with `(5,) <- (4,)`
 errors; `a[:] = v` with `(5, 3) <- (3,)` stays clean, scalars always
-fit).
+fit). Symbolic sizes are compared by the rule of a broadcast: `out[i] =
+v[:-1]` with `out: F64[S, C]` and `v: F64[C]` is `cannot assign value of
+shape (C-1,) into target of shape (C,)`. Two different names (`S` into
+`C`), an unknown and an `int` size are not provable and stay silent
+(`tests/fixtures/bad_setitem_symbolic.py`).
 
 ## Unions that check every member
 
@@ -1397,7 +1421,12 @@ subtraction below.
   dims (`(n, 3)` by `(3, 3)` is `tuple[int, Literal[3]]`, while 3 against
   4 is an error as for literal shapes; an `int` dim landing on an axis
   where an operand has a literal turns unknown, so `(n, 3)` by `(3, k)`
-  is `tuple[Any, Any]`); transposes move the literal with its axis.
+  is `tuple[Any, Any]`); transposes move the literal with its axis;
+  arithmetic, comparisons, `&`, `|` and `^` between two arrays keep the
+  rank, make each `int` axis unknown and still check the named axes
+  (`a[:, 1:] | a` with `a: Bool[int, N]` is `N-1 vs N`);
+  `np.searchsorted(a, v)` and `a.searchsorted(v)` have the shape of `v`
+  as it stands.
   Other ops on such an array (or on one annotated that way) use numpy's
   stubs. Shape-keeping ones (arithmetic, `astype`, `copy`, `flip`, sorts
   along an axis, ...) keep the literal. For the rest the stubs' answer turns
