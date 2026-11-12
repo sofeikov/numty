@@ -713,6 +713,23 @@ b[np.zeros(3)]                    # error: integer (or boolean) type required
 np.take_along_axis(a, idx2d, axis=1)  # error: same number of dimensions
 ```
 
+Integer arrays can also carry *which* axis their values index into,
+not just how many entries they hold. `Index[P, N]` spells positions on
+size P, N of them (`Index[P]` leaves the count dynamic, `Index["P N"]`
+splits a string the same way); `argmin`/`argmax`, `argsort`,
+`arange`, `flatnonzero`, `nonzero` and `searchsorted` record the same
+fact themselves when the values are certainly positions. A recorded
+bound provably above the axis errors; a different *named* size is an
+opt-in `[numty-names]` error (`enable_error_code = numty-names`),
+silent by default:
+
+```python
+table[row, col]                   # clean: positions on the right axes
+table[col, row]                   # error (opt-in): Q on P, P on Q
+plain[np.searchsorted(a, v)]      # error: positions run to N+1 over N
+padded[np.searchsorted(a, v)]     # clean: the axis spells N+1
+```
+
 Indexed assignment checks the write: the target solves like a read
 (out-of-range and mask-length errors fire), and the value must
 broadcast one-directionally into it (`m[:, 0] = col` with `(5,) <- (4,)`
@@ -1489,6 +1506,21 @@ subtraction below.
   over bare names to the display).
 - Different TypeVars (`N` vs `M`) never conflict, even when provably
   different at a call site — only same-name TypeVars are unified.
+  Index *positions* are the exception: `Index[P, N]` records that an
+  int array's values index size P, and a recorded bound provably above
+  the indexed axis (`searchsorted` positions on `N+1` over `N`,
+  `arange(5)` on a size-3 axis) errors as `[numty-axis]`, while a
+  different named size (positions on M over N) needs the opt-in
+  `numty-names` code (`enable_error_code = numty-names`) and is silent
+  by default. Producers record the fact themselves when the values are
+  certainly positions (`argmin`/`argmax` and the `nan` twins,
+  `argsort`/`argpartition` on one known axis with a 1-d result,
+  0-based `arange`, 1-d `flatnonzero`, per-member `nonzero`/`where`,
+  `searchsorted`). Everything else stays silent: multi-dim results,
+  records flowing through value-preserving ops (`reshape`, `astype`,
+  arithmetic), cross-module uses, ambiguous records (two producers on
+  one line with same-shaped results), unions that disagree, and scalar
+  positions (a `-1`-for-none sentinel is not tracked).
 - Bare ints are rejected in alias definitions by mypy itself, before
   any plugin runs (`Mat34 = F64[3, 4]` errors exactly like
   `X = list[3]` does). Spell the sizes with `Literal`

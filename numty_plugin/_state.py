@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from mypy.types import TypeVarId, TypeVarLikeType, TypeVarType
+    from mypy.types import Type, TypeVarId, TypeVarLikeType, TypeVarType
 
     from ._forms import _DivForm, _LinForm, _MonoForm
 
@@ -45,6 +45,16 @@ class NumtyState:
     # owning plugin's objects - see NumtyPlugin.__init__).
     fam_late_bound: set[str] = field(default_factory=set)
     startup_canary_checked: set[str] = field(default_factory=set)
+    # Region D - index positions (issues #285-287): producer calls and
+    # Index[...] annotations record the size an int array's values index
+    # into ("positions on P"). Keys are "module@line@column" for exact
+    # producer-call sites and "module@line" for line entries; values are
+    # (shape dims or None, recorded size) lists. Entries dedupe by content
+    # so rechecks and overload candidates stay stable; lookups with zero
+    # or several matches stay silent.
+    index_on: dict[str, list[tuple[list[int | Type] | None, int | Type]]] = field(
+        default_factory=dict
+    )
 
 
 STATE: NumtyState = NumtyState()

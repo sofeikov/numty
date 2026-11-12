@@ -6,17 +6,20 @@ from __future__ import annotations
 
 import ast
 import keyword
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
-from ._errors import NUMTY_ANNOTATION, _swallowed
+from ._errors import NUMTY_ANNOTATION, NUMTY_NAMES, _swallowed
 from ._exprs import (
     _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars,
     _normalize_ns, _seen_vars,
 )
 from ._forms import _LinForm, _form_never_size
+from ._state import STATE
 from ._types import (
-    INT_FULLNAME, _dim_value,
+    INT_FULLNAME, _dim_eq, _dim_str, _dim_value, _dims_provably_ne,
 )
+from ._unknowns import _is_same_unknown
 
 
 def _is_fam_int_name(fullname: str) -> bool:
@@ -29,11 +32,12 @@ def _is_fam_int_name(fullname: str) -> bool:
     return fullname == "builtins.int"
 
 if TYPE_CHECKING:
-    from mypy.plugin import AnalyzeTypeContext
+    from mypy.nodes import Expression
+    from mypy.plugin import AnalyzeTypeContext, FunctionContext, MethodContext
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.types import Type, TypeVarLikeType
 
-from mypy.nodes import TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var
+from mypy.nodes import Expression, NameExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var
 from mypy.typeanal import TypeAnalyser
 from mypy.types import (
     AnyType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny,
@@ -50,6 +54,10 @@ _FAM_HEAD_DTYPES = {
     "numty.I8": "numpy.int8",
     "numty.U8": "numpy.uint8",
     "numty.Bool": "numpy.bool",
+    # Issue #286: Index[P, N] is positions on P, N of them. It analyzes
+    # through its own hook (see get_type_analyze_hook), but its dtype
+    # rides here with the other heads so the head/plugin/codmod sync holds.
+    "numty.Index": "numpy.int64",
 }
 
 
@@ -104,6 +112,13 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
         return AnyType(TypeOfAny.from_error)
     except _FamBail:
         return AnyType(TypeOfAny.from_error)
+    return _finish_fam(ctx, head, dims, dtype_fullname)
+
+
+def _finish_fam(
+    ctx: AnalyzeTypeContext, head: str, dims: list[int | Type], dtype_fullname: str
+) -> Type:
+    """Build the ndarray type for flat familiar-style dims."""
     line, column = ctx.context.line, ctx.context.column
     int_inst = cast(TypeAnalyser, ctx.api).named_type("builtins.int", [], line, column)
     int_tuple = cast(TypeAnalyser, ctx.api).named_type("builtins.tuple", [int_inst], line, column)
@@ -734,3 +749,337 @@ def _fam_applied(
 
 # Every numpy hook goes through _guard_mixed (see there); the solver
 # dispatch itself lives in the underscored getters below.
+
+
+# Index positions (issues #285, #286, #287). An int array's shape says how
+# many entries it holds, never which axis its values index into. The
+# Index[P, N] head spells the missing half (positions on size P, N of
+# them), and producer calls whose values are certainly positions
+# (argmin/argmax, argsort, arange, flatnonzero, nonzero, searchsorted)
+# record the same fact. The getitem fancy-index path reads the record:
+# a recorded size used on a provably different axis is an error, a
+# different *named* size is an opt-in [numty-names] error, and anything
+# unrecorded or ambiguous stays silent.
+_index_on = STATE.index_on
+
+
+def _index_module(ctx: object) -> str:
+    """Module holding the checked code, or "" when unknowable."""
+    api = getattr(ctx, "api", None)
+    tree = getattr(api, "tree", None)
+    if tree is not None:
+        return str(getattr(tree, "fullname", "") or "")
+    mod = getattr(api, "cur_mod_node", None)
+    return str(getattr(mod, "fullname", "") or "")
+
+
+def _index_dims_match(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
+    """Same shape for index-record purposes: equal, or the same unknown."""
+    return len(a) == len(b) and all(
+        _dim_eq(x, y) or _is_same_unknown(x, y) for x, y in zip(a, b)
+    )
+
+
+def _index_recorded_eq(a: int | Type, b: int | Type) -> bool:
+    """Same recorded size: same ints, or the same named size."""
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    return isinstance(a, TypeVarType) and isinstance(b, TypeVarType) and a.fullname == b.fullname
+
+
+def _record_index_on(
+    ctx: AnalyzeTypeContext | FunctionContext | MethodContext,
+    dims: Sequence[int | Type] | None,
+    recorded: int | Type,
+) -> None:
+    """Remember that a dims-shaped int array holds positions on `recorded`.
+
+    Best-effort and silent: anything that cannot be keyed (a multi-dim
+    result, a non-size dim, a non-size recorded) is ignored. The exact
+    producer-call site serves direct uses (`d[np.argsort(x)]`); line
+    entries serve stored results (`rows = ...; d[rows]`) and Index[...]
+    annotations. Duplicate (recheck/overload) records collapse.
+    """
+    try:
+        if dims is not None and (
+            len(dims) != 1 or not all(isinstance(d, (int, TypeVarType)) for d in dims)
+        ):
+            return
+        if not isinstance(recorded, (int, TypeVarType)):
+            return
+        module = _index_module(ctx)
+        context = ctx.context
+        exact = f"{module}@{context.line}@{context.column}"
+        bucket = _index_on.get(exact)
+        if bucket is None:
+            bucket = []
+            _index_on[exact] = bucket
+        if not any(first is None and _index_recorded_eq(second, recorded) for first, second in bucket):
+            bucket.append((None, recorded))
+        if dims is not None:
+            line_key = f"{module}@{context.line}"
+            entries = _index_on.get(line_key)
+            if entries is None:
+                entries = []
+                _index_on[line_key] = entries
+            if not any(
+                first is not None
+                and _index_dims_match(first, dims)
+                and _index_recorded_eq(second, recorded)
+                for first, second in entries
+            ):
+                entries.append((list(dims), recorded))
+    except Exception:
+        _swallowed(ctx, "_record_index_on")
+
+
+def _recorded_index_on(
+    ctx: MethodContext, dims: list[int | Type], expr: Expression | None
+) -> int | Type | None:
+    """The size a 1-d fancy-index operand's values are positions on, else None.
+
+    Exact call-site records serve direct producer calls; line entries
+    serve stored results and Index[...] annotations (matched by shape, so
+    entries that name no shape match nothing). Zero or several matches
+    stay silent.
+    """
+    try:
+        if len(dims) != 1 or not all(isinstance(d, (int, TypeVarType)) for d in dims):
+            return None
+        module = _index_module(ctx)
+        if expr is not None:
+            seen = _index_on.get(f"{module}@{expr.line}@{expr.column}")
+            if seen:
+                first = [second for first, second in seen if first is None]
+                if len(first) == 1:
+                    return first[0]
+                if first:
+                    return None
+        line = None
+        if isinstance(expr, NameExpr):
+            node = expr.node
+            raw = getattr(node, "line", None)
+            if isinstance(raw, int):
+                line = raw
+        if line is None:
+            return None
+        found = [
+            second
+            for first, second in _index_on.get(f"{module}@{line}", [])
+            if first is not None and _index_dims_match(first, dims)
+        ]
+        if len(found) != 1:
+            return None
+        return found[0]
+    except Exception:
+        _swallowed(ctx, "_recorded_index_on")
+        return None
+
+
+def _index_recorded_exceeds(rec: int | Type, size: int | Type) -> bool:
+    """The recorded exclusive bound provably exceeds the axis size.
+
+    Position values run below the recorded size, so `arange(5)` on a
+    size-22 axis is fine (5 < 22) while `searchsorted` positions on N+1
+    over an N axis always overflow. Strictly below zero for every size
+    (`_form_never_size`), so the empty-axis edge (2*N vs N, equal at
+    N == 0) stays silent like every other check.
+    """
+    from numty_plugin import _resolve_dim
+    from ._forms import _form_has_unknown, _lin_add, _lin_scale
+    try:
+        if isinstance(rec, int) and isinstance(size, int):
+            return rec > size
+        fa = _resolve_dim(rec)
+        fb = _resolve_dim(size)
+        if not isinstance(fa, _LinForm) or not isinstance(fb, _LinForm):
+            return False
+        if _form_has_unknown(fa) or _form_has_unknown(fb):
+            return False
+        return _form_never_size(_lin_add(fb, _lin_scale(fa, -1)))
+    except Exception:
+        _swallowed(None, "_index_recorded_exceeds")
+        return False
+
+
+def _named_sizes_differ(a: int | Type, b: int | Type) -> bool:
+    """Two sizes spelled over names, neither with an unknown, that are not the same size.
+
+    `N` against `M`, `N+1` against `M`. A literal, an `int`, an `Any`
+    and an unknown (`?U`) never count: nothing is known about them. A
+    pair that is provably unequal (`N` against `N-1`) is an error
+    already, under the code of its check.
+    """
+    from numty_plugin import _resolve_dim
+    from ._forms import _form_has_unknown
+    if not isinstance(a, TypeVarType) or not isinstance(b, TypeVarType):
+        return False
+    if _dim_eq(a, b) or _dims_provably_ne(a, b):
+        return False
+    try:
+        fa = _resolve_dim(a)
+        fb = _resolve_dim(b)
+    except Exception:
+        _swallowed(None, "_named_sizes_differ")
+        return False
+    if fa is None or fb is None or _form_has_unknown(fa) or _form_has_unknown(fb):
+        return False
+    return True
+
+
+def _names_enabled(
+    ctx: FunctionContext | MethodContext,
+) -> bool:
+    """Whether `enable_error_code = numty-names` is set for the module being checked."""
+    options = getattr(ctx.api, "options", None)
+    return options is not None and NUMTY_NAMES in options.enabled_error_codes
+
+
+def _report_names(
+    ctx: FunctionContext | MethodContext,
+    a: int | Type,
+    b: int | Type,
+    where: str,
+) -> None:
+    """The opt-in `[numty-names]` report for a pair of different named sizes.
+
+    Called where a check finds two sizes that must be equal and cannot
+    prove them equal or unequal. Nothing is emitted with the code off
+    (the default): mypy counts a message of a disabled code as a failure
+    of the overload it is checking, so the result would gain mypy's own
+    error. The result of the check is the same either way.
+    """
+    try:
+        if _names_enabled(ctx) and _named_sizes_differ(a, b):
+            ctx.api.fail(
+                f"{where}: {_dim_str(a)} and {_dim_str(b)} are different names",
+                ctx.context,
+                code=NUMTY_NAMES,
+            )
+    except Exception:
+        _swallowed(ctx, "_report_names")
+
+
+def _index_head(ctx: AnalyzeTypeContext, late_bound: set[str]) -> Type:
+    """Index[P, ...dims]: positions on size P with a 1-d-or-more shape.
+
+    `Index[P, N]` is a 1-d int64 array of length N whose values index
+    size P (issue #286: the spelling that says which axis, not how
+    many). `Index[P]` leaves the count dynamic. A multi-word string
+    splits the same way (`Index["P N"]`); a lone recorded size may be a
+    linear form (`Index["P+1"]`). The shape analyzes exactly like the
+    other heads; the recorded size is remembered for the getitem check
+    (issue #285). A scalar `-1`-for-none position is not tracked.
+    """
+    head = ctx.type.name
+    try:
+        raw_args = list(ctx.type.args)
+        recorded, dims = _index_split_args(ctx, head, raw_args, late_bound)
+        if not dims:
+            dims = [_index_fresh_count(ctx, head, recorded, raw_args[0], late_bound)]
+        for d in dims:
+            if isinstance(d, int) and d < 0:
+                raise _FamFail(f"{head} dim {d} is negative; a size cannot be below 0")
+            form = _form_of(d)
+            if form is not None and _form_never_size(form):
+                raise _FamFail(
+                    f"{head} dim {_expr_str(form)} is negative for every size;"
+                    " a size cannot be below 0"
+                )
+        _record_index_on(ctx, dims if all(isinstance(d, (int, TypeVarType)) for d in dims) else None, recorded)
+    except _FamFail as bad:
+        ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
+        return AnyType(TypeOfAny.from_error)
+    except _FamBail:
+        return AnyType(TypeOfAny.from_error)
+    return _finish_fam(ctx, head, dims, "numpy.int64")
+
+
+def _index_split_args(
+    ctx: AnalyzeTypeContext, head: str, raw_args: list[Type], late_bound: set[str]
+) -> tuple[int | Type, list[int | Type]]:
+    """The recorded size (first dim overall) plus the shape dims."""
+    if not raw_args:
+        raise _FamFail(f"{head} takes a recorded size and optional shape dims: {head}[P, N]")
+    first = raw_args[0]
+    extra: list[int | Type] = []
+    if isinstance(first, RawExpressionType) and isinstance(first.literal_value, str):
+        words = _fam_string(ctx, head, first.literal_value, first, late_bound)
+        recorded, extra = words[0], words[1:]
+    elif (
+        isinstance(first, UnboundType)
+        and first.original_str_expr is not None
+        and not first.args
+    ):
+        words = _fam_string(ctx, head, first.name, first, late_bound)
+        recorded, extra = words[0], words[1:]
+    else:
+        recorded = _index_recorded_one(ctx, head, first, late_bound)
+    dims = list(extra)
+    for a in raw_args[1:]:
+        parsed = _fam_arg(ctx, head, a, late_bound)
+        if isinstance(parsed, list):
+            dims.extend(parsed)
+        else:
+            dims.append(parsed)
+    return recorded, dims
+
+
+def _index_recorded_one(
+    ctx: AnalyzeTypeContext, head: str, arg: Type, late_bound: set[str]
+) -> int | Type:
+    """One recorded-size arg: an integer, a size name, or a linear form."""
+    if isinstance(arg, RawExpressionType):
+        value = arg.literal_value
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise _FamFail(
+                f"{head} recorded size must be a TypeVar, a non-negative integer,"
+                ' or a string spec like "P N"'
+            )
+        return value
+    if isinstance(arg, UnboundType):
+        if arg.args:
+            short = arg.name.rpartition(".")[2]
+            if short == "Literal":
+                got = _fam_applied(ctx, head, arg, late_bound)
+                if isinstance(got, int):
+                    return got
+            raise _FamFail(
+                f"{head} recorded size must be a TypeVar, a non-negative integer,"
+                ' or a string spec like "P N"'
+            )
+        return _fam_bare(ctx, head, arg, late_bound)
+    if isinstance(arg, TypeVarType):
+        return arg
+    if isinstance(arg, AnyType):
+        return arg
+    raise _FamFail(
+        f"{head} recorded size must be a TypeVar, a non-negative integer,"
+        ' or a string spec like "P N"'
+    )
+
+
+def _index_fresh_count(
+    ctx: AnalyzeTypeContext,
+    head: str,
+    recorded: int | Type,
+    node: Type,
+    late_bound: set[str],
+) -> Type:
+    """A dynamic count dim for a bare `Index[P]` (issue #286).
+
+    A plain `int` dim never proves equal, so the record could never be
+    read back; mint an implicit dim exactly like a string-spec word, so
+    one bare Index is one count that still unifies.
+    """
+    del head
+    stem = _dim_str(recorded)
+    word = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in stem)
+    if not word or word[0].isdigit():
+        word = f"pos_{word}" if word else "pos"
+    word = f"{word}_count"
+    analyzer = cast(TypeAnalyser, ctx.api)
+    scope = analyzer.tvar_scope
+    if not isinstance(node, (RawExpressionType, UnboundType)):
+        raise _FamFail("Index[P] needs a recorded size")
+    return _fam_ensure_implicit(ctx, analyzer, scope, word, node, late_bound)

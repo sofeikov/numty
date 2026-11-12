@@ -97,7 +97,7 @@ from ._broadcast import (
 )
 from ._heads import (
     _FAM_HEAD_DTYPES, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
-    _fam_expr, _fam_head, _fam_string,
+    _fam_expr, _fam_head, _fam_string, _index_head,
 )
 from ._exprs import (
     _iter_tvarlikes,
@@ -484,6 +484,15 @@ class NumtyPlugin(Plugin):
     def get_type_analyze_hook(
         self, fullname: str
     ) -> Callable[[AnalyzeTypeContext], Type] | None:
+        # Issue #286: Index[P, N] spells positions on P, N of them. Flat
+        # args like the other heads (a nested Index[P][N] cannot round-trip
+        # through analyze hooks), so it dispatches before the dtype map.
+        if fullname == "numty.Index":
+
+            def index_hook(ctx: AnalyzeTypeContext) -> Type:
+                return self._index_head(ctx)
+
+            return index_hook
         dtype_fullname = _FAM_HEAD_DTYPES.get(fullname)
         if dtype_fullname is not None:
 
@@ -560,6 +569,9 @@ class NumtyPlugin(Plugin):
     # self._fam_late_bound, mutated in place).
     def _fam_head(self, ctx: AnalyzeTypeContext, dtype_fullname: str) -> Type:
         return _fam_head(ctx, dtype_fullname, self._fam_late_bound)
+
+    def _index_head(self, ctx: AnalyzeTypeContext) -> Type:
+        return _index_head(ctx, self._fam_late_bound)
 
     def _fam_arg(
         self, ctx: AnalyzeTypeContext, head: str, arg: Type

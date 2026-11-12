@@ -151,6 +151,19 @@ class Bool(_StringDims, Generic[Unpack[TsFam]]):
     _numty_dtype = np.dtype(np.bool_)
 
 
+class Index(_StringDims, Generic[Unpack[TsFam]]):
+    """Positions array: Index[P, N] holds N int64 values indexing size P.
+
+    The shape says how many; the first arg says which axis the values are
+    positions on (issues #285, #286). Index[P] leaves the count dynamic,
+    Index["P N"] splits a string spec the same way, and a multi-dim shape
+    (Index[P, N, M]) records P but is not checked. A scalar -1-for-none
+    position is not tracked.
+    """
+
+    _numty_dtype = np.dtype(np.int64)
+
+
 # Ready-made dim TypeVars for the heads above: `F64[batch, features]`
 # works with a single import, no declarations. Same name unifies across
 # annotations; declare your own TypeVar for anything not listed here.
