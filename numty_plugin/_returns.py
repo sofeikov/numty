@@ -21,6 +21,7 @@ from mypy.types import (
     TupleType,
     Type,
     TypeOfAny,
+    TypeVarType,
     UnionType,
     get_proper_type,
 )
@@ -170,6 +171,69 @@ def _assigned_name_returned(returns: list, assigns: list, line: int, col: int) -
     return None
 
 
+def _declared_return_shapes(ctx: object, rank: int) -> list[list[Type]]:
+    """Shapes of the given rank that the function being checked declares it returns.
+
+    Read from the checker's stack of declared return types. A union
+    (`F64[N, int] | None`) gives each array member of that rank. Anything
+    else (a tuple of arrays, no annotation, another rank) gives nothing.
+    """
+    stack = getattr(getattr(ctx, "api", None), "return_types", None)
+    if not stack:
+        return []
+    declared = get_proper_type(stack[-1])
+    members = declared.items if isinstance(declared, UnionType) else [declared]
+    out: list[list[Type]] = []
+    for member in members:
+        proper = get_proper_type(member)
+        if not isinstance(proper, Instance) or proper.type.fullname != NDARRAY_FULLNAME or len(proper.args) != 2:
+            continue
+        shape = get_proper_type(proper.args[0])
+        if isinstance(shape, TupleType) and len(shape.items) == rank:
+            out.append([get_proper_type(item) for item in shape.items])
+    return out
+
+
+def _same_named_size(a: Type, b: Type) -> bool:
+    return isinstance(a, TypeVarType) and isinstance(b, TypeVarType) and a.fullname == b.fullname
+
+
+def _misplaced_name_axes(ctx: object, items: list[Type]) -> set[int]:
+    """Axes whose plain `int` must not be written as Any: the value is transposed (issue #297).
+
+    The rewrite lets `int` fit a declared name, and a name always fits a
+    declared `int`, so `(int, N)` passed where `(N, int)` is declared: a
+    matrix allocated with its axes swapped. An `int` axis keeps its type
+    when the name declared there is a size of the value on another axis,
+    one that is not declared with that name. mypy then reports the
+    return as it did before the rewrite. `(int, N)` where `(N, N)` is
+    declared still passes, and so does `(S, int)` where `(S, C)` is.
+    """
+    try:
+        value = [get_proper_type(item) for item in items]
+        shapes = _declared_return_shapes(ctx, len(value))
+        if not shapes:
+            return set()
+        per_shape: list[set[int]] = []
+        for declared in shapes:
+            axes: set[int] = set()
+            for i, (have, want) in enumerate(zip(value, declared)):
+                if not _is_dynamic_return_dim(have) or not isinstance(want, TypeVarType):
+                    continue
+                if any(
+                    k != i and _same_named_size(value[k], want) and not _same_named_size(declared[k], want)
+                    for k in range(len(value))
+                ):
+                    axes.add(i)
+            per_shape.append(axes)
+        # With several declared members, an axis is kept only when it
+        # is misplaced for every one of them.
+        return set.intersection(*per_shape)
+    except Exception:
+        _swallowed(None, "_misplaced_name_axes")
+        return set()
+
+
 def _return_any_for_dynamic(
     ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext, tp: Type
 ) -> Type:
@@ -219,9 +283,13 @@ def _return_any_for_dynamic(
     except Exception:
         _swallowed(ctx, "_return_any_for_dynamic")
         return tp
+    keep = _misplaced_name_axes(ctx, list(shape.items))
     new_items: list[Type] = [
-        AnyType(TypeOfAny.explicit) if _is_dynamic_return_dim(get_proper_type(item)) else item for item in shape.items
+        AnyType(TypeOfAny.explicit) if i not in keep and _is_dynamic_return_dim(get_proper_type(item)) else item
+        for i, item in enumerate(shape.items)
     ]
+    if all(new is old for new, old in zip(new_items, shape.items)):
+        return tp
     try:
         new_shape = shape.copy_modified(items=new_items)
     except Exception:

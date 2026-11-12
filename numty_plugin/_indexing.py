@@ -37,7 +37,9 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import ARG_POS, EllipsisExpr, Expression, IntExpr, ListExpr, NameExpr, SliceExpr, StarExpr, TupleExpr
+from mypy.nodes import (
+    ARG_POS, EllipsisExpr, Expression, IndexExpr, IntExpr, ListExpr, NameExpr, SliceExpr, StarExpr, TupleExpr,
+)
 from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
 from ._linalg import (
     _dtype_base, _kind_of, _scalar_of_dtype, _string_value,
@@ -280,12 +282,40 @@ def _ann_recorded_name(ann: object | None) -> int | str | None:
         return None
 
 
+def _selection_base(
+    ctx: MethodContext | FunctionSigContext, expr: IndexExpr
+) -> tuple[Expression, list[int | Type]] | None:
+    """The index array a 1-d selection was taken from, with its dims, else None.
+
+    `rows[known]`, `rows[a:b]` and `rows[order]` hold fewer positions,
+    or the same ones in another order, and every one of them is a value
+    of `rows`: a selection changes how many positions there are, not the
+    size they are positions on (issue #305). Only a 1-d integer array
+    selected by a mask, a slice or an integer array is looked through.
+    """
+    lookup = getattr(ctx.api, "lookup_type_or_none", None)
+    index = expr.index
+    if lookup is None or isinstance(index, (TupleExpr, EllipsisExpr)):
+        return None
+    base_tp = lookup(expr.base)
+    parts = _ndarray_parts(base_tp) if base_tp is not None else None
+    if parts is None or len(parts[0]) != 1 or _dtype_base(parts[1]) not in ("i", "u"):
+        return None
+    if not isinstance(index, SliceExpr):
+        index_tp = lookup(index)
+        iparts = (_ndarray_parts(index_tp) or _known_rank_parts(index_tp)) if index_tp is not None else None
+        if iparts is None or len(iparts[0]) != 1 or _dtype_base(iparts[1]) not in ("b", "i", "u"):
+            return None
+    return expr.base, list(parts[0])
+
+
 def _recorded_for_operand(
     ctx: MethodContext | FunctionSigContext,
     module: str,
     func_node: object | None,
     expr: Expression | None,
     idims: list[int | Type],
+    depth: int = 0,
 ) -> int | Type | str | None:
     """The size an index operand's values are positions on, else None.
 
@@ -297,6 +327,10 @@ def _recorded_for_operand(
     silent. Never raises.
     """
     try:
+        if isinstance(expr, IndexExpr) and depth < 4:
+            base = _selection_base(ctx, expr)
+            if base is not None:
+                return _recorded_for_operand(ctx, module, func_node, base[0], base[1], depth + 1)
         if not isinstance(expr, NameExpr):
             return _recorded_index_on(ctx, idims, expr)
         varname = expr.name

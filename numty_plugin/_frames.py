@@ -18,7 +18,7 @@ the type of a Series does not say which it holds.
 """
 from __future__ import annotations
 
-from mypy.nodes import CallExpr, MemberExpr
+from mypy.nodes import CallExpr, Expression, MemberExpr
 from mypy.plugin import MethodContext
 from mypy.types import AnyType, CallableType, Instance, Type, TypeOfAny, get_proper_type
 
@@ -37,12 +37,41 @@ _POLARS_SCALARS = frozenset(
 )
 
 
+# Series methods that return a Series of the same dtype, still one value
+# per entry: the cast before them is still what `to_numpy()` reads (issue
+# 299). `cast(pl.Float64).fill_null(np.nan).to_numpy()` is how a nullable
+# column is read as floats. Checked against polars for Float32 / Float64.
+_KEEPS_CAST = frozenset(
+    {
+        "fill_null", "fill_nan", "drop_nulls", "drop_nans", "sort", "head", "tail", "slice", "filter",
+        "reverse", "clip", "limit", "shift", "gather", "rechunk", "clone", "alias", "rename", "unique",
+    }
+)
+POLARS_SERIES = "polars.series.series.Series"
+
+
+def _is_series(ctx: MethodContext, expr: Expression) -> bool:
+    tp = get_proper_type(ctx.api.get_expression_type(expr))
+    return isinstance(tp, Instance) and tp.type.fullname == POLARS_SERIES
+
+
 def _visible_cast(ctx: MethodContext) -> str | None:
-    """The polars dtype name of `<series>.cast(pl.X).to_numpy()`, else None."""
+    """The polars dtype name of `<series>.cast(pl.X).to_numpy()`, else None.
+
+    Calls of the `_KEEPS_CAST` methods between the cast and `to_numpy()`
+    are looked through, as long as each is a method of a Series.
+    """
     call = ctx.context
     if not isinstance(call, CallExpr) or not isinstance(call.callee, MemberExpr):
         return None
     receiver = call.callee.expr
+    while (
+        isinstance(receiver, CallExpr)
+        and isinstance(receiver.callee, MemberExpr)
+        and receiver.callee.name in _KEEPS_CAST
+        and _is_series(ctx, receiver.callee.expr)
+    ):
+        receiver = receiver.callee.expr
     if (
         not isinstance(receiver, CallExpr)
         or not isinstance(receiver.callee, MemberExpr)

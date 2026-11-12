@@ -14,6 +14,18 @@ say what it holds, so rank 1 would be a lie with no clean way out.
 Pinned by `tests/fixtures/polars_to_numpy.py` (needs polars; the test
 skips without it).
 
+The cast is still seen behind the Series methods that keep the dtype
+and one value per entry: `fill_null`, `fill_nan`, `drop_nulls`,
+`drop_nans`, `sort`, `head`, `tail`, `slice`, `filter`, `reverse`,
+`clip`, `limit`, `shift`, `gather`, `rechunk`, `clone`, `alias`,
+`rename` and `unique`. So `s.cast(pl.Float64).fill_null(np.nan).to_numpy()`,
+the usual way to read a nullable column as floats, is `(int,)` float64.
+A method that is not on the list (`cum_sum`, `to_frame`) ends it. On the
+array, `astype(float)` names the dtype even when the rank is unknown
+(`s.to_numpy().astype(float)` is `ndarray[Any, dtype[float64]]`), and
+`astype(d)` with `d: np.dtype[T]` keeps an `int`-sized array
+(`tests/fixtures/polars_cast_chain.py`).
+
 Annotate the local where the rank matters
 (`x: F64[int] = df["x"].to_numpy()`). `structured=True` and
 `masked=True` also keep polars' answer.

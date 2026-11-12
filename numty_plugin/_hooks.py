@@ -37,7 +37,7 @@ from ._unknowns import _fresh_unknown
 
 from ._types import (
     _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _mentions_ndarray,
-    _info_mentions_array, _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME,
+    _info_mentions_array, _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, NDARRAY_FULLNAME,
     TUPLE_FULLNAME, _OPERATOR_DUNDERS,
 )
 from ._callbind import (
@@ -110,7 +110,7 @@ from ._exprs import (
     _iter_tvarlikes,
 )
 from ._reshape import (
-    _movable_parts,
+    _known_rank_parts, _movable_parts,
 )
 from ._linalg import (
     _dtype_base,
@@ -1384,8 +1384,17 @@ def astype_method_hook(ctx: MethodContext) -> Type:
 
 
 def _astype_type(ctx: FunctionContext | MethodContext, tp: Type, named: Type) -> Type:
-    parts = _parts_or_unpack(tp)
+    # A shape with an `int` or `Any` size is read too (issues 270 and
+    # 299): an array read from a frame always has an `int` size, and
+    # `astype(d)` with `d: np.dtype[T]` lost it altogether.
+    parts = _parts_or_unpack(tp) or _known_rank_parts(tp)
     if parts is None:
+        # No rank to read (`s.to_numpy()` of a plain Series): the dtype
+        # after an `astype` does not depend on it. `astype(float)` gives
+        # what `astype(np.float64)` gives through the stubs.
+        proper = get_proper_type(tp)
+        if isinstance(proper, Instance) and proper.type.fullname == NDARRAY_FULLNAME and len(proper.args) == 2:
+            return proper.copy_modified(args=[proper.args[0], named])
         return ctx.default_return_type
     dims, _ = parts
     return _ndarray_type(ctx, dims, named)

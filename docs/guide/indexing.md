@@ -78,7 +78,11 @@ error (`tests/fixtures/bad_index_overrun.py`).
 An `Index` spelled through an alias (`R = Index[P, N]`), a call from
 another module, a method call, or keyword arguments keeps today's
 behavior (silent); like every other record, value-preserving reshapes
-and arithmetic do not carry it.
+and arithmetic do not carry it. A selection does carry it: `rows[known]`,
+`rows[1:]` and `rows[order]` hold fewer positions, or the same ones in
+another order, on the size `rows` holds them on, so
+`table[cols[known], rows[known]]` is reported like `table[cols, rows]`
+(`tests/fixtures/index_selection.py`).
 
 ## Indexed assignment
 
