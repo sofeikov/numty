@@ -13,6 +13,7 @@ from mypy.nodes import (
     ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo,
     TypeVarLikeExpr,
 )
+from mypy.argmap import map_actuals_to_formals
 from mypy.expandtype import expand_type
 from mypy.plugin import (
     AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
@@ -61,7 +62,7 @@ from ._ops import (
     repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook,
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook,
     flatnonzero_function_hook, argwhere_function_hook, unique_function_hook, isin_function_hook,
-    searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
+    histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
     atleast_function_hook,
 )
 from ._reshape import (
@@ -118,7 +119,8 @@ from ._unions import (
     _UNION_PAIR_METHODS, _reflected_name, _union_pair_hook, _union_reflected_hook,
     _union_signature_clash,
 )
-from ._callsite import _relax_dynamic_formals
+from ._callsite import _relax_dynamic_formals, minmax_function_hook
+from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 
 class NumtyPlugin(Plugin):
     def __init__(self, options) -> None:
@@ -269,6 +271,10 @@ class NumtyPlugin(Plugin):
             return _matmul_signature_hook
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
+        # mypy names the call after the class of the callee, not after
+        # the class that declares `__call__` (numba._dispatcher.Dispatcher).
+        if fullname in ("numba.core.dispatcher.Dispatcher.__call__", "numba._dispatcher.Dispatcher.__call__"):
+            return partial(self.dispatcher_signature_hook, fullname)
         # A hook here would make every method call in the program (list,
         # dict and str ones included) walk the plugin chain and scan its
         # arguments. A method none of whose parameters is declared with an
@@ -312,6 +318,36 @@ class NumtyPlugin(Plugin):
         else:
             return True
         return any(_mentions_ndarray(arg) for item in items for arg in [*item.arg_types, item.ret_type])
+
+    def dispatcher_signature_hook(self, fullname: str, ctx: MethodSigContext) -> FunctionLike:
+        """A call of a numba-jitted function, checked as a call of the function itself.
+
+        `@njit` gives `Dispatcher[F]`, with `F` the function's own
+        signature, and `Dispatcher.__call__` is declared over a ParamSpec
+        taken from `F`. mypy does not solve the function's size variables
+        through that, so every call of a jitted function with named
+        sizes was `expected "Never"` (issue 281). The signature here is
+        `F`, with the call's arguments put in the order of its
+        parameters, so the call-site checks of a plain function apply.
+        """
+        try:
+            receiver = get_proper_type(ctx.type)
+            wrapped = get_proper_type(receiver.args[0]) if isinstance(receiver, Instance) and receiver.args else None
+            call = ctx.context
+            if not isinstance(wrapped, CallableType) or not isinstance(call, CallExpr):
+                return ctx.default_signature
+            formal_to_actual = map_actuals_to_formals(
+                call.arg_kinds,
+                call.arg_names,
+                wrapped.arg_kinds,
+                wrapped.arg_names,
+                lambda i: ctx.api.get_expression_type(call.args[i]),
+            )
+            args = [[call.args[i] for i in actuals] for actuals in formal_to_actual]
+            return self.method_signature_hook(fullname, ctx._replace(args=args, default_signature=wrapped))
+        except Exception:
+            _swallowed(ctx, "dispatcher_signature_hook")
+            return ctx.default_signature
 
     def method_signature_hook(self, fullname: str, ctx: MethodSigContext) -> FunctionLike:
         # This hook covers every method, so first run whatever a later
@@ -621,7 +657,9 @@ class NumtyPlugin(Plugin):
     def _fam_bare(self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType) -> int | Type:
         return _fam_bare(ctx, head, arg, self._fam_late_bound)
 
-    def _fam_applied(self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType) -> int | Type:
+    def _fam_applied(
+        self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType
+    ) -> int | Type | list[int | Type]:
         return _fam_applied(ctx, head, arg, self._fam_late_bound)
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
@@ -648,6 +686,8 @@ class NumtyPlugin(Plugin):
             return len_function_hook
         if fullname == "builtins.divmod":
             return divmod_function_hook
+        if fullname in ("builtins.max", "builtins.min"):
+            return minmax_function_hook
         reflected = _reflected_name(fullname)
         if reflected is not None:
             # Issues #252, #255, #256: a reflected operator on a union of arrays.
@@ -694,6 +734,10 @@ class NumtyPlugin(Plugin):
         return substituted_attribute_hook
 
     def _method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
+        if fullname == POLARS_SERIES_TO_NUMPY:
+            return partial(frame_to_numpy_hook, rank=1)
+        if fullname == POLARS_FRAME_TO_NUMPY:
+            return partial(frame_to_numpy_hook, rank=2)
         reflected = _reflected_name(fullname)
         if reflected is not None:
             # Issues #252, #255, #256: a reflected operator on a union of arrays.
@@ -1735,6 +1779,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "delete": delete_function_hook,
             "sinc": partial(ufunc_function_hook, group="float"),
         },
+        "numpy.lib._histograms_impl": {"histogram": histogram_function_hook},
         "numpy.lib._nanfunctions_impl": {
             "nanargmax": partial(arg_function_hook, op="nanargmax"),
             "nanargmin": partial(arg_function_hook, op="nanargmin"),

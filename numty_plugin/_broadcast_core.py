@@ -23,6 +23,7 @@ from ._reshape import (
     _scalar_key,
 )
 from ._builders import _default_dtype, _scalar_ret_name
+from ._linalg import _is_numpy_scalar, _scalar_family
 
 
 _KIND_RANK = {"b": 0, "i": 1, "u": 1, "f": 2, "c": 3}
@@ -167,7 +168,13 @@ def _fallback_dtype(
         if key is None:
             ret_name = _scalar_ret_name(tp)
             if ret_name is None:
-                return any_dtype
+                # A numpy scalar with no width (`floating[Any]`, issue
+                # 277): its family is its kind, and it has no name.
+                family = _scalar_family(tp)
+                if family is None or family not in _KIND_RANK:
+                    return any_dtype
+                strong.append((family, None, None))
+                continue
             key = ("strong", ret_name)
         if key[0] == "weak":
             weak_kind = _WEAK_KIND.get(key[1])
@@ -438,6 +445,11 @@ def _solve_broadcast_scalar(
         # Numpy scalars (np.int64(3), x.max()) are strong (issue #61).
         name = _scalar_ret_name(other)
         if name is None:
+            if _is_numpy_scalar(other):
+                # A numpy scalar with no width (`t.min()` of an array
+                # with a family dtype, issue 277): still a scalar, so the
+                # array dims are kept, and the dtype follows the kinds.
+                return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [dtype, other]))
             return ctx.default_return_type
         key = ("strong", name)
     strong = _dtype_fullname(dtype)

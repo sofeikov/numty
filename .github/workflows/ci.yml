@@ -54,3 +54,9 @@ jobs:
           else
             uv run --with scikit-learn pytest
           fi
+      - name: Run the polars and numba fixtures
+        # Optional like scikit-learn, and kept out of the run above: numba
+        # caps the numpy it accepts, so installing it there could move
+        # the "latest" numpy of this matrix. These two tests skip
+        # without the packages, so CI must have them (issues #272, #281).
+        run: uv run --with polars --with numba pytest tests/test_static.py -k "polars_to_numpy or numba_dispatcher" -rs

@@ -47,6 +47,14 @@ def _ensure_batch() -> None:
         text=True,
         timeout=300,
     )
+    # mypy exits 0 or 1. Anything else is a crash or a killed process
+    # (out of memory on a small runner), and its output stops partway:
+    # the fixtures after that point would read as clean. Fail here, with
+    # the reason; the tests after this one run mypy per file.
+    assert result.returncode in (0, 1), (
+        f"batched mypy run exited with {result.returncode}\n"
+        f"{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+    )
     per_file: dict[str, list[str]] = {f.name: [] for f in files}
     for line in result.stdout.splitlines():
         # mypy prints paths relative to cwd (tests/fixtures/<name>:...).
@@ -2091,12 +2099,26 @@ def test_f64_undeclared_name() -> None:
     )
 
 
-def test_f64_star_redirect() -> None:
+def test_f64_star_needs_typevartuple() -> None:
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_star.py"),
-        "F64 star syntax (*Ts) is not supported",
-        "write Unpack[Ts] instead",
+        "F64 star dims take a TypeVarTuple, e.g. *Ts",
+        "[numty-annotation]",
     )
+
+
+def test_f64_star_form() -> None:
+    # Issue 282: `F32[*Ts]` was refused with "write Unpack[Ts] instead",
+    # and ruff's UP044 asks for the star. Both spellings are one type.
+    result = run_mypy(FIXTURES / "f64_star_ok.py")
+    assert result.returncode == 0, result.stdout
+    f32 = "numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]"
+    assert reveals_by_line(result) == {
+        24: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {f32}]"',
+        25: '"numpy.ndarray[tuple[Literal[5], Literal[7]], numpy.dtype[numpy.float64]]"',
+        26: f'"numpy.ndarray[tuple[Literal[3], Literal[4]], {f32}]"',
+    }, result.stdout
+    assert _run_fixture("f64_star_ok.py") == ["(3, 4)", "(5, 7)"]
 
 
 def test_f64_unbounded_typevar() -> None:
@@ -2563,7 +2585,8 @@ def test_ufunc_methods_ok_clean_and_runs() -> None:
         32: f'"{any_dt.format("Literal[2], Literal[3]")}"',
         33: f'"{any_dt.format("Literal[3], Literal[4]")}"',
         34: f'"{any_dt.format("Literal[3]")}"',
-        35: f'"{any_dt.format("Literal[2]")}"',
+        # Issue 283: minimum picks elements, so the dtype is the operand's.
+        35: '"numpy.ndarray[tuple[Literal[2]], numpy.dtype[numpy.float64]]"',
         36: f'"{any_dt.format("Literal[2]")}"',
         37: f'"{any_dt.format("Literal[4], Literal[2]")}"',
         38: '"numpy.ndarray[tuple[Literal[2]], '
@@ -4578,11 +4601,13 @@ def test_any_bound_size_is_stable() -> None:
     # Issue 284: with an argument of unknown rank and a union argument,
     # mypy solved `T` by a join whose order changed from run to run, and
     # about one cold run in four reported `cannot be "object"`. Eight
-    # cold runs must all be clean.
+    # cold runs must all be clean. Two at a time: each cold run reads
+    # numpy's stubs from scratch, and eight at once next to the batched
+    # runs of the other workers ran a CI runner out of memory.
     from concurrent.futures import ThreadPoolExecutor
 
     fixture = FIXTURES / "callsite_any_bound_ok.py"
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: run_mypy(fixture, flags=("--cache-dir", os.devnull)), range(8)))
     for result in results:
         assert result.returncode == 0, result.stdout
@@ -4696,3 +4721,186 @@ def test_container_int_sizes_and_bare_container() -> None:
     assert notes[60] == f'"numpy.ndarray[tuple[int], {_I64}]"', result.stdout
     assert notes[69] == f'"numpy.ndarray[tuple[F], {_F64}]"', result.stdout
     assert notes[70] == f'"numpy.ndarray[tuple[F], {_F64}]"', result.stdout
+
+
+_ND = "numpy.ndarray"
+
+
+def test_coverage_batch() -> None:
+    # Issue 283: np.array of a list built at runtime or of arrays,
+    # broadcast_to with runtime sizes, split at an index array, the
+    # dtype of max/min ufunc methods, the dtype a builder is given when
+    # every size is a runtime int, and np.histogram.
+    result = run_mypy(FIXTURES / "coverage_batch_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        13: f'"{_ND}[tuple[?U@13], {_BOOL}]"',
+        14: f'"{_ND}[tuple[?U@14], {_BOOL}]"',
+        15: f'"{_ND}[tuple[?U@15], numpy.dtype[numpy.signedinteger[{_NB}_32Bit]]]"',
+        16: f'"{_ND}[tuple[Literal[2], N], {_F64}]"',
+        17: f'"{_ND}[tuple[N, Literal[2]], {_F64}]"',
+        18: f'"{_ND}[tuple[?U@18, N], {_F64}]"',
+        19: f'"{_ND}[tuple[int, N], {_F64}]"',
+        20: f'"{_ND}[tuple[int, int], {_F64}]"',
+        21: f'"list[{_ND}[tuple[?U@21b], {_I64}]]"',
+        22: f'"list[{_ND}[tuple[?U@22b], {_I64}]]"',
+        23: f'"{_ND}[tuple[?U@23], {_F32}]"',
+        24: f'"{_ND}[tuple[N], {_F32}]"',
+        25: f'"{_ND}[tuple[N], {_F64}]"',
+        26: f'"{_ND}[tuple[N], Any]"',
+        27: f'"{_ND}[tuple[int, int], {_BOOL}]"',
+        28: f'"{_ND}[tuple[int, int], {_I64}]"',
+        29: f'"{_ND}[tuple[int, int], {_F32}]"',
+        30: f'"{_ND}[tuple[int, int], {_F64}]"',
+        31: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        35: f'"tuple[{_ND}[tuple[Literal[15]], {_I64}], {_ND}[tuple[Literal[16]], {_F64}]]"',
+        36: f'"tuple[{_ND}[tuple[Literal[10]], {_I64}], {_ND}[tuple[Literal[11]], {_F64}]]"',
+        37: f'"tuple[{_ND}[tuple[Literal[4]], {_I64}], {_ND}[tuple[Literal[5]], {_F32}]]"',
+        38: f'"tuple[{_ND}[tuple[B-1], {_I64}], {_ND}[tuple[B], {_F64}]]"',
+        39: f'"tuple[{_ND}[tuple[?U@39], {_I64}], {_ND}[tuple[?U@39b], {_F64}]]"',
+        40: f'"tuple[{_ND}[tuple[Literal[3]], numpy.dtype[Any]], {_ND}[tuple[Literal[4]], {_F64}]]"',
+        42: f'"{_ND}[tuple[B-1], {_F64}]"',
+    }, result.stdout
+    assert _run_fixture("coverage_batch_ok.py") == [
+        "(15,) int64 (16,) float64",
+        "(4,) int64 (5,) float32",
+        "bool (7, 2)",
+        "(2, 7) float32",
+        "bool float64",
+        "[(2,), (3,), (2,)]",
+    ]
+
+
+def test_dtype_generic_helpers() -> None:
+    # Issue 278:  and ufuncs keep a dtype TypeVar, so the
+    # body of a helper generic in its dtype is checked: a result built
+    # on the wrong axis is reported.
+    result = run_mypy(FIXTURES / "bad_dtype_generic.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [30], result.stdout
+    assert 'got "ndarray[tuple[E, N], dtype[T]]", expected "ndarray[tuple[E, M], dtype[T]]"' in errors[30][0], (
+        result.stdout
+    )
+    assert reveals_by_line(result) == {
+        16: f'"{_ND}[tuple[E, M], numpy.dtype[T]]"',
+        17: f'"{_ND}[tuple[E, Literal[2]], numpy.dtype[T]]"',
+        23: f'"{_ND}[tuple[N, M], numpy.dtype[FT]]"',
+        24: f'"{_ND}[tuple[N, M], numpy.dtype[FT]]"',
+        25: f'"{_ND}[tuple[N, M], numpy.dtype[FT]]"',
+        34: f'"{_ND}[tuple[E, M], {_F32}]"',
+        35: f'"{_ND}[tuple[N, M], {_F32}]"',
+        36: f'"{_ND}[tuple[E, M], {_F32}]"',
+    }, result.stdout
+
+
+def test_family_dtype_heads() -> None:
+    # Issue 277: Floating / Integer heads, elementwise ops that keep the
+    # shape and the family, a numpy scalar of unknown width as an
+    # operand, max() of such a scalar and a float, and the heads U16,
+    # U32, U64 and Intp.
+    result = run_mypy(FIXTURES / "bad_family_dtype.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [48, 51, 55], result.stdout
+    assert "dtype[integer[Any]]" in errors[48][0] and "[arg-type]" in errors[48][0], result.stdout
+    assert "dtype[floating[Any]]" in errors[51][0] and "[arg-type]" in errors[51][0], result.stdout
+    assert "N-1 vs N (shapes (N-1,) vs (N,))  [numty-broadcast]" in errors[55][0], result.stdout
+    assert reveals_by_line(result) == {
+        28: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
+        29: f'"{_ND}[tuple[N], numpy.dtype[numpy.integer[Any]]]"',
+        30: f'"{_ND}[tuple[N], numpy.dtype[numpy.unsignedinteger[{_NB}_32Bit]]]"',
+        31: f'"{_ND}[tuple[N, M], numpy.dtype[numpy.unsignedinteger[{_NB}_16Bit]]]"',
+        32: f'"{_ND}[tuple[N], numpy.dtype[numpy.unsignedinteger[{_NB}_64Bit]]]"',
+        33: f'"{_ND}[tuple[N], numpy.dtype[numpy.signedinteger[{_NB}_32Bit | {_NB}_64Bit]]]"',
+        34: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
+        35: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
+        36: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
+        37: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
+        38: f'"{_ND}[tuple[int, N], numpy.dtype[numpy.floating[Any]]]"',
+        39: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
+        40: '"numpy.floating[Any] | float"',
+        41: f'"{_ND}[tuple[N], numpy.dtype[Any]]"',
+        42: f'"{_ND}[tuple[N], numpy.dtype[numpy.integer[Any]]]"',
+        43: f'"{_ND}[tuple[N], numpy.dtype[Any]]"',
+        44: f'"{_ND}[tuple[N], numpy.dtype[numpy.unsignedinteger[{_NB}_32Bit]]]"',
+        45: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
+    }, result.stdout
+
+
+def test_literal_formula_spelling() -> None:
+    # Issue 282: `U8[Literal["N+1"]]` is the string spec `U8["N+1"]` in a
+    # spelling that ruff's UP037 does not rewrite.
+    result = run_mypy(FIXTURES / "bad_literal_formula.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [25], result.stdout
+    assert "tuple[N+1, M]" in errors[25][0] and "tuple[N+1, M+1]" in errors[25][0], result.stdout
+    u8 = f"numpy.dtype[numpy.unsignedinteger[{_NB}_8Bit]]"
+    assert reveals_by_line(result) == {
+        29: f'"numpy.ndarray[tuple[N+1, M+1], {u8}]"',
+        30: f'"numpy.ndarray[tuple[Literal[4], Literal[5]], {u8}]"',
+        31: f'"numpy.ndarray[tuple[N+1, M+1], {u8}]"',
+    }, result.stdout
+
+
+def test_polars_to_numpy() -> None:
+    # Issue 272: DataFrame.to_numpy() is 2-D; Series.to_numpy() is 1-D
+    # after a visible cast to a numeric or boolean dtype, and a float
+    # cast names the dtype. A plain Series.to_numpy(), a cast to Array
+    # or String, and structured=True keep polars' own answer.
+    pytest.importorskip("polars")
+    result = run_mypy(FIXTURES / "polars_to_numpy.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [21], result.stdout
+    assert any("too many indices for 1 dimensions" in line and "[numty-axis]" in line for line in errors[21]), (
+        result.stdout
+    )
+    polars_answer = '"numpy.ndarray[Any, Any]"'
+    assert reveals_by_line(result) == {
+        7: polars_answer,
+        8: f'"{_ND}[tuple[int], {_F64}]"',
+        9: f'"{_ND}[tuple[int], {_F32}]"',
+        10: f'"{_ND}[tuple[int], numpy.dtype[Any]]"',
+        11: f'"{_ND}[tuple[int], {_F64}]"',
+        12: polars_answer,
+        13: polars_answer,
+        14: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        15: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        16: polars_answer,
+        17: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        19: f'"{_ND}[tuple[?U@19c], {_F64}]"',
+        20: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+    }, result.stdout
+    assert _run_fixture("polars_to_numpy.py") == [
+        "(3,) float64",
+        "float32 float64",
+        "(3, 2) (3,)",
+        "(3, 2)",
+    ]
+
+
+def test_numba_dispatcher_call() -> None:
+    # Issue 281: a call of a jitted function is checked as a call of the
+    # function: sizes are solved (they were `Never`), a formula return is
+    # put in the caller's terms, and the call-site checks apply.
+    pytest.importorskip("numba")
+    result = run_mypy(FIXTURES / "numba_dispatch.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [34, 35, 36], result.stdout
+    assert "call-site shape conflict for 'N': 5 (argument 'a', axis 0) vs 6 (argument 'b', axis 0)" in errors[34][0], (
+        result.stdout
+    )
+    assert 'Argument 1 to "total"' in errors[35][0] and "[arg-type]" in errors[35][0], result.stdout
+    assert 'Argument 2 to "total" has incompatible type "str"; expected "float"' in errors[36][0], result.stdout
+    assert "Never" not in "".join(line for lines in errors.values() for line in lines if "total" not in line)
+    assert reveals_by_line(result) == {
+        29: f'"{_ND}[tuple[M], {_F32}]"',
+        30: f'"{_ND}[tuple[M-1], {_F32}]"',
+        31: f'"tuple[{_ND}[tuple[M+1], {_F32}], {_ND}[tuple[N+1, M+1], {_F32}]]"',
+        32: f'"tuple[{_ND}[tuple[M+1], {_F32}], {_ND}[tuple[N+1, M+1], {_F32}]]"',
+        33: f'"{_ND}[tuple[Literal[5]], {_F32}]"',
+    }, result.stdout
+    assert _run_fixture("numba_dispatch.py") == ["(4,) [(5,), (4, 5)]"]

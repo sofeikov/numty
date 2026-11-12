@@ -18,17 +18,18 @@ from ._dtypes import (
     _promote_strong, _promote_weak,
 )
 from ._types import (
-    DTYPE_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int, _has_unpack,
-    _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _shape_from_arg, _split_flat,
-    _union_members,
+    DTYPE_FULLNAME, INT_FULLNAME, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
+    _fold_int, _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _shape_from_arg,
+    _split_flat, _union_members,
 )
 from ._reshape import (
     _all_positionals, _all_positionals_expanded, _bool_value, _datetime_kind, _dims_str,
-    _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _known_rank_parts,
+    _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _is_plain_int, _known_rank_parts,
     _scalar_key, _weak_name,
 )
 from ._builders import (
-    _apply_out_dtype, _default_dtype, _explicit_dtype, _fold_single, _named_dtype, _scalar_ret_name,
+    _apply_out_dtype, _default_dtype, _element_expr_type, _explicit_dtype, _fold_single, _is_dynamic_sequence,
+    _named_dtype, _scalar_ret_name,
 )
 from ._linalg import (
     _linalg_dtype, _linalg_real_name, _linalg_tuple,
@@ -46,9 +47,10 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import Expression, ListExpr, OpExpr, TupleExpr
+from mypy.nodes import Expression, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
+from mypy.subtypes import is_same_type
 from mypy.types import (
-    AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, UninhabitedType,
+    AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, UninhabitedType, UnionType,
     get_proper_type,
 )
 from ._reshape import (
@@ -61,7 +63,7 @@ from ._types import (
     _unpack_shape,
 )
 from ._linalg import (
-    _dtype_base, _kind_of,
+    _dtype_base, _dtype_family, _is_numpy_scalar, _kind_of,
 )
 from ._broadcast_core import (
     _fallback_dtype, _loose_dtype_name, _merge_unpack_dims, _solve_broadcast, _whole_shape_operands,
@@ -589,6 +591,16 @@ def _shapes_for_broadcast(types: list[Type]) -> list[list[int | Type]] | None:
             continue
         if _scalar_key(tp) is not None or _scalar_ret_name(tp) is not None:
             continue
+        if _is_numpy_scalar(tp):
+            # A numpy scalar with no width (`floating[Any]`, issue 277).
+            continue
+        proper = get_proper_type(tp)
+        if isinstance(proper, UnionType) and all(
+            _scalar_key(m) is not None or _scalar_ret_name(m) is not None or _is_numpy_scalar(m)
+            for m in proper.items
+        ):
+            # One of several scalars (`max(t.max(), 1e-9)`): still a scalar.
+            continue
         return None
     return shapes
 
@@ -857,6 +869,8 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     dims = _shape_from_arg(shape_pair[0], shape_pair[1])
     if dims is None:
+        dims = _display_dims(shape_pair[0], shape_pair[1])
+    if dims is None:
         return ctx.default_return_type
     if any(isinstance(d, int) and d < 0 for d in dims):
         ctx.api.fail(
@@ -869,6 +883,36 @@ def _solve_broadcast_to(ctx: FunctionContext) -> Type:
     if dist is not None:
         return dist
     return _broadcast_to_types(ctx, pairs[0][0], dims)
+
+
+def _display_dims(tp: Type, expr: Expression | None) -> list[int | Type] | None:
+    """Dims of a shape display that has runtime sizes: `(len(names), n, 3)`.
+
+    A size that folds or has a known dim is that dim; a plain `int` one
+    stays `int`. `np.broadcast_to(x, (n, len(x)))` had no shape at all
+    (issue 283), though the result of the call, when it runs, has the
+    shape it is given.
+    """
+    proper = get_proper_type(tp)
+    if (
+        not isinstance(expr, TupleExpr)
+        or not isinstance(proper, TupleType)
+        or len(proper.items) != len(expr.items)
+    ):
+        return None
+    out: list[int | Type] = []
+    for item, item_tp in zip(expr.items, proper.items):
+        if isinstance(item, StarExpr):
+            return None
+        value = _fold_int(item)
+        dim = value if value is not None else _dim_value(item_tp)
+        if dim is None:
+            dynamic = get_proper_type(item_tp)
+            if not (isinstance(dynamic, Instance) and dynamic.type.fullname == INT_FULLNAME):
+                return None
+            dim = dynamic.copy_modified(last_known_value=None)
+        out.append(dim)
+    return out
 
 
 def _broadcast_to_compatible(
@@ -917,6 +961,10 @@ def _broadcast_to_compatible(
                 code=NUMTY_SHAPE,
             )
             return False
+        if _is_plain_int(s) or _is_plain_int(t):
+            # A runtime size on either side: not provable, and the
+            # result has the target shape when the call runs.
+            continue
         return False
     return True
 
@@ -1052,10 +1100,10 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         elems = list(zip([t for t in checked if t is not None], expr.items))
     if not elems:
-        return ctx.default_return_type
+        return _asarray_dynamic(ctx, tp, expr, named)
     kinds = [_display_element_kind(t, e) for t, e in elems]
     if any(k is None for k in kinds):
-        return ctx.default_return_type
+        return _asarray_of_arrays(ctx, [t for t, _ in elems], named)
     if named is None:
         if "builtins.complex" in kinds:
             default_name = "numpy.complex128"
@@ -1073,6 +1121,75 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
     dims = _apply_ndmin(ctx, [len(elems)])
     if dims is None:
         return ctx.default_return_type
+    return _ndarray_type(ctx, dims, dtype)
+
+
+def _asarray_of_arrays(ctx: FunctionContext, items: list[Type], named: Type | None) -> Type:
+    """`np.array([a, b])` of arrays of one shape and dtype: `(2, *shape)` (issue 283).
+
+    The same answer as `np.stack`. Items whose shapes or dtypes are not
+    provably the same stay with the stubs: numpy refuses different
+    shapes, and promotes different dtypes.
+    """
+    parts = [part for part in map(_ndarray_parts, items) if part is not None]
+    if not parts or len(parts) != len(items):
+        return ctx.default_return_type
+    first_dims, first_dtype = parts[0]
+    for dims, dtype in parts[1:]:
+        if len(dims) != len(first_dims) or not all(_dim_eq(a, b) for a, b in zip(dims, first_dims)):
+            return ctx.default_return_type
+        if named is None and not is_same_type(dtype, first_dtype):
+            return ctx.default_return_type
+    out = _apply_ndmin(ctx, [len(items), *first_dims])
+    if out is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out, named if named is not None else first_dtype)
+
+
+def _asarray_dynamic(
+    ctx: FunctionContext, tp: Type, expr: Expression | None, named: Type | None
+) -> Type:
+    """`np.array` of a list built at runtime: one unknown axis in front (issue 283).
+
+    A list comprehension or a `list[...]` value has an unknowable length
+    and one item type. Items that are arrays of one declared shape give
+    `(?U, *shape)`, as `np.stack` does. Items that are scalars give
+    `(?U,)`. The dtype is the one the call names, else `bool` for `bool`
+    items (exact: `bool` has no subclass), else the dtype of a numpy
+    scalar item, else the stubs' answer: a `list[int]` may hold bools and
+    a `list[float]` may hold ints, so nothing is claimed for them here.
+    """
+    from numty_plugin import _fresh_unknown
+
+    if isinstance(expr, ListComprehension):
+        item = _element_expr_type(ctx, expr.generator.left_expr)
+    elif _is_dynamic_sequence(tp, expr):
+        proper = get_proper_type(tp)
+        item = proper.args[0] if isinstance(proper, Instance) and proper.args else None
+    else:
+        return ctx.default_return_type
+    if item is None:
+        return ctx.default_return_type
+    lead = _fresh_unknown(ctx, "asarray", 0)
+    part = _ndarray_parts(item)
+    if part is not None:
+        dims = _apply_ndmin(ctx, [lead, *part[0]])
+        if dims is None:
+            return ctx.default_return_type
+        return _ndarray_type(ctx, dims, named if named is not None else part[1])
+    key = _scalar_key(item)
+    if key is None:
+        return ctx.default_return_type
+    dims = _apply_ndmin(ctx, [lead])
+    if dims is None:
+        return ctx.default_return_type
+    if named is not None:
+        return _ndarray_type(ctx, dims, named)
+    kind, name = key
+    exact = name if kind == "strong" else ("numpy.bool" if name == "builtins.bool" else None)
+    dtype = _construct_dtype(ctx, exact) if exact is not None else None
+    if dtype is None:
+        dtype = _default_dtype(ctx)
     return _ndarray_type(ctx, dims, dtype)
 
 
@@ -1163,7 +1280,24 @@ def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> 
         return _out(bool_dtype)
     ks = _dtype_kind_size(dtype)
     if ks is None:
-        return ctx.default_return_type
+        # No width (issues 277 and 278): a family (`np.floating`,
+        # `np.integer`), a dtype TypeVar, or `np.intp`. The shape is
+        # that of the operand whatever the dtype is. The dtype is the
+        # operand's where the family keeps it: a real under abs/real, a
+        # float under sqrt/exp. `np.intp` is read as int64. Anything
+        # else is unknown: an integer of unknown width becomes float16,
+        # float32 or float64, and `Any` there keeps a correct `F64`
+        # annotation of the result from being an error.
+        family = _dtype_family(dtype)
+        keeps = family is not None and (family != "c" if group in ("abs", "real") else family in ("f", "c"))
+        if keeps:
+            return _out(dtype)
+        loose = _loose_dtype_name(dtype)
+        name = _smallest_float(loose) if loose is not None and family in ("b", "i", "u") else None
+        named = _construct_dtype(ctx, name) if name is not None else None
+        if named is not None:
+            return _out(named)
+        return _out(ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)]))
     kind, size = ks
     if group == "abs":
         # abs of complex is real; everything else keeps its dtype.

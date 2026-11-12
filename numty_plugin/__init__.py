@@ -10,8 +10,8 @@ from mypy.plugin import Plugin
 
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
-    _broadcast, _broadcast_core, _builders, _callsite, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _heads,
-    _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _state, _trace, _types, _unions,
+    _broadcast, _broadcast_core, _builders, _callsite, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _frames,
+    _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _state, _trace, _types, _unions,
     _unknowns,
 )
 from ._state import (  # noqa: F401
@@ -60,7 +60,8 @@ from ._linalg import (  # noqa: F401
     _linalg_pinv, _linalg_qr, _linalg_real_name, _linalg_same_shape, _linalg_slogdet, _linalg_solve,
     _linalg_solve_dtype, _linalg_svd, _linalg_tensorsolve, _linalg_tuple, _norm_ord_fits,
     _norm_signature_hook, _reject_float16_linalg, cross_function_hook, linalg_cross_function_hook,
-    linalg_function_hook, _dtype_base, _kind_of, _maybe_scalar, _scalar_of_dtype, _string_value,
+    linalg_function_hook, _dtype_base, _dtype_family, _is_numpy_scalar, _kind_of, _maybe_scalar,
+    _scalar_family, _scalar_of_dtype, _string_value,
 )
 from ._indexing import (  # noqa: F401
     _consume_one, _consume_prefix, _consume_suffix, _getitem_types, _index_pairs, _is_scalar_target,
@@ -103,7 +104,8 @@ from ._types import (  # noqa: F401
     _unpack_shape,
 )
 from ._builders import (  # noqa: F401
-    _operands_have_known_shape, _builder_shape, _has_literal_dim, _has_int_dim, _has_mixed_operand,
+    _operands_have_known_shape, _builder_shape, _stub_shape_named_dtype, _has_literal_dim, _has_int_dim,
+    _has_mixed_operand,
     _is_degraded_operand, _undegraded_args, _guard_mixed, _default_float_dtype, _dims_fit_intp,
     zeros_like_hook, _default_dtype, _fill_dtype_name, _fold_single, _explicit_dtype,
     _instance_fullname, _scalar_ret_name, _named_dtype, _apply_out_dtype, like_function_hook,
@@ -135,8 +137,8 @@ from ._ops import (  # noqa: F401
     pad_function_hook, split_function_hook, array_split_function_hook, _select_index_elem,
     _nonzero_like, nonzero_function_hook, count_nonzero_function_hook, flatnonzero_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook, _search_values_dims,
-    searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
-    atleast_function_hook,
+    histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook,
+    sliding_window_view_function_hook, atleast_function_hook,
     _fft_seq_arg, _fft_seq_entry,
 )
 from ._reshape import (  # noqa: F401
@@ -175,8 +177,11 @@ from ._broadcast_core import (  # noqa: F401
     _broadcast_types, _merge_known_pair, _merge_unpack_dims, _same_unpack, _solve_broadcast,
     _solve_broadcast_scalar, _solve_broadcast_unpack,
 )
+from ._frames import (  # noqa: F401
+    POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
+)
 from ._callsite import (  # noqa: F401
-    _int_sizes_accept_any, _relax_dynamic_formals
+    _int_sizes_accept_any, _relax_dynamic_formals, minmax_function_hook
 )
 from ._hooks import (  # noqa: F401
     NumtyPlugin, _reshape_signature_hook, _broadcast_signature_hook, _matmul_signature_hook,

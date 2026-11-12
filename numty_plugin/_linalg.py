@@ -39,7 +39,7 @@ from ._dtypes import (
     _DTYPE_INFO,
 )
 from mypy.types import (
-    Instance, LiteralType, get_proper_type,
+    Instance, LiteralType, TypeVarType, get_proper_type,
 )
 
 def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Type:
@@ -1254,6 +1254,57 @@ def _dtype_base(dtype: Type) -> str | None:
         # but the kind alone classifies index/ufunc/logical operands.
         "numpy.integer": "i",
     }.get(element.type.fullname)
+
+
+_FAMILY_OF_BASE = {
+    "numpy.bool": "b",
+    "numpy.floating": "f",
+    "numpy.complexfloating": "c",
+    "numpy.signedinteger": "i",
+    "numpy.unsignedinteger": "u",
+    "numpy.integer": "i",
+}
+
+
+def _dtype_family(dtype: Type) -> str | None:
+    """b/i/u/f/c for a dtype whose width may be unknown, else None.
+
+    Like `_dtype_base`, and also for a dtype that is a TypeVar
+    (`np.dtype[FT]` with `FT` bounded by `np.floating`): the family of
+    the bound. `np.number`, `np.inexact` and `np.generic` name no one
+    family and give None (issues 277 and 278).
+    """
+    proper = get_proper_type(dtype)
+    if not isinstance(proper, Instance) or not proper.args:
+        return None
+    element = get_proper_type(proper.args[0])
+    if isinstance(element, TypeVarType):
+        element = get_proper_type(element.upper_bound)
+    if not isinstance(element, Instance):
+        return None
+    for base in element.type.mro:
+        family = _FAMILY_OF_BASE.get(base.fullname)
+        if family is not None:
+            return family
+    return None
+
+
+def _is_numpy_scalar(tp: Type) -> bool:
+    """A numpy scalar type of any width: `np.float32`, `floating[Any]`, `np.integer`."""
+    proper = get_proper_type(tp)
+    return isinstance(proper, Instance) and any(base.fullname == "numpy.generic" for base in proper.type.mro)
+
+
+def _scalar_family(tp: Type) -> str | None:
+    """b/i/u/f/c for a numpy scalar type whose width may be unknown, else None."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance):
+        return None
+    for base in proper.type.mro:
+        family = _FAMILY_OF_BASE.get(base.fullname)
+        if family is not None:
+            return family
+    return None
 
 
 def _string_value(tp: Type) -> str | None:

@@ -63,12 +63,18 @@ class _HeadMeta(type):
     """
 
     _numty_dtype: np.dtype[Any] | None = None
+    # A family head (`Floating`, `Integer`) has no one dtype: it matches
+    # the arrays whose dtype is a subtype of this numpy scalar class.
+    _numty_family: type[np.generic] | None = None
 
     def __instancecheck__(cls, obj: object) -> bool:
         dtype = cls._numty_dtype
-        if dtype is None:
-            return super().__instancecheck__(obj)
-        return isinstance(obj, np.ndarray) and obj.dtype == dtype
+        if dtype is not None:
+            return isinstance(obj, np.ndarray) and obj.dtype == dtype
+        family = cls._numty_family
+        if family is not None:
+            return isinstance(obj, np.ndarray) and np.issubdtype(obj.dtype, family)
+        return super().__instancecheck__(obj)
 
     def __call__(cls, *args: Any, **kwargs: Any) -> Any:
         raise TypeError(
@@ -145,10 +151,54 @@ class U8(_StringDims, Generic[Unpack[TsFam]]):
     _numty_dtype = np.dtype(np.uint8)
 
 
+class U16(_StringDims, Generic[Unpack[TsFam]]):
+    """uint16 array with flat dims, e.g. U16[height, width] for a depth image."""
+
+    _numty_dtype = np.dtype(np.uint16)
+
+
+class U32(_StringDims, Generic[Unpack[TsFam]]):
+    """uint32 array with flat dims, e.g. U32[rows] for a polars row index."""
+
+    _numty_dtype = np.dtype(np.uint32)
+
+
+class U64(_StringDims, Generic[Unpack[TsFam]]):
+    """uint64 array with flat dims, e.g. U64[rows] for hashes."""
+
+    _numty_dtype = np.dtype(np.uint64)
+
+
+class Intp(_StringDims, Generic[Unpack[TsFam]]):
+    """`np.intp` array with flat dims: what `argsort`, `argmin` and `arange` give.
+
+    int64 on a 64-bit platform, where it is the same dtype as `I64`.
+    """
+
+    _numty_dtype = np.dtype(np.intp)
+
+
 class Bool(_StringDims, Generic[Unpack[TsFam]]):
     """boolean array with flat dims, e.g. Bool[batch, mask]."""
 
     _numty_dtype = np.dtype(np.bool_)
+
+
+class Floating(_StringDims, Generic[Unpack[TsFam]]):
+    """Array of any float dtype (float16, float32, float64, longdouble) with flat dims.
+
+    For data that is float32 from one source and float64 from another,
+    in code that keeps whichever it gets. Elementwise operations keep
+    the shape and the family.
+    """
+
+    _numty_family = np.floating
+
+
+class Integer(_StringDims, Generic[Unpack[TsFam]]):
+    """Array of any integer dtype, signed or unsigned, with flat dims."""
+
+    _numty_family = np.integer
 
 
 # Ready-made dim TypeVars for the heads above: `F64[batch, features]`
