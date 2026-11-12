@@ -4904,3 +4904,33 @@ def test_numba_dispatcher_call() -> None:
         33: f'"{_ND}[tuple[Literal[5]], {_F32}]"',
     }, result.stdout
     assert _run_fixture("numba_dispatch.py") == ["(4,) [(5,), (4, 5)]"]
+
+
+def test_names_opt_in() -> None:
+    # Issue 280: two different names where one size is needed. Off by
+    # default: `F64[N] + F64[M]` runs when N == M, and nothing is said
+    # (not even mypy's own [operator] error). With the code on, each
+    # such line of a generic body has one [numty-names] error.
+    fixture = FIXTURES / "names_opt_in.py"
+    off = run_mypy(fixture)
+    assert sorted(_errors_by_line(off)) == [30], off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    expected = {
+        19: "boolean index on axis 0 (shape (A, B)): B and A are different names",
+        21: "broadcast at trailing axis 0 (shapes (B, A) vs (B,)): A and B are different names",
+        22: "broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names",
+        23: "assignment of shape (A,) into target of shape (B,): A and B are different names",
+        24: "boolean index on axis 0 (shape (A, B)): B and A are different names",
+        25: "concatenate dimension 0 (shapes (A, B) vs (B, A)): A and B are different names",
+        26: "stack dimension 0 (shapes (B,) vs (A,)): B and A are different names",
+        28: "call-site binding of 'K' (argument 'ids', axis 0, and argument 'd', axis 1): "
+        "B and A are different names",
+        29: "broadcast at trailing axis 0 (shapes (A,) vs (B,)): A and B are different names",
+        34: "broadcast at trailing axis 0 (shapes (B-1,) vs (A,)): B-1 and A are different names",
+    }
+    assert sorted(errors) == sorted([*expected, 30]), on.stdout
+    for line, message in expected.items():
+        assert len(errors[line]) == 1, on.stdout
+        assert message in errors[line][0] and errors[line][0].endswith("[numty-names]"), on.stdout
+    assert errors[30][0].endswith("[numty-broadcast]"), on.stdout

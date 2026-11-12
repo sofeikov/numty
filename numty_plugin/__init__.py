@@ -18,7 +18,7 @@ from ._state import (  # noqa: F401
     STATE
 )
 from ._errors import (  # noqa: F401
-    NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL,
+    NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL, NUMTY_NAMES,
     NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION,
     _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning,
     _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed, _warn_startup,
@@ -89,7 +89,9 @@ from ._heads import (  # noqa: F401
     _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string, _is_fam_int_name,
 )
 from ._types import (  # noqa: F401
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2,
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _named_sizes_differ, _named_pair_in, _names_enabled,
+    _report_names, _dim_str,
+    _dim_add_const, _dim_add2,
     _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim, _linear_product, _reshape_total_form,
     _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr,
     _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members, _distribute_pairings,
@@ -181,7 +183,7 @@ from ._frames import (  # noqa: F401
     POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 )
 from ._callsite import (  # noqa: F401
-    _int_sizes_accept_any, _relax_dynamic_formals, minmax_function_hook
+    _int_sizes_accept_any, _relax_dynamic_formals, _report_call_site_names, minmax_function_hook
 )
 from ._hooks import (  # noqa: F401
     NumtyPlugin, _reshape_signature_hook, _broadcast_signature_hook, _matmul_signature_hook,
