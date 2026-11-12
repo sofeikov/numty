@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 538" width="920" height="538" role="img" aria-labelledby="t d">
+<title id="t">numty catching two shape bugs in plain NumPy code</title>
+<desc id="d">Twelve lines of unannotated NumPy. numty infers every shape and mypy reports a transposed weight matrix and a missing keepdims before the code runs.</desc>
+<style>
+text{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Liberation Mono",monospace;font-size:14px;fill:#e6edf3}
+.ui{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.ln{fill:#6e7681;text-anchor:end}
+.com{fill:#8b949e;font-style:italic}.kw,.op{fill:#ff7b72}.num{fill:#79c0ff}.fn{fill:#d2a8ff}.name,.p{fill:#e6edf3}
+.note{fill:#3fb950}.bad{fill:#ff7b72;font-weight:600}
+.hd{fill:#7d8590;font-size:11px;letter-spacing:.08em}
+.sq{fill:none;stroke:#f85149;stroke-width:1.6;stroke-linejoin:round}
+.t text,.t tspan{font-size:13px}
+.tp{fill:#7d8590}.te{fill:#ffa198}.ts{fill:#f85149;font-weight:600}
+</style>
+<rect x="1" y="1" width="918" height="536" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="2"/>
+<path d="M2 44 V13 a11 11 0 0 1 11 -11 H907 a11 11 0 0 1 11 11 V44 Z" fill="#161b22"/>
+<line x1="2" y1="44" x2="918" y2="44" stroke="#30363d"/>
+<circle cx="24" cy="23.0" r="6" fill="#ff5f57"/>
+<circle cx="44" cy="23.0" r="6" fill="#febc2e"/>
+<circle cx="64" cy="23.0" r="6" fill="#28c840"/>
+<text class="ui" x="460.0" y="28.0" text-anchor="middle" style="fill:#8b949e;font-size:13px">train.py — plain NumPy, no annotations, no numty import</text>
+<text class="ui hd" x="668" y="62">SHAPES NUMTY INFERS</text>
+<line x1="650" y1="56" x2="650" y2="370" stroke="#21262d"/>
+<text class="ln" x="40" y="88">1</text>
+<text y="88"><tspan class="kw" x="62.0" textLength="50.4">import</tspan><tspan class="name" x="120.8" textLength="42.0">numpy</tspan><tspan class="kw" x="171.2" textLength="16.8">as</tspan><tspan class="name" x="196.4" textLength="16.8">np</tspan></text>
+<text class="ln" x="40" y="112">2</text>
+<text class="ln" x="40" y="136">3</text>
+<text y="136"><tspan class="name" x="62.0" textLength="50.4">images</tspan><tspan class="op" x="120.8">=</tspan><tspan class="name" x="137.6" textLength="16.8">np</tspan><tspan class="p" x="154.4">.</tspan><tspan class="fn" x="162.8" textLength="42.0">zeros</tspan><tspan class="p" x="204.8">(</tspan><tspan class="p" x="213.2">(</tspan><tspan class="num" x="221.6" textLength="16.8">64</tspan><tspan class="p" x="238.4">,</tspan><tspan class="num" x="255.2" textLength="16.8">28</tspan><tspan class="p" x="272.0">,</tspan><tspan class="num" x="288.8" textLength="16.8">28</tspan><tspan class="p" x="305.6">)</tspan><tspan class="p" x="314.0">)</tspan></text>
+<text y="136"><tspan class="note" x="668.0" textLength="100.8">(64, 28, 28)</tspan></text>
+<text class="ln" x="40" y="160">4</text>
+<text y="160"><tspan class="name" x="62.0" textLength="58.8">weights</tspan><tspan class="op" x="129.2">=</tspan><tspan class="name" x="146.0" textLength="16.8">np</tspan><tspan class="p" x="162.8">.</tspan><tspan class="fn" x="171.2" textLength="42.0">zeros</tspan><tspan class="p" x="213.2">(</tspan><tspan class="p" x="221.6">(</tspan><tspan class="num" x="230.0" textLength="16.8">10</tspan><tspan class="p" x="246.8">,</tspan><tspan class="num" x="263.6" textLength="25.2">784</tspan><tspan class="p" x="288.8">)</tspan><tspan class="p" x="297.2">)</tspan><tspan class="com" x="322.4" textLength="277.2"># transposed: should be (784, 10)</tspan></text>
+<text y="160"><tspan class="note" x="668.0" textLength="75.6">(10, 784)</tspan></text>
+<text class="ln" x="40" y="184">5</text>
+<text y="184"><tspan class="name" x="62.0" textLength="33.6">bias</tspan><tspan class="op" x="104.0">=</tspan><tspan class="name" x="120.8" textLength="16.8">np</tspan><tspan class="p" x="137.6">.</tspan><tspan class="fn" x="146.0" textLength="42.0">zeros</tspan><tspan class="p" x="188.0">(</tspan><tspan class="num" x="196.4" textLength="16.8">10</tspan><tspan class="p" x="213.2">)</tspan></text>
+<text y="184"><tspan class="note" x="668.0" textLength="42.0">(10,)</tspan></text>
+<text class="ln" x="40" y="208">6</text>
+<text class="ln" x="40" y="232">7</text>
+<text y="232"><tspan class="name" x="62.0" textLength="33.6">flat</tspan><tspan class="op" x="104.0">=</tspan><tspan class="name" x="120.8" textLength="50.4">images</tspan><tspan class="p" x="171.2">.</tspan><tspan class="fn" x="179.6" textLength="58.8">reshape</tspan><tspan class="p" x="238.4">(</tspan><tspan class="num" x="246.8" textLength="16.8">64</tspan><tspan class="p" x="263.6">,</tspan><tspan class="op" x="280.4">-</tspan><tspan class="num" x="288.8">1</tspan><tspan class="p" x="297.2">)</tspan></text>
+<text y="232"><tspan class="note" x="668.0" textLength="75.6">(64, 784)</tspan></text>
+<rect x="2" y="239" width="916" height="24" fill="#f85149" fill-opacity=".12"/>
+<rect x="2" y="239" width="3" height="24" fill="#f85149"/>
+<text class="ln" x="40" y="256">8</text>
+<text y="256"><tspan class="name" x="62.0" textLength="50.4">logits</tspan><tspan class="op" x="120.8">=</tspan><tspan class="name" x="137.6" textLength="33.6">flat</tspan><tspan class="op" x="179.6">@</tspan><tspan class="name" x="196.4" textLength="58.8">weights</tspan><tspan class="op" x="263.6">+</tspan><tspan class="name" x="280.4" textLength="33.6">bias</tspan></text>
+<path class="sq" d="M137.6 260.0 L141.8 262.6 L146.0 260.0 L150.2 262.6 L154.4 260.0 L158.6 262.6 L162.8 260.0 L167.0 262.6 L171.2 260.0 L175.4 262.6 L179.6 260.0 L183.8 262.6 L188.0 260.0 L192.2 262.6 L196.4 260.0 L200.6 262.6 L204.8 260.0 L209.0 262.6 L213.2 260.0 L217.4 262.6 L221.6 260.0 L225.8 262.6 L230.0 260.0 L234.2 262.6 L238.4 260.0 L242.6 262.6 L246.8 260.0 L251.0 262.6 L255.2 260.0"/>
+<text y="256"><tspan class="bad" x="668.0" textLength="176.4">(64, 784) @ (10, 784)</tspan></text>
+<text class="bad" x="857.0" y="256">✗</text>
+<text class="ln" x="40" y="280">9</text>
+<text class="ln" x="40" y="304">10</text>
+<text y="304"><tspan class="name" x="62.0" textLength="50.4">scores</tspan><tspan class="op" x="120.8">=</tspan><tspan class="name" x="137.6" textLength="16.8">np</tspan><tspan class="p" x="154.4">.</tspan><tspan class="fn" x="162.8" textLength="42.0">zeros</tspan><tspan class="p" x="204.8">(</tspan><tspan class="p" x="213.2">(</tspan><tspan class="num" x="221.6" textLength="16.8">64</tspan><tspan class="p" x="238.4">,</tspan><tspan class="num" x="255.2" textLength="16.8">10</tspan><tspan class="p" x="272.0">)</tspan><tspan class="p" x="280.4">)</tspan></text>
+<text y="304"><tspan class="note" x="668.0" textLength="67.2">(64, 10)</tspan></text>
+<text class="ln" x="40" y="328">11</text>
+<text y="328"><tspan class="name" x="62.0" textLength="25.2">exp</tspan><tspan class="op" x="95.6">=</tspan><tspan class="name" x="112.4" textLength="16.8">np</tspan><tspan class="p" x="129.2">.</tspan><tspan class="fn" x="137.6" textLength="25.2">exp</tspan><tspan class="p" x="162.8">(</tspan><tspan class="name" x="171.2" textLength="50.4">scores</tspan><tspan class="p" x="221.6">)</tspan></text>
+<text y="328"><tspan class="note" x="668.0" textLength="67.2">(64, 10)</tspan></text>
+<rect x="2" y="335" width="916" height="24" fill="#f85149" fill-opacity=".12"/>
+<rect x="2" y="335" width="3" height="24" fill="#f85149"/>
+<text class="ln" x="40" y="352">12</text>
+<text y="352"><tspan class="name" x="62.0" textLength="42.0">probs</tspan><tspan class="op" x="112.4">=</tspan><tspan class="name" x="129.2" textLength="25.2">exp</tspan><tspan class="op" x="162.8">/</tspan><tspan class="name" x="179.6" textLength="25.2">exp</tspan><tspan class="p" x="204.8">.</tspan><tspan class="fn" x="213.2" textLength="25.2">sum</tspan><tspan class="p" x="238.4">(</tspan><tspan class="name" x="246.8" textLength="33.6">axis</tspan><tspan class="op" x="280.4">=</tspan><tspan class="num" x="288.8">1</tspan><tspan class="p" x="297.2">)</tspan><tspan class="com" x="322.4" textLength="184.8"># forgot keepdims=True</tspan></text>
+<path class="sq" d="M129.2 356.0 L133.4 358.6 L137.6 356.0 L141.8 358.6 L146.0 356.0 L150.2 358.6 L154.4 356.0 L158.6 358.6 L162.8 356.0 L167.0 358.6 L171.2 356.0 L175.4 358.6 L179.6 356.0 L183.8 358.6 L188.0 356.0 L192.2 358.6 L196.4 356.0 L200.6 358.6 L204.8 356.0 L209.0 358.6 L213.2 356.0 L217.4 358.6 L221.6 356.0 L225.8 358.6 L230.0 356.0 L234.2 358.6 L238.4 356.0 L242.6 358.6 L246.8 356.0 L251.0 358.6 L255.2 356.0 L259.4 358.6 L263.6 356.0 L267.8 358.6 L272.0 356.0 L276.2 358.6 L280.4 356.0 L284.6 358.6 L288.8 356.0 L293.0 358.6 L297.2 356.0 L301.4 358.6 L305.6 356.0"/>
+<text y="352"><tspan class="bad" x="668.0" textLength="134.4">(64, 10) / (64,)</tspan></text>
+<text class="bad" x="815.0" y="352">✗</text>
+<path d="M2 378 H918 V525 a11 11 0 0 1 -11 11 H13 a11 11 0 0 1 -11 -11 Z" fill="#010409"/>
+<line x1="2" y1="378" x2="918" y2="378" stroke="#30363d"/>
+<text class="ui hd" x="24" y="400">TERMINAL — BEFORE ANYTHING RUNS</text>
+<g class="t">
+<text y="424"><tspan class="tp" x="24.0" textLength="117.0">$ mypy train.py</tspan></text>
+<text y="446"><tspan class="te" x="24.0" textLength="483.6">train.py:8: error: matmul inner dimensions disagree: 784 vs 10</tspan><tspan class="te" x="523.2" textLength="101.4">[numty-shape]</tspan></text>
+<text y="468"><tspan class="te" x="24.0" textLength="733.2">train.py:12: error: true_divide shapes disagree: broadcast shapes disagree at trailing axis 0:</tspan></text>
+<text y="490"><tspan class="te" x="55.2" textLength="273.0">10 vs 64 (shapes (64, 10) vs (64,))</tspan><tspan class="te" x="343.8" textLength="132.6">[numty-broadcast]</tspan></text>
+<text y="512"><tspan class="ts" x="24.0" textLength="374.4">Found 2 errors in 1 file (checked 1 source file)</tspan></text>
+</g></svg>

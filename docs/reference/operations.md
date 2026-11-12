@@ -1,0 +1,137 @@
+# Supported operations
+
+What the solver follows, family by family. Anything not listed keeps
+NumPy's own stub type: unknown is never an error.
+
+## Construction
+
+`zeros_like` keeps shape and dtype, `full((2, 3), 5.0)`
+is a known 2x3 float64, plus `eye(3)`, `arange(6)`, and `atleast_2d`
+promoting `(N,)` to `(1, N)`.
+
+## Joining
+
+`concatenate` adds dims on the axis, `stack` adds the
+stacked axis, `vstack`/`hstack`/`dstack`/`column_stack` promote then
+concatenate — including enum-driven stacks; mismatches error. Lists
+built at runtime whose items share one shape (typed lists, list
+comprehensions) leave only the joined axis unknown.
+
+## Reshape
+
+Conserves the total with symbolic sizes and infers `-1`
+(`(N, 10, 2)` to `(N, 20)` is fine, `(N, 10, 2)` to `(N, 21)` errors,
+`(N, 10)` to `(M, 10)` bails). Over `*Ts` the spelled target is the
+whole new shape (`(*Ts, 2, 3)` to `(6,)`; a `-1` that would absorb
+`*Ts`, or a total no `*Ts` can absorb, bails or errors respectively).
+
+## Rank changes
+
+`transpose`/`.T` (which bail out over `*Ts`: no
+annotation can spell its reversal), `squeeze`, `expand_dims`; bad
+permutations, repeated axes and non-1 squeeze axes error.
+
+## Reductions
+
+`sum(axis=1)` (plus `median` and every `nan*` twin:
+`nansum`, `nanmean`, `nanargmin`, …), `average` (1-D weights must match
+the averaged axis), `diff` (concrete lengths subtract, bad axes and
+negative orders error), `cumsum`/`cumprod` (shape-preserving).
+
+## Matmul family
+
+`matmul` solves inner dims and batch-broadcasts
+through shared `*Ts` (a lone concrete 1-D/2-D operand contributes an
+empty batch). The rest solves through the same inner-dim machinery:
+`dot` (no batch broadcast past rank 2), `tensordot` (int or pair-of-lists
+axes), `inner`/`outer`/`vdot` (scalars included), and `take` (the axis is
+swapped for the index shape; literal indices past the axis error unless
+`mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, and
+`linalg.norm` with an explicit `ord` needs one or two reduced axes.
+
+## Indexing
+
+Consumes leading dims without an ellipsis (`v[0]`,
+`v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax`
+drops the axis, `sort` keeps the shape, and a literal `partition` kth
+past the axis errors.
+
+## Shape math
+
+`flip`/`fliplr`/`flipud`/`roll` preserve (with rank floors
+and axis checks; `flip` rejects a repeated axis, `roll` a shift that does
+not match its axes), `rot90` swaps dims on odd turns (equal axes error),
+`gradient` keeps the shape for one resolved axis, `convolve`/`correlate`
+compute full/valid/same lengths (empty operands error). The fft family tracks complex dtypes — `rfft` halves (`N//2+1`),
+`fftn`/`rfftn` apply `s` over `axes` with trailing alignment; bad axes and
+non-positive sizes error.
+
+## Data prep
+
+`tile` multiplies reps, `repeat` scales the axis
+(flattening to one dim for `axis=None`; a count list of several entries
+must have one per element and literal counts sum to the new size, other
+array repeats give `?U`), `pad`
+adds widths per axis, `split` returns a list of equal parts (`?U` for
+uneven index splits); negative counts and uneven divisions error.
+
+## Selection
+
+`unique` keeps the dtype with a `?U` length (rank kept for
+`axis=`), `nonzero`/`where` with one argument return per-dim `?U` tuples
+(`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the input shape
+with a bool dtype, `searchsorted` follows the values shape; 0-d nonzero
+errors. `histogram` returns `(counts, edges)` with one edge more than
+counts: `bins=16` gives `(16,)` and `(17,)`, an array of `B` edges gives
+`(B-1,)` and `(B,)`. The counts are int64, and the edges have the dtype
+of the edges array, or of the data for a count of bins (float64 for
+integer data). `split` and `array_split` at a 1-D array of positions
+return a list of pieces with a `?U` size on the axis.
+
+## Arrays from lists built at runtime
+
+`np.array` of a list
+comprehension or of a `list[...]` value has one `?U` axis in front:
+`np.array([i == 1 for i in kinds])` is `(?U,)` bool, and a list of
+`F64[N]` items is `(?U, N)`, as for `np.stack`. `np.array([a, b])` of
+two arrays of one shape is `(2, *shape)`. The dtype is the one the call
+names, else `bool` for `bool` items, else the item arrays' dtype; for
+`int` and `float` items it is left to numpy's stubs, because a
+`list[int]` may hold bools and a `list[float]` may hold ints. A builder
+whose sizes are all runtime ints keeps the dtype it is given
+(`np.zeros((n, k), dtype=bool)`, `np.full((n, k), np.nan)`), and
+`np.broadcast_to(x, (n, len(x)))` has the shape it is asked for
+(`tests/fixtures/coverage_batch_ok.py`).
+
+## Symbolic arithmetic
+
+Dims stay exact through arithmetic (`N*2`, `N+2`, `N//2+1`, `C*H*W`).
+See [Symbolic arithmetic](../guide/symbolic.md).
+
+## polars and numba
+
+See [polars and numba](../guide/integrations.md).
+
+## Elementwise, einsum, linalg, random
+
+Operators and bare `np.*`
+ufuncs alike — broadcast shapes and promote dtypes. In-place ops
+(`+=`, `-=`, …) reuse the broadcast check and additionally require the
+result to fit the target (`(3,) += (2, 3)` errors). Promotion matches
+NumPy (`np.result_type` over the full dtype matrix, plus weak Python
+and numpy scalars): float ufuncs pick the smallest float (`sqrt(uint8)`
+is `float16`), true division of ints is `float64` (`f32 / u8` stays
+`float32`), `rng(..., dtype=np.float32)` is honored, `clip` promotes
+across all operands, `linalg.solve` maps ints to `float64` and rejects
+`float16`, and reductions keep NumPy dtypes (`sum` of ints is `int64`,
+`mean` is `float64`, complex `std` is real).
+`einsum` parses the subscript string (explicit, implicit,
+ellipsis, diagonals) and `linalg` checks squareness and inner dims while
+tracking dtypes (`eigh` stays real, `svd` shrinks with
+`full_matrices=False`). `linalg.cross` takes batches of vectors of any
+rank, where NumPy's stubs stop at 2-D. `np.round` and `np.around` keep
+the shape and dtype; a bool array comes back `float16`, and rounding
+one to `decimals` other than 0, which NumPy refuses, is typed `Any`
+(numty reports shape errors, not dtype errors). `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
+`dtype=` you name is used as-is when it resolves; anything exotic bails
+out instead of guessing.

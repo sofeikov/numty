@@ -10,3 +10,4 @@ __pycache__/
 .mypy-codmod-cache-*/
 .pytest_cache/
 dist/
+site/
