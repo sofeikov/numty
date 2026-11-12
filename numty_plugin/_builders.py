@@ -33,7 +33,7 @@ from ._types import (
 )
 from ._reshape import (
     _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,
-    _movable_int_parts, _normalize_axis, _promote_all, _scalar_key,
+    _known_rank_parts, _normalize_axis, _promote_all, _scalar_key,
 )
 from ._types import (
     _enum_member_count,
@@ -1123,7 +1123,7 @@ def _sequence_parts(
         if isinstance(expr, TupleExpr) and len(expr.items) == len(proper.items):
             expr_items = list(expr.items)
         for idx, item in enumerate(proper.items):
-            parts = _ndarray_parts(item) or _movable_int_parts(item)
+            parts = _ndarray_parts(item) or _known_rank_parts(item)
             if parts is None:
                 item_expr = expr_items[idx] if expr_items is not None else None
                 if isinstance(item_expr, ListExpr) and item_expr.items:
@@ -1142,7 +1142,7 @@ def _sequence_parts(
             item_tp = ctx.api.get_expression_type(item_expr)
             if item_tp is None:
                 return None
-            parts = _ndarray_parts(item_tp) or _movable_int_parts(item_tp)
+            parts = _ndarray_parts(item_tp) or _known_rank_parts(item_tp)
             if parts is None:
                 # Plain Python lists (e.g. [0] in
                 # concatenate([[0], cumsum(lengths)]), the N+1 offsets
@@ -1715,13 +1715,18 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                 return ctx.default_return_type
             # Issue #227: plain-int (dynamic) axes never prove equal but
             # the rank is known. Mint ?U for the differing axes instead
-            # of bailing to Any.
+            # of bailing to Any. Issue #259: the same for an `Any` axis.
             if diff_at is not None:
                 from numty_plugin import _fresh_unknown
 
+                def _dynamic(d: int | Type) -> bool:
+                    return not isinstance(d, int) and (
+                        _is_plain_int(d) or isinstance(get_proper_type(d), AnyType)
+                    )
+
                 minted = False
                 for i, (x, y) in enumerate(zip(first, dims)):
-                    if not _dim_eq(x, y) and (_is_plain_int(x) or _is_plain_int(y)):
+                    if not _dim_eq(x, y) and (_dynamic(x) or _dynamic(y)):
                         first[i] = _fresh_unknown(ctx, "stack", i)
                         minted = True
                 if minted:

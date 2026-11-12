@@ -4438,3 +4438,25 @@ def test_any_dim_keeps_rank_in_ufuncs() -> None:
     for line in (13, 17, 18, 19, 20):
         assert notes[line] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
     assert notes[22] == '"numpy.ndarray[tuple[?U@22], numpy.dtype[numpy.bool[bool]]]"', result.stdout
+
+
+def test_any_dim_keeps_rank_outside_broadcast() -> None:
+    # Issue 259: np.take, the items of np.stack and np.concatenate, and the
+    # reductions read a shape with an `Any` dim, as with a plain `int` dim.
+    result = run_mypy(FIXTURES / "any_dim_readers_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    f64 = "numpy.dtype[numpy.float64]"
+    intp = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]"
+    assert notes[14] == f'"numpy.ndarray[tuple[Literal[2]], {f64}]"', result.stdout
+    assert notes[15] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
+    for line in (16, 17, 25):
+        assert notes[line] == f'"numpy.ndarray[tuple[Literal[2], ?U@{line}], {f64}]"', result.stdout
+    for line in (18, 19):
+        assert notes[line] == f'"numpy.ndarray[tuple[?U@{line}], {f64}]"', result.stdout
+    assert notes[20] == f'"numpy.ndarray[tuple[Any], {intp}]"', result.stdout
+    assert notes[21] == f'"numpy.ndarray[tuple[Any, Any], {f64}]"', result.stdout
+    assert notes[22] == f'"numpy.ndarray[tuple[Any], {intp}]"', result.stdout
+    assert notes[23] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
+    assert notes[24] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
+    assert notes[26] == f'"numpy.ndarray[tuple[int], {intp}]"', result.stdout

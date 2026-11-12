@@ -1705,28 +1705,6 @@ def _movable_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
     return dims, proper.args[1]
 
 
-def _movable_int_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
-    """(dims, dtype) of an int-dim array (plain `int` in its shape).
-
-    Like _movable_parts but only when at least one axis is a dynamic
-    plain-`int` size and none is `Any` (issue #227): lets rank-keeping
-    solvers read F64[int] and F64[int, 3] the way they read symbolic
-    dims, while Any-shaped arrays keep bailing exactly as before.
-    """
-    parts = _movable_parts(tp)
-    if parts is None:
-        return None
-    dims, _ = parts
-    if not any(_is_plain_int(d) for d in dims):
-        return None
-    for d in dims:
-        if isinstance(d, int):
-            continue
-        if isinstance(get_proper_type(d), AnyType):
-            return None
-    return parts
-
-
 def _known_rank_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
     """(dims, dtype) of a shape with a dynamic (`int`) or unknown (`Any`) dim.
 
