@@ -28,7 +28,7 @@ from ._dtypes import (
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
-    _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr,
+    _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._reshape import (
@@ -1472,6 +1472,9 @@ def _concat_merge(
                 if _is_plain_int(out[i]) or _is_plain_int(d):
                     out[i] = _fresh_unknown(ctx, op, i)
                     continue
+                _report_names(
+                    ctx, out[i], d, f"{op} dimension {i} (shapes {_dims_str(out)} vs {_dims_str(dims)})"
+                )
                 return ctx.default_return_type
         acc, extra = out[norm], dims[norm]
         if isinstance(acc, int) and isinstance(extra, int):
@@ -1766,6 +1769,12 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                         minted = True
                 if minted:
                     continue
+                _report_names(
+                    ctx,
+                    first[diff_at],
+                    dims[diff_at],
+                    f"stack dimension {diff_at} (shapes {_dims_str(first)} vs {_dims_str(dims)})",
+                )
             return ctx.default_return_type
     ndim = len(first)
     norm = axis + ndim + 1 if axis < 0 else axis

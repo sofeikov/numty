@@ -53,6 +53,16 @@ NUMTY_UNSOLVED = ErrorCode(
     "numty",
     sub_code_of=MISC,
 )
+# Off by default (issue 280). `F64[N] + F64[M]` runs when N == M, so it
+# is not provably wrong and the default checks stay silent. A function
+# generic in N and M has to work when they differ, and with this code on
+# a body that pairs two different names is reported.
+NUMTY_NAMES = ErrorCode(
+    "numty-names",
+    "Two different named sizes are used where one size is needed",
+    "numty",
+    default_enabled=False,
+)
 NUMTY_INTERNAL = ErrorCode(
     "numty-internal",
     "numty itself failed on this expression; the result is unchecked",

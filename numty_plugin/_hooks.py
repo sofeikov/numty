@@ -113,13 +113,13 @@ from ._linalg import (
     _dtype_base,
 )
 from ._types import (
-    _enum_member_count,
+    _enum_member_count, _named_pair_in, _names_enabled,
 )
 from ._unions import (
     _UNION_PAIR_METHODS, _reflected_name, _union_pair_hook, _union_reflected_hook,
     _union_signature_clash,
 )
-from ._callsite import _relax_dynamic_formals, minmax_function_hook
+from ._callsite import _relax_dynamic_formals, _report_call_site_names, minmax_function_hook
 from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 
 class NumtyPlugin(Plugin):
@@ -421,6 +421,7 @@ class NumtyPlugin(Plugin):
             _swallowed(ctx, "method_signature_hook")
             pass
         if isinstance(sig, CallableType) and not overloaded:
+            _report_call_site_names(sig, ctx)
             sig = _relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx)
         _note_rank_mismatches(ctx, sig)
         return sig
@@ -518,6 +519,7 @@ class NumtyPlugin(Plugin):
         except Exception:
             _swallowed(ctx, "_callsite_check")
             pass
+        _report_call_site_names(sig, ctx)
         return _relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx)
 
     # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty/__init__.py): the
@@ -1164,8 +1166,13 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
                     _, msg = _broadcast_result(list(da), list(db), None)
                     if msg is not None:
                         return True
+                    # The opt-in report for two different names (issue
+                    # 280) is an error of the method hook as well.
+                    if names_on and _named_pair_in(da, db):
+                        return True
             return False
 
+        names_on = _names_enabled(ctx)
         other_expr = None
         call = ctx.context
         if isinstance(call, _OpExpr):

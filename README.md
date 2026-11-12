@@ -634,8 +634,9 @@ pack(np.zeros((5, 10, 2)), np.zeros((5, 10)) > 0)  # (5, 10, 2), precise
 Two arguments sharing one shape TypeVar are checked at the call site,
 where the actual shapes are still visible: `f(x_5, y_6)` against `(A[N],
 A[N])` errors with the two sizes named. Different TypeVars (`N` vs `M`)
-stay silent by design — their equality is unprovable, and unknown is not
-an error. The same holds for `matmul` inner dims between distinct free
+stay silent by default — their equality is unprovable, and unknown is not
+an error (the opt-in `numty-names` code reports them, see
+[Error codes](#error-codes)). The same holds for `matmul` inner dims between distinct free
 symbolics (`(S,F)@(S,T)` keeps `(S,T)` "if legal", issue #127): a generic
 function whose body needs `F == S` but declares them independent cannot
 be proven wrong inside the body, so the check stays at the call site,
@@ -1093,7 +1094,7 @@ your `mypy.ini`) to have the solver check them too.
 
 ## Error codes
 
-Every numty diagnostic carries one of eight mypy error codes, so each kind
+Every numty diagnostic carries one of nine mypy error codes, so each kind
 can be silenced or selected on its own:
 
 | Code | Covers | Example message |
@@ -1104,6 +1105,7 @@ can be silenced or selected on its own:
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
+| `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
 
@@ -1145,12 +1147,53 @@ disable_error_code = numty-bail
 ```
 
 or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
-reports a shape error on that line. All eight are sub-codes of `misc`, so
-an existing `# type: ignore[misc]` or `disable_error_code = misc` keeps
-covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
+reports a shape error on that line. All but `numty-names` are sub-codes of
+`misc`, so an existing `# type: ignore[misc]` or `disable_error_code = misc`
+keeps covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
 then asks for the narrower code (`Unused "type: ignore" comment, use
 narrower [numty-shape] instead of [misc] code`), so switch those
 comments to the `numty-*` code when upgrading.
+
+### Different names: the opt-in `numty-names` code
+
+`F64[N] + F64[M]` runs when `N == M`, so it is not provably wrong, and
+by default numty says nothing about it. A function generic in `N` and
+`M` has to work when they differ, though, and most plausible mistakes
+in such a body pair two different names: a mask on the wrong axis, a
+transposed matrix, a per-row array against a per-group one. Turn the
+check on to have them reported:
+
+```ini
+[mypy]
+plugins = numty_plugin
+enable_error_code = numty-names
+```
+
+```python
+def f(d: F64[A, B], mask: Bool[B], v: F64[B], w: F64[A]) -> None:
+    d[:, mask]       # fine
+    d[mask]          # a mask of length B on an axis of size A
+    d.T - v          # (B, A) - (B,)
+    d[0] = w         # A into B
+    np.concatenate([d, d.T], axis=1)
+```
+
+```text
+error: boolean index on axis 0 (shape (A, B)): B and A are different names  [numty-names]
+error: broadcast at trailing axis 0 (shapes (B, A) vs (B,)): A and B are different names  [numty-names]
+error: assignment of shape (A,) into target of shape (B,): A and B are different names  [numty-names]
+error: concatenate dimension 0 (shapes (A, B) vs (B, A)): A and B are different names  [numty-names]
+```
+
+It covers a broadcast (operators, comparisons, ufuncs, `where`), a
+boolean mask, an indexed assignment, `concatenate` and `stack`, and a
+call that binds one name of the callee to two names of the caller
+(`score(ids: I64[K], d: F64[P, K])` given an `I64[B]` and an
+`F64[B, A]`). It does not cover `matmul` inner sizes or shapes with
+`*Ts`. Only names count: a literal, an `int`, an `Any` and an unknown
+(`?U`) against a name stay silent, and so do two names of a callee
+that a call binds to one size. Where two names are known to be one
+size, give them one name. The fixture is `tests/fixtures/names_opt_in.py`.
 
 ### Give-up trace and strict mode
 
@@ -1597,8 +1640,10 @@ subtraction below.
   member; per-name precision needs the tuple display (or
   `python -m numty_codmod --unpack-displays`, which unrolls mapped comprehensions
   over bare names to the display).
-- Different TypeVars (`N` vs `M`) never conflict, even when provably
-  different at a call site — only same-name TypeVars are unified.
+- Different TypeVars (`N` vs `M`) never conflict by default, even when
+  provably different at a call site — only same-name TypeVars are
+  unified. The opt-in `numty-names` code reports them inside a generic
+  body (see [Error codes](#error-codes)).
 - A size that is a sum of values is unknown. `np.repeat(x, counts)` with
   an array of counts has `sum(counts)` entries, and
   `np.maximum.reduceat(x, starts)` has one per start. So in "reduce per

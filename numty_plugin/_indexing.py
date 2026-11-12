@@ -14,7 +14,7 @@ from ._forms import (
 )
 from ._types import (
     INT_FULLNAME, _dim_eq, _dims_provably_ne, _distribute_solve, _fold_int, _has_unpack, _int_value,
-    _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
+    _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_names, _union_members,
 )
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _known_rank_parts, _movable_parts,
@@ -464,6 +464,7 @@ def _consume_prefix(
                         code=NUMTY_AXIS,
                     )
                     return None
+                _report_names(ctx, md, pd, f"boolean index on axis {i + off} (shape {shape_repr})")
             out.append(_fresh_unknown(ctx, "mask", i))
             i += rank
             continue
@@ -720,6 +721,7 @@ def _solve_getitem(
                             code=NUMTY_AXIS,
                         )
                         return ctx.default_return_type
+                    _report_names(ctx, md, pd, f"boolean index on axis {dim + off} (shape {_dims_str(dims)})")
                 unk = _fresh_unknown(ctx, "mask", dim)
                 if not adv_block:
                     adv_block = [unk]
@@ -905,6 +907,9 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
             return ctx.default_return_type
         # Unknown, or two names that may be equal: unprovable. The
         # other axes are still compared.
+        _report_names(
+            ctx, v, t, f"assignment of shape {_dims_str(value_dims)} into target of shape {_dims_str(target_dims)}"
+        )
     return ctx.default_return_type
 
 

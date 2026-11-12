@@ -14,7 +14,10 @@ from mypy.types import (
 
 from ._errors import _swallowed
 from ._exprs import _iter_tvarlikes
-from ._types import INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _parts_or_unpack, _strip_optional
+from ._types import (
+    INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _parts_or_unpack, _report_names, _shape_tvar_formals,
+    _strip_optional,
+)
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
 from ._linalg import _is_numpy_scalar
 
@@ -145,6 +148,45 @@ def _relax_dynamic_formals(sig: CallableType, ctx: FunctionSigContext | MethodSi
     except Exception:
         _swallowed(ctx, "_relax_dynamic_formals")
         return sig
+
+
+def _report_call_site_names(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> None:
+    """The opt-in `[numty-names]` report at a call (issue 280).
+
+    `score(ids: I64[K], d: F64[P, K])` called with an `I64[N]` and an
+    `F64[N, P]` binds `K` to the caller's `N` and to its `P`. The
+    callee's names are being solved here, so two of them may be one
+    size; one of them cannot be two of the caller's names. The first
+    array argument that names the size is compared with the later ones.
+    """
+    try:
+        if len(ctx.args) != len(sig.arg_types):
+            return
+        first: dict[str, tuple[str, int, Type]] = {}
+        for i, positions in _shape_tvar_formals(sig):
+            if len(ctx.args[i]) != 1:
+                continue
+            actual = _parts_or_unpack(ctx.api.get_expression_type(ctx.args[i][0]))
+            if actual is None:
+                continue
+            name = sig.arg_names[i] or "?"
+            for dim, tvar in positions:
+                if dim >= len(actual[0]):
+                    continue
+                adim = actual[0][dim]
+                if isinstance(adim, int):
+                    continue
+                seen = first.setdefault(tvar.fullname, (name, dim, adim))
+                if seen[2] is not adim:
+                    _report_names(
+                        ctx,
+                        seen[2],
+                        adim,
+                        f"call-site binding of '{tvar.name}' (argument '{seen[0]}', axis {seen[1]}, "
+                        f"and argument '{name}', axis {dim})",
+                    )
+    except Exception:
+        _swallowed(ctx, "_report_call_site_names")
 
 
 def minmax_function_hook(ctx: FunctionContext) -> Type:

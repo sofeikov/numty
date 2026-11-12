@@ -25,7 +25,7 @@ from mypy.types import (
 if TYPE_CHECKING:
     from mypy.checker import TypeChecker
 
-from ._errors import NUMTY_CALLSITE, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_CALLSITE, NUMTY_NAMES, NUMTY_SHAPE, _swallowed
 from ._forms import (
     _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul,
     _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize,
@@ -123,6 +123,59 @@ def _dims_provably_ne(a: int | Type, b: int | Type, nonzero: bool = False) -> bo
     fa = _resolve_dim(a)
     fb = _resolve_dim(b)
     return _forms_provably_ne(fa, fb, nonzero)
+
+
+def _named_sizes_differ(a: int | Type, b: int | Type) -> bool:
+    """Two sizes spelled over names, neither with an unknown, that are not the same size.
+
+    `N` against `M`, `N+1` against `M`. A literal, an `int`, an `Any`
+    and an unknown (`?U`) never count: nothing is known about them. A
+    pair that is provably unequal (`N` against `N-1`) is an error
+    already, under the code of its check.
+    """
+    from numty_plugin import _resolve_dim
+    if not isinstance(a, TypeVarType) or not isinstance(b, TypeVarType):
+        return False
+    if _dim_eq(a, b) or _dims_provably_ne(a, b):
+        return False
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if fa is None or fb is None or _form_has_unknown(fa) or _form_has_unknown(fb):
+        return False
+    return True
+
+
+def _names_enabled(ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext) -> bool:
+    """Whether `enable_error_code = numty-names` is set for the module being checked."""
+    options = getattr(ctx.api, "options", None)
+    return options is not None and NUMTY_NAMES in options.enabled_error_codes
+
+
+def _named_pair_in(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
+    """Whether the broadcast of two shapes pairs two different named sizes."""
+    return any(_named_sizes_differ(x, y) for x, y in zip(reversed(a), reversed(b)))
+
+
+def _report_names(
+    ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext,
+    a: int | Type,
+    b: int | Type,
+    where: str,
+) -> None:
+    """The opt-in `[numty-names]` report for a pair of different named sizes (issue 280).
+
+    Called where a check finds two sizes that must be equal and cannot
+    prove them equal or unequal. Nothing is emitted with the code off
+    (the default): mypy counts a message of a disabled code as a failure
+    of the overload it is checking, so `v + w` would get mypy's own
+    `[operator]` error. The result of the check is the same either way.
+    """
+    if _names_enabled(ctx) and _named_sizes_differ(a, b):
+        ctx.api.fail(
+            f"{where}: {_dim_str(a)} and {_dim_str(b)} are different names",
+            ctx.context,
+            code=NUMTY_NAMES,
+        )
 
 
 def _dim_str(d: int | Type) -> str:
