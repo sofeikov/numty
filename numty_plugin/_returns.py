@@ -1,9 +1,11 @@
 """_returns.py — return-boundary dynamic dims (issues #269/#271).
 
-A plain-`int` or bare-unknown dim in a directly returned array value (or in
-an unannotated local that value is returned through) cannot be proven for
-or against a declared named size, so at the `return` it is `Any`. Top-level
-imports go to earlier layers only (order in tests/test_layout.py, _LAYERS).
+A plain-`int` dim in a directly returned array value (or in an
+unannotated local that value is returned through) cannot be proven for
+or against a declared named size, so at the `return` it is `Any`. Mask
+counts and other unknowns keep checking: only the unprovable `int`
+is rewritten. Top-level imports go to earlier layers only (order in
+tests/test_layout.py, _LAYERS).
 """
 
 from __future__ import annotations
@@ -11,38 +13,36 @@ from __future__ import annotations
 import ast
 import os
 
-from mypy.plugin import AttributeContext, FunctionContext, MethodContext
+from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import (
     AnyType,
+    CallableType,
     Instance,
     TupleType,
     Type,
     TypeOfAny,
-    TypeVarType,
     UnionType,
     get_proper_type,
 )
 
 from ._errors import _swallowed
-from ._forms import _is_unknown_fullname
 from ._types import INT_FULLNAME, NDARRAY_FULLNAME
 
 
 def _is_dynamic_return_dim(d: int | Type) -> bool:
     """A dim the return-boundary rewrite turns into Any (issues #269/#271).
 
-    Plain `int` (a builder's dynamic axis, e.g. `n` in `np.zeros(n)` or
-    `len()` of a non-array) and a bare fresh unknown (e.g. a mask count)
-    are unprovable sizes: at a `return` they are written as `Any`, which
-    fits any declared named size. Literal ints (including `(0,)`) and
-    named or formula TypeVars keep checking, so provable mismatches
-    still fail.
+    A plain `int` (a builder's dynamic axis, e.g. `n` in `np.zeros(n)` or
+    `len()` of a non-array) is an unprovable size: at a `return` it is
+    written as `Any`, which fits any declared named size. Literal ints
+    (including `(0,)`), mask counts and other unknowns, and named or
+    formula TypeVars keep checking, so provable mismatches still fail.
     """
     if isinstance(d, int):
         return False
     if isinstance(d, Instance):
         return d.type.fullname == INT_FULLNAME and d.last_known_value is None
-    return isinstance(d, TypeVarType) and _is_unknown_fullname(d.fullname)
+    return False
 
 
 _RETURN_SITES_CACHE: dict[str, tuple[float, list, list]] = {}
@@ -170,17 +170,19 @@ def _assigned_name_returned(returns: list, assigns: list, line: int, col: int) -
     return None
 
 
-def _return_any_for_dynamic(ctx: FunctionContext | MethodContext | AttributeContext, tp: Type) -> Type:
+def _return_any_for_dynamic(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext, tp: Type
+) -> Type:
     """`tp` with returned dynamic dims written as Any (issues #269/#271).
 
-    A plain-`int` or bare-unknown dim in a directly returned array value
-    (or in an unannotated local that value is returned through) cannot
-    be proven for or against a declared named size, so it is `Any`,
-    which fits any declared size. Runs on the hook result (or the kept
-    stub default) in `_guard_mixed`, so every producer shares it; mypy
-    still reports the check itself as [return-value] when a literal or
-    named dim disagrees. Literals, named and formula TypeVars, unpacks
-    and dtypes are untouched.
+    A plain-`int` dim in a directly returned array value (or in an
+    unannotated local that value is returned through) cannot be proven
+    for or against a declared named size, so it is `Any`, which fits
+    any declared size. Runs on the hook result (or the kept stub
+    default) in `_guard_mixed`, so every producer shares it; mypy
+    still reports the check itself as [return-value] when a literal,
+    an unknown, or a named dim disagrees. Literals, unknowns, named
+    and formula TypeVars, unpacks and dtypes are untouched.
     """
     proper = get_proper_type(tp)
     if isinstance(proper, UnionType):
@@ -230,3 +232,25 @@ def _return_any_for_dynamic(ctx: FunctionContext | MethodContext | AttributeCont
     except Exception:
         _swallowed(ctx, "_return_any_for_dynamic")
         return tp
+
+
+def _return_sig_for_dynamic(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> CallableType:
+    """`sig` for a call that is returned, with the result's plain `int` sizes as Any.
+
+    `return np.zeros(n)` fits a declared `F64[N]` through the rewrite of
+    the hook's result. `return helper(n)`, with `helper` a function of
+    the project that returns `F64[int]`, has no hook for its result, so
+    it was still an error: the same value passed or failed by where it
+    was built. The call's signature is where its result type can be
+    reached, so the rewrite is done on the return type there, at the
+    same sites (a direct `return`, or one unannotated local that is
+    returned).
+    """
+    try:
+        ret = _return_any_for_dynamic(ctx, sig.ret_type)
+        if ret is sig.ret_type:
+            return sig
+        return sig.copy_modified(ret_type=ret)
+    except Exception:
+        _swallowed(ctx, "_return_sig_for_dynamic")
+        return sig

@@ -33,7 +33,7 @@ def _is_fam_int_name(fullname: str) -> bool:
 
 if TYPE_CHECKING:
     from mypy.nodes import Expression
-    from mypy.plugin import AnalyzeTypeContext, FunctionContext, MethodContext
+    from mypy.plugin import AnalyzeTypeContext, FunctionContext, FunctionSigContext, MethodContext
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.types import Type, TypeVarLikeType
 
@@ -910,6 +910,7 @@ def _fam_applied(
 # different *named* size is an opt-in [numty-names] error, and anything
 # unrecorded or ambiguous stays silent.
 _index_on = STATE.index_on
+_index_exact = STATE.index_exact
 
 
 def _index_module(ctx: object) -> str:
@@ -936,10 +937,41 @@ def _index_recorded_eq(a: int | Type, b: int | Type) -> bool:
     return isinstance(a, TypeVarType) and isinstance(b, TypeVarType) and a.fullname == b.fullname
 
 
+def _index_tag(recorded: int | Type) -> str:
+    """A hashable name for a recorded size: the int, or the variable's fullname."""
+    return str(recorded) if isinstance(recorded, int) else getattr(recorded, "fullname", "")
+
+
+def _index_record_exact(ctx: object, expr: Expression | None, recorded: int | Type) -> bool:
+    """Whether the operand's record says it holds every position below `recorded`.
+
+    True for a direct `arange(n)` / `argsort(x)` operand and for a name
+    stored from one. Then a recorded size above the axis is a certain
+    IndexError. Every other record (`searchsorted`, `argmax`,
+    `flatnonzero`, an `Index[...]` annotation) is an upper bound on the
+    values, so the same comparison only says that an overrun is possible.
+    """
+    try:
+        module = _index_module(ctx)
+        tag = _index_tag(recorded)
+        keys = []
+        if expr is not None:
+            keys.append(f"{module}@{expr.line}@{expr.column}")
+        if isinstance(expr, NameExpr):
+            line = getattr(expr.node, "line", None)
+            if isinstance(line, int):
+                keys.append(f"{module}@{line}")
+        return any((key, tag) in _index_exact for key in keys)
+    except Exception:
+        _swallowed(ctx, "_index_record_exact")
+        return False
+
+
 def _record_index_on(
     ctx: AnalyzeTypeContext | FunctionContext | MethodContext,
     dims: Sequence[int | Type] | None,
     recorded: int | Type,
+    exact: bool = False,
 ) -> None:
     """Remember that a dims-shaped int array holds positions on `recorded`.
 
@@ -958,11 +990,15 @@ def _record_index_on(
             return
         module = _index_module(ctx)
         context = ctx.context
-        exact = f"{module}@{context.line}@{context.column}"
-        bucket = _index_on.get(exact)
+        site_key = f"{module}@{context.line}@{context.column}"
+        if exact:
+            _index_exact.add((site_key, _index_tag(recorded)))
+            if dims is not None:
+                _index_exact.add((f"{module}@{context.line}", _index_tag(recorded)))
+        bucket = _index_on.get(site_key)
         if bucket is None:
             bucket = []
-            _index_on[exact] = bucket
+            _index_on[site_key] = bucket
         if not any(first is None and _index_recorded_eq(second, recorded) for first, second in bucket):
             bucket.append((None, recorded))
         if dims is not None:
@@ -983,7 +1019,7 @@ def _record_index_on(
 
 
 def _recorded_index_on(
-    ctx: MethodContext, dims: list[int | Type], expr: Expression | None
+    ctx: MethodContext | FunctionSigContext, dims: list[int | Type], expr: Expression | None
 ) -> int | Type | None:
     """The size a 1-d fancy-index operand's values are positions on, else None.
 
@@ -1022,6 +1058,29 @@ def _recorded_index_on(
         return found[0]
     except Exception:
         _swallowed(ctx, "_recorded_index_on")
+        return None
+
+
+def _recorded_at_site(ctx: object, module: str, line: int, column: int) -> int | Type | None:
+    """The recorded positions-on size stored at one source site, else None.
+
+    Annotation sites are unique per parameter even on one shared `def`
+    line, so two Index parameters with the same count resolve
+    independently (issue #286). Zero or several shapeless records at
+    the site stay silent. Never raises.
+    """
+    try:
+        if line <= 0:
+            return None
+        seen = _index_on.get(f"{module}@{line}@{column}")
+        if not seen:
+            return None
+        first = [second for first, second in seen if first is None]
+        if len(first) != 1:
+            return None
+        return first[0]
+    except Exception:
+        _swallowed(ctx, "_recorded_at_site")
         return None
 
 

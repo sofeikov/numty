@@ -8,17 +8,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_NAMES, NUMTY_SHAPE, _swallowed
 from ._forms import (
     _LinForm,
 )
 from ._types import (
     INT_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int,
-    _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_mask_names,
+    _has_unpack, _int_value, _named_sizes_differ, _names_enabled, _ndarray_parts, _ndarray_type,
+    _parts_or_unpack, _report_mask_names,
     _report_names, _union_members,
 )
 from ._heads import (
-    _index_recorded_exceeds, _recorded_index_on,
+    _index_record_exact, _index_recorded_exceeds, _recorded_at_site, _recorded_index_on,
 )
 from ._unknowns import _fresh_mask_count
 from ._reshape import (
@@ -31,12 +32,13 @@ from ._reductions import (
 
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
+    from mypy.plugin import FunctionSigContext
     from mypy.plugin import MethodContext
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import ARG_POS, EllipsisExpr, Expression, IntExpr, ListExpr, NameExpr, SliceExpr, StarExpr, TupleExpr
-from mypy.types import Instance, TupleType, Type, TypeVarType, UnpackType, get_proper_type
+from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
 from ._linalg import (
     _dtype_base, _kind_of, _scalar_of_dtype, _string_value,
 )
@@ -46,7 +48,7 @@ from ._types import (
 
 
 def _enclosing_func(
-    ctx: MethodContext,
+    ctx: MethodContext | FunctionSigContext,
     use_line: int,
 ) -> tuple[str, object | None]:
     """Innermost function containing `use_line`: (fullname, node).
@@ -171,6 +173,173 @@ def _count_var_assignments(func_node: object | None, varname: str) -> tuple[int,
     if isinstance(top_body, list):
         _walk(top_body)
     return count, is_param
+
+
+def _own_index_annotation(func_node: object | None, varname: str, var_line: int) -> tuple[bool, bool, object | None]:
+    """(has_ann, is_index, ann) for `varname`'s own annotation.
+
+    Reads the annotation node off the enclosing function node: a
+    parameter's `type_annotation`, or the annotated assignment on the
+    matching line for a local. Positions identify the annotation site,
+    so two Index parameters on one `def` line resolve independently
+    (issue #286). `is_index` is true only for an `Index[...]`
+    application; `ann` is its node (still unanalyzed). Never raises.
+    """
+
+    try:
+        if func_node is None:
+            return False, False, None
+        ann: object | None = None
+        for arg in getattr(func_node, "arguments", []) or []:
+            variable = getattr(arg, "variable", None)
+            if getattr(variable, "name", None) == varname:
+                ann = getattr(arg, "type_annotation", None)
+                break
+        else:
+            from mypy.nodes import AssignmentStmt as _AssignmentStmt
+
+            for stmt in getattr(getattr(func_node, "body", None), "body", []) or []:
+                if not isinstance(stmt, _AssignmentStmt):
+                    continue
+                if getattr(stmt, "line", -1) != var_line:
+                    continue
+                for lvalue in getattr(stmt, "lvalues", []) or []:
+                    if isinstance(lvalue, NameExpr) and lvalue.name == varname:
+                        ann = getattr(stmt, "type_annotation", None)
+                        break
+                if ann is not None:
+                    break
+        if ann is None:
+            return False, False, None
+        name = getattr(ann, "name", None)
+        if not isinstance(name, str):
+            return True, False, None
+        if name != "Index" and not name.endswith(".Index"):
+            return True, False, None
+        return True, True, ann
+    except Exception:
+        _swallowed(None, "_own_index_annotation")
+        return False, False, None
+
+
+def _ann_recorded_name(ann: object | None) -> int | str | None:
+    """The recorded size spelled in an Index[...] annotation, else None.
+
+    A bare name stays a string (resolved against real dims by the
+    caller, which knows the scope); ints stay ints; linear forms and
+    anything computed stay silent. Never raises.
+    """
+    try:
+        if ann is None:
+            return None
+        args = getattr(ann, "args", ()) or ()
+        if not args:
+            return None
+        first = args[0]
+        tname = type(first).__name__
+        if tname == "UnboundType":
+            sub = getattr(first, "args", ()) or ()
+            name = getattr(first, "name", None)
+            if sub or not isinstance(name, str):
+                return None
+            word = name.split()
+            # Bare size names match by string; anything else (dotted
+            # paths, linear forms) stays silent here — the analyzed
+            # record covers those when present.
+            if len(word) != 1 or not word[0].isidentifier():
+                return None
+            return word[0]
+        if isinstance(first, bool):
+            return None
+        if isinstance(first, int):
+            return first
+        if tname == "RawExpressionType":
+            try:
+                lit = first.literal_value()  # type: ignore[union-attr]
+            except Exception:
+                _swallowed(None, "_ann_recorded_name")
+                return None
+            if isinstance(lit, bool):
+                return None
+            if isinstance(lit, int):
+                return lit
+            if isinstance(lit, str):
+                word = lit.split()
+                if len(word) != 1 or not word[0].isidentifier():
+                    return None
+                return word[0]
+            return None
+        if isinstance(first, TypeVarType):
+            return first
+        proper = get_proper_type(first)
+        if isinstance(proper, TypeVarType):
+            return proper
+        return None
+    except Exception:
+        _swallowed(None, "_ann_recorded_name")
+        return None
+
+
+def _recorded_for_operand(
+    ctx: MethodContext | FunctionSigContext,
+    module: str,
+    func_node: object | None,
+    expr: Expression | None,
+    idims: list[int | Type],
+) -> int | Type | str | None:
+    """The size an index operand's values are positions on, else None.
+
+    Order: an Index[...] annotation on the operand's own parameter or
+    local wins (name-keyed, so same-line parameters stay distinct);
+    a reassigned variable bails (its record is stale: `clip`/`- 1`
+    clear the positions); otherwise the producer line entries apply
+    (direct calls, single-assignment stores). Anything ambiguous stays
+    silent. Never raises.
+    """
+    try:
+        if not isinstance(expr, NameExpr):
+            return _recorded_index_on(ctx, idims, expr)
+        varname = expr.name
+        if not varname or varname in ("True", "False", "None"):
+            return None
+        node = getattr(expr, "node", None)
+        if type(node).__name__ != "Var":
+            return _recorded_index_on(ctx, idims, expr)
+        var_line = getattr(node, "line", 0) or 0
+        use_line = getattr(expr, "line", 0) or 0
+        if func_node is None:
+            _, func_node = _enclosing_func(ctx, use_line or var_line)
+        count, is_param = _count_var_assignments(func_node, varname)
+        if is_param:
+            if count >= 1:
+                return None
+        elif count > 1:
+            return None
+        has_ann, is_index, ann = _own_index_annotation(func_node, varname, var_line or use_line)
+        if is_index:
+            # The annotation site is unique per parameter even on one
+            # shared `def` line; the analyzed record was stored there.
+            # Without one (warm cache, odd spelling), the spelled name
+            # still matches by string.
+            if ann is not None:
+                aline = getattr(ann, "line", 0) or 0
+                acol = getattr(ann, "column", 0) or 0
+                rec = _recorded_at_site(ctx, module, aline, acol)
+                if rec is not None:
+                    return rec
+            return _ann_recorded_name(ann)
+        if has_ann:
+            # A non-Index annotation carries no record (plain I64 stays
+            # silent even where a producer record shares the line).
+            return None
+        return _recorded_index_on(ctx, idims, expr)
+    except Exception:
+        _swallowed(ctx, "_recorded_for_operand")
+        try:
+            return _recorded_index_on(ctx, idims, expr)
+        except Exception:
+            _swallowed(ctx, "_recorded_for_operand")
+            return None
 
 
 def _mask_var_key(ctx: MethodContext, mask_expr: Expression | None) -> str | None:
@@ -757,40 +926,89 @@ def _check_index_positions(
     size: int | Type,
     axis: int,
     dims: list[int | Type],
-) -> None:
+) -> bool:
     """A recorded positions-on size must fit the axis it indexes (issues #285, #287).
 
     A recorded bound provably above the axis (N+1 positions on an N
     axis) is an error; a different *named* size is an opt-in
     [numty-names] error; equal, fitting, unknown, or unrecorded
-    operands stay silent.
+    operands stay silent. Returns True when an error was reported, so
+    the caller can keep the stubs' type: like every older index error,
+    a failed check yields the default rather than a solved shape, which
+    also keeps a mechanical [operator] duplicate off enclosing
+    expressions.
     """
     tp, expr = pair
     parts = _ndarray_parts(tp)
     if parts is None:
-        return
+        return False
     idims, _ = parts
     if len(idims) != 1:
-        return
-    recorded = _recorded_index_on(ctx, idims, expr)
+        return False
+    try:
+        tree = getattr(ctx.api, "tree", None)
+        module = getattr(tree, "fullname", "") or ""
+        use_line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+        _, func_node = _enclosing_func(ctx, use_line)
+        recorded = _recorded_for_operand(ctx, module, func_node, expr, list(idims))
+    except Exception:
+        _swallowed(ctx, "_check_index_positions")
+        return False
     if recorded is None:
-        return
+        return False
+    if isinstance(recorded, str):
+        # The annotation spelled a bare size name the analyzed record
+        # missed (warm cache, odd spelling): match by name. Same name
+        # as the axis is fitting; a different named axis is the opt-in
+        # report. Linear forms fall back to silent here; the analyzed
+        # record covers them when present.
+        if isinstance(size, int):
+            return False
+        proper_size = get_proper_type(size)
+        if isinstance(proper_size, TypeVarType) and proper_size.name == recorded:
+            return False
+        if _names_enabled(ctx):
+            if isinstance(proper_size, TypeVarType) and proper_size.name != recorded:
+                ctx.api.fail(
+                    f"index positions on axis {axis} (shape {_dims_str(dims)}): "
+                    f"{recorded} and {_dim_str(size)} are different names",
+                    ctx.context,
+                    code=NUMTY_NAMES,
+                )
+                return True
+        return False
     if _dim_eq(recorded, size):
-        return
+        return False
     if _index_recorded_exceeds(recorded, size):
+        # An error by default only when the overrun is certain: the
+        # operand holds every position below the recorded size (`arange`,
+        # `argsort`). `searchsorted`, `argmax`, `flatnonzero` and an
+        # `Index[...]` annotation give an upper bound on the values, so
+        # `a[np.searchsorted(a, v)]` is wrong only when a value is above
+        # `a[-1]`, and code that clips, guards or fixes the positions in
+        # place is right. That report is under the opt-in code.
+        certain = _index_record_exact(ctx, expr, recorded)
+        if not certain and not _names_enabled(ctx):
+            return False
         ctx.api.fail(
             f"index positions on {_dim_str(recorded)} used on axis {axis} "
-            f"of size {_dim_str(size)} (shape {_dims_str(dims)})",
+            f"of size {_dim_str(size)} (shape {_dims_str(dims)})"
+            + ("" if certain else ": they may run past the axis"),
             ctx.context,
-            code=NUMTY_AXIS,
+            code=NUMTY_AXIS if certain else NUMTY_NAMES,
         )
-        return
+        return True
     _report_names(
         ctx,
         recorded,
         size,
         f"index positions on axis {axis} (shape {_dims_str(dims)})",
     )
+    try:
+        return bool(_names_enabled(ctx) and _named_sizes_differ(recorded, size))
+    except Exception:
+        _swallowed(ctx, "_check_index_positions")
+        return True
 
 
 def _solve_getitem(
@@ -862,6 +1080,7 @@ def _solve_getitem(
     kept_after: list[int | Type] = []
     adv_block: list[int | Type] = []
     adv_seen = False
+    pos_failed = False
     dim = 0
     for n, item in enumerate(items):
         kind = item[0]
@@ -899,7 +1118,13 @@ def _solve_getitem(
                 adv_seen = adv_seen or is_adv
         elif kind == "fancy":
             shape: list[int | Type] = list(item[1])
-            _check_index_positions(ctx, pairs[n], dims[dim], dim, dims)
+            # A failed positions check still runs the remaining axes
+            # (all errors are reported); the result below is error-Any
+            # like every older index error, so no mechanical [operator]
+            # duplicate lands on an enclosing expression (issue #148's
+            # widening, applied at the source instead of the operator).
+            if _check_index_positions(ctx, pairs[n], dims[dim], dim, dims):
+                pos_failed = True
             if not adv_block:
                 adv_block = shape
             else:
@@ -1043,8 +1268,12 @@ def _solve_getitem(
         # Every axis consumed by integers: a numpy scalar, not an array.
         # The dtype is known even when the bound is not (issue #230:
         # np.r_[x[0], x] needs the float64 scalar, not Any).
+        if pos_failed:
+            return AnyType(TypeOfAny.from_error)
         scalar = _scalar_of_dtype(dtype)
         return scalar if scalar is not None else ctx.default_return_type
+    if pos_failed:
+        return AnyType(TypeOfAny.from_error)
     return _ndarray_type(ctx, out, dtype)
 
 

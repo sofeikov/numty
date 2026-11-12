@@ -406,12 +406,12 @@ def test_init_is_thin_facade() -> None:
     assert n_defs < 20, f"facade has {n_defs} defs >= 20 (must be <20)"
 
 
-def test_submodules_under_2100() -> None:
+def test_submodules_under_2000() -> None:
     for py in _pkg_files():
         if py.name == "__init__.py":
             continue
         lines = py.read_text(encoding="utf-8").splitlines()
-        assert len(lines) < 2100, f"{py.name} {len(lines)} lines >= 2100"
+        assert len(lines) < 2000, f"{py.name} {len(lines)} lines >= 2000"
     assert (ROOT / "numty_plugin" / "_hooks.py").exists()
 
 
@@ -457,6 +457,7 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
         "_broadcast",
         "_broadcast_core",
         "_builders",
+        "_callbind",
         "_callsite",
         "_dtypes",
         "_einsum",
@@ -513,6 +514,7 @@ _LAYERS = (
     "_unknowns",
     "_exprs",
     "_types",
+    "_callbind",
     "_returns",
     "_heads",
     "_reshape",

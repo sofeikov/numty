@@ -661,13 +661,35 @@ def test_index_pos_ok() -> None:
         71: f'"numpy.ndarray[tuple[K], {f64}]"',
         76: f'"numpy.ndarray[tuple[K], {f64}]"',
         82: f'"numpy.ndarray[tuple[J, Q], {f64}]"',
+        90: f'"numpy.ndarray[tuple[K], {f64}]"',
+        97: f'"numpy.ndarray[tuple[K], {f64}]"',
     }, run_mypy(FIXTURES / "index_pos_ok.py").stdout
+
+
+def test_bad_index_callsite() -> None:
+    # Issue #286: an index recorded for one size passed where an Index
+    # formal declares another is an opt-in [numty-names] error at the
+    # call. Same-module plain positional calls only; producers, stored
+    # results and matching positions stay clean, and the default run
+    # stays silent everywhere (unknown is not an error).
+    fixture = FIXTURES / "bad_index_callsite.py"
+    assert run_mypy(fixture).returncode == 0, run_mypy(fixture).stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [31], on.stdout
+    assert len(errors[31]) == 1, on.stdout
+    assert (
+        "index positions on argument 'rows': N and P are different names"
+        in errors[31][0]
+    ), on.stdout
+    assert errors[31][0].endswith("[numty-names]"), on.stdout
 
 
 def test_bad_index_pos() -> None:
     # Issues #285/#286/#287: recorded positions on one size used on
-    # another. A provably overflowing bound (N+1 on N, 5 on 3) errors by
-    # default; different names need the opt-in code. Mixed slice+fancy
+    # another. A certain overrun (`arange(5)` on a size-3 axis) errors by
+    # default. A possible one (`searchsorted` positions run to N on an
+    # axis of size N) and different names need the opt-in code. Mixed slice+fancy
     # lines also carry mypy's own [index] error, as every mixed-tuple
     # solver error does (see assert_rank_mismatch).
     # Merged with issue #288: two fancy indices broadcast their counts,
@@ -676,7 +698,7 @@ def test_bad_index_pos() -> None:
     # reports only the broadcast.
     fixture = FIXTURES / "bad_index_pos.py"
     off = run_mypy(fixture)
-    assert sorted(_errors_by_line(off)) == [38, 44], off.stdout
+    assert sorted(_errors_by_line(off)) == [44], off.stdout
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
     errors = _errors_by_line(on)
     expected = {
@@ -695,7 +717,7 @@ def test_bad_index_pos() -> None:
             "index positions on axis 0 (shape (N, M)): M and N are different names",
             "index positions on axis 1 (shape (N, M)): N and M are different names",
         ],
-        38: ["index positions on N+1 used on axis 0 of size N (shape (N,))"],
+        38: ["index positions on N+1 used on axis 0 of size N (shape (N,)): they may run past the axis"],
         44: ["index positions on 5 used on axis 0 of size 3 (shape (3,))"],
         48: ["index positions on axis 1 (shape (P, Q)): M and Q are different names"],
     }
@@ -704,7 +726,10 @@ def test_bad_index_pos() -> None:
         assert len(errors[line]) == len(messages) + (1 if line in (22, 23, 28) else 0), on.stdout
         for message in messages:
             assert any(
-                message in text and text.endswith("[numty-names]" if "different names" in message else "[numty-axis]")
+                message in text
+                and text.endswith(
+                    "[numty-names]" if "different names" in message or "may run past" in message else "[numty-axis]"
+                )
                 for text in errors[line]
             ), on.stdout
     for line in (22, 23, 28):
@@ -1296,10 +1321,11 @@ def test_generic_namedtuple_box_unknown_arg() -> None:
 
 
 def test_ret_int_ok() -> None:
-    # Issues #269/#271: a plain-`int` (or mask-count) size in a returned
+    # Issues #269/#271: a plain-`int` size in a returned
     # value fits a declared named size, inline and through a name, bound
     # or unbound. Each call of an unbound-name function still returns a
-    # fresh unknown; literals keep checking (see bad_ret_literal).
+    # fresh unknown; literals and unknowns keep checking
+    # (see bad_ret_literal, bad_mask_ts).
     result = run_mypy(FIXTURES / "ret_int_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
@@ -1309,15 +1335,13 @@ def test_ret_int_ok() -> None:
     }
     f64 = "numpy.dtype[numpy.float64]"
     assert notes == {
-        98: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
-        99: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
-        100: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
-        101: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
+        93: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        94: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        95: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
     }, result.stdout
     assert _run_fixture("ret_int_ok.py") == [
         "(5,)",
         "(6,)",
-        "(4,)",
         "(4,)",
     ]
 
@@ -1790,6 +1814,18 @@ def test_gather_over_ts_prefix_solves() -> None:
         "Incompatible return value",
         "tuple[K, *Ts]",
         "tuple[total, *Ts]",
+    )
+
+
+def test_mask_over_ts_prefix_counts_once() -> None:
+    # A k-d mask consumes k prefix axes for one data-dependent count.
+    # Unknowns keep checking at a return (only plain `int` is rewritten
+    # to Any there, issues #269/#271), so the count still mismatches N.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mask_ts.py"),
+        "Incompatible return value",
+        "tuple[?U@12, *Ts]",
+        "tuple[N, *Ts]",
     )
 
 
@@ -5165,3 +5201,46 @@ def test_names_opt_in() -> None:
         assert len(errors[line]) == 1, on.stdout
         assert message in errors[line][0] and errors[line][0].endswith("[numty-names]"), on.stdout
     assert errors[30][0].endswith("[numty-broadcast]"), on.stdout
+
+
+def test_index_overrun_certain_or_possible() -> None:
+    # A recorded size above the axis is an error by default only when the
+    # index holds every position below it (`arange`, `argsort`). For
+    # `searchsorted`, `argmax` and `flatnonzero` the size is an upper
+    # bound on the values: the usual ways to use such positions safely
+    # (fix in place, `out=`, a guard, values known to be in range) are
+    # clean, and the possible overrun is an opt-in report.
+    fixture = FIXTURES / "bad_index_overrun.py"
+    off = _errors_by_line(run_mypy(fixture))
+    assert sorted(off) == [13, 14, 16], off
+    for line in (13, 14, 16):
+        assert len(off[line]) == 1 and off[line][0].endswith("[numty-axis]"), off
+    assert "index positions on 5 used on axis 0 of size 3 (shape (3,))" in off[13][0], off
+    assert "index positions on N+1 used on axis 0 of size N (shape (N,))" in off[14][0], off
+    on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    possible = [22, 23, 25, 31, 37, 43, 48, 56]
+    assert sorted(on) == sorted([13, 14, 16, *possible]), on
+    for line in possible:
+        assert len(on[line]) == 1, on
+        assert "they may run past the axis" in on[line][0] and on[line][0].endswith("[numty-names]"), on
+
+
+def test_return_of_helper_result() -> None:
+    # Issues 269/271: the return rule covered the result of a numpy call
+    # only, so `return np.zeros(n)` passed and `return helper(n)`, with
+    # `helper(...) -> F64[int]`, did not. A call of a project function or
+    # method is covered through its signature. A literal that disagrees,
+    # an unknown, two names and a bare parameter (which is no call) are
+    # still errors.
+    result = run_mypy(FIXTURES / "bad_ret_helper.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [39, 48, 52, 56], result.stdout
+    for line in (39, 48, 52, 56):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), result.stdout
+    assert "tuple[Any, Literal[3]]" in errors[39][0] and "tuple[N, Literal[4]]" in errors[39][0], result.stdout
+    assert "tuple[int]" in errors[52][0], result.stdout
+    notes = reveals_by_line(result)
+    # A local that is returned has `Any` there; one that is not keeps `int`.
+    assert notes[30] == '"numpy.ndarray[tuple[Any], numpy.dtype[numpy.float64]]"', result.stdout
+    assert notes[44] == '"numpy.ndarray[tuple[int], numpy.dtype[numpy.float64]]"', result.stdout

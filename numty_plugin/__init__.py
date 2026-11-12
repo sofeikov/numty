@@ -10,9 +10,9 @@ from mypy.plugin import Plugin
 
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
-    _broadcast, _broadcast_core, _builders, _callsite, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _frames,
-    _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _returns, _state, _trace, _types,
-    _unions, _unknowns,
+    _broadcast, _broadcast_core, _builders, _callbind, _callsite, _dtypes, _einsum, _errors, _exprs, _fft, _forms,
+    _frames, _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _returns, _state, _trace,
+    _types, _unions, _unknowns,
 )
 from ._state import (  # noqa: F401
     STATE
@@ -90,21 +90,22 @@ from ._heads import (  # noqa: F401
     _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string, _index_head, _is_fam_int_name,
 )
 from ._types import (  # noqa: F401
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _is_mask_count_dim, _mask_counts_differ, _mask_pair_in,
-    _named_sizes_differ, _named_pair_in, _names_enabled, _report_mask_names, _report_names, _dim_str,
-    _dim_add_const, _dim_add2,
-    _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim, _linear_product, _reshape_total_form,
-    _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr,
-    _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members, _distribute_pairings,
-    _union_results, _distribute_solve, _split_flat, _shape_tvar_formals, _strip_optional,
-    _sequence_element, _align_pair, _pairs_for_actual, _conflict_pairs, _emit_call_site_conflicts,
-    _callsite_formula_return, _callsite_expr_bindings, _substitute_return_exprs, _fixed_shape,
-    _shape_note_str, _rank_mismatch_notes, _reported_as_operator, _mentions_ndarray,
-    _info_mentions_array, _note_rank_mismatches, _ndarray_type, _single_shape_arg,
-    _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr,
-    NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME,
-    _SEQUENCE_FULLNAMES, _OPERATOR_DUNDERS, _enum_member_count, _fold_dim_expr, _has_unknown_shape,
-    _unpack_shape,
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _is_mask_count_dim, _mask_counts_differ,
+    _mask_pair_in, _named_sizes_differ, _named_pair_in, _names_enabled, _report_mask_names, _report_names,
+    _dim_str, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim,
+    _linear_product, _reshape_total_form, _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int,
+    _fold_len_arg, _fold_shape_expr, _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members,
+    _distribute_pairings, _union_results, _distribute_solve, _split_flat, _fixed_shape, _shape_note_str,
+    _rank_mismatch_notes, _reported_as_operator, _mentions_ndarray, _info_mentions_array,
+    _note_rank_mismatches, _ndarray_type, _single_shape_arg, _single_shape_expr, _shape_from_arg,
+    _int_shape_from_arg, _builder_fold_dim_expr, NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME,
+    FLOAT64_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME, _OPERATOR_DUNDERS, _enum_member_count, _fold_dim_expr,
+    _has_unknown_shape, _unpack_shape,
+)
+from ._callbind import (  # noqa: F401
+    _shape_tvar_formals, _strip_optional, _sequence_element, _align_pair, _pairs_for_actual,
+    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _callsite_expr_bindings,
+    _substitute_return_exprs, _SEQUENCE_FULLNAMES,
 )
 from ._builders import (  # noqa: F401
     _operands_have_known_shape, _builder_shape, _stub_shape_named_dtype, _has_literal_dim, _has_int_dim,

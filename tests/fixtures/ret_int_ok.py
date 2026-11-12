@@ -1,11 +1,12 @@
-"""Issues #269/#271: a plain-`int` (or mask-count) size in a returned value fits a named size.
+"""Issues #269/#271: a plain-`int` size in a returned value fits a named size.
 
-A dynamic size cannot be proven for or against a declared name, so at a
-`return` it is `Any`: bound names (built from `n: int` or `len()` of a
-non-array) and unbound names (`def flags(n: int) -> Bool[N]`, where no
+A dynamic `int` size cannot be proven for or against a declared name, so
+at a `return` it is `Any`: bound names (built from `n: int` or `len()` of
+a non-array) and unbound names (`def flags(n: int) -> Bool[N]`, where no
 parameter binds `N`) both check. Each call of an unbound-name function
-still returns a fresh unknown. Literals keep checking (see
-`bad_ret_literal.py`), as do named-against-named mismatches.
+still returns a fresh unknown. Literals and unknowns keep checking (see
+`bad_ret_literal.py`, `bad_mask_ts.py`), as do named-against-named
+mismatches.
 """
 
 from typing import TYPE_CHECKING, TypeVar
@@ -46,12 +47,6 @@ def bound_len(values: list[int], x: F64[N]) -> F64[N]:
 
 def mixed_literal(n: int) -> F64[N, 3]:
     return np.zeros((n, 3))
-
-
-def masked(x: F64[N], keep: Bool[N]) -> F64[N]:
-    # Accepted cost: a mask count is provably not `N`, but it is still a
-    # dynamic size, so it passes like a plain `int` does.
-    return x[keep]
 
 
 def flags(n: int) -> Bool[N]:
@@ -98,7 +93,6 @@ def use() -> None:
     reveal_type(flags(5))
     reveal_type(flags_named(6))
     reveal_type(bound_inline(np.zeros(4), 4))
-    reveal_type(masked(np.zeros(4), np.ones(4, dtype=bool) > 0))
 
 
 use()
