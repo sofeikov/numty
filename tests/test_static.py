@@ -1359,16 +1359,17 @@ def test_bad_ret_literal() -> None:
 
 def test_builder_int_tuple_return_checked() -> None:
     # Issue 233: a tuple with one plain-int size reports the R-vs-A swap
-    # both inline and through a name (same [return-value] twice). The
-    # dynamic dim itself is `Any` at the return (issues #269/#271), so
-    # only the named-against-named swap is reported.
+    # both inline and through a name (same [return-value] twice). A
+    # dynamic dim is `Any` at a return (issues #269/#271), but not here:
+    # `R` is declared on the axis that holds the `int` and sits on the
+    # other axis of the value, so the `int` is kept (issue 297).
     result = run_mypy(FIXTURES / "bad_builder_int_tuple.py")
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 2, result.stdout
     for line in errors:
         assert "[return-value]" in line, result.stdout
-        assert "tuple[Any, R]" in line, result.stdout
+        assert "tuple[int, R]" in line, result.stdout
         assert "tuple[R, A]" in line, result.stdout
 
 
@@ -5335,4 +5336,76 @@ def test_coverage_batch_2() -> None:
         "(2, 3) float32",
         "(2,) float32 bool",
         "int64 float32 bool",
+    ]
+
+
+def test_return_transposed_is_not_let_through() -> None:
+    # Issue 297: a plain `int` size fits a declared name at a return
+    # (issues 269/271), and a name fits a declared `int`, so `(int, N)`
+    # passed where `(N, int)` is declared. The `int` is kept when the
+    # name declared on its axis is a size of the value on another axis.
+    result = run_mypy(FIXTURES / "bad_ret_transposed.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [13, 18, 24, 28], result.stdout
+    for line in (13, 18, 24, 28):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), result.stdout
+    assert 'got "ndarray[tuple[int, N]' in errors[13][0] and "tuple[N, int]" in errors[13][0], result.stdout
+    assert 'got "ndarray[tuple[N, int]' in errors[18][0] and "tuple[int, N]" in errors[18][0], result.stdout
+    assert "| None" in errors[24][0], result.stdout
+    assert "tuple[N, int, Any]" in errors[28][0] and "tuple[int, N, int]" in errors[28][0], result.stdout
+    assert _run_fixture("bad_ret_transposed.py") == ["(2, 3) (3, 2) (3, 2) (3, 2, 4)"]
+
+
+def test_index_record_survives_a_selection() -> None:
+    # Issue 305: `rows[known]`, `rows[1:]` and `rows[order]` still hold
+    # positions on the size `rows` does. Silent by default, like every
+    # report of one named size on an axis of another.
+    fixture = FIXTURES / "index_selection.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    assert sorted(on) == [15, 17, 19, 20], on
+    for line in (15, 17, 19, 20):
+        assert len(on[line]) == 2, on
+        assert "index positions on axis 0 (shape (P, E)): E and P are different names" in on[line][0], on
+        assert "index positions on axis 1 (shape (P, E)): P and E are different names" in on[line][1], on
+        assert all(text.endswith("[numty-names]") for text in on[line]), on
+    assert _run_fixture("index_selection.py") == ["(3,)", "IndexError"]
+
+
+def test_polars_to_numpy_cast_chain() -> None:
+    # Issue 299: the cast is seen behind the Series methods that keep the
+    # dtype (fill_null, fill_nan, drop_nulls, sort, head, ...), `astype`
+    # names the dtype of an array of unknown rank for `float` as for
+    # `np.float64`, and `astype(d)` with a dtype variable keeps an
+    # `int`-sized array. A method that is not on the list (`cum_sum`)
+    # and a plain `fill_null` with no cast keep polars' own answer.
+    pytest.importorskip("polars")
+    result = run_mypy(FIXTURES / "polars_cast_chain.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [36], result.stdout
+    assert "tuple[int, Literal[1]]" in errors[36][0] and errors[36][0].endswith("[return-value]"), result.stdout
+    polars_answer = '"numpy.ndarray[Any, Any]"'
+    assert reveals_by_line(result) == {
+        16: f'"{_ND}[tuple[int], {_F64}]"',
+        17: f'"{_ND}[tuple[int], {_F32}]"',
+        18: f'"{_ND}[tuple[int], {_F64}]"',
+        19: f'"{_ND}[tuple[int], {_F64}]"',
+        20: f'"{_ND}[tuple[int], numpy.dtype[Any]]"',
+        21: polars_answer,
+        22: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        23: polars_answer,
+        24: f'"{_ND}[Any, {_F64}]"',
+        25: f'"{_ND}[Any, {_F64}]"',
+        26: f'"{_ND}[Any, {_BOOL}]"',
+        30: f'"{_ND}[tuple[N], numpy.dtype[FloatT]]"',
+        31: f'"{_ND}[tuple[int], numpy.dtype[FloatT]]"',
+        32: f'"{_ND}[tuple[int], {_F32}]"',
+    }, result.stdout
+    assert _run_fixture("polars_cast_chain.py") == [
+        "(3,) float32",
+        "(2,) float64",
+        "float64 (3,)",
     ]

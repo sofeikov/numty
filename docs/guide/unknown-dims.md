@@ -81,6 +81,22 @@ unknowns (a mask count returned where `F64[N]` is declared is still
 rejected, `tests/fixtures/bad_mask_ts.py`) and a named size against
 another named size.
 
+One case keeps its `int`: a result with a named size on the wrong axis.
+`int` fits a declared name and a name fits a declared `int`, so without
+this `np.empty((n_items, len(grid)))` would pass where `F64[N, int]` is
+declared, a matrix allocated transposed. The `int` on an axis stays
+`int` when the name declared there is a size of the value on another
+axis, one not declared with that name, and mypy reports the return:
+
+```text
+error: Incompatible return value type (got "ndarray[tuple[int, N], dtype[float64]]", expected "ndarray[tuple[N, int], dtype[float64]]")  [return-value]
+```
+
+`(int, N)` where `F64[N, N]` is declared still passes, and so does
+`(S, int)` where `F64[S, C]` is (`tests/fixtures/bad_ret_transposed.py`).
+It reads the declared return type, so it covers a function that returns
+one array (or `None`), not an array inside a returned tuple.
+
 ## Stacking lists built at runtime
 
 Stacking a list built at runtime works the same way when every item has
