@@ -268,7 +268,27 @@ def _same_named_size(a: Type, b: Type) -> bool:
     return isinstance(a, TypeVarType) and isinstance(b, TypeVarType) and a.fullname == b.fullname
 
 
-def _misplaced_name_axes(ctx: object, items: list[Type]) -> set[int]:
+_ANNOTATED_VALUES_CACHE: dict[str, tuple[ast.Module, set[tuple[int, int]]]] = {}
+
+
+def _is_annotated_value(path: str, line: int, col: int) -> bool:
+    """Whether the expression at `(line, col)` is the value of an annotated assignment (`x: T = <here>`)."""
+    mod = _module_ast(path)
+    if mod is None:
+        return False
+    hit = _ANNOTATED_VALUES_CACHE.get(path)
+    if hit is None or hit[0] is not mod:
+        spots = {
+            (node.value.lineno, node.value.col_offset)
+            for node in ast.walk(mod)
+            if isinstance(node, ast.AnnAssign) and node.value is not None
+        }
+        hit = (mod, spots)
+        _ANNOTATED_VALUES_CACHE[path] = hit
+    return (line, col) in hit[1]
+
+
+def _misplaced_name_axes(ctx: object, items: list[Type], shapes: list[list[Type]] | None = None) -> set[int]:
     """Axes whose plain `int` must not be written as Any: the value is transposed (issue #297).
 
     The rewrite lets `int` fit a declared name, and a name always fits a
@@ -281,7 +301,8 @@ def _misplaced_name_axes(ctx: object, items: list[Type]) -> set[int]:
     """
     try:
         value = [get_proper_type(item) for item in items]
-        shapes = _declared_return_shapes(ctx, len(value))
+        if shapes is None:
+            shapes = _declared_return_shapes(ctx, len(value))
         if not shapes:
             return set()
         per_shape: list[set[int]] = []
@@ -611,12 +632,23 @@ def _return_any_for_dynamic(
             return tp
         returns, assigns = sites
         directly = any(ret.value is not None and _ast_directly_returns(ret.value, line, col) for ret, _ in returns)
+        # An annotated local (`out: F64[S, C] = np.full((len(steps), k), 0.0)`):
+        # the annotation is the author's word for the `int` size, as a
+        # declared return is. Only an axis declared with a name takes it.
+        local: list[list[Type]] | None = None
         if not directly and _assigned_name_returned(returns, assigns, line, col) is None:
-            return tp
+            if not _is_annotated_value(path, line, col):
+                return tp
+            stack = getattr(getattr(ctx.api, "expr_checker", None), "type_context", None)
+            local = _array_shapes(stack[-1] if stack else None, len(shape.items))
+            if len(local) != 1:
+                return tp
     except Exception:
         _swallowed(ctx, "_return_any_for_dynamic")
         return tp
-    keep = _misplaced_name_axes(ctx, list(shape.items))
+    keep = _misplaced_name_axes(ctx, list(shape.items), local)
+    if local is not None:
+        keep |= {i for i, want in enumerate(local[0]) if not isinstance(want, TypeVarType)}
     new_items: list[Type] = [
         AnyType(TypeOfAny.explicit) if i not in keep and _is_dynamic_return_dim(get_proper_type(item)) else item
         for i, item in enumerate(shape.items)

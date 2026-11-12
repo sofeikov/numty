@@ -64,7 +64,7 @@ from ._ops import (
     rot90_function_hook, convolve_function_hook, correlate_function_hook, tile_function_hook,
     repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook,
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook,
-    flatnonzero_function_hook, argwhere_function_hook, unique_function_hook, isin_function_hook,
+    argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
     atleast_function_hook,
 )
@@ -92,7 +92,7 @@ from ._linalg import (
     linalg_cross_function_hook, linalg_function_hook,
 )
 from ._indexing import (
-    getitem_method_hook, setitem_method_hook, take_along_axis_function_hook, take_function_hook,
+    flatnonzero_mask_hook, getitem_method_hook, setitem_method_hook, take_along_axis_function_hook, take_function_hook,
     take_method_hook,
 )
 from ._broadcast import (
@@ -1777,7 +1777,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "count_nonzero": count_nonzero_function_hook,
             "cross": cross_function_hook,
             "diagonal": diagonal_function_hook,
-            "flatnonzero": flatnonzero_function_hook,
+            "flatnonzero": flatnonzero_mask_hook,
             "full": full_function_hook,
             "full_like": like_function_hook,
             "identity": identity_function_hook,

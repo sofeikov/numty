@@ -65,6 +65,7 @@ from ._linalg import (  # noqa: F401
     _scalar_family, _scalar_of_dtype, _string_value,
 )
 from ._indexing import (  # noqa: F401
+    flatnonzero_mask_hook,
     _consume_one, _consume_prefix, _consume_suffix, _getitem_types, _index_pairs, _is_scalar_target,
     _parse_index_item, _parse_index_items, _solve_getitem, _solve_getitem_unpack, _take_in_bounds,
     _take_index_values, _take_indices, _take_solve, getitem_method_hook, setitem_method_hook,
