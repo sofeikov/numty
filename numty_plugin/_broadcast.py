@@ -23,7 +23,7 @@ from ._types import (
 )
 from ._reshape import (
     _all_positionals, _all_positionals_expanded, _bool_value, _dims_str,
-    _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _known_rank_parts, _movable_int_parts,
+    _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _known_rank_parts,
     _scalar_key, _weak_name,
 )
 from ._builders import (
@@ -459,10 +459,10 @@ def _operand_spec(tp: Type) -> tuple[list[int | Type] | None, str, str] | None:
 
     dims is None for scalars (broadcast-neutral); kind is "strong" for
     array dtypes and numpy scalars, "weak" for Python scalars.
-    Issue #227: plain-int dims read via _movable_int_parts like symbolic
+    Issue #227: plain-int dims read via _known_rank_parts like symbolic
     ones so promotion still applies instead of bailing to keep-dims.
     """
-    part = _parts_or_unpack(tp) or _movable_int_parts(tp)
+    part = _parts_or_unpack(tp) or _known_rank_parts(tp)
     if part is not None:
         name = _dtype_fullname(part[1])
         if name is None:
@@ -505,7 +505,7 @@ def _shapes_for_broadcast(types: list[Type]) -> list[list[int | Type]] | None:
     """
     shapes: list[list[int | Type]] = []
     for tp in types:
-        part = _parts_or_unpack(tp) or _movable_int_parts(tp)
+        part = _parts_or_unpack(tp) or _known_rank_parts(tp)
         if part is not None:
             shapes.append(list(part[0]))
             continue
@@ -707,7 +707,7 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
     branches = [(specs[1][1], specs[1][2]), (specs[2][1], specs[2][2])]
     array_dtypes = []
     for tp in (x, y):
-        part = _parts_or_unpack(tp) or _movable_int_parts(tp)
+        part = _parts_or_unpack(tp) or _known_rank_parts(tp)
         if part is not None:
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, branches, array_dtypes)
@@ -761,7 +761,7 @@ def _clip_types(ctx: FunctionContext | MethodContext, types: list[Type]) -> Type
     branches = [(kind, name) for _, kind, name in specs]
     array_dtypes = []
     for tp in types:
-        part = _parts_or_unpack(tp) or _movable_int_parts(tp)
+        part = _parts_or_unpack(tp) or _known_rank_parts(tp)
         if part is not None:
             array_dtypes.append(part[1])
     dtype = _specs_dtype(ctx, branches, array_dtypes)
@@ -849,13 +849,13 @@ def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int | Type]) 
         # Issue #217: an abstract dtype must not hide a provable
         # incompatibility with the target shape.
         # Issue #227: plain-int dims check the same way.
-        part = _parts_or_unpack(tp) or _movable_int_parts(tp)
+        part = _parts_or_unpack(tp) or _known_rank_parts(tp)
         if part is None:
             return ctx.default_return_type
         arr_dims, dtype = part
         if _has_unpack(arr_dims):
             return ctx.default_return_type
-        if _ndarray_parts(tp) is None and _movable_int_parts(tp) is None:
+        if _ndarray_parts(tp) is None and _known_rank_parts(tp) is None:
             return ctx.default_return_type
         if not _broadcast_to_compatible(ctx, arr_dims, dims):
             return ctx.default_return_type
@@ -865,7 +865,7 @@ def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int | Type]) 
         if _has_unpack(arr_dims):
             # Compatibility with the target shape is unprovable.
             return ctx.default_return_type
-        part = _ndarray_parts(tp) or _movable_int_parts(tp)
+        part = _ndarray_parts(tp) or _known_rank_parts(tp)
         if part is None:
             return ctx.default_return_type
         if not _broadcast_to_compatible(ctx, arr_dims, dims):
@@ -1024,7 +1024,7 @@ def _smallest_float(name: str) -> str | None:
 
 
 def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> Type:
-    part = _parts_or_unpack(tp) or _movable_int_parts(tp)
+    part = _parts_or_unpack(tp) or _known_rank_parts(tp)
     whole_var = None
     if part is None:
         whole = _whole_shape_var(tp)
@@ -1126,7 +1126,7 @@ def _solve_round(
     (it cannot cast the scaled values back to bool), so nothing is
     claimed there. numty has no error code for a dtype failure.
     Issue #229: whole-shape _S keeps _S. Issue #227: plain-int dims
-    keep rank via _movable_int_parts.
+    keep rank via _known_rank_parts (also `Any` dims, issue #257).
     """
     whole = _whole_shape_var(array)
     if whole is not None:
@@ -1157,7 +1157,7 @@ def _solve_round(
         if f16 is None:
             return ctx.default_return_type
         return _whole_shape_type(ctx, var, f16)
-    part = _parts_or_unpack(array) or _movable_int_parts(array)
+    part = _parts_or_unpack(array) or _known_rank_parts(array)
     if part is None:
         return ctx.default_return_type
     out = _formal_pair(ctx, "out")
@@ -1273,7 +1273,7 @@ def _truediv_types(
             arr_w: list[Type] = list(wdtypes)
             for tp in (left, right):
                 if _whole_shape_var(tp) is None:
-                    p = _parts_or_unpack(tp) or _movable_int_parts(tp)
+                    p = _parts_or_unpack(tp) or _known_rank_parts(tp)
                     if p is not None and p[1] not in arr_w:
                         arr_w.append(p[1])
             if not any(_kind_of(n) in ("f", "c") for n in names_w):
@@ -1308,7 +1308,7 @@ def _truediv_types(
     names = {name_l, name_r}
     array_dtypes: list[Type] = []
     for tp in (left, right):
-        part = _ndarray_parts(tp) or _movable_int_parts(tp)
+        part = _ndarray_parts(tp) or _known_rank_parts(tp)
         if part is not None:
             array_dtypes.append(part[1])
     # Division with no float/complex operand yields the default float;

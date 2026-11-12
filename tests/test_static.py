@@ -4385,3 +4385,56 @@ def test_union_operator_no_false_error() -> None:
     # an error (the same union on both sides).
     result = run_mypy(FIXTURES / "union_operator_ok.py")
     assert result.returncode == 0, result.stdout
+
+
+def test_union_eq_ne_broadcast_mismatch() -> None:
+    # Issue 255: for `==` and `!=` mypy names the reflected call on a union
+    # "__eq__ of _ArrayOrScalarCommon", the class that defines the method.
+    result = run_mypy(FIXTURES / "bad_union_eq_broadcast.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 5, result.stdout
+    for line, text in zip((11, 12, 13, 14, 15), errors):
+        assert f":{line}:" in text and "[numty-broadcast]" in text, result.stdout
+
+
+def test_union_operator_result_is_solved() -> None:
+    # Issue 256: a valid operator with an array union as the right operand
+    # has the union of the solved results, not the stub answer.
+    result = run_mypy(FIXTURES / "union_operator_result_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    nb = "numpy._typing._nbit_base."
+    f64 = "numpy.ndarray[tuple[N], numpy.dtype[numpy.float64]]"
+    f32 = f"numpy.ndarray[tuple[N], numpy.dtype[numpy.floating[{nb}_32Bit]]]"
+    boolean = '"numpy.ndarray[tuple[N], numpy.dtype[numpy.bool[bool]]]"'
+    for line in (15, 16, 17, 18, 19):
+        assert notes[line] == f'"{f64} | {f32}"', result.stdout
+    for line in (20, 21, 22):
+        assert notes[line] == boolean, result.stdout
+    for line in (23, 24, 25):
+        assert notes[line] == f'"{f64}"', result.stdout
+    assert notes[26] == (
+        f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.signedinteger[{nb}_64Bit]]]'
+        f' | numpy.ndarray[tuple[N], numpy.dtype[numpy.signedinteger[{nb}_32Bit]]]"'
+    ), result.stdout
+    assert notes[27] == f'"{f64} | {f32}"'.replace("tuple[N]", "tuple[N-1]"), result.stdout
+    # Only the members that fit: (3,) with (4,) is not in the result.
+    assert notes[31] == (
+        '"numpy.ndarray[tuple[Literal[3]], numpy.dtype[numpy.float64]]'
+        ' | numpy.ndarray[tuple[Literal[4]], numpy.dtype[numpy.float64]]"'
+    ), result.stdout
+
+
+def test_any_dim_keeps_rank_in_ufuncs() -> None:
+    # Issue 257: true division, np.where and the ufuncs read a shape with
+    # an `Any` dim, as `+ - *` do since issue 249.
+    result = run_mypy(FIXTURES / "any_dim_ufunc_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    f64 = "numpy.dtype[numpy.float64]"
+    for line in (12, 14, 15, 16, 21):
+        assert notes[line] == f'"numpy.ndarray[tuple[?U@{line}], {f64}]"', result.stdout
+    for line in (13, 17, 18, 19, 20):
+        assert notes[line] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
+    assert notes[22] == '"numpy.ndarray[tuple[?U@22], numpy.dtype[numpy.bool[bool]]]"', result.stdout
