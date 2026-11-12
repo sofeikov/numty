@@ -17,7 +17,7 @@ from ._types import (
     _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
 )
 from ._heads import (
-    _index_recorded_exceeds, _recorded_index_on, _report_names,
+    _index_recorded_exceeds, _recorded_index_on,
 )
 from ._names import _report_mask_names, _report_names
 from ._unknowns import _fresh_mask_count
@@ -600,7 +600,6 @@ def _consume_prefix(
     exprs: list[Expression | None] | None = None,
 ) -> tuple[list[int | Type], list[int | Type]] | None:
     """Items before ... consume the known prefix; (kept, unmatched)."""
-    from numty_plugin import _fresh_unknown
     out: list[int | Type] = []
     i = 0
     for pos, item in enumerate(items):

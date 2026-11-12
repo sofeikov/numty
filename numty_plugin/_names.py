@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from mypy.plugin import FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
-from mypy.types import CallableType, Type, TypeVarType, get_proper_type
+from mypy.types import CallableType, Type, TypeVarType
 
 from ._errors import NUMTY_NAMES, _swallowed
 from ._forms import _form_has_unknown, _is_unknown_fullname

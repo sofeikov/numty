@@ -9,7 +9,7 @@ import keyword
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_NAMES, _swallowed
+from ._errors import NUMTY_ANNOTATION, _swallowed
 from ._exprs import (
     _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars,
     _normalize_ns, _seen_vars,
@@ -17,7 +17,7 @@ from ._exprs import (
 from ._forms import _LinForm, _form_never_size
 from ._state import STATE
 from ._types import (
-    INT_FULLNAME, _dim_eq, _dim_str, _dim_value, _dims_provably_ne,
+    INT_FULLNAME, _dim_eq, _dim_str, _dim_value,
 )
 from ._unknowns import _is_same_unknown
 
@@ -1027,64 +1027,6 @@ def _index_recorded_exceeds(rec: int | Type, size: int | Type) -> bool:
     except Exception:
         _swallowed(None, "_index_recorded_exceeds")
         return False
-
-
-def _named_sizes_differ(a: int | Type, b: int | Type) -> bool:
-    """Two sizes spelled over names, neither with an unknown, that are not the same size.
-
-    `N` against `M`, `N+1` against `M`. A literal, an `int`, an `Any`
-    and an unknown (`?U`) never count: nothing is known about them. A
-    pair that is provably unequal (`N` against `N-1`) is an error
-    already, under the code of its check.
-    """
-    from numty_plugin import _resolve_dim
-    from ._forms import _form_has_unknown
-    if not isinstance(a, TypeVarType) or not isinstance(b, TypeVarType):
-        return False
-    if _dim_eq(a, b) or _dims_provably_ne(a, b):
-        return False
-    try:
-        fa = _resolve_dim(a)
-        fb = _resolve_dim(b)
-    except Exception:
-        _swallowed(None, "_named_sizes_differ")
-        return False
-    if fa is None or fb is None or _form_has_unknown(fa) or _form_has_unknown(fb):
-        return False
-    return True
-
-
-def _names_enabled(
-    ctx: FunctionContext | MethodContext,
-) -> bool:
-    """Whether `enable_error_code = numty-names` is set for the module being checked."""
-    options = getattr(ctx.api, "options", None)
-    return options is not None and NUMTY_NAMES in options.enabled_error_codes
-
-
-def _report_names(
-    ctx: FunctionContext | MethodContext,
-    a: int | Type,
-    b: int | Type,
-    where: str,
-) -> None:
-    """The opt-in `[numty-names]` report for a pair of different named sizes.
-
-    Called where a check finds two sizes that must be equal and cannot
-    prove them equal or unequal. Nothing is emitted with the code off
-    (the default): mypy counts a message of a disabled code as a failure
-    of the overload it is checking, so the result would gain mypy's own
-    error. The result of the check is the same either way.
-    """
-    try:
-        if _names_enabled(ctx) and _named_sizes_differ(a, b):
-            ctx.api.fail(
-                f"{where}: {_dim_str(a)} and {_dim_str(b)} are different names",
-                ctx.context,
-                code=NUMTY_NAMES,
-            )
-    except Exception:
-        _swallowed(ctx, "_report_names")
 
 
 def _index_head(ctx: AnalyzeTypeContext, late_bound: set[str]) -> Type:

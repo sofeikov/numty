@@ -607,13 +607,25 @@ def test_argmax_axis_mismatch() -> None:
 
 
 def test_index_pos_ok() -> None:
-    # Issues #285/#286/#287: recorded index positions check clean, with
-    # and without the opt-in names code. Index[P, N] spells which axis
-    # the values index into; producers (argmin/argmax, arange,
-    # flatnonzero, nonzero, searchsorted) record it themselves.
-    for flags in ((), ("--enable-error-code", "numty-names")):
-        result = run_mypy(FIXTURES / "index_pos_ok.py", flags=flags)
-        assert result.returncode == 0, result.stdout
+    # Issues #285/#286/#287: recorded index positions check clean by
+    # default; producers (argmin/argmax, arange, flatnonzero, nonzero,
+    # searchsorted) record it themselves. Index[P, N] spells which axis
+    # the values index into.
+    # Under the opt-in names code (issue #288, shared with #280) the
+    # order_ok pair broadcasts two different counts (J,) vs (K,), so
+    # line 19 reports the broadcast names error there while everything
+    # else stays clean. The default run keeps the full reveal pins.
+    off = run_mypy(FIXTURES / "index_pos_ok.py")
+    assert off.returncode == 0, off.stdout
+    on = run_mypy(FIXTURES / "index_pos_ok.py", flags=("--enable-error-code", "numty-names"))
+    on_errors = _errors_by_line(on)
+    assert sorted(on_errors) == [19], on.stdout
+    assert len(on_errors[19]) == 1, on.stdout
+    assert (
+        "broadcast at trailing axis 0 (shapes (J,) vs (K,)): J and K are different names"
+        in on_errors[19][0]
+    ), on.stdout
+    assert on_errors[19][0].endswith("[numty-names]"), on.stdout
     f64 = "numpy.dtype[numpy.float64]"
     i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
     pi64 = (
@@ -650,6 +662,10 @@ def test_bad_index_pos() -> None:
     # default; different names need the opt-in code. Mixed slice+fancy
     # lines also carry mypy's own [index] error, as every mixed-tuple
     # solver error does (see assert_rank_mismatch).
+    # Merged with issue #288: two fancy indices broadcast their counts,
+    # so (J,) vs (K,) is a broadcast names error too — line 17 gains one
+    # alongside its two position errors and the correct-positions line 18
+    # reports only the broadcast.
     fixture = FIXTURES / "bad_index_pos.py"
     off = run_mypy(fixture)
     assert sorted(_errors_by_line(off)) == [38, 44], off.stdout
@@ -659,6 +675,10 @@ def test_bad_index_pos() -> None:
         17: [
             "index positions on axis 0 (shape (P, Q)): Q and P are different names",
             "index positions on axis 1 (shape (P, Q)): P and Q are different names",
+            "broadcast at trailing axis 0 (shapes (K,) vs (J,)): K and J are different names",
+        ],
+        18: [
+            "broadcast at trailing axis 0 (shapes (J,) vs (K,)): J and K are different names",
         ],
         22: ["index positions on axis 1 (shape (P, Q)): M and Q are different names"],
         23: ["index positions on axis 0 (shape (P, Q)): M and P are different names"],
@@ -671,7 +691,7 @@ def test_bad_index_pos() -> None:
         44: ["index positions on 5 used on axis 0 of size 3 (shape (3,))"],
         48: ["index positions on axis 1 (shape (P, Q)): M and Q are different names"],
     }
-    assert sorted(errors) == [17, 22, 23, 28, 33, 38, 44, 48], on.stdout
+    assert sorted(errors) == [17, 18, 22, 23, 28, 33, 38, 44, 48], on.stdout
     for line, messages in expected.items():
         assert len(errors[line]) == len(messages) + (1 if line in (22, 23, 28) else 0), on.stdout
         for message in messages:
