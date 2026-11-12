@@ -202,3 +202,36 @@ def _fresh_own_size(
         line=line,
         column=column,
     )
+
+
+def _fresh_int_symbol(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext,
+    name: str,
+    var_key: str,
+) -> TypeVarType:
+    """The value of an `int` variable bound once, as an unknown named `?name`.
+
+    `window[k - 1 :]` on an axis of size `N` is `N-?k+1`. It is an
+    unknown like any other: nothing is proved from it, and a formula
+    over it is only compared under the opt-in code.
+    """
+    tree = getattr(ctx.api, "tree", None)
+    module = getattr(tree, "fullname", "") or ""
+    key = f"{module}_intvar_{var_key}"
+    vid = _unknown_ids.get(key)
+    if vid is None:
+        vid = TypeVarId.new(0)
+        _unknown_ids[key] = vid
+    fullname = f"__numty_unknown__.intvar_{var_key}"
+    _unknown_names.setdefault(fullname, f"?{name}")
+    upper = ctx.api.named_generic_type("builtins.int", [])
+    return TypeVarType(
+        name=_unknown_names[fullname],
+        fullname=fullname,
+        id=vid,
+        values=[],
+        upper_bound=upper,
+        default=AnyType(TypeOfAny.from_omitted_generics),
+        line=ctx.context.line,
+        column=ctx.context.column,
+    )

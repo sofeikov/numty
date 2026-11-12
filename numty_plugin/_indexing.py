@@ -39,7 +39,8 @@ if TYPE_CHECKING:
 
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import (
-    ARG_POS, EllipsisExpr, Expression, IndexExpr, IntExpr, ListExpr, NameExpr, SliceExpr, StarExpr, TupleExpr,
+    ARG_POS, CallExpr, EllipsisExpr, Expression, IndexExpr, IntExpr, ListExpr, NameExpr, OpExpr, SliceExpr, StarExpr,
+    TupleExpr,
 )
 from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
 from ._linalg import (
@@ -106,7 +107,44 @@ def _enclosing_func(
         return f"{module}::<module>", None
 
 
-def _count_var_assignments(func_node: object | None, varname: str) -> tuple[int, bool]:
+def _nested_bodies(stmt: object) -> list[list]:
+    """The statement lists inside a compound statement.
+
+    `body` is one block (`for`, `while`, `with`, `try`) or a list of
+    blocks (`if` / `elif`); `handlers` is the list of `except` blocks.
+    """
+    out: list[list] = []
+    for attr in ("body", "else_body", "finally_body", "handlers"):
+        sub = getattr(stmt, attr, None)
+        for block in sub if isinstance(sub, list) else [sub]:
+            inner = getattr(block, "body", None)
+            if isinstance(inner, list) and inner:
+                out.append(inner)
+    return out
+
+
+def _shallow_bodies(stmt: object) -> list[list]:
+    """`_nested_bodies` without the branches of an `if`: what the counts of issue #288 were built on.
+
+    The records of index positions rely on it (a name assigned in both
+    branches of an `if` keeps its record, `bad_index_overrun.py`).
+    """
+    out: list[list] = []
+    for attr in ("body", "else_body", "finally_body"):
+        sub = getattr(stmt, attr, None)
+        inner = getattr(sub, "body", None) if sub is not None else None
+        if isinstance(inner, list) and inner:
+            out.append(inner)
+    handlers = getattr(stmt, "handlers", None)
+    if isinstance(handlers, list):
+        for handler in handlers:
+            hbody = getattr(getattr(handler, "body", None), "body", None)
+            if isinstance(hbody, list) and hbody:
+                out.append(hbody)
+    return out
+
+
+def _count_var_assignments(func_node: object | None, varname: str, deep: bool = False) -> tuple[int, bool]:
     """(assignments to `varname`, is_param) in one function body.
 
     Flow-insensitive: any `Name = ...`, `for Name in ...`, `with ... as
@@ -160,22 +198,145 @@ def _count_var_assignments(func_node: object | None, varname: str) -> tuple[int,
                     target = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
                     if target is not None and varname in _targets(target):
                         count += 1
-            for attr in ("body", "else_body", "finally_body"):
-                sub = getattr(stmt, attr, None)
-                inner = getattr(sub, "body", None) if sub is not None else None
-                if isinstance(inner, list) and inner:
-                    _walk(inner)
-            handlers = getattr(stmt, "handlers", None)
-            if isinstance(handlers, list):
-                for handler in handlers:
-                    hbody = getattr(getattr(handler, "body", None), "body", None)
-                    if isinstance(hbody, list) and hbody:
-                        _walk(hbody)
+            for inner in _nested_bodies(stmt) if deep else _shallow_bodies(stmt):
+                _walk(inner)
 
     top_body = getattr(getattr(func_node, "body", None), "body", []) or []
     if isinstance(top_body, list):
         _walk(top_body)
     return count, is_param
+
+
+def _single_rvalue(func_node: object | None, varname: str) -> Expression | None:
+    """The value of `varname = <expr>` when that is the only binding of the name in the function."""
+    from mypy.nodes import AssignmentStmt as _AssignmentStmt
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import FuncDef as _FuncDef
+
+    count, is_param = _count_var_assignments(func_node, varname, deep=True)
+    if is_param or count != 1:
+        return None
+    found: list[Expression] = []
+
+    def _walk(stmts: object) -> None:
+        for stmt in stmts if isinstance(stmts, list) else []:
+            if isinstance(stmt, (_FuncDef, _ClassDef)):
+                continue
+            if isinstance(stmt, _AssignmentStmt) and len(stmt.lvalues) == 1:
+                lv = stmt.lvalues[0]
+                if isinstance(lv, NameExpr) and lv.name == varname:
+                    found.append(stmt.rvalue)
+            for inner in _nested_bodies(stmt):
+                _walk(inner)
+
+    _walk(getattr(getattr(func_node, "body", None), "body", None))
+    return found[0] if len(found) == 1 else None
+
+
+def _int_expr_dim(ctx: MethodContext | FunctionContext, expr: Expression | None, depth: int = 0) -> int | Type | None:
+    """An `int` expression as a size: a literal, a named size, or a formula over `int` variables.
+
+    `len(x)` and `x.shape[i]` read the size of `x`. A variable bound
+    once by `n = <expr>` reads that expression; any other variable
+    bound once (a parameter, a loop variable) is the unknown `?name`.
+    `+`, `-` and a literal factor combine them. Anything else is None.
+    """
+    from numty_plugin import _materialize_dim, _resolve_dim
+    from ._forms import _lin_add, _lin_scale
+    from ._unknowns import _fresh_int_symbol
+
+    if expr is None or depth > 4:
+        return None
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+
+    def combine(left: int | Type | None, right: int | Type | None, sign: int) -> int | Type | None:
+        if left is None or right is None:
+            return None
+        fl, fr = _resolve_dim(left), _resolve_dim(right)
+        if not isinstance(fl, _LinForm) or not isinstance(fr, _LinForm):
+            return None
+        return _materialize_dim(ctx, "slice", 0, _lin_add(fl, _lin_scale(fr, sign)))
+
+    if isinstance(expr, OpExpr) and expr.op in ("+", "-"):
+        left = _int_expr_dim(ctx, expr.left, depth + 1)
+        return combine(left, _int_expr_dim(ctx, expr.right, depth + 1), 1 if expr.op == "+" else -1)
+    if isinstance(expr, OpExpr) and expr.op == "*":
+        for factor, other in ((expr.left, expr.right), (expr.right, expr.left)):
+            k = _fold_int(factor)
+            if k is not None:
+                return combine(0, _int_expr_dim(ctx, other, depth + 1), k)
+        return None
+    if isinstance(expr, CallExpr):
+        callee = expr.callee
+        if isinstance(callee, NameExpr) and callee.fullname == "builtins.len" and len(expr.args) == 1:
+            parts = _ndarray_parts(ctx.api.get_expression_type(expr.args[0]))
+            if parts is not None and parts[0] and isinstance(parts[0][0], (int, TypeVarType)):
+                return parts[0][0]
+        return None
+    tp = get_proper_type(ctx.api.get_expression_type(expr))
+    if isinstance(tp, TypeVarType):
+        return tp if isinstance(_resolve_dim(tp), _LinForm) else None  # `x.shape[i]` of a named size
+    if not isinstance(expr, NameExpr) or not isinstance(tp, Instance) or tp.type.fullname != INT_FULLNAME:
+        return None
+    if tp.last_known_value is not None and isinstance(tp.last_known_value.value, int):
+        return tp.last_known_value.value
+    key = _mask_var_key(ctx, expr)
+    if key is None:
+        return None
+    use_line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+    rvalue = _single_rvalue(_enclosing_func(ctx, use_line)[1], expr.name)
+    if rvalue is not None:
+        inner = _int_expr_dim(ctx, rvalue, depth + 1)
+        if inner is not None:
+            return inner
+    return _fresh_int_symbol(ctx, expr.name, key)
+
+
+def _symbolic_slice(
+    ctx: MethodContext, dim: int, size: int | Type, begin: object, end: object, stride: object
+) -> int | Type | None:
+    """The size of `a[b:e]` with a bound that is a formula over `int` variables, else None.
+
+    `e - b`, with the axis size for a missing end and a negative literal
+    counted from the end. This holds when the bounds are inside the
+    axis; numpy clips them otherwise. So the answer is given only when
+    an `int` variable is left in it: such a size is an unknown, nothing
+    is proved from it, and it is compared only under the opt-in code
+    (`N-?k` against `N-?k+1` are 1 apart).
+    """
+    from numty_plugin import _materialize_dim, _resolve_dim
+    from ._forms import _form_has_unknown, _lin_add, _lin_scale
+
+    if not isinstance(begin, Type) and not isinstance(end, Type):
+        return None
+    if stride not in ("missing", 1):
+        return None
+    whole = _resolve_dim(size)
+    if not isinstance(whole, _LinForm):
+        return None
+
+    def position(bound: object, missing: _LinForm) -> _LinForm | None:
+        if bound == "missing":
+            return missing
+        if isinstance(bound, bool):
+            return None
+        if isinstance(bound, int):
+            return _LinForm((), bound) if bound >= 0 else _lin_add(whole, _LinForm((), bound))
+        if isinstance(bound, Type):
+            form = _resolve_dim(bound)
+            return form if isinstance(form, _LinForm) else None
+        return None
+
+    lo = position(begin, _LinForm((), 0))
+    hi = position(end, whole)
+    if lo is None or hi is None:
+        return None
+    form = _lin_add(hi, _lin_scale(lo, -1))
+    if not _form_has_unknown(form):
+        return None
+    return _materialize_dim(ctx, "slice", dim, form)
 
 
 def _own_index_annotation(func_node: object | None, varname: str, var_line: int) -> tuple[bool, bool, object | None]:
@@ -662,6 +823,15 @@ def _parse_index_item(
         begin = _fold_index_bound(ctx, expr.begin_index)
         end = _fold_index_bound(ctx, expr.end_index)
         stride = _fold_index_bound(ctx, expr.stride)
+        # A bound that is a formula over `int` variables (`k - 1`,
+        # `shift + n_windows`): kept as a size for `_symbolic_slice`.
+        try:
+            if begin is None:
+                begin = _int_expr_dim(ctx, expr.begin_index)
+            if end is None:
+                end = _int_expr_dim(ctx, expr.end_index)
+        except Exception:
+            _swallowed(ctx, "_parse_index_item")
         # Unprovable bounds no longer bail the whole getitem (issue #57):
         # they become "unknown" and the consumer mints a fresh unknown
         # for that axis while keeping the sibling dims.
@@ -802,6 +972,8 @@ def _consume_one(
         )
         return None
     _, begin, end, stride = item
+    if isinstance(begin, Type) or isinstance(end, Type):
+        return [_fresh_unknown(ctx, role, pos)]  # a symbolic bound: not followed on this path
     if isinstance(size, int):
         if "unknown" in (begin, end, stride):
             return [_fresh_unknown(ctx, role, pos)]
@@ -1267,7 +1439,17 @@ def _solve_getitem(
             _, begin, end, stride = item
             size = dims[dim]
             frag: int | Type
-            if isinstance(size, int):
+            symbolic = None
+            if isinstance(begin, Type) or isinstance(end, Type):
+                try:
+                    symbolic = _symbolic_slice(ctx, dim, size, begin, end, stride)
+                except Exception:
+                    _swallowed(ctx, "_solve_getitem")
+                begin = "unknown" if isinstance(begin, Type) else begin
+                end = "unknown" if isinstance(end, Type) else end
+            if symbolic is not None:
+                frag = symbolic
+            elif isinstance(size, int):
                 if "unknown" in (begin, end, stride):
                     frag = _fresh_unknown(ctx, "slice", dim)
                 else:
