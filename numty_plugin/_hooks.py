@@ -35,7 +35,8 @@ from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
 from ._types import (
     _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _conflict_pairs,
     _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray, _info_mentions_array,
-    _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, TUPLE_FULLNAME, _OPERATOR_DUNDERS,
+    _note_rank_mismatches, _ndarray_type, _union_members, _union_results, INT_FULLNAME, TUPLE_FULLNAME,
+    _OPERATOR_DUNDERS,
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
@@ -611,8 +612,14 @@ class NumtyPlugin(Plugin):
             return len_function_hook
         if fullname == "builtins.divmod":
             return divmod_function_hook
-        if fullname.endswith(" of ndarray") and fullname[:-11] in _REFLECTED_BROADCAST:
-            return partial(_union_reflected_hook, name=fullname[:-11])
+        reflected = _reflected_name(fullname)
+        if reflected is not None:
+            # Issues #252, #255, #256: a reflected operator on a union of arrays.
+            return partial(
+                _union_reflected_hook,
+                name=reflected,
+                solve=self._method_hook(f"numpy.ndarray.{reflected}"),
+            )
         # Raw np.matmul solves through the ufunc __call__ hook; the
         # numty.matmul wrapper below stays as a convenience alias.
         if fullname == "numty.matmul":
@@ -651,9 +658,14 @@ class NumtyPlugin(Plugin):
         return substituted_attribute_hook
 
     def _method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
-        if fullname.endswith(" of ndarray") and fullname[:-11] in _REFLECTED_BROADCAST:
-            # Issue #252: a reflected operator on a union of arrays.
-            return partial(_union_reflected_hook, name=fullname[:-11])
+        reflected = _reflected_name(fullname)
+        if reflected is not None:
+            # Issues #252, #255, #256: a reflected operator on a union of arrays.
+            return partial(
+                _union_reflected_hook,
+                name=reflected,
+                solve=self._method_hook(f"numpy.ndarray.{reflected}"),
+            )
         if fullname == "numpy.ndarray.__matmul__":
             return matmul_method_hook
         if fullname == "numpy.ndarray.__rmatmul__":
@@ -912,8 +924,25 @@ _REFLECTED_BROADCAST = {
 }
 
 
-def _union_reflected_hook(ctx: FunctionContext | MethodContext, name: str) -> Type:
-    """Broadcast check for an operator whose right operand is an array union.
+def _reflected_name(fullname: str) -> str | None:
+    """The reflected broadcast method in a name such as "__rsub__ of ndarray".
+
+    mypy gives a call on a union this name: the method and the class
+    that defines it. `__eq__` and `__ne__` are defined in
+    `_ArrayOrScalarCommon` in the numpy stubs (issue #255).
+    """
+    method, sep, owner = fullname.partition(" of ")
+    if sep and owner in ("ndarray", "_ArrayOrScalarCommon") and method in _REFLECTED_BROADCAST:
+        return method
+    return None
+
+
+def _union_reflected_hook(
+    ctx: FunctionContext | MethodContext,
+    name: str,
+    solve: Callable[[MethodContext], Type] | None = None,
+) -> Type:
+    """An operator whose right operand is an array union: check and solve.
 
     Issue #252. For `a - u` with `u` a union of arrays, mypy calls the
     reflected method on the union first (`u.__rsub__(a)`), because the
@@ -928,6 +957,12 @@ def _union_reflected_hook(ctx: FunctionContext | MethodContext, name: str) -> Ty
     where the method hooks run as usual. A left operand that fits one
     member is not reported: the members of two unions can be paired
     (the same union on both sides).
+
+    Issue #256. Without a mismatch, the result is the union of the results
+    of `solve` (the method hook of `numpy.ndarray.<name>`) for each member
+    that can broadcast with the left operand. mypy calls this hook once
+    for each member without telling which one, so each call gives the
+    whole union.
     """
     from numty_plugin import _broadcast_result
     try:
@@ -941,30 +976,54 @@ def _union_reflected_hook(ctx: FunctionContext | MethodContext, name: str) -> Ty
             and call.operators[0] in _REFLECTED_BROADCAST[name]
         ):
             right = call.operands[1]
+        # `__rpow__` has a second formal (mod), which has no actual argument.
         if right is None or not ctx.arg_types or len(ctx.arg_types[0]) != 1:
             return ctx.default_return_type
         members = _union_members(ctx.api.get_expression_type(right))
         if members is None:
             return ctx.default_return_type
+        # None: the left operand is not an array of known rank (a scalar).
         left = _ndarray_parts(ctx.arg_types[0][0]) or _movable_parts(ctx.arg_types[0][0])
-        if left is None:
-            return ctx.default_return_type
         first: str | None = None
+        fits: list[Type] = []
         for member in members:
-            part = _ndarray_parts(member) or _movable_parts(member)
-            if part is None:
-                return ctx.default_return_type
-            _, message = _broadcast_result(list(left[0]), list(part[0]), None)
-            if message is None:
-                return ctx.default_return_type
-            if first is None:
-                first = message
-        if first is not None:
-            if name == "__rtruediv__":
-                # The message of the true-division hook, which runs for
-                # each pair of members after this error: one line, not two.
-                first = f"true_divide shapes disagree: {first}"
-            ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
+            if left is not None:
+                part = _ndarray_parts(member) or _movable_parts(member)
+                if part is None:
+                    return ctx.default_return_type
+                _, message = _broadcast_result(list(left[0]), list(part[0]), None)
+                if message is not None:
+                    if first is None:
+                        first = message
+                    continue
+            fits.append(member)
+        if not fits:
+            if first is not None:
+                if name == "__rtruediv__":
+                    # The message of the true-division hook, which runs for
+                    # each pair of members after this error: one line, not two.
+                    first = f"true_divide shapes disagree: {first}"
+                ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
+            return ctx.default_return_type
+        if solve is None:
+            return ctx.default_return_type
+        results = [
+            solve(
+                MethodContext(
+                    type=get_proper_type(member),
+                    arg_types=ctx.arg_types,
+                    arg_kinds=ctx.arg_kinds,
+                    callee_arg_names=ctx.callee_arg_names,
+                    arg_names=ctx.arg_names,
+                    default_return_type=ctx.default_return_type,
+                    args=ctx.args,
+                    context=ctx.context,
+                    api=ctx.api,
+                )
+            )
+            for member in fits
+        ]
+        return _union_results(results)
     except Exception:
         _swallowed(ctx, "_union_reflected_hook")
     return ctx.default_return_type
