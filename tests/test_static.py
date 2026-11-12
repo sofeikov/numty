@@ -1190,27 +1190,56 @@ def test_generic_namedtuple_box_unknown_arg() -> None:
     assert "var-annotated" not in result.stdout, result.stdout
 
 
-def test_builder_int_return_checked() -> None:
-    # Issue 233: a plain-int builder size checks like the named value.
-    # Single-dim inline and named both fail ([int] vs [R]).
-    result = run_mypy(FIXTURES / "bad_builder_int_return.py")
-    assert result.returncode == 1, result.stdout
-    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    assert len(errors) == 2, result.stdout
-    for line in errors:
-        assert "[return-value]" in line, result.stdout
+def test_ret_int_ok() -> None:
+    # Issues #269/#271: a plain-`int` (or mask-count) size in a returned
+    # value fits a declared named size, inline and through a name, bound
+    # or unbound. Each call of an unbound-name function still returns a
+    # fresh unknown; literals keep checking (see bad_ret_literal).
+    result = run_mypy(FIXTURES / "ret_int_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    notes = {
+        line: re.sub(r"\?U@\d+[a-z]?", "?U", shape)
+        for line, shape in reveals_by_line(result).items()
+    }
+    f64 = "numpy.dtype[numpy.float64]"
+    assert notes == {
+        98: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        99: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        100: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
+        101: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
+    }, result.stdout
+    assert _run_fixture("ret_int_ok.py") == [
+        "(5,)",
+        "(6,)",
+        "(4,)",
+        "(4,)",
+    ]
+
+
+def test_bad_ret_literal() -> None:
+    # Issues #269/#271: a literal size in a returned value still checks
+    # against a declared named size.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_ret_literal.py"),
+        "Incompatible return value",
+        "tuple[Literal[0]]",
+        "tuple[N]",
+    )
 
 
 def test_builder_int_tuple_return_checked() -> None:
     # Issue 233: a tuple with one plain-int size reports the R-vs-A swap
-    # both inline and through a name (same [return-value] twice).
+    # both inline and through a name (same [return-value] twice). The
+    # dynamic dim itself is `Any` at the return (issues #269/#271), so
+    # only the named-against-named swap is reported.
     result = run_mypy(FIXTURES / "bad_builder_int_tuple.py")
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 2, result.stdout
     for line in errors:
         assert "[return-value]" in line, result.stdout
-        assert "tuple[int, R]" in line, result.stdout
+        assert "tuple[Any, R]" in line, result.stdout
         assert "tuple[R, A]" in line, result.stdout
 
 
@@ -1629,10 +1658,13 @@ def test_pad_time_kernel_clean_and_runs() -> None:
 
 
 def test_pad_time_kernel_keeps_time_axis() -> None:
+    # The padded block keeps the time axis (`*frames.shape`, not `[1:]`).
+    # The two dynamic dims are `Any` at the return (issues #269/#271), so
+    # the error names the kept `total` axis against the declared shape.
     assert_single_error(
         run_mypy(FIXTURES / "bad_pad_time_axis.py"),
         "Incompatible return value",
-        "tuple[int, int, total, *Ts]",
+        "tuple[Any, Any, total, *Ts]",
         "tuple[int, int, *Ts]",
     )
 
@@ -1653,16 +1685,6 @@ def test_gather_over_ts_prefix_solves() -> None:
         "Incompatible return value",
         "tuple[K, *Ts]",
         "tuple[total, *Ts]",
-    )
-
-
-def test_mask_over_ts_prefix_counts_once() -> None:
-    # A k-d mask consumes k prefix axes for one data-dependent count.
-    assert_single_error(
-        run_mypy(FIXTURES / "bad_mask_ts.py"),
-        "Incompatible return value",
-        "tuple[?U@12, *Ts]",
-        "tuple[N, *Ts]",
     )
 
 
