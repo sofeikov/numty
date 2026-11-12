@@ -38,6 +38,7 @@ from ._types import (
     _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, TUPLE_FULLNAME,
     _OPERATOR_DUNDERS,
 )
+from ._names import _mask_pair_in, _named_pair_in, _names_enabled, _report_call_site_names
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
     ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook,
@@ -374,6 +375,7 @@ class NumtyPlugin(Plugin):
         try:
             if isinstance(sig, CallableType) and not overloaded:
                 _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
+                _report_call_site_names(sig, ctx)
         except Exception:
             _swallowed(ctx, "method_signature_hook")
             pass
@@ -472,6 +474,7 @@ class NumtyPlugin(Plugin):
         # fall back to the default, unrepaired signature).
         try:
             _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
+            _report_call_site_names(sig, ctx)
         except Exception:
             _swallowed(ctx, "_callsite_check")
             pass
@@ -1086,10 +1089,20 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         def _any_mismatch(
             a_list: list[list[int | Type]], b_list: list[list[int | Type]]
         ) -> bool:
+            try:
+                names_on = _names_enabled(ctx)
+            except Exception:
+                _swallowed(ctx, "_any_mismatch")
+                names_on = False
             for da in a_list:
                 for db in b_list:
                     _, msg = _broadcast_result(list(da), list(db), None)
                     if msg is not None:
+                        return True
+                    # The opt-in reports for two different names (issue
+                    # #280) and for selection counts (issue #288) are
+                    # errors of the method hook as well.
+                    if names_on and (_named_pair_in(da, db) or _mask_pair_in(da, db)):
                         return True
             return False
 

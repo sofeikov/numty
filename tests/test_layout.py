@@ -498,6 +498,7 @@ _LAYERS = (
     "_unknowns",
     "_exprs",
     "_types",
+    "_names",
     "_heads",
     "_reshape",
     "_builders",

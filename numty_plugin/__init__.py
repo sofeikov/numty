@@ -11,7 +11,7 @@ from mypy.plugin import Plugin
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
     _broadcast, _broadcast_core, _builders, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _heads, _hooks,
-    _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _state, _trace, _types, _unions,
+    _indexing, _linalg, _matmul, _names, _ops, _reshape, _reductions, _state, _trace, _types, _unions,
     _unknowns,
 )
 from ._state import (  # noqa: F401
@@ -19,7 +19,7 @@ from ._state import (  # noqa: F401
 )
 from ._errors import (  # noqa: F401
     NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL,
-    NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION,
+    NUMTY_NAMES, NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION,
     _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning,
     _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed, _warn_startup,
 )
@@ -38,7 +38,8 @@ from ._forms import (  # noqa: F401
     _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize,
 )
 from ._unknowns import (  # noqa: F401
-    _fresh_unknown, _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names, _unknown_per_line
+    _fresh_mask_count, _fresh_unknown, _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names,
+    _unknown_per_line
 )
 from ._exprs import (  # noqa: F401
     _EXPR_PREFIX, _LATE_PREFIXES, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _expr_var,
@@ -101,6 +102,10 @@ from ._types import (  # noqa: F401
     NDARRAY_FULLNAME, INT_FULLNAME, TUPLE_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME,
     _SEQUENCE_FULLNAMES, _OPERATOR_DUNDERS, _enum_member_count, _fold_dim_expr, _has_unknown_shape,
     _unpack_shape,
+)
+from ._names import (  # noqa: F401
+    _is_mask_count_dim, _mask_counts_differ, _mask_pair_in, _named_pair_in, _named_sizes_differ,
+    _names_enabled, _report_call_site_names, _report_mask_names, _report_names,
 )
 from ._builders import (  # noqa: F401
     _operands_have_known_shape, _builder_shape, _has_literal_dim, _has_int_dim, _has_mixed_operand,

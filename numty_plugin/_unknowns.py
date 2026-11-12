@@ -104,3 +104,41 @@ def _fresh_unknown(
         line=line,
         column=column,
     )
+
+
+def _fresh_mask_count(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext,
+    var_key: str,
+) -> TypeVarType:
+    """One unknown per mask variable (issue #288), stable across passes.
+
+    `var_key` is `module::func::varname` for a mask variable that is not
+    rebound between uses (best-effort flow-insensitive check at the call
+    site; any reassignment in the same function bails to a fresh
+    per-site unknown). The same variable reuses the same id, so
+    `ids[keep]` and `d[0, keep]` share `?U`; different variables mint
+    different ids. The fullname carries `.maskcount_` so the opt-in
+    report can tell a selection count from a generic unknown, while the
+    default checks treat it like any unknown (silent, unifying).
+    """
+    tree = getattr(ctx.api, "tree", None)
+    module = getattr(tree, "fullname", "") or ""
+    line = ctx.context.line
+    column = ctx.context.column
+    key = f"{module}_maskcount_{var_key}"
+    vid = _unknown_ids.get(key)
+    if vid is None:
+        vid = TypeVarId.new(0)
+        _unknown_ids[key] = vid
+    fullname = f"__numty_unknown__.maskcount_{var_key}"
+    upper = ctx.api.named_generic_type("builtins.int", [])
+    return TypeVarType(
+        name=_unknown_display_name(module, line, fullname),
+        fullname=fullname,
+        id=vid,
+        values=[],
+        upper_bound=upper,
+        default=AnyType(TypeOfAny.from_omitted_generics),
+        line=line,
+        column=column,
+    )
