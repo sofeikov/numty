@@ -834,8 +834,8 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
     Solves the target with the read path so out-of-range, too-many and
     mask-length errors fire on writes too, then requires the value to
     broadcast one-directionally into the target. Scalars always fit;
-    unpack/unknown/symbolic targets bail. Returns the stub default
-    (None) in every case.
+    unpack and unknown targets bail. Returns the stub default (None) in
+    every case.
     """
     pairs = _all_positionals(ctx)
     if len(pairs) != 2:
@@ -891,7 +891,11 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
             continue
         if isinstance(v, int) and v == 1:
             continue
-        if isinstance(t, int) and isinstance(v, int):
+        # The rule of a broadcast (issue 290): two literal sizes, or two
+        # symbolic ones that no sizes make equal (`C-1` into `C`). Only
+        # literal sizes were compared, so `out[i] = v[:-1]` was silent
+        # while `out[i] + v[:-1]` was an error.
+        if _dims_provably_ne(t, v):
             ctx.api.fail(
                 f"cannot assign value of shape {_dims_str(value_dims)} "
                 f"into target of shape {_dims_str(target_dims)}",
@@ -899,8 +903,8 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
                 code=NUMTY_BROADCAST,
             )
             return ctx.default_return_type
-        # Symbolic or unknown: unprovable, bail silently.
-        return ctx.default_return_type
+        # Unknown, or two names that may be equal: unprovable. The
+        # other axes are still compared.
     return ctx.default_return_type
 
 

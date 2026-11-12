@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, cast
 
 from mypy.errorcodes import ARG_TYPE
+from mypy.expandtype import expand_type
 from mypy.nodes import (
     ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, CallExpr, Context, Expression, IntExpr,
     ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var,
@@ -817,22 +818,51 @@ def _callsite_formula_return(
         formals = _shape_tvar_formals(sig)
         bindings = _callsite_expr_bindings(sig, formals, ctx)
         new_ret = _substitute_return_exprs(sig, bindings, ctx)
-        if new_ret is None:
-            return sig
-        # Formula variables only the old return mentioned are no longer
-        # the callee's to bind (see the note in `_substitute_return_exprs`).
-        formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
-        return sig.copy_modified(
-            ret_type=new_ret,
-            variables=[
-                v
-                for v in sig.variables
-                if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
-            ],
-        )
+        if new_ret is not None:
+            # Formula variables only the old return mentioned are no longer
+            # the callee's to bind (see the note in `_substitute_return_exprs`).
+            formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
+            sig = sig.copy_modified(
+                ret_type=new_ret,
+                variables=[
+                    v
+                    for v in sig.variables
+                    if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
+                ],
+            )
+        return _settle_any_bound(sig, bindings)
     except Exception:
         _swallowed(ctx, "_callsite_formula_return")
         return sig
+
+
+def _settle_any_bound(sig: CallableType, bindings: dict[str, int | Type | _LinForm]) -> CallableType:
+    """`sig` with every size the call bound to `Any` written as `Any`.
+
+    An argument of unknown rank binds the sizes of its formal to `Any`
+    (see `_callsite_expr_bindings`). Left as variables, mypy solves them
+    again from every argument, by a join of the lower bounds in the
+    order of a set of types. With `Any`, a caller's name and a literal
+    among the bounds the join is `Any` in one order and `object` in
+    another, so the same call was an error (`Value of type variable "T"
+    cannot be "object"`) in some runs and clean in others (issue 284).
+    Written as `Any` in the formals and the return, and dropped from the
+    variables, the size is not solved a second time.
+    """
+    env: dict[TypeVarId, Type] = {}
+    for v in sig.variables:
+        if not isinstance(v, TypeVarType):
+            continue
+        bound = bindings.get(v.fullname)
+        if isinstance(bound, Type) and isinstance(get_proper_type(bound), AnyType):
+            env[v.id] = AnyType(TypeOfAny.explicit)
+    if not env:
+        return sig
+    return sig.copy_modified(
+        arg_types=[expand_type(tp, env) for tp in sig.arg_types],
+        ret_type=expand_type(sig.ret_type, env),
+        variables=[v for v in sig.variables if v.id not in env],
+    )
 
 
 def _callsite_expr_bindings(
@@ -1271,6 +1301,7 @@ def _substitute_return_exprs(
     rdims, _dtype = ret_parts
     new_dims: list[int | Type] = []
     changed = False
+    own_ids = {v.id for v in sig.variables}
     # For building new expr vars we need constituent objects by fullname.
     # Caller-ns first (Phase 4 Phase 1 namespaced B keys), then any-ns.
     obj_by_fullname: dict[str, TypeVarType] = {}
@@ -1305,7 +1336,12 @@ def _substitute_return_exprs(
             if form_early is None:
                 bound = bindings.get(d.fullname)
                 if bound is None:
-                    if d.fullname in inferred:
+                    if d.fullname in inferred or d.id not in own_ids:
+                        # Not this call's to bind (issue 274): a size of
+                        # the receiver's class, already written in the
+                        # caller's terms. Made unknown here, the items of
+                        # a returned NamedTuple no longer matched its
+                        # fallback (`Block[P, Any]` is not `Block[P, Any]`).
                         new_dims.append(d)
                     else:
                         new_dims.append(_fresh_unknown(ctx, "callsite-return", index))

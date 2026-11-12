@@ -445,6 +445,7 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
         "_broadcast",
         "_broadcast_core",
         "_builders",
+        "_callsite",
         "_dtypes",
         "_einsum",
         "_errors",
@@ -511,6 +512,7 @@ _LAYERS = (
     "_fft",
     "_indexing",
     "_unions",
+    "_callsite",
     "_hooks",
 )
 

@@ -4572,3 +4572,127 @@ def test_integer_timedelta_bitwise_dtypes() -> None:
     # A common integer type exists: no error.
     assert notes[25] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.signedinteger[{nb}_64Bit]]]"', result.stdout
     assert notes[26] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.unsignedinteger[{nb}_64Bit]]]"', result.stdout
+
+
+def test_any_bound_size_is_stable() -> None:
+    # Issue 284: with an argument of unknown rank and a union argument,
+    # mypy solved `T` by a join whose order changed from run to run, and
+    # about one cold run in four reported `cannot be "object"`. Eight
+    # cold runs must all be clean.
+    from concurrent.futures import ThreadPoolExecutor
+
+    fixture = FIXTURES / "callsite_any_bound_ok.py"
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: run_mypy(fixture, flags=("--cache-dir", os.devnull)), range(8)))
+    for result in results:
+        assert result.returncode == 0, result.stdout
+        nb = "numpy._typing._nbit_base."
+        assert reveals_by_line(result)[17] == (
+            f'"numpy.ndarray[tuple[Any, Literal[5]], numpy.dtype[numpy.floating[{nb}_32Bit]]]"'
+        ), result.stdout
+
+
+_NB = "numpy._typing._nbit_base."
+_I64 = f"numpy.dtype[numpy.signedinteger[{_NB}_64Bit]]"
+_F32 = f"numpy.dtype[numpy.floating[{_NB}_32Bit]]"
+_F64 = "numpy.dtype[numpy.float64]"
+_BOOL = "numpy.dtype[numpy.bool[bool]]"
+
+
+def test_namedtuple_method_with_unknown_index() -> None:
+    # Issue 274: `block.take(fi)` with an untyped index made the item of
+    # the returned NamedTuple `(?U, Any)` and left its fallback `Block[P,
+    # Any]`, so passing it on was `"Block[P, Any]"; expected "Block[P, Any]"`.
+    result = run_mypy(FIXTURES / "generic_namedtuple_unknown_index_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    block = "tests.fixtures.generic_namedtuple_unknown_index_ok.Block"
+    assert notes[27] == f'"tuple[numpy.ndarray[tuple[P, Any], {_F32}], fallback={block}[P, Any]]"', result.stdout
+    assert notes[29] == f'"tuple[numpy.ndarray[tuple[P, R], {_F32}], fallback={block}[P, R]]"', result.stdout
+
+
+def test_property_and_method_own_size_is_unknown() -> None:
+    # Issue 276: a size that only the return of a property or a method
+    # names is unknown at each read. A property gave the caller's size of
+    # the same name, a method gave `Never`.
+    result = run_mypy(FIXTURES / "property_own_size.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[45] == f'"numpy.ndarray[tuple[?U@45], {_I64}]"', result.stdout
+    assert notes[46] == f'"numpy.ndarray[tuple[?U@46], {_I64}]"', result.stdout
+    assert notes[47] == f'"numpy.ndarray[tuple[?U@47], {_I64}]"', result.stdout
+    # `scores: F64[E]` plus the property is not `F64[E]`.
+    assert notes[48] == f'"numpy.ndarray[tuple[?U@48b], {_F64}]"', result.stdout
+    # A size of the class is still the caller's.
+    assert notes[49] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
+    assert notes[50] == (
+        f'"tuple[numpy.ndarray[tuple[E], {_F64}], numpy.ndarray[tuple[?U@50], {_I64}]]"'
+    ), result.stdout
+    assert notes[51] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
+    assert notes[52] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
+
+
+def test_int_dims_keep_shape_in_bitwise_and_searchsorted() -> None:
+    # Issues 270 and 275: `&` and `|` read a shape with an `int` size,
+    # as a comparison does, and `searchsorted` has the shape of its
+    # values. Both gave the stubs' rank-less answer, and for the results
+    # of a generic call `ndarray[Any, Any]`, which hid a wrong dtype.
+    result = run_mypy(FIXTURES / "bad_int_dims_bitwise.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [27, 34], result.stdout
+    assert "N-1 vs N (shapes (?, N-1) vs (?, N))  [numty-broadcast]" in errors[27][0], result.stdout
+    assert "[return-value]" in errors[34][0] and "numpy.bool" in errors[34][0], result.stdout
+    notes = reveals_by_line(result)
+    assert notes[17] == f'"numpy.ndarray[tuple[?U@17], {_BOOL}]"', result.stdout
+    assert notes[18] == f'"numpy.ndarray[tuple[?U@18, N], {_BOOL}]"', result.stdout
+    assert notes[19] == f'"numpy.ndarray[tuple[int, N], {_BOOL}]"', result.stdout
+    assert notes[20] == f'"numpy.ndarray[tuple[int, N], {_BOOL}]"', result.stdout
+    assert notes[21] == f'"numpy.ndarray[tuple[?U@21], {_I64}]"', result.stdout
+    assert notes[22] == f'"numpy.ndarray[tuple[int], {_I64}]"', result.stdout
+    assert notes[23] == f'"numpy.ndarray[tuple[int], {_I64}]"', result.stdout
+    assert notes[24] == f'"numpy.ndarray[tuple[N], {_I64}]"', result.stdout
+    assert notes[25] == f'"numpy.ndarray[tuple[int], {_I64}]"', result.stdout
+    assert notes[26] == f'"numpy.ndarray[tuple[N], {_I64}]"', result.stdout
+    assert notes[33] == f'"numpy.ndarray[tuple[?U@33, N], {_BOOL}]"', result.stdout
+
+
+def test_setitem_symbolic_sizes() -> None:
+    # Issue 290: an assignment compared sizes only when both were
+    # literal, so `out[i] = v[:-1]` was silent and `out[i] + v[:-1]` was
+    # an error. Two names, an unknown and an `int` stay silent.
+    result = run_mypy(FIXTURES / "bad_setitem_symbolic.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [13, 14, 15, 16, 18, 19], result.stdout
+    expected = {
+        13: "cannot assign value of shape (C-1,) into target of shape (C,)",
+        14: "broadcast shapes disagree at trailing axis 0: C vs C-1",
+        15: "cannot assign value of shape (S-1,) into target of shape (S,)",
+        16: "cannot assign value of shape (S, C) into target of shape (S-1, C)",
+        18: "cannot assign value of shape (S, C-2) into target of shape (S, C-1)",
+        19: "cannot assign value of shape (S-2, C) into target of shape (S-1, C)",
+    }
+    for line, message in expected.items():
+        assert len(errors[line]) == 1, result.stdout
+        assert message in errors[line][0] and "[numty-broadcast]" in errors[line][0], result.stdout
+
+
+def test_container_int_sizes_and_bare_container() -> None:
+    # Issue 279: at a call, `int` in a size position of a container of
+    # arrays accepts a named or a literal size (NamedTuple, dataclass,
+    # Optional, inside a list, a method); an array argument with an
+    # `int` size does not stop the container from binding the name; a
+    # bare generic NamedTuple of arrays is reported.
+    result = run_mypy(FIXTURES / "bad_container_int_sizes.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [53, 64, 66, 67], result.stdout
+    assert "Box used bare" in errors[53][0] and "[numty-annotation]" in errors[53][0], result.stdout
+    assert '"Data[F, str]"; expected "Data[Any, int]"' in errors[64][0], result.stdout
+    assert '"Box[Literal[1]]"; expected "Box[Literal[3]]"' in errors[66][0], result.stdout
+    assert '"Box[F]"; expected "Box[Literal[3]]"' in errors[67][0], result.stdout
+    notes = reveals_by_line(result)
+    assert notes[60] == f'"numpy.ndarray[tuple[int], {_I64}]"', result.stdout
+    assert notes[69] == f'"numpy.ndarray[tuple[F], {_F64}]"', result.stdout
+    assert notes[70] == f'"numpy.ndarray[tuple[F], {_F64}]"', result.stdout

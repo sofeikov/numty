@@ -29,7 +29,7 @@ from ._matmul import (
     _matmul_promoted,
 )
 from ._reshape import (
-    _construct_dtype, _mixed_parts,
+    _construct_dtype, _known_rank_parts, _mixed_parts,
 )
 from ._reshape import (
     _check_unique_axes, _int_or_none, _picture_complete, _positionals_only,
@@ -1328,7 +1328,9 @@ def _search_values_dims(
         # Only the nested-literal recursion passes None, and that
         # case returns above.
         return None
-    parts = _ndarray_parts(tp)
+    # The result has the shape of the values as it stands, so a size
+    # that is `int` or `Any` is kept too (issue 270).
+    parts = _ndarray_parts(tp) or _known_rank_parts(tp)
     if parts is not None:
         return list(parts[0])
     proper = get_proper_type(tp)
@@ -1350,9 +1352,23 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
+    return _searchsorted_types(ctx, pairs[0][0], pairs[1])
+
+
+def searchsorted_method_hook(ctx: MethodContext) -> Type:
+    """`a.searchsorted(v)`: the same answer as `np.searchsorted(a, v)`."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _searchsorted_types(ctx, ctx.type, pairs[0])
+
+
+def _searchsorted_types(
+    ctx: FunctionContext | MethodContext, sorted_tp: Type, values: tuple[Type, Expression | None]
+) -> Type:
     # numpy only searches a 1-D array ("object too deep for desired
     # array" otherwise): a known other rank is an error, not a shape.
-    sorted_parts = _ndarray_parts(pairs[0][0])
+    sorted_parts = _ndarray_parts(sorted_tp)
     if sorted_parts is not None and not _has_unpack(sorted_parts[0]):
         if len(sorted_parts[0]) != 1:
             ctx.api.fail(
@@ -1362,7 +1378,7 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
                 code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
-    values_dims = _search_values_dims(pairs[1][0], pairs[1][1])
+    values_dims = _search_values_dims(values[0], values[1])
     if values_dims is None:
         return ctx.default_return_type
     dtype = _construct_dtype(ctx, "numpy.int64")
