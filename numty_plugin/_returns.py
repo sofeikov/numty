@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import os
+from collections.abc import Callable
 
 from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import (
@@ -26,8 +27,13 @@ from mypy.types import (
     get_proper_type,
 )
 
+from mypy.nodes import LambdaExpr
+from mypy.types import LiteralType
+
 from ._errors import _swallowed
-from ._types import INT_FULLNAME, NDARRAY_FULLNAME
+from ._exprs import _EXPR_PREFIX, _iter_tvarlikes, _resolve_dim
+from ._forms import _form_has_unknown, _is_unknown_fullname
+from ._types import _OWN_NAME_OF, INT_FULLNAME, NDARRAY_FULLNAME
 
 
 def _is_dynamic_return_dim(d: int | Type) -> bool:
@@ -97,6 +103,70 @@ def _return_sites_of(path: str) -> tuple[list, list] | None:
         return None
     _RETURN_SITES_CACHE[path] = (mtime, returns, assigns)
     return returns, assigns
+
+
+_MODULE_AST_CACHE: dict[str, tuple[float, ast.Module]] = {}
+
+
+def _module_ast(path: str) -> ast.Module | None:
+    try:
+        mtime = os.path.getmtime(path)
+        hit = _MODULE_AST_CACHE.get(path)
+        if hit is not None and hit[0] == mtime:
+            return hit[1]
+        with open(path, "r", encoding="utf-8") as fh:
+            mod = ast.parse(fh.read())
+    except (OSError, SyntaxError, ValueError):
+        return None
+    _MODULE_AST_CACHE[path] = (mtime, mod)
+    return mod
+
+
+def _holder_key(path: str | None, use_line: int, name: str) -> str | None:
+    """A key for the object the variable `name` holds at `use_line`, else None.
+
+    The key is the innermost function around the line and the line of
+    the last binding of the name before it (0 for a parameter or a name
+    from outside), so `ctx = ctx or Ctx(...)` starts a new object and
+    the reads after it share one. Not flow-sensitive: with a binding
+    inside a loop and another one anywhere, there is no key.
+    """
+    mod = _module_ast(path) if path else None
+    if mod is None or use_line <= 0:
+        return None
+    func: ast.AST = mod
+    found = True
+    while found:
+        found = False
+        todo = list(ast.iter_child_nodes(func))
+        while todo:
+            node = todo.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.lineno <= use_line <= (node.end_lineno or node.lineno):
+                    func, found = node, True
+                    break
+                continue
+            todo.extend(ast.iter_child_nodes(node))
+    stores: list[tuple[int, bool]] = []
+
+    def walk(node: ast.AST, in_loop: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue
+            if isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, (ast.Store, ast.Del)):
+                stores.append((child.lineno, in_loop))
+            walk(child, in_loop or isinstance(child, (ast.For, ast.AsyncFor, ast.While)))
+
+    walk(func, False)
+    args = getattr(func, "args", None)
+    is_param = args is not None and any(
+        a is not None and a.arg == name
+        for a in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+    )
+    if len(stores) + (1 if is_param else 0) > 1 and any(loop for _, loop in stores):
+        return None
+    last = max((line for line, _ in stores if line < use_line), default=0)
+    return f"{getattr(func, 'name', '')}@{getattr(func, 'lineno', 0)}::{name}::{last}"
 
 
 def _ast_directly_returns(node: ast.AST, line: int, col: int) -> bool:
@@ -234,6 +304,268 @@ def _misplaced_name_axes(ctx: object, items: list[Type]) -> set[int]:
         return set()
 
 
+_FREE_NAMES_CACHE: dict[int, tuple[object, dict[str, TypeVarType]]] = {}
+
+
+def _free_return_names(ctx: object) -> dict[str, TypeVarType]:
+    """Sizes the function being checked names in its return alone, by fullname (issue 307).
+
+    `def bounds(seg: I64[N]) -> tuple[I64[K], I64[K]]`: no parameter
+    binds `K`, so no caller chooses it. It is the function's to choose:
+    a size born in the body. A name of the class, a name a parameter of
+    an enclosing function binds, a formula and an unknown are not such
+    names. A lambda has none.
+    """
+    scope = getattr(getattr(ctx, "api", None), "scope", None)
+    func = scope.current_function() if scope is not None else None
+    if func is None or isinstance(func, LambdaExpr):
+        return {}
+    hit = _FREE_NAMES_CACHE.get(id(func))
+    if hit is not None and hit[0] is func:
+        return hit[1]
+    out: dict[str, TypeVarType] = {}
+    try:
+        tp = get_proper_type(func.type)
+        if isinstance(tp, CallableType):
+            bound: set[str] = set()
+            for item in getattr(scope, "stack", []):
+                item_tp = get_proper_type(getattr(item, "type", None))
+                if isinstance(item_tp, CallableType):
+                    for arg in item_tp.arg_types:
+                        bound.update(tv.fullname for tv in _iter_tvarlikes(arg))
+                defn = getattr(item, "defn", None)  # a class on the stack
+                for tv in getattr(defn, "type_vars", None) or []:
+                    bound.add(tv.fullname)
+            info = getattr(func, "info", None)
+            for tv in getattr(getattr(info, "defn", None), "type_vars", None) or []:
+                bound.add(tv.fullname)
+            for tv in _iter_tvarlikes(tp.ret_type):
+                if (
+                    isinstance(tv, TypeVarType)
+                    and tv.fullname not in bound
+                    and not _is_unknown_fullname(tv.fullname)
+                    and not tv.fullname.startswith(_EXPR_PREFIX)
+                    and not tv.values
+                ):
+                    upper = get_proper_type(tv.upper_bound)
+                    if isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME:
+                        out[tv.fullname] = tv
+    except Exception:
+        _swallowed(None, "_free_return_names")
+        out = {}
+    _FREE_NAMES_CACHE[id(func)] = (func, out)
+    return out
+
+
+def _is_literal_dim(d: Type) -> bool:
+    if isinstance(d, LiteralType):
+        return isinstance(d.value, int)
+    return isinstance(d, Instance) and d.type.fullname == INT_FULLNAME and d.last_known_value is not None
+
+
+def _is_born_dim(d: Type) -> bool:
+    """A size with no name of the signature in it: `int`, an unknown, a formula over an unknown."""
+    if _is_dynamic_return_dim(d):
+        return True
+    if not isinstance(d, TypeVarType):
+        return False
+    if _is_unknown_fullname(d.fullname):
+        return True
+    if d.fullname.startswith(_EXPR_PREFIX):
+        form = _resolve_dim(d)
+        return form is not None and _form_has_unknown(form)
+    return False
+
+
+def _array_shapes(tp: Type | None, rank: int) -> list[list[Type]]:
+    """Shapes of the given rank among the array members of `tp` (an array, or a union with one)."""
+    if tp is None:
+        return []
+    proper = get_proper_type(tp)
+    members = proper.items if isinstance(proper, UnionType) else [proper]
+    out: list[list[Type]] = []
+    for member in members:
+        inst = get_proper_type(member)
+        if not isinstance(inst, Instance) or inst.type.fullname != NDARRAY_FULLNAME or len(inst.args) != 2:
+            continue
+        shape = get_proper_type(inst.args[0])
+        if isinstance(shape, TupleType) and len(shape.items) == rank:
+            out.append([get_proper_type(item) for item in shape.items])
+    return out
+
+
+def _return_positions(node: ast.AST, match: Callable[[ast.AST], bool]) -> list[int | None]:
+    """Where the returned value `node` holds what `match` accepts: None for the value itself, else the tuple index."""
+    if isinstance(node, ast.IfExp):
+        return _return_positions(node.body, match) + _return_positions(node.orelse, match)
+    if isinstance(node, ast.NamedExpr):
+        return _return_positions(node.value, match)
+    if match(node):
+        return [None]
+    if isinstance(node, ast.Tuple):
+        return [i for i, elt in enumerate(node.elts) if match(elt)]
+    return []
+
+
+def _bound_once(func: ast.AST, name: str) -> bool:
+    """Whether `name` is bound exactly once in the body of `func` (its own scope) and is not a parameter."""
+    count = 0
+    args = getattr(func, "args", None)
+    if args is not None:
+        every = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+        if any(a is not None and a.arg == name for a in every):
+            return False
+    todo = list(ast.iter_child_nodes(func))
+    while todo:
+        node = todo.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del)):
+            count += 1
+        todo.extend(ast.iter_child_nodes(node))
+    return count == 1
+
+
+# Sizes already given to a free name in one `return`, by position:
+# (path, line and column of the return, name) -> {(tuple index, axis): size}.
+_OWN_RETURN_SIZES: dict[tuple[str, int, int, str], dict[tuple[int, int], Type]] = {}
+
+
+def _fits_first(key: tuple[str, int, int, str], where: tuple[int, int], dim: Type) -> bool:
+    """Record `dim` for this position, and say whether it is the size the first position has.
+
+    Every position a `return` declares with one free name must hold one
+    size. The position checked first is the reference (a local that is
+    returned, then the items of the `return` from the left). `int` is
+    not followed, so it fits anything, as it fits a name a parameter
+    binds.
+    """
+    seen = _OWN_RETURN_SIZES.setdefault(key, {})
+    seen[where] = dim
+    # The position recorded first, which keeps its place when it is
+    # recorded again: the same reference in every pass.
+    first = next(iter(seen))
+    if first == where:
+        return True
+    ref = seen[first]
+    if _is_dynamic_return_dim(ref) or _is_dynamic_return_dim(dim):
+        return True
+    return bool(ref == dim)
+
+
+def _name_born_sizes(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext, tp: Type
+) -> Type:
+    """`tp` with the sizes born here written as the free name declared for them (issues 306, 307).
+
+    A free name is a size the function names in its return alone (see
+    `_free_return_names`). Where a value meets a position declared with
+    one, a size with no name in it (`int`, a selection count, any other
+    unknown) takes the name:
+
+    - a value under a declared type: `ex: F64[E] = col.to_numpy()`, a
+      directly returned call, an item of a returned tuple;
+    - a call assigned to a plain local that is bound once and returned,
+      `starts = np.flatnonzero(...)` then `return starts, ends`. The
+      local then has the name for its whole life, so what is computed
+      from it is in the name's terms: `np.r_[starts[1:], n]` is `(K,)`
+      and `np.r_[starts, n]` is `(K+1,)`, which mypy refuses for `K`.
+
+    In a `return`, a literal size takes the name too (`return
+    np.zeros(0), np.zeros(0)`), and every position declared with one
+    name must hold the size the first one checked holds; a position that
+    does not keeps its own size, and mypy reports the return. A size with a
+    name of the signature in it (`N`, `N+1`) is never renamed.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance) or proper.type.fullname != NDARRAY_FULLNAME or len(proper.args) != 2:
+        return tp
+    shape = get_proper_type(proper.args[0])
+    if not isinstance(shape, TupleType) or not shape.items:
+        return tp
+    free = _free_return_names(ctx)
+    if not free:
+        return tp
+    items = [get_proper_type(item) for item in shape.items]
+    if not any(_is_born_dim(item) or _is_literal_dim(item) for item in items):
+        return tp
+    try:
+        tree = getattr(ctx.api, "tree", None)
+        path = getattr(tree, "path", None) if tree is not None else None
+        line = getattr(ctx.context, "line", None)
+        col = getattr(ctx.context, "column", None)
+        if path is None or line is None or col is None:
+            return tp
+        sites = _return_sites_of(path)
+        if sites is None:
+            return tp
+        returns, assigns = sites
+
+        def here(node: ast.AST) -> bool:
+            return (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col)
+
+        # (declared shape, the return and tuple index it is a position of)
+        declared: list[Type] | None = None
+        direct: list[tuple[ast.Return, int]] = []
+        for ret, _ in returns:
+            if ret.value is not None:
+                direct.extend((ret, -1 if p is None else p) for p in _return_positions(ret.value, here))
+        stack = getattr(getattr(ctx.api, "expr_checker", None), "type_context", None)
+        context = stack[-1] if stack else None
+        shapes = _array_shapes(context, len(items))
+        if len(shapes) == 1:
+            declared = shapes[0]
+        elif not direct:
+            # A plain local, bound once, that is returned.
+            ret_stack = getattr(ctx.api, "return_types", None)
+            for assign, fstack in assigns:
+                targets = assign.targets
+                if len(targets) != 1 or not isinstance(targets[0], ast.Name) or not here(assign.value):
+                    continue
+                name = targets[0].id
+                if not fstack or not ret_stack or not _bound_once(fstack[-1], name):
+                    break
+                want = get_proper_type(ret_stack[-1])
+                for ret, rstack in returns:
+                    if rstack != fstack or ret.value is None:
+                        continue
+                    for p in _return_positions(ret.value, lambda n: isinstance(n, ast.Name) and n.id == name):
+                        if p is None:
+                            found = _array_shapes(want, len(items))
+                        elif isinstance(want, TupleType) and p < len(want.items):
+                            found = _array_shapes(want.items[p], len(items))
+                        else:
+                            found = []
+                        if len(found) == 1 and (declared is None or declared == found[0]):
+                            declared = found[0]
+                            direct.append((ret, -1 if p is None else p))
+                break
+        if declared is None:
+            return tp
+        new_items: list[Type] = list(shape.items)
+        for axis, (have, want) in enumerate(zip(items, declared)):
+            # By id: a callee's variable of the same name (the formal an
+            # argument is checked under) is not this function's name.
+            if not isinstance(want, TypeVarType) or want.fullname not in free or want.id != free[want.fullname].id:
+                continue
+            if not (_is_born_dim(have) or (direct and _is_literal_dim(have))):
+                continue
+            if all(
+                _fits_first((path, ret.lineno, ret.col_offset, want.fullname), (p, axis), have) for ret, p in direct
+            ):
+                new_items[axis] = want
+                if isinstance(have, TypeVarType) and _is_unknown_fullname(have.fullname):
+                    # The name is this unknown: one count is not two
+                    # sizes when it meets itself under the name.
+                    _OWN_NAME_OF.setdefault(want.id, set()).add(have.fullname)
+        if all(new is old for new, old in zip(new_items, shape.items)):
+            return tp
+        return proper.copy_modified(args=[shape.copy_modified(items=new_items), proper.args[1]])
+    except Exception:
+        _swallowed(ctx, "_name_born_sizes")
+        return tp
+
+
 def _return_any_for_dynamic(
     ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext, tp: Type
 ) -> Type:
@@ -248,6 +580,7 @@ def _return_any_for_dynamic(
     an unknown, or a named dim disagrees. Literals, unknowns, named
     and formula TypeVars, unpacks and dtypes are untouched.
     """
+    tp = _name_born_sizes(ctx, tp)
     proper = get_proper_type(tp)
     if isinstance(proper, UnionType):
         members = [_return_any_for_dynamic(ctx, item) for item in proper.items]

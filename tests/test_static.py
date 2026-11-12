@@ -1335,8 +1335,8 @@ def test_ret_int_ok() -> None:
     }
     f64 = "numpy.dtype[numpy.float64]"
     assert notes == {
-        93: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
-        94: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        93: '"numpy.ndarray[tuple[?N@93], numpy.dtype[numpy.bool[Any]]]"',
+        94: '"numpy.ndarray[tuple[?N@94], numpy.dtype[numpy.bool[Any]]]"',
         95: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
     }, result.stdout
     assert _run_fixture("ret_int_ok.py") == [
@@ -1348,7 +1348,8 @@ def test_ret_int_ok() -> None:
 
 def test_bad_ret_literal() -> None:
     # Issues #269/#271: a literal size in a returned value still checks
-    # against a declared named size.
+    # against a declared named size that a parameter binds. (A name of
+    # the return alone takes it, see own_size_return.py.)
     assert_single_error(
         run_mypy(FIXTURES / "bad_ret_literal.py"),
         "Incompatible return value",
@@ -4864,15 +4865,18 @@ def test_property_and_method_own_size_is_unknown() -> None:
     result = run_mypy(FIXTURES / "property_own_size.py")
     assert result.returncode == 0, result.stdout
     notes = reveals_by_line(result)
-    assert notes[45] == f'"numpy.ndarray[tuple[?U@45], {_I64}]"', result.stdout
-    assert notes[46] == f'"numpy.ndarray[tuple[?U@46], {_I64}]"', result.stdout
-    assert notes[47] == f'"numpy.ndarray[tuple[?U@47], {_I64}]"', result.stdout
+    # Read through a variable, the size is the object's: two properties
+    # declared with `E` have one size (issue 306). A method call chooses
+    # a size per call (issue 307).
+    assert notes[45] == f'"numpy.ndarray[tuple[?c.E], {_I64}]"', result.stdout
+    assert notes[46] == f'"numpy.ndarray[tuple[?c.E], {_I64}]"', result.stdout
+    assert notes[47] == f'"numpy.ndarray[tuple[?E@47], {_I64}]"', result.stdout
     # `scores: F64[E]` plus the property is not `F64[E]`.
-    assert notes[48] == f'"numpy.ndarray[tuple[?U@48b], {_F64}]"', result.stdout
+    assert notes[48] == f'"numpy.ndarray[tuple[?U@48], {_F64}]"', result.stdout
     # A size of the class is still the caller's.
     assert notes[49] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
     assert notes[50] == (
-        f'"tuple[numpy.ndarray[tuple[E], {_F64}], numpy.ndarray[tuple[?U@50], {_I64}]]"'
+        f'"tuple[numpy.ndarray[tuple[E], {_F64}], numpy.ndarray[tuple[?b.E], {_I64}]]"'
     ), result.stdout
     assert notes[51] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
     assert notes[52] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
@@ -5119,7 +5123,7 @@ def test_mask_count_reuses_one_unknown_per_variable() -> None:
     # Lines 15-16 share one count for `keep`; line 17 keeps it.
     assert notes[15] == f'"numpy.ndarray[tuple[?U@15], {i64}]"', result.stdout
     assert notes[16] == f'"numpy.ndarray[tuple[?U@15], {f64}]"', result.stdout
-    assert notes[17] == f'"numpy.ndarray[tuple[?U@17], {f64}]"', result.stdout
+    assert notes[17] == f'"numpy.ndarray[tuple[?U@15], {f64}]"', result.stdout
     assert _run_fixture("mask_count_ok.py") == ["ok"]
     # Under the opt-in only line 14 reports (N vs K); line 17 stays clean.
     on = run_mypy(FIXTURES / "mask_count_ok.py", flags=("--enable-error-code", "numty-names"))
@@ -5149,6 +5153,73 @@ def test_mask_count_optin_reports_selection_counts() -> None:
     for line in (28, 29, 31, 32):
         assert len(errors[line]) == 1, on.stdout
         assert errors[line][0].endswith("[numty-names]"), on.stdout
+
+
+def test_own_size_return() -> None:
+    # Issues 306/307: a name of the return alone is the function's to
+    # choose. Its positions in a `return` hold one size (a literal, a
+    # selection count, a local that takes the name), a local annotated
+    # with it names a size born in the body, and a call gives one
+    # unknown per name, shared by the positions.
+    result = run_mypy(FIXTURES / "own_size_return.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    notes = reveals_by_line(result)
+    assert notes[27] == f'"numpy.ndarray[tuple[K], {_I64}]"', result.stdout
+    assert notes[28] == f'"numpy.ndarray[tuple[K], {_I64}]"', result.stdout
+    assert notes[52] == f'"numpy.ndarray[tuple[O, E], {_F64}]"', result.stdout
+    assert notes[68] == f'"numpy.ndarray[tuple[?K@67], {_I64}]"', result.stdout
+    assert notes[69] == f'"numpy.ndarray[tuple[?K@67], {_I64}]"', result.stdout
+    assert notes[71] == f'"numpy.ndarray[tuple[?K@70], {_F64}]"', result.stdout
+    assert notes[72] == f'"numpy.ndarray[tuple[?J@70], {_F64}]"', result.stdout
+    assert notes[73] == f'"numpy.ndarray[tuple[?K@73], {_F64}]"', result.stdout
+    assert _run_fixture("own_size_return.py") == ["(3,) (3,)", "(3,) (3,)", "(2, 3)", "(3, 2)"]
+    # Nothing in it is two sizes that meet, so the opt-in adds no error.
+    on = run_mypy(FIXTURES / "own_size_return.py", flags=("--enable-error-code", "numty-names"))
+    assert "error:" not in on.stdout, on.stdout
+
+
+def test_bad_own_size_return() -> None:
+    # Issue 307: positions declared with one free name that hold two
+    # sizes are refused by mypy, with the first position under the name
+    # and the other under its own size. A name a parameter binds still
+    # refuses a selection count. numpy: the ends are (4,) for 3 starts.
+    result = run_mypy(FIXTURES / "bad_own_size_return.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 16, 20, 25, 29], result.stdout
+    for line in errors:
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), result.stdout
+    assert "tuple[K]" in errors[14][0] and "tuple[Literal[1]]" in errors[14][0], result.stdout
+    assert "tuple[K+1]" in errors[16][0], result.stdout
+    assert "tuple[?U@20b]" in errors[20][0], result.stdout
+    # A local that is returned takes the name where it is assigned, so
+    # here the item of the `return` is the one that keeps its own size.
+    assert 'got "tuple[ndarray[tuple[?U@25]' in errors[25][0], result.stdout
+    assert "tuple[?U@29]" in errors[29][0] and '"ndarray[tuple[N]' in errors[29][0], result.stdout
+    assert _run_fixture("bad_own_size_return.py") == ["(3,) (4,)"]
+
+
+def test_bad_own_size_optin() -> None:
+    # Issues 306/307 (opt-in): the size a call chose, and the size an
+    # object's properties name, are sizes of their own. Silent by default.
+    fixture = FIXTURES / "bad_own_size_optin.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    assert "error:" not in off.stdout
+    assert reveals_by_line(off)[74] == f'"numpy.ndarray[tuple[?ctx.E, T], {_F64}]"', off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [58, 65, 67, 75, 81], on.stdout
+    # A local that took a free name is that count: only another count reports.
+    assert "K and ?U@58 are different names" in errors[58][0], on.stdout
+    assert "N and ?K@63 are different names" in errors[65][0], on.stdout
+    assert "?K@66 and ?J@66 are different names" in errors[67][0], on.stdout
+    assert "?ctx.E and T are different names" in errors[75][0], on.stdout
+    assert "?a.E and ?b.E are different names" in errors[81][0], on.stdout
+    for line in errors:
+        assert len(errors[line]) == 1, on.stdout
+        assert errors[line][0].endswith("[numty-names]"), on.stdout
+    assert _run_fixture("bad_own_size_optin.py") == ["(3, 4)"]
 
 
 def test_numba_dispatcher_call() -> None:

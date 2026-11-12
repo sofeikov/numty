@@ -68,7 +68,8 @@ by default numty says nothing about it. A function generic in `N` and
 in such a body pair two different names: a mask on the wrong axis, a
 transposed matrix, a per-row array against a per-group one. Turn the
 check on to have them reported (issue #280), including selection counts
-(issue #288):
+(issue #288) and the sizes a function or an object chose (`?K@12`,
+`?ctx.E`, see [A size the function chooses](../guide/unknown-dims.md#a-size-the-function-chooses)):
 
 ```ini
 [mypy]

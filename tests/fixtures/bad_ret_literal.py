@@ -9,5 +9,5 @@ from numty import F64
 N = TypeVar("N", bound=int)
 
 
-def lit() -> F64[N]:
+def lit(x: F64[N]) -> F64[N]:
     return np.zeros((0,))

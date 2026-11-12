@@ -16,6 +16,7 @@ from mypy.types import (
 )
 
 from ._errors import NUMTY_CALLSITE, _swallowed
+from ._unknowns import _fresh_own_size
 from ._forms import _LinForm, _form_has_unknown
 from ._exprs import (
     _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _iter_tvarlikes,
@@ -512,6 +513,21 @@ def _substitute_return_exprs(
         except Exception:
             _swallowed(ctx, "_substitute_return_exprs")
             return None
+    # Names a formal mentions only inside a formula (`x: F64["2*N"]`).
+    in_formula: set[str] = set()
+    for formal in sig.arg_types:
+        try:
+            for tv in _iter_tvarlikes(formal):
+                form = _form_of(tv) if isinstance(tv, TypeVarType) else None
+                if isinstance(form, _LinForm):
+                    in_formula.update(name for name, _ in form.coeffs)
+                elif form is not None:
+                    in_formula.update(getattr(form, "vars", ()) or ())
+                    inner = getattr(form, "inner", None)
+                    if isinstance(inner, _LinForm):
+                        in_formula.update(name for name, _ in inner.coeffs)
+        except Exception:
+            _swallowed(ctx, "_substitute_return_exprs")
     try:
         ret_parts = _parts_or_unpack(sig.ret_type)
     except Exception:
@@ -785,8 +801,15 @@ def _substitute_return_exprs(
                         # a returned NamedTuple no longer matched its
                         # fallback (`Block[P, Any]` is not `Block[P, Any]`).
                         new_dims.append(d)
-                    else:
+                    elif d.fullname in in_formula:
+                        # A formal names it inside a formula the call
+                        # could not solve (`2*N` given an odd size).
                         new_dims.append(_fresh_unknown(ctx, "callsite-return", index))
+                        changed = True
+                    else:
+                        # A name of the return alone: one size per call
+                        # and name, shared by every position (issue 307).
+                        new_dims.append(_fresh_own_size(ctx, d.name, d.fullname))
                         changed = True
                     continue
                 if not isinstance(bound, _LinForm):

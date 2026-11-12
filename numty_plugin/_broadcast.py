@@ -21,7 +21,7 @@ from ._dtypes import (
 from ._types import (
     DTYPE_FULLNAME, INT_FULLNAME, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
     _fold_int, _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_mask_names,
-    _report_names,
+    _report_names, _same_own_size,
     _shape_from_arg,
     _split_flat, _union_members,
 )
@@ -92,7 +92,9 @@ def _broadcast_result(
     from numty_plugin import _fresh_unknown
     out: list[int | Type] = []
     for k, (x, y) in enumerate(zip(reversed(a), reversed(b))):
-        if _dim_eq(x, y):
+        if _dim_eq(x, y) or _same_own_size(x, y):
+            # One selection count, or one size a call chose, on both
+            # sides: the result keeps it (no proof is drawn from it).
             out.append(x)
         elif isinstance(x, int) and x == 1:
             out.append(y)
