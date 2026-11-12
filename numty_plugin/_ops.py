@@ -1176,7 +1176,7 @@ def _record_flat_positions(
 
 
 def _record_searchsorted(
-    ctx: FunctionContext,
+    ctx: FunctionContext | MethodContext,
     sorted_parts: tuple[list[int | Type], Type] | None,
     values_dims: Sequence[int | Type],
 ) -> None:

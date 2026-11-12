@@ -80,3 +80,18 @@ def union_ok(d: F64[P, Q], row: Index[P, J], other: I64[J], flag: bool) -> None:
     pick = row if flag else other
     y = d[pick, :]
     reveal_type(y)
+
+
+def clip_clears(a: F64[N], v: F64[K]) -> None:
+    # Reassigning through `clip` clears the positions record: the
+    # clipped index is safe on any axis.
+    idx = np.searchsorted(a, v)
+    idx = np.clip(idx, 0, len(a) - 1)
+    reveal_type(a[idx])
+
+
+def sub_clears(a: F64[N], v: F64[K]) -> None:
+    # `idx - 1` is a new value, not the recorded one.
+    idx = np.searchsorted(a, v, side="right")
+    idx = idx - 1
+    reveal_type(a[idx])

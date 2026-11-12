@@ -664,16 +664,16 @@ named in signatures — there is no spelling for "somebody else's count".
 Reduce them, or leave the position to inference.
 
 A dynamic size in a returned value fits a declared named size. A plain
-`int` (`np.zeros(n)`, `len()` of a non-array) or a bare unknown (a mask
-count) in a directly returned expression — or in an unannotated local it
-is returned through — is `Any` there, so it checks against any declared
-name, bound or not (`tests/fixtures/ret_int_ok.py`). A name no parameter
-binds (`def flags(n: int) -> Bool[N]`) is still a fresh unknown at each
-call. Literals keep checking: `return np.zeros((0,))` against `F64[N]`
-stays a `[return-value]` error (`tests/fixtures/bad_ret_literal.py`), as
-does a named size against another named size. The cost is known: a mask
-count returned where a named size is declared passes too, even though
-the count is provably not that size.
+`int` (`np.zeros(n)`, `len()` of a non-array) in a directly returned
+expression — or in an unannotated local it is returned through — is
+`Any` there, so it checks against any declared name, bound or not
+(`tests/fixtures/ret_int_ok.py`). A name no parameter binds
+(`def flags(n: int) -> Bool[N]`) is still a fresh unknown at each call.
+Literals keep checking: `return np.zeros((0,))` against `F64[N]` stays
+a `[return-value]` error (`tests/fixtures/bad_ret_literal.py`), as do
+unknowns (a mask count returned where `F64[N]` is declared is still
+rejected, `tests/fixtures/bad_mask_ts.py`) and a named size against
+another named size.
 
 Stacking a list built at runtime works the same way when every item has
 one declared shape: a name typed `list[...]`, or a list comprehension
@@ -861,7 +861,10 @@ splits a string the same way); `argmin`/`argmax`, `argsort`,
 fact themselves when the values are certainly positions. A recorded
 bound provably above the axis errors; a different *named* size is an
 opt-in `[numty-names]` error (`enable_error_code = numty-names`),
-silent by default:
+silent by default. A variable rebound between uses loses its record
+(`idx = searchsorted(...); idx = clip(idx, ...)` checks clean), and a
+same-module plain call checks the actual's record against the formal's
+`Index` under the same opt-in code:
 
 ```python
 table[row, col]                   # clean: positions on the right axes
@@ -869,6 +872,11 @@ table[col, row]                   # error (opt-in): Q on P, P on Q
 plain[np.searchsorted(a, v)]      # error: positions run to N+1 over N
 padded[np.searchsorted(a, v)]     # clean: the axis spells N+1
 ```
+
+An `Index` spelled through an alias (`R = Index[P, N]`), a call from
+another module, a method call, or keyword arguments keeps today's
+behavior (silent); like every other record, value-preserving reshapes
+and arithmetic do not carry it.
 
 Indexed assignment checks the write: the target solves like a read
 (out-of-range and mask-length errors fire), and the value must
@@ -1780,11 +1788,22 @@ subtraction below.
   against the named one, and neither is reported
   ([#289](https://github.com/sofeikov/numty/issues/289)). The check is
   a runtime one ([#17](https://github.com/sofeikov/numty/issues/17)).
-- The values of a plain index array are not followed, only its shape.
-  `d[rows, cols]` and `d[cols, rows]` have the same type when both
-  index arrays have the same length, and positions that run one past
-  the end (`np.searchsorted` returns `0..N` inclusive) are not reported
-  for plain arrays without an `Index` annotation
+- Index positions are best-effort by design. A recorded bound
+  provably above the indexed axis errors by default (`searchsorted`
+  positions on `N+1` over `N`, `arange(5)` on a size-3 axis); a
+  different named size needs the opt-in `numty-names` code and is
+  silent by default, including at a same-module plain call (an actual
+  recorded on N passed where the formal declares `Index` on P,
+  `tests/fixtures/bad_index_callsite.py`). Records come from the
+  `Index[P, N]` annotation (resolved off the enclosing function, so
+  two parameters on one `def` line stay distinct) and from producers
+  whose values are certainly positions. Everything else stays silent:
+  multi-dim results, records flowing through value-preserving ops
+  (`reshape`, `astype`, arithmetic) or a rebinding (`clip`, `- 1`
+  clear the record), cross-module or method calls, keyword arguments,
+  aliases (`R = Index[P, N]`), ambiguous records (two producers on
+  one line with same-shaped results), unions that disagree, and scalar
+  positions (a `-1`-for-none sentinel is not tracked)
   ([#285](https://github.com/sofeikov/numty/issues/285),
   [#286](https://github.com/sofeikov/numty/issues/286),
   [#287](https://github.com/sofeikov/numty/issues/287)).

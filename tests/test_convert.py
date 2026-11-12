@@ -630,13 +630,15 @@ def test_e2e_seeded_bias_bug_is_caught(tmp_path: Path) -> None:
     result = _run_mypy(converted, tmp_path=tmp_path)
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    # The HID/OUT mismatch surfaces once, at the call site: the unprovable
-    # (BATCH, OUT) + (HID) broadcast mints ?U, and a dynamic size in a
-    # returned value fits the declared (BATCH, OUT) (issues #269/#271), so
-    # there is no [return-value] echo anymore.
-    assert len(errors) == 1, result.stdout
-    assert "call-site shape conflict for 'HID'" in errors[0], result.stdout
-    assert "8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)" in errors[0], result.stdout
+    # The HID/OUT mismatch surfaces at the call site; the unprovable
+    # (BATCH, OUT) + (HID) broadcast mints ?U, and an unknown in a
+    # returned value still checks against the declared (BATCH, OUT)
+    # (only plain `int` is rewritten to Any at a return, issues
+    # #269/#271), so the [return-value] echo stays too.
+    assert len(errors) == 2, result.stdout
+    assert "tuple[BATCH, ?U@" in errors[0] and "[return-value]" in errors[0], result.stdout
+    assert "call-site shape conflict for 'HID'" in errors[1], result.stdout
+    assert "8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)" in errors[1], result.stdout
 
 
 # A stand-in for jaxtyping at runtime. Without `@jaxtyped` real jaxtyping

@@ -33,7 +33,7 @@ def _is_fam_int_name(fullname: str) -> bool:
 
 if TYPE_CHECKING:
     from mypy.nodes import Expression
-    from mypy.plugin import AnalyzeTypeContext, FunctionContext, MethodContext
+    from mypy.plugin import AnalyzeTypeContext, FunctionContext, FunctionSigContext, MethodContext
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.types import Type, TypeVarLikeType
 
@@ -983,7 +983,7 @@ def _record_index_on(
 
 
 def _recorded_index_on(
-    ctx: MethodContext, dims: list[int | Type], expr: Expression | None
+    ctx: MethodContext | FunctionSigContext, dims: list[int | Type], expr: Expression | None
 ) -> int | Type | None:
     """The size a 1-d fancy-index operand's values are positions on, else None.
 
@@ -1022,6 +1022,29 @@ def _recorded_index_on(
         return found[0]
     except Exception:
         _swallowed(ctx, "_recorded_index_on")
+        return None
+
+
+def _recorded_at_site(ctx: object, module: str, line: int, column: int) -> int | Type | None:
+    """The recorded positions-on size stored at one source site, else None.
+
+    Annotation sites are unique per parameter even on one shared `def`
+    line, so two Index parameters with the same count resolve
+    independently (issue #286). Zero or several shapeless records at
+    the site stay silent. Never raises.
+    """
+    try:
+        if line <= 0:
+            return None
+        seen = _index_on.get(f"{module}@{line}@{column}")
+        if not seen:
+            return None
+        first = [second for first, second in seen if first is None]
+        if len(first) != 1:
+            return None
+        return first[0]
+    except Exception:
+        _swallowed(ctx, "_recorded_at_site")
         return None
 
 

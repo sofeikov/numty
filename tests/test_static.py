@@ -661,7 +661,28 @@ def test_index_pos_ok() -> None:
         71: f'"numpy.ndarray[tuple[K], {f64}]"',
         76: f'"numpy.ndarray[tuple[K], {f64}]"',
         82: f'"numpy.ndarray[tuple[J, Q], {f64}]"',
+        90: f'"numpy.ndarray[tuple[K], {f64}]"',
+        97: f'"numpy.ndarray[tuple[K], {f64}]"',
     }, run_mypy(FIXTURES / "index_pos_ok.py").stdout
+
+
+def test_bad_index_callsite() -> None:
+    # Issue #286: an index recorded for one size passed where an Index
+    # formal declares another is an opt-in [numty-names] error at the
+    # call. Same-module plain positional calls only; producers, stored
+    # results and matching positions stay clean, and the default run
+    # stays silent everywhere (unknown is not an error).
+    fixture = FIXTURES / "bad_index_callsite.py"
+    assert run_mypy(fixture).returncode == 0, run_mypy(fixture).stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [31], on.stdout
+    assert len(errors[31]) == 1, on.stdout
+    assert (
+        "index positions on argument 'rows': N and P are different names"
+        in errors[31][0]
+    ), on.stdout
+    assert errors[31][0].endswith("[numty-names]"), on.stdout
 
 
 def test_bad_index_pos() -> None:
@@ -1296,10 +1317,11 @@ def test_generic_namedtuple_box_unknown_arg() -> None:
 
 
 def test_ret_int_ok() -> None:
-    # Issues #269/#271: a plain-`int` (or mask-count) size in a returned
+    # Issues #269/#271: a plain-`int` size in a returned
     # value fits a declared named size, inline and through a name, bound
     # or unbound. Each call of an unbound-name function still returns a
-    # fresh unknown; literals keep checking (see bad_ret_literal).
+    # fresh unknown; literals and unknowns keep checking
+    # (see bad_ret_literal, bad_mask_ts).
     result = run_mypy(FIXTURES / "ret_int_ok.py")
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
@@ -1309,15 +1331,13 @@ def test_ret_int_ok() -> None:
     }
     f64 = "numpy.dtype[numpy.float64]"
     assert notes == {
-        98: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
-        99: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
-        100: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
-        101: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
+        93: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        94: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        95: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
     }, result.stdout
     assert _run_fixture("ret_int_ok.py") == [
         "(5,)",
         "(6,)",
-        "(4,)",
         "(4,)",
     ]
 
@@ -1790,6 +1810,18 @@ def test_gather_over_ts_prefix_solves() -> None:
         "Incompatible return value",
         "tuple[K, *Ts]",
         "tuple[total, *Ts]",
+    )
+
+
+def test_mask_over_ts_prefix_counts_once() -> None:
+    # A k-d mask consumes k prefix axes for one data-dependent count.
+    # Unknowns keep checking at a return (only plain `int` is rewritten
+    # to Any there, issues #269/#271), so the count still mismatches N.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_mask_ts.py"),
+        "Incompatible return value",
+        "tuple[?U@12, *Ts]",
+        "tuple[N, *Ts]",
     )
 
 

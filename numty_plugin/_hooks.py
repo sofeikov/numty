@@ -119,7 +119,7 @@ from ._unions import (
     _UNION_PAIR_METHODS, _reflected_name, _union_pair_hook, _union_reflected_hook,
     _union_signature_clash,
 )
-from ._callsite import _relax_dynamic_formals, _report_call_site_names, minmax_function_hook
+from ._callsite import _relax_dynamic_formals, _report_call_site_names, _report_index_call_site, minmax_function_hook
 from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 
 class NumtyPlugin(Plugin):
@@ -518,6 +518,7 @@ class NumtyPlugin(Plugin):
         try:
             _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
             _report_call_site_names(sig, ctx)
+            _report_index_call_site(sig, ctx)
         except Exception:
             _swallowed(ctx, "_callsite_check")
             pass

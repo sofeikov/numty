@@ -5,17 +5,20 @@ to earlier layers only (order in tests/test_layout.py, _LAYERS).
 from __future__ import annotations
 
 from mypy.expandtype import expand_type_by_instance
-from mypy.nodes import ARG_POS
+from mypy.nodes import ARG_POS, CallExpr, NameExpr
 from mypy.plugin import FunctionContext, FunctionSigContext, MethodSigContext
 from mypy.typeops import make_simplified_union
 from mypy.types import (
     AnyType, CallableType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnionType, get_proper_type,
 )
 
-from ._errors import _swallowed
+from ._errors import NUMTY_NAMES, _swallowed
 from ._exprs import _iter_tvarlikes
+from ._indexing import _recorded_for_operand
 from ._types import (
-    INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _parts_or_unpack, _report_mask_names, _report_names,
+    INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _names_enabled, _ndarray_parts, _parts_or_unpack,
+    _report_mask_names,
+    _report_names,
     _shape_tvar_formals,
     _strip_optional,
 )
@@ -196,6 +199,143 @@ def _report_call_site_names(sig: CallableType, ctx: FunctionSigContext | MethodS
                     )
     except Exception:
         _swallowed(ctx, "_report_call_site_names")
+
+
+def _index_formal_recorded(ann: object | None) -> int | str | None:
+    """The recorded size spelled in an Index[...] formal, else None.
+
+    Bare names stay strings (compared by name: the callee's scope is
+    not available here); ints stay ints (always silent at a call);
+    linear forms and anything computed stay silent. Never raises.
+    """
+    try:
+        if ann is None:
+            return None
+        name = getattr(ann, "name", None)
+        if not isinstance(name, str):
+            return None
+        if name != "Index" and not name.endswith(".Index"):
+            return None
+        args = getattr(ann, "args", ()) or ()
+        if not args:
+            return None
+        first = args[0]
+        if type(first).__name__ == "UnboundType":
+            sub = getattr(first, "args", ()) or ()
+            fname = getattr(first, "name", None)
+            if sub or not isinstance(fname, str):
+                return None
+            return fname if fname.isidentifier() else None
+        if isinstance(first, bool):
+            return None
+        if isinstance(first, int):
+            return first
+        return None
+    except Exception:
+        _swallowed(None, "_index_formal_recorded")
+        return None
+
+
+def _report_index_call_site(sig: CallableType, ctx: FunctionSigContext) -> None:
+    """Opt-in positions check at a call (issues #285/#286).
+
+    An actual recorded as positions on one size passed where the
+    formal declares `Index` on another is reportable: `read(m,
+    m.argmin(axis=0))` is silent where `read` expects positions on P,
+    while `read(m, np.argsort(t))` (positions on N) is an error with
+    the opt-in code. Same-module plain functions only (the formal's
+    annotation is read off the callee's own node); methods,
+    cross-module calls, overloads and keyword arguments stay silent.
+    Ints on either side stay silent. Never raises.
+    """
+    try:
+        from mypy.types import TypeVarType as _TVT
+
+        if not _names_enabled(ctx):
+            return
+        call = ctx.context
+        if not isinstance(call, CallExpr):
+            return
+        callee = getattr(call, "callee", None)
+        if not isinstance(callee, NameExpr):
+            return
+        node = getattr(callee, "node", None)
+        if type(node).__name__ != "FuncDef":
+            return
+        tree = getattr(ctx.api, "tree", None)
+        module = getattr(tree, "fullname", "") or ""
+        if not module:
+            return
+        callee_full = getattr(node, "fullname", "") or ""
+        if not callee_full.startswith(module + "."):
+            return
+        formals = getattr(node, "arguments", []) or []
+        if not formals:
+            return
+        if not any(
+            isinstance(getattr(f, "type_annotation", None), object)
+            and getattr(getattr(f, "type_annotation", None), "name", "") in ("Index",)
+            or (
+                isinstance(getattr(getattr(f, "type_annotation", None), "name", ""), str)
+                and getattr(getattr(f, "type_annotation", None), "name", "").endswith(".Index")
+            )
+            for f in formals
+        ):
+            return
+        kinds = list(getattr(call, "arg_kinds", None) or [])
+        args = getattr(ctx, "args", None) or []
+        for i, formal in enumerate(formals):
+            if i >= len(args) or i >= len(kinds):
+                break
+            if kinds[i] != ARG_POS or len(args[i]) != 1:
+                continue
+            formal_rec = _index_formal_recorded(getattr(formal, "type_annotation", None))
+            if formal_rec is None or isinstance(formal_rec, bool):
+                continue
+            if isinstance(formal_rec, int):
+                continue
+            actual_expr = args[i][0]
+            try:
+                actual_tp = ctx.api.get_expression_type(actual_expr)
+            except Exception:
+                _swallowed(ctx, "_report_index_call_site")
+                continue
+            parts = _ndarray_parts(actual_tp)
+            if parts is None or len(parts[0]) != 1:
+                continue
+            actual_rec = _recorded_for_operand(
+                ctx,
+                module,
+                None,
+                actual_expr,
+                list(parts[0]),
+            )
+
+            if actual_rec is None or isinstance(actual_rec, bool):
+                continue
+            if isinstance(actual_rec, int):
+                continue
+            if isinstance(actual_rec, str):
+                aname: str | None = actual_rec if actual_rec.isidentifier() else None
+            elif isinstance(actual_rec, _TVT):
+                aname = actual_rec.name
+            else:
+                continue
+            if not aname or aname == formal_rec:
+                continue
+            argname = getattr(getattr(formal, "variable", None), "name", None) or "?"
+            try:
+                ctx.api.fail(
+                    f"index positions on argument '{argname}': "
+                    f"{aname} and {formal_rec} are different names",
+                    ctx.context,
+                    code=NUMTY_NAMES,
+                )
+            except Exception:
+                _swallowed(ctx, "_report_index_call_site")
+                return
+    except Exception:
+        _swallowed(ctx, "_report_index_call_site")
 
 
 def minmax_function_hook(ctx: FunctionContext) -> Type:
