@@ -39,8 +39,10 @@ of a file gives `?U@7` and `?U@7b` (numpy: `(4,)` and `(3,)` for
 One count per mask variable (issue #288): the same mask variable in
 the same function reuses one unknown, so `ids[keep]` and `d[0, keep]`
 share `?U` and their sum stays clean
-(`tests/fixtures/mask_count_ok.py`). Different variables mint
-different unknowns; a variable rebound between uses, a mask from a
+(`tests/fixtures/mask_count_ok.py`). `np.flatnonzero(keep)` holds one entry per True
+of `keep`, so it has that count too, and so has what is taken or
+reduced with it (`np.fmax.reduceat(x, np.flatnonzero(keep))`). Different
+variables mint different unknowns; a variable rebound between uses, a mask from a
 different scope, and an inline mask (`x[x > 0]`, `flatnonzero`, chained
 selections) mint fresh each time — best-effort flow-insensitive
 tracking (same `Name` in the same function, bail on reassignment).
@@ -149,6 +151,14 @@ np.zeros((0,))` against `F64[N]` stays a `[return-value]` error
 returned where `F64[N]` is declared is still rejected,
 `tests/fixtures/bad_mask_ts.py`) and a named size against another named
 size.
+
+The same holds at an annotated local: `out: F64[S, C] =
+np.full((len(steps), len(channels)), np.nan)` is accepted, the `int`
+taking the declared name. The annotation is the author's word for a
+size numty does not follow, as a declared return is. Only a plain `int`
+on an axis declared with a name is taken: a literal, a selection count
+and an axis declared with a literal are still `[assignment]` errors
+(`tests/fixtures/local_name_flatnonzero.py`, `tests/fixtures/bad_local_name.py`).
 
 One case keeps its `int`: a result with a named size on the wrong axis.
 `int` fits a declared name and a name fits a declared `int`, so without

@@ -4968,8 +4968,9 @@ def test_coverage_batch() -> None:
         19: f'"{_ND}[tuple[int, N], {_F64}]"',
         20: f'"{_ND}[tuple[int, int], {_F64}]"',
         21: f'"list[{_ND}[tuple[?U@21b], {_I64}]]"',
-        22: f'"list[{_ND}[tuple[?U@22b], {_I64}]]"',
-        23: f'"{_ND}[tuple[?U@23], {_F32}]"',
+        22: f'"list[{_ND}[tuple[?U@22], {_I64}]]"',
+        # one entry per True of `alive`: the count minted on line 21
+        23: f'"{_ND}[tuple[?U@21], {_F32}]"',
         24: f'"{_ND}[tuple[N], {_F32}]"',
         25: f'"{_ND}[tuple[N], {_F64}]"',
         26: f'"{_ND}[tuple[N], {_F32}]"',
@@ -5220,6 +5221,37 @@ def test_bad_own_size_optin() -> None:
         assert len(errors[line]) == 1, on.stdout
         assert errors[line][0].endswith("[numty-names]"), on.stdout
     assert _run_fixture("bad_own_size_optin.py") == ["(3, 4)"]
+
+
+def test_local_name_and_flatnonzero_count() -> None:
+    # An `int` size fits a declared name at an annotated local, as at a
+    # `return`, and `np.flatnonzero(mask)` has the count of the mask
+    # variable. Silent by default; the opt-in reports the two mistakes.
+    fixture = FIXTURES / "local_name_flatnonzero.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    notes = reveals_by_line(off)
+    assert notes[20] == f'"numpy.ndarray[tuple[S, C], {_F64}]"', off.stdout
+    assert notes[33] == f'"numpy.ndarray[tuple[?U@30], {_I64}]"', off.stdout
+    assert notes[34] == f'"numpy.ndarray[tuple[?U@30], {_F64}]"', off.stdout
+    assert notes[35] == f'"numpy.ndarray[tuple[?U@30], {_F64}]"', off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [23, 38], on.stdout
+    assert "?U@21 and C are different names" in errors[23][0], on.stdout
+    assert "?U@30 and F are different names" in errors[38][0], on.stdout
+    assert _run_fixture("local_name_flatnonzero.py") == ["(2, 3)", "(5,)"]
+
+
+def test_bad_local_name() -> None:
+    # The annotation of a local takes an `int` size only: a literal, a
+    # selection count, a transposed value and an axis declared with a
+    # literal are still refused.
+    result = run_mypy(FIXTURES / "bad_local_name.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 15, 16, 17], result.stdout
+    for line in errors:
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[assignment]"), result.stdout
 
 
 def test_numba_dispatcher_call() -> None:

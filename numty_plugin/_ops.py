@@ -1146,14 +1146,14 @@ def array_split_function_hook(ctx: FunctionContext) -> Type:
 
 
 def _select_index_elem(
-    ctx: FunctionContext, op: str, index: int
+    ctx: FunctionContext, op: str, index: int, count: Type | None = None
 ) -> Type | None:
-    """A 1-d int64 ?U index array, else None to bail."""
+    """A 1-d int64 ?U index array (of `count` entries when given), else None to bail."""
     from numty_plugin import _fresh_unknown
     dtype = _construct_dtype(ctx, "numpy.int64")
     if dtype is None:
         return None
-    return _ndarray_type(ctx, [_fresh_unknown(ctx, op, index)], dtype)
+    return _ndarray_type(ctx, [count if count is not None else _fresh_unknown(ctx, op, index)], dtype)
 
 
 def _record_flat_positions(
@@ -1284,7 +1284,8 @@ def count_nonzero_function_hook(ctx: FunctionContext) -> Type:
     return ctx.default_return_type
 
 
-def flatnonzero_function_hook(ctx: FunctionContext) -> Type:
+def flatnonzero_function_hook(ctx: FunctionContext, count: Type | None = None) -> Type:
+    """`count`: the size to give the result (the count of a mask variable, see `_indexing`)."""
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1292,7 +1293,7 @@ def flatnonzero_function_hook(ctx: FunctionContext) -> Type:
     if parts is None:
         return ctx.default_return_type
     dims, _ = parts
-    elem = _select_index_elem(ctx, "flatnonzero", 0)
+    elem = _select_index_elem(ctx, "flatnonzero", 0, count)
     if elem is None:
         return ctx.default_return_type
     if len(dims) == 1:

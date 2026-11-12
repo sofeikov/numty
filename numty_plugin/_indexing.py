@@ -22,6 +22,7 @@ from ._heads import (
     _index_record_exact, _index_recorded_exceeds, _recorded_at_site, _recorded_index_on,
 )
 from ._unknowns import _fresh_mask_count
+from ._ops import flatnonzero_function_hook
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _known_rank_parts, _movable_parts,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
@@ -50,7 +51,7 @@ from ._types import (
 
 
 def _enclosing_func(
-    ctx: MethodContext | FunctionSigContext,
+    ctx: MethodContext | FunctionSigContext | FunctionContext,
     use_line: int,
 ) -> tuple[str, object | None]:
     """Innermost function containing `use_line`: (fullname, node).
@@ -376,7 +377,7 @@ def _recorded_for_operand(
             return None
 
 
-def _mask_var_key(ctx: MethodContext, mask_expr: Expression | None) -> str | None:
+def _mask_var_key(ctx: MethodContext | FunctionContext, mask_expr: Expression | None) -> str | None:
     """Stable key for a mask variable use, else None to mint per site (issue #288).
 
     Same `Name` in the same function (module::func::name), not rebound
@@ -422,6 +423,30 @@ def _mask_count_for(ctx: MethodContext, mask_expr: Expression | None, dim: int) 
     except Exception:
         _swallowed(ctx, "_mask_count_for")
         return _fresh_unknown(ctx, "mask", dim)
+
+
+def flatnonzero_mask_hook(ctx: FunctionContext) -> Type:
+    """`np.flatnonzero(mask)` of a boolean mask variable has the count of that mask.
+
+    `x[keep]` and `np.flatnonzero(keep)` hold one entry per True of
+    `keep`, so they share the unknown of the variable (issue #288), and
+    under the opt-in code the positions are a size of their own against
+    a name. Any other argument (an expression, a non-boolean array, a
+    variable bound twice) gives a fresh unknown, as before.
+    """
+    count: Type | None = None
+    try:
+        if ctx.args and ctx.args[0] and ctx.arg_types and ctx.arg_types[0]:
+            expr = ctx.args[0][0]
+            parts = _ndarray_parts(ctx.arg_types[0][0])
+            if isinstance(expr, NameExpr) and parts is not None and _dtype_base(parts[1]) == "b":
+                key = _mask_var_key(ctx, expr)
+                if key is not None:
+                    count = _fresh_mask_count(ctx, key)
+    except Exception:
+        _swallowed(ctx, "flatnonzero_mask_hook")
+        count = None
+    return flatnonzero_function_hook(ctx, count)
 
 
 def _take_indices(
