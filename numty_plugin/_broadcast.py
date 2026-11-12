@@ -20,9 +20,10 @@ from ._dtypes import (
 from ._types import (
     DTYPE_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int, _has_unpack,
     _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _shape_from_arg, _split_flat,
+    _union_members,
 )
 from ._reshape import (
-    _all_positionals, _all_positionals_expanded, _bool_value, _dims_str,
+    _all_positionals, _all_positionals_expanded, _bool_value, _datetime_kind, _dims_str,
     _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _known_rank_parts,
     _scalar_key, _weak_name,
 )
@@ -63,8 +64,8 @@ from ._linalg import (
     _dtype_base, _kind_of,
 )
 from ._broadcast_core import (
-    _fallback_dtype, _merge_unpack_dims, _solve_broadcast, _whole_shape_operands, _whole_shape_type,
-    _whole_shape_var,
+    _fallback_dtype, _loose_dtype_name, _merge_unpack_dims, _solve_broadcast, _whole_shape_operands,
+    _whole_shape_type, _whole_shape_var,
 )
 
 def _broadcast_result(
@@ -111,12 +112,49 @@ def _broadcast_result(
     return [*prefix, *reversed(out)], None
 
 
+_BITWISE_UFUNC = {
+    "&": "bitwise_and", "|": "bitwise_or", "^": "bitwise_xor", "<<": "left_shift", ">>": "right_shift",
+}
+
+
+def _bitwise_no_loop(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> bool:
+    """Report a bitwise operator on integer arrays with no common integer type.
+
+    Issue #267: int64 with uint64 promotes to float64, and the bitwise
+    ufuncs have no float loop, so numpy raises TypeError. numty gave the
+    result the dtype float64.
+    """
+    op = ctx.context.op if isinstance(ctx.context, OpExpr) else None
+    if op not in _BITWISE_UFUNC:
+        return False
+    a, b = _parts_or_unpack(left), _parts_or_unpack(right)
+    if a is None or b is None:
+        return False
+    name_a, name_b = _loose_dtype_name(a[1]), _loose_dtype_name(b[1])
+    if name_a is None or name_b is None:
+        return False
+    if _kind_of(name_a) not in ("i", "u") or _kind_of(name_b) not in ("i", "u"):
+        return False
+    promoted = name_a if name_a == name_b else _promote_strong(name_a, name_b)
+    if promoted is None or _kind_of(promoted) != "f":
+        return False
+    ctx.api.fail(
+        f"ufunc '{_BITWISE_UFUNC[op]}' not supported for {name_a.rsplit('.', 1)[-1]} with "
+        f"{name_b.rsplit('.', 1)[-1]}: they have no common integer type",
+        ctx.context,
+        code=NUMTY_BROADCAST,
+    )
+    return True
+
+
 def broadcast_method_hook(ctx: MethodContext, op: str | None = None) -> Type:
     # Never replace a stub Never (no loop) with a valid array (issue #61).
     if isinstance(get_proper_type(ctx.default_return_type), UninhabitedType):
         return ctx.default_return_type
     args = _positional_actuals(ctx, 1)
     if args is None:
+        return ctx.default_return_type
+    if _bitwise_no_loop(ctx, ctx.type, args[0]):
         return ctx.default_return_type
     return _solve_broadcast(ctx, ctx.type, args[0], op)
 
@@ -163,6 +201,20 @@ def floordiv_mod_pow_method_hook(ctx: MethodContext) -> Type:
                     code=NUMTY_BROADCAST,
                 )
                 return ctx.default_return_type
+    if isinstance(ctx.context, OpExpr) and ctx.context.op == "//":
+        # timedelta64 // timedelta64 is int64, not timedelta64 (issue #267).
+        td_a, td_b = _parts_or_unpack(ctx.type), _parts_or_unpack(arg)
+        if (
+            td_a is not None
+            and td_b is not None
+            and _datetime_kind(td_a[1]) == "m"
+            and _datetime_kind(td_b[1]) == "m"
+        ):
+            dims = _broadcast_dims(ctx, ctx.type, arg)
+            int64 = _construct_dtype(ctx, "numpy.int64")
+            if dims is None or int64 is None:
+                return ctx.default_return_type
+            return _ndarray_type(ctx, dims, int64)
     squared = (
         isinstance(ctx.context, OpExpr)
         and ctx.context.op == "**"
@@ -233,7 +285,6 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
     Scalars, unpack shapes and unprovable symbolic dims bail silently,
     keeping the stubs' dtype checking and Self return.
     """
-    from numty_plugin import _broadcast_result
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
@@ -243,16 +294,42 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
     lhs_dims, _ = lhs
     if _scalar_key(args[0]) is not None:
         return ctx.default_return_type
+    members = _union_members(args[0])
+    if members is not None:
+        # Issue #263: a union of arrays on the right. An error when no
+        # member fits the target; a dry run, so no unknown is made.
+        first: str | None = None
+        for member in members:
+            part = _ndarray_parts(member)
+            if part is None:
+                return ctx.default_return_type
+            message = _inplace_message(lhs_dims, part[0], None)
+            if message is None:
+                return ctx.default_return_type
+            if first is None:
+                first = message
+        if first is not None:
+            ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
+        return ctx.default_return_type
     rhs = _ndarray_parts(args[0])
     if rhs is None:
         return ctx.default_return_type
-    rhs_dims, _ = rhs
-    dims, message = _broadcast_result(lhs_dims, rhs_dims, ctx)
+    message = _inplace_message(lhs_dims, rhs[0], ctx)
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
-        return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def _inplace_message(
+    lhs_dims: list[int | Type], rhs_dims: list[int | Type], ctx: MethodContext | None
+) -> str | None:
+    """The error of `lhs <op>= rhs` for two known shapes, else None."""
+    from numty_plugin import _broadcast_result
+    dims, message = _broadcast_result(lhs_dims, rhs_dims, ctx)
+    if message is not None:
+        return message
     if dims is None:
-        return ctx.default_return_type
+        return None
     if len(dims) != len(lhs_dims) or any(
         not _dim_eq(d, l) for d, l in zip(dims, lhs_dims)
     ):
@@ -263,13 +340,8 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
             isinstance(d, int) and isinstance(l, int) and d != l
             for d, l in zip(dims, lhs_dims)
         ):
-            ctx.api.fail(
-                f"in-place result {_dims_str(dims)} does not fit "
-                f"target {_dims_str(lhs_dims)}",
-                ctx.context,
-                code=NUMTY_BROADCAST,
-            )
-    return ctx.default_return_type
+            return f"in-place result {_dims_str(dims)} does not fit target {_dims_str(lhs_dims)}"
+    return None
 
 
 def _broadcast_dims_unpack(
@@ -392,6 +464,8 @@ def _logical_types(ctx: FunctionContext | MethodContext, left: Type, right: Type
     other = _parts_or_unpack(right)
     if other is not None:
         if _dtype_base(other[1]) not in ("b", "i", "u"):
+            return ctx.default_return_type
+        if _bitwise_no_loop(ctx, left, right):
             return ctx.default_return_type
         # Bool pairs keep bool out; int pairs promote like add.
         if base == "b" and _dtype_base(other[1]) == "b":

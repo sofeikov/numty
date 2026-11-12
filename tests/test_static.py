@@ -485,8 +485,7 @@ def test_stack_shape_mismatch() -> None:
         run_mypy(FIXTURES / "bad_stack_shape.py"),
         "stack dimension 0 differs: 2 vs 3",
         "(2, 3)",
-        "(3, 2)",
-        "axis 0",
+        "(3, 2))  [numty-shape]",
     )
 
 
@@ -1233,7 +1232,8 @@ def test_abstract_dtype_promotion() -> None:
     assert notes[35] == f'"numpy.ndarray[_S, {f64}]"', result.stdout
     assert "signedinteger[numpy._typing._nbit_base._64Bit]" in notes[36], result.stdout
     assert "_32Bit | numpy._typing._nbit_base._64Bit" in notes[37], result.stdout
-    assert "numpy.integer[Any]" in notes[38], result.stdout
+    # Issue 267: two np.integer operands can be int64 with uint64 (float64).
+    assert notes[38] == '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"', result.stdout
     # A TypeVar dtype: kept with Python scalars and with itself.
     assert notes[66] == '"numpy.ndarray[tuple[N], numpy.dtype[ST]]"', result.stdout
     assert notes[67] == '"numpy.ndarray[tuple[N], numpy.dtype[ST]]"', result.stdout
@@ -1242,7 +1242,8 @@ def test_abstract_dtype_promotion() -> None:
     td = '"numpy.ndarray[tuple[N], numpy.dtype[numpy.timedelta64[Any]]]"'
     for line in (72, 73, 74, 75):
         assert notes[line] == td, result.stdout
-    assert notes[76] == '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"', result.stdout
+    # Issue 267: timedelta64 / timedelta64 is float64.
+    assert notes[76] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.float64]]"', result.stdout
     for line in (77, 78, 79):
         assert notes[line] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.object_]]"', result.stdout
     assert notes[80] == '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"', result.stdout
@@ -2701,7 +2702,8 @@ def test_provable_linear_mismatch() -> None:
     assert "matmul inner dimensions disagree: N vs N+2" in errors[1], result.stdout
     assert "stack dimension 0 differs: N+2 vs N" in errors[2], result.stdout
     assert "(N+2,)" in errors[2] and "(N,)" in errors[2], result.stdout
-    assert "axis 0" in errors[2], result.stdout
+    # Issue 266: the stack axis is not in the message.
+    assert "axis 0" not in errors[2], result.stdout
 
 
 def test_comprehension_unknown_bails_not_false_proof() -> None:
@@ -4353,7 +4355,8 @@ def test_stack_error_names_the_provable_axis() -> None:
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 1, result.stdout
     assert ":7:" in errors[0], result.stdout
-    assert "stack dimension 1 differs: 3 vs 4 (shapes (?, 3) vs (?, 4); axis 0)" in errors[0], (
+    # Issue 266: without the stack axis, the form of the concatenate message.
+    assert "stack dimension 1 differs: 3 vs 4 (shapes (?, 3) vs (?, 4))  [numty-shape]" in errors[0], (
         result.stdout
     )
     notes = reveals_by_line(result)
@@ -4376,8 +4379,9 @@ def test_union_operator_broadcast_mismatch() -> None:
         assert "[numty-broadcast]" in by_line[line][0], result.stdout
         assert "N-1 vs N (shapes (N-1,) vs (N,))" in by_line[line][0], result.stdout
     assert "true_divide shapes disagree" in by_line[21][0], result.stdout
-    assert len(by_line[29]) == 2, result.stdout
-    assert "3 vs 5" in by_line[29][0] and "4 vs 5" in by_line[29][1], result.stdout
+    # Issue 265: one error for the line, for the first member that fits none.
+    assert len(by_line[29]) == 1, result.stdout
+    assert "3 vs 5" in by_line[29][0], result.stdout
 
 
 def test_union_operator_no_false_error() -> None:
@@ -4460,3 +4464,111 @@ def test_any_dim_keeps_rank_outside_broadcast() -> None:
     assert notes[23] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
     assert notes[24] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
     assert notes[26] == f'"numpy.ndarray[tuple[int], {intp}]"', result.stdout
+
+
+def _errors_by_line(result: "subprocess.CompletedProcess[str]") -> dict[int, list[str]]:
+    out: dict[int, list[str]] = {}
+    for text in result.stdout.splitlines():
+        if ": error:" in text:
+            out.setdefault(int(text.split(":")[1]), []).append(text)
+    return out
+
+
+def test_union_matmul() -> None:
+    # Issue 261: `@` with an array union as an operand is checked by the
+    # matmul rule and solved, with one error and no [operator] error.
+    result = run_mypy(FIXTURES / "bad_union_matmul.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [12, 13, 17], result.stdout
+    for line, pair in ((12, "N-1 vs N"), (13, "N vs N-1"), (17, "N vs N-1")):
+        assert len(errors[line]) == 1, result.stdout
+        assert f"matmul inner dimensions disagree: {pair}  [numty-shape]" in errors[line][0], result.stdout
+    notes = reveals_by_line(result)
+    assert notes[14] == '"numpy.float64"', result.stdout
+    assert notes[15] == '"numpy.ndarray[tuple[M], numpy.dtype[numpy.float64]]"', result.stdout
+    assert notes[16] == '"numpy.ndarray[tuple[M], numpy.dtype[numpy.float64]]"', result.stdout
+
+
+def test_union_chained_comparison() -> None:
+    # Issue 262: each pair of a chained comparison is checked and solved.
+    result = run_mypy(FIXTURES / "bad_union_chained_comparison.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [12, 13, 15], result.stdout
+    for line in (12, 13, 15):
+        assert len(errors[line]) == 1, result.stdout
+        assert "N-1 vs N (shapes (N-1,) vs (N,))  [numty-broadcast]" in errors[line][0], result.stdout
+    notes = reveals_by_line(result)
+    assert notes[14] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.bool[bool]]]"', result.stdout
+
+
+def test_union_inplace() -> None:
+    # Issue 263: an in-place operator with an array union on the right is
+    # an error when no member fits the target.
+    result = run_mypy(FIXTURES / "bad_union_inplace.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [13, 14, 16, 18], result.stdout
+    for line in (13, 14, 16, 18):
+        assert len(errors[line]) == 1, result.stdout
+        assert "[numty-broadcast]" in errors[line][0], result.stdout
+
+
+def test_unpack_shape_mismatch_has_one_error() -> None:
+    # Issue 264: a mismatch between Unpack[Ts] shapes has no [operator] error.
+    result = run_mypy(FIXTURES / "bad_unpack_operator.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [18, 19, 20, 21], result.stdout
+    for line, pair in ((18, "4 vs 3"), (19, "4 vs 3"), (20, "3 vs 4"), (21, "4 vs 3")):
+        assert len(errors[line]) == 1, result.stdout
+        assert pair in errors[line][0] and "[numty-broadcast]" in errors[line][0], result.stdout
+
+
+def test_union_operator_one_error_per_line() -> None:
+    # Issue 265: one error for the first member of the left operand that
+    # fits no member of the right operand.
+    result = run_mypy(FIXTURES / "bad_union_one_error.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [16, 17, 18], result.stdout
+    for line, pair in ((16, "3 vs 5"), (17, "4 vs 3"), (18, "3 vs 5")):
+        assert len(errors[line]) == 1, result.stdout
+        assert f": {pair} (shapes" in errors[line][0], result.stdout
+
+
+def test_stack_messages_have_no_axis_suffix() -> None:
+    # Issue 266: the `axis` argument has no effect on a stack mismatch.
+    result = run_mypy(FIXTURES / "bad_stack_axis_suffix.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [7, 8], result.stdout
+    assert "stack dimension 1 differs: 3 vs 4 (shapes (2, 3) vs (2, 4))  [numty-shape]" in errors[7][0], (
+        result.stdout
+    )
+    assert "stack ranks differ: (2, 3), (2, 3, 1)  [numty-shape]" in errors[8][0], result.stdout
+
+
+def test_integer_timedelta_bitwise_dtypes() -> None:
+    # Issue 267: two np.integer operands have no known dtype; timedelta64
+    # divides to int64 (//) and float64 (/); a bitwise operator on integer
+    # arrays with no common integer type is an error.
+    result = run_mypy(FIXTURES / "bad_integer_timedelta_bitwise.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [19, 20, 21, 22, 23, 24], result.stdout
+    names = ("bitwise_and", "bitwise_and", "bitwise_or", "bitwise_xor", "left_shift", "right_shift")
+    for line, name in zip((19, 20, 21, 22, 23, 24), names):
+        assert len(errors[line]) == 1, result.stdout
+        assert f"ufunc '{name}' not supported for int64 with uint64" in errors[line][0], result.stdout
+        assert "[numty-broadcast]" in errors[line][0], result.stdout
+    notes = reveals_by_line(result)
+    nb = "numpy._typing._nbit_base."
+    assert notes[15] == '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"', result.stdout
+    assert notes[16] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.float64]]"', result.stdout
+    assert notes[17] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.signedinteger[{nb}_64Bit]]]"', result.stdout
+    assert notes[18] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.float64]]"', result.stdout
+    # A common integer type exists: no error.
+    assert notes[25] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.signedinteger[{nb}_64Bit]]]"', result.stdout
+    assert notes[26] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.unsignedinteger[{nb}_64Bit]]]"', result.stdout

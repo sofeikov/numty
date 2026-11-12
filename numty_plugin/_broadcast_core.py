@@ -89,6 +89,15 @@ def _is_object_dtype(dtype: Type) -> bool:
     return isinstance(element, Instance) and element.type.fullname == "numpy.object_"
 
 
+def _is_bare_integer(dtype: Type) -> bool:
+    """dtype[np.integer]: the signedness and the width are unknown."""
+    proper = get_proper_type(dtype)
+    if not (isinstance(proper, Instance) and proper.args):
+        return False
+    inner = get_proper_type(proper.args[0])
+    return isinstance(inner, Instance) and inner.type.fullname == "numpy.integer"
+
+
 def _is_abstract_floating(dtype: Type) -> bool:
     """dtype[floating[Any]]: a float dtype with no known width."""
     proper = get_proper_type(dtype)
@@ -185,6 +194,10 @@ def _fallback_dtype(
             # td * f64), and datetime64 + int stays datetime64. Two
             # timedelta64 operands divide to float64.
             if true_div and len(other) > 1:
+                # Two timedelta64 operands divide to float64 (issue #267).
+                if not strong and not weak and all(_datetime_kind(d) == "m" for d in other):
+                    built = _construct_dtype(ctx, "numpy.float64")
+                    return built if built is not None else any_dtype
                 return any_dtype
             if all(_KIND_RANK[kind] <= 2 for kind, _, _ in strong):
                 return other[0]
@@ -273,8 +286,9 @@ def _fallback_dtype(
             return top_dtypes[0]
         return any_dtype
     # Integer (signedness may be unknown) or bool on top: only identical
-    # dtypes have a known result.
-    if same:
+    # dtypes have a known result. Two `np.integer` operands are not
+    # identical dtypes (issue #267): int64 with uint64 is float64.
+    if same and (len(tops) == 1 or not _is_bare_integer(top_dtypes[0])):
         return top_dtypes[0]
     return any_dtype
 

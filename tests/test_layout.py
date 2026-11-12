@@ -462,6 +462,7 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
         "_state",
         "_trace",
         "_types",
+        "_unions",
         "_unknowns",
     }
     assert expected.issubset(eager), f"missing eager imports: {expected - eager}"
@@ -509,6 +510,7 @@ _LAYERS = (
     "_broadcast",
     "_fft",
     "_indexing",
+    "_unions",
     "_hooks",
 )
 

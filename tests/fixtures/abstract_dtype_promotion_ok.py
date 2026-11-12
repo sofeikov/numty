@@ -35,7 +35,7 @@ def show(
     reveal_type(b * 0.5)  # _S, float64
     reveal_type(p - j)  # line 36: int64
     reveal_type(p + 1)  # intp, the operand's own spelling
-    reveal_type(i + i)  # integer
+    reveal_type(i + i)  # dtype[Any]: np.integer can be int64 with uint64 (issue 267)
     reveal_type(g + x)  # floating
 
 
@@ -73,7 +73,7 @@ def other_kinds(td: Td[N], ob: Ob[N], x: F64[N], i: Int[N], g: Fl[N], c: C128[N]
     reveal_type(x * td)  # timedelta64
     reveal_type(i * td)  # timedelta64
     reveal_type(td / 2.0)  # timedelta64
-    reveal_type(td / td)  # line 76: dtype[Any] (numpy: float64)
+    reveal_type(td / td)  # line 76: float64 (issue 267)
     reveal_type(ob + 1)  # line 77: object_
     reveal_type(x + ob)  # object_
     reveal_type(np.where(m, x, ob))  # object_
