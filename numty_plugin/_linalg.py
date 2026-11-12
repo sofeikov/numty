@@ -1267,11 +1267,18 @@ def _string_value(tp: Type) -> str | None:
 
 
 def _scalar_of_dtype(dtype: Type) -> Type | None:
-    """The numpy scalar Instance carried by a dtype[...], else None."""
+    """The element type of a dtype[...], else None.
+
+    This is the numpy scalar Instance of the dtype. For `object_` it is
+    `Any`: an element of an object array is the Python object that the
+    array holds, not an `np.object_` (issue #250, as in the numpy stubs).
+    """
     proper = get_proper_type(dtype)
     if isinstance(proper, Instance) and proper.args:
         inner = get_proper_type(proper.args[0])
         if isinstance(inner, Instance):
+            if inner.type.fullname == "numpy.object_":
+                return AnyType(TypeOfAny.implementation_artifact)
             return inner
     return None
 

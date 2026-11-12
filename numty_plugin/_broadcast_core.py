@@ -19,7 +19,7 @@ from ._types import (
     _ndarray_parts, _ndarray_type, _unpack_shape,
 )
 from ._reshape import (
-    _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _movable_int_parts, _promote_dtypes,
+    _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _known_rank_parts, _promote_dtypes,
     _scalar_key,
 )
 from ._builders import _default_dtype, _scalar_ret_name
@@ -578,14 +578,14 @@ def _broadcast_types(
     b = _ndarray_parts(right)
     if a is None or b is None:
         # Issues #227/#229: int dims (F64[int], F64[int, 3]) keep rank via
-        # _movable_int_parts (plain-int dims, no Any): solve with ctx so
-        # unprovable pairs mint ?U instead of bailing to Any, while
-        # provable clashes still fail loudly. Anything without a plain-int
-        # dim (Any shapes, unpacks) keeps today's bail behavior.
+        # _known_rank_parts: solve with ctx so unprovable pairs mint ?U
+        # instead of bailing to Any, while provable clashes still fail
+        # loudly. Issue #249: an `Any` dim (tuple[Any]) keeps the rank in
+        # the same way. Shapes of unknown rank and unpacks bail as before.
         from numty_plugin import _broadcast_result as _br
 
-        ma = _movable_int_parts(left) if a is None else None
-        mb = _movable_int_parts(right) if b is None else None
+        ma = _known_rank_parts(left) if a is None else None
+        mb = _known_rank_parts(right) if b is None else None
         aa = ma if ma is not None else a
         bb = mb if mb is not None else b
         if aa is not None and bb is not None:

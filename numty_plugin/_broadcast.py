@@ -23,7 +23,7 @@ from ._types import (
 )
 from ._reshape import (
     _all_positionals, _all_positionals_expanded, _bool_value, _dims_str,
-    _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _movable_int_parts,
+    _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _known_rank_parts, _movable_int_parts,
     _scalar_key, _weak_name,
 )
 from ._builders import (
@@ -315,9 +315,9 @@ def _broadcast_dims(
     a = _ndarray_parts(left)
     b = _ndarray_parts(right)
     if a is None:
-        a = _movable_int_parts(left)
+        a = _known_rank_parts(left)
     if b is None:
-        b = _movable_int_parts(right)
+        b = _known_rank_parts(right)
     if a is None or b is None:
         return _broadcast_dims_unpack(ctx, left, right, a, b)
     dims_a, _ = a

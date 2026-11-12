@@ -10,7 +10,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from mypy.nodes import (
-    ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo,
+    ARG_POS, CallExpr, ComparisonExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo,
     TypeVarLikeExpr,
 )
 from mypy.plugin import (
@@ -611,6 +611,8 @@ class NumtyPlugin(Plugin):
             return len_function_hook
         if fullname == "builtins.divmod":
             return divmod_function_hook
+        if fullname.endswith(" of ndarray") and fullname[:-11] in _REFLECTED_BROADCAST:
+            return partial(_union_reflected_hook, name=fullname[:-11])
         # Raw np.matmul solves through the ufunc __call__ hook; the
         # numty.matmul wrapper below stays as a convenience alias.
         if fullname == "numty.matmul":
@@ -649,6 +651,9 @@ class NumtyPlugin(Plugin):
         return substituted_attribute_hook
 
     def _method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
+        if fullname.endswith(" of ndarray") and fullname[:-11] in _REFLECTED_BROADCAST:
+            # Issue #252: a reflected operator on a union of arrays.
+            return partial(_union_reflected_hook, name=fullname[:-11])
         if fullname == "numpy.ndarray.__matmul__":
             return matmul_method_hook
         if fullname == "numpy.ndarray.__rmatmul__":
@@ -896,6 +901,75 @@ def _reshape_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         return ctx.default_signature
 
 
+# Operator symbol for each reflected method that mypy calls on the right
+# operand: `a - b` is `b.__rsub__(a)`, `a < b` is `b.__gt__(a)`.
+_REFLECTED_BROADCAST = {
+    "__radd__": ("+",), "__rsub__": ("-",), "__rmul__": ("*",), "__rtruediv__": ("/",),
+    "__rfloordiv__": ("//",), "__rmod__": ("%",), "__rpow__": ("**",), "__rand__": ("&",),
+    "__ror__": ("|",), "__rxor__": ("^",), "__rlshift__": ("<<",), "__rrshift__": (">>",),
+    "__eq__": ("==",), "__ne__": ("!=",), "__gt__": ("<",), "__ge__": ("<=",),
+    "__lt__": (">",), "__le__": (">=",),
+}
+
+
+def _union_reflected_hook(ctx: FunctionContext | MethodContext, name: str) -> Type:
+    """Broadcast check for an operator whose right operand is an array union.
+
+    Issue #252. For `a - u` with `u` a union of arrays, mypy calls the
+    reflected method on the union first (`u.__rsub__(a)`), because the
+    union covers the type of `a` at runtime. A call on a union has no
+    object type, so no method hook and no signature hook runs, and the
+    stubs accept the call: a provable mismatch gave no error. The only
+    hook that mypy asks for has the name "__rsub__ of ndarray": a function
+    hook for most operators, a method hook for `/` and the comparisons.
+
+    This hook reports the mismatch when the left operand cannot broadcast
+    with any member of the union. mypy then checks each pair of members,
+    where the method hooks run as usual. A left operand that fits one
+    member is not reported: the members of two unions can be paired
+    (the same union on both sides).
+    """
+    from numty_plugin import _broadcast_result
+    try:
+        call = ctx.context
+        right: Expression | None = None
+        if isinstance(call, OpExpr) and call.op in _REFLECTED_BROADCAST[name]:
+            right = call.right
+        elif (
+            isinstance(call, ComparisonExpr)
+            and len(call.operators) == 1
+            and call.operators[0] in _REFLECTED_BROADCAST[name]
+        ):
+            right = call.operands[1]
+        if right is None or not ctx.arg_types or len(ctx.arg_types[0]) != 1:
+            return ctx.default_return_type
+        members = _union_members(ctx.api.get_expression_type(right))
+        if members is None:
+            return ctx.default_return_type
+        left = _ndarray_parts(ctx.arg_types[0][0]) or _movable_parts(ctx.arg_types[0][0])
+        if left is None:
+            return ctx.default_return_type
+        first: str | None = None
+        for member in members:
+            part = _ndarray_parts(member) or _movable_parts(member)
+            if part is None:
+                return ctx.default_return_type
+            _, message = _broadcast_result(list(left[0]), list(part[0]), None)
+            if message is None:
+                return ctx.default_return_type
+            if first is None:
+                first = message
+        if first is not None:
+            if name == "__rtruediv__":
+                # The message of the true-division hook, which runs for
+                # each pair of members after this error: one line, not two.
+                first = f"true_divide shapes disagree: {first}"
+            ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
+    except Exception:
+        _swallowed(ctx, "_union_reflected_hook")
+    return ctx.default_return_type
+
+
 def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
     """Widen other to Any on provable broadcast mismatch (issue #148).
 
@@ -976,6 +1050,10 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
                         if not all_bad:
                             break
                     if all_bad and first_msg is not None:
+                        if isinstance(call, _OpExpr0) and call.op == "/":
+                            # The message of the true-division hook: one
+                            # line for the mismatch, not two (issue #252).
+                            first_msg = f"true_divide shapes disagree: {first_msg}"
                         try:
                             ctx.api.fail(first_msg, ctx.context, code=NUMTY_BROADCAST)
                         except Exception:

@@ -4312,3 +4312,76 @@ def test_sklearn_clean_under_allow_redefinition() -> None:
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 1, result.stdout
     assert "tuple[n_samples, ?U" in errors[0] and "[return-value]" in errors[0], result.stdout
+
+
+def test_any_dim_arithmetic_keeps_rank() -> None:
+    # Issue 249: an `Any` dim (tuple[Any]) is a known rank. A binary
+    # operation keeps the rank and the dtype; an axis that is not provable
+    # is a fresh unknown, as with a plain `int` dim.
+    result = run_mypy(FIXTURES / "any_dim_arith_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    f64 = "numpy.dtype[numpy.float64]"
+    for line in (17, 18, 19, 29):
+        assert notes[line] == f'"numpy.ndarray[tuple[?U@{line}], {f64}]"', result.stdout
+    for line in (20, 21):
+        assert notes[line] == f'"numpy.ndarray[tuple[Literal[3], ?U@{line}], {f64}]"', result.stdout
+    assert notes[22] == '"numpy.ndarray[tuple[?U@22], numpy.dtype[numpy.bool[bool]]]"', result.stdout
+    assert notes[23] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
+    assert notes[28] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
+    # The result of the call keeps its rank in the next operations.
+    assert notes[30] == f'"numpy.ndarray[tuple[?U@30c], {f64}]"', result.stdout
+
+
+def test_object_array_element_is_any() -> None:
+    # Issue 250: an element of an object array is the Python object that
+    # the array holds. Its type is Any, as in the numpy stubs.
+    result = run_mypy(FIXTURES / "object_element_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    for line in (13, 16, 17, 19, 20):
+        assert notes[line] == '"Any"', result.stdout
+    assert notes[18] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.object_]]"', result.stdout
+    assert notes[21] == '"numpy.float64"', result.stdout
+
+
+def test_stack_error_names_the_provable_axis() -> None:
+    # Issue 251: (?, 3) with (?, 4) differs at axis 1. Two dynamic dims
+    # are not a provable difference, and alone they give no error.
+    result = run_mypy(FIXTURES / "bad_stack_int_leading.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    assert len(errors) == 1, result.stdout
+    assert ":7:" in errors[0], result.stdout
+    assert "stack dimension 1 differs: 3 vs 4 (shapes (?, 3) vs (?, 4); axis 0)" in errors[0], (
+        result.stdout
+    )
+    notes = reveals_by_line(result)
+    assert notes[8].startswith('"numpy.ndarray[tuple[Literal[2], ?U@8, Literal[3]]'), result.stdout
+
+
+def test_union_operator_broadcast_mismatch() -> None:
+    # Issue 252: with an array union as the right operand, mypy calls the
+    # reflected method on the union and no ndarray hook runs. The mismatch
+    # is reported for each operator, once per line.
+    result = run_mypy(FIXTURES / "bad_union_operator_broadcast.py")
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
+    by_line: dict[int, list[str]] = {}
+    for text in errors:
+        by_line.setdefault(int(text.split(":")[1]), []).append(text)
+    assert sorted(by_line) == [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 29], result.stdout
+    for line in range(16, 26):
+        assert len(by_line[line]) == 1, result.stdout
+        assert "[numty-broadcast]" in by_line[line][0], result.stdout
+        assert "N-1 vs N (shapes (N-1,) vs (N,))" in by_line[line][0], result.stdout
+    assert "true_divide shapes disagree" in by_line[21][0], result.stdout
+    assert len(by_line[29]) == 2, result.stdout
+    assert "3 vs 5" in by_line[29][0] and "4 vs 5" in by_line[29][1], result.stdout
+
+
+def test_union_operator_no_false_error() -> None:
+    # Issue 252: a left operand that fits one member of the union is not
+    # an error (the same union on both sides).
+    result = run_mypy(FIXTURES / "union_operator_ok.py")
+    assert result.returncode == 0, result.stdout

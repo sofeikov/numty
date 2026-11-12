@@ -1680,11 +1680,18 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                 return ctx.default_return_type
             # Same rank: name the first differing dimension and its values,
             # like concatenate does, plus the stack axis.
+            # A provable difference comes first (issue #251): in (?, 3) vs
+            # (?, 4) the error is axis 1, not the two dynamic dims of axis 0.
             diff_at: int | None = None
             for i, (x, y) in enumerate(zip(first, dims)):
-                if not _dim_eq(x, y):
+                if _dims_provably_ne(x, y):
                     diff_at = i
                     break
+            if diff_at is None:
+                for i, (x, y) in enumerate(zip(first, dims)):
+                    if not _dim_eq(x, y):
+                        diff_at = i
+                        break
             if diff_at is not None and (
                 all(isinstance(d, int) for d in dims)
                 and all(isinstance(d, int) for d in first)
