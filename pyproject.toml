@@ -13,6 +13,11 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 
+[project.urls]
+Documentation = "https://sofeikov.github.io/numty/"
+Repository = "https://github.com/sofeikov/numty"
+Issues = "https://github.com/sofeikov/numty/issues"
+
 [dependency-groups]
 dev = [
     "hypothesis>=6.170.15",
@@ -21,6 +26,9 @@ dev = [
     "pytest-xdist>=3.8.0",
     "ruff==0.17.4",
     "ty==0.0.97",
+]
+docs = [
+    "mkdocs-material>=9.6",
 ]
 
 [build-system]

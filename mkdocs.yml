@@ -1,0 +1,96 @@
+site_name: numty
+site_description: Static shape checking for NumPy. One mypy plugin, precise shapes, errors before anything runs.
+site_url: https://sofeikov.github.io/numty/
+repo_url: https://github.com/sofeikov/numty
+repo_name: sofeikov/numty
+edit_uri: edit/main/docs/
+copyright: MIT licensed
+
+theme:
+  name: material
+  icon:
+    logo: material/shape-outline
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: deep purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: deep purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.instant
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - Home: index.md
+  - Get started: get-started.md
+  - Guide:
+      - Annotating shapes: guide/annotations.md
+      - Fixed and named sizes: guide/sizes.md
+      - Symbolic arithmetic: guide/symbolic.md
+      - Unknown dims: guide/unknown-dims.md
+      - Indexing: guide/indexing.md
+      - Unions: guide/unions.md
+      - "Generic in dtype: Arr": guide/dtype-generic.md
+      - Narrowing and runtime: guide/runtime.md
+      - polars and numba: guide/integrations.md
+      - Coming from jaxtyping: jaxtyping.md
+  - Examples:
+      - Bug gallery: examples/bug-gallery.md
+      - Attention block: examples/attention.md
+      - Ridge regression from sklearn: examples/ridge.md
+      - Chained block: examples/chains.md
+      - One signature, every rank: examples/rank-generic.md
+      - Generic code end to end: examples/generic-code.md
+  - Reference:
+      - Supported operations: reference/operations.md
+      - Error codes: reference/error-codes.md
+      - Tracing and strict mode: reference/diagnostics.md
+  - Under the hood:
+      - Why trust it: internals/why-trust-it.md
+      - How it works: internals/how-it-works.md
+      - Checked against numpy: internals/checked-against-numpy.md
+      - Limitations: internals/limitations.md
+      - Roadmap: internals/roadmap.md
+      - Development: contributing.md
