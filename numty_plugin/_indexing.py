@@ -17,7 +17,7 @@ from ._types import (
     _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _formal_pair, _is_none_type, _movable_int_parts, _movable_parts,
+    _all_positionals, _dims_str, _formal_pair, _is_none_type, _known_rank_parts, _movable_parts,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
 )
 from ._reductions import (
@@ -119,7 +119,7 @@ def _take_solve(
 ) -> Type:
     if pair is None:
         return ctx.default_return_type
-    parts = _ndarray_parts(array) or _movable_int_parts(array)
+    parts = _ndarray_parts(array) or _known_rank_parts(array)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
