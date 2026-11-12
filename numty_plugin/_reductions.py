@@ -728,6 +728,7 @@ def _record_single_axis_positions(
     dims: Sequence[int | Type],
     norm: int | None,
     result_dims: Sequence[int | Type],
+    exact: bool = False,
 ) -> None:
     """Record positions-on for a single-axis integer result (issue #285).
 
@@ -740,7 +741,7 @@ def _record_single_axis_positions(
     rec = dims[norm]
     if not isinstance(rec, (int, TypeVarType)):
         return
-    _record_index_on(ctx, result_dims, rec)
+    _record_index_on(ctx, result_dims, rec, exact=exact)
 
 
 def _record_argsort_positions(
@@ -757,7 +758,8 @@ def _record_argsort_positions(
     """
     if not int_out:
         return
-    _record_single_axis_positions(ctx, dims, norm, result_dims)
+    # A 1-d argsort or argpartition is a permutation: every position occurs.
+    _record_single_axis_positions(ctx, dims, norm, result_dims, exact=True)
 
 
 def _solve_argdrop(

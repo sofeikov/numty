@@ -667,7 +667,16 @@ A dynamic size in a returned value fits a declared named size. A plain
 `int` (`np.zeros(n)`, `len()` of a non-array) in a directly returned
 expression — or in an unannotated local it is returned through — is
 `Any` there, so it checks against any declared name, bound or not
-(`tests/fixtures/ret_int_ok.py`). A name no parameter binds
+(`tests/fixtures/ret_int_ok.py`). This holds for the result of a numpy
+call and for the result of a call of your own function or method
+(`return helper(n)` with `helper(...) -> F64[int]`,
+`tests/fixtures/bad_ret_helper.py`). Two limits come from where a
+plugin can act. A bare parameter is not a call, so `return x` with
+`x: F64[int]` where `F64[N]` is declared is still a `[return-value]`
+error; write the parameter with the name. And the size is written as
+`Any` where the value is produced, so a local that is returned has
+`Any` in that size for its whole life, not only at the `return`. A
+name no parameter binds
 (`def flags(n: int) -> Bool[N]`) is still a fresh unknown at each call.
 Literals keep checking: `return np.zeros((0,))` against `F64[N]` stays
 a `[return-value]` error (`tests/fixtures/bad_ret_literal.py`), as do
@@ -859,19 +868,30 @@ size P, N of them (`Index[P]` leaves the count dynamic, `Index["P N"]`
 splits a string the same way); `argmin`/`argmax`, `argsort`,
 `arange`, `flatnonzero`, `nonzero` and `searchsorted` record the same
 fact themselves when the values are certainly positions. A recorded
-bound provably above the axis errors; a different *named* size is an
-opt-in `[numty-names]` error (`enable_error_code = numty-names`),
-silent by default. A variable rebound between uses loses its record
-(`idx = searchsorted(...); idx = clip(idx, ...)` checks clean), and a
-same-module plain call checks the actual's record against the formal's
-`Index` under the same opt-in code:
+size above the axis is an error by default only when the overrun is
+certain: the index holds every position below its size, as `arange(n)`
+and `argsort` do. For `searchsorted`, `argmax`, `flatnonzero` and an
+`Index[...]` annotation the size is an upper bound on the values, so
+the overrun is only possible, and that report is under the opt-in
+`[numty-names]` code (`enable_error_code = numty-names`), like a
+different *named* size. A variable rebound between uses loses its
+record (`idx = searchsorted(...); idx = clip(idx, ...)` checks clean),
+and a same-module plain call checks the actual's record against the
+formal's `Index` under the same opt-in code:
 
 ```python
 table[row, col]                   # clean: positions on the right axes
 table[col, row]                   # error (opt-in): Q on P, P on Q
-plain[np.searchsorted(a, v)]      # error: positions run to N+1 over N
+small[np.arange(len(small) + 1)]  # error: every position 0..N occurs
+plain[np.searchsorted(a, v)]      # error (opt-in): they may run past the axis
 padded[np.searchsorted(a, v)]     # clean: the axis spells N+1
 ```
+
+`a[np.searchsorted(a, v)]` is wrong only when a value is above `a[-1]`.
+Code that fixes the positions in place (`idx[idx == len(a)] = len(a) - 1`,
+`np.clip(idx, 0, len(a) - 1, out=idx)`), guards them, or looks up
+values that are in `a` is right, which is why this is not a default
+error (`tests/fixtures/bad_index_overrun.py`).
 
 An `Index` spelled through an alias (`R = Index[P, N]`), a call from
 another module, a method call, or keyword arguments keeps today's
@@ -1307,9 +1327,14 @@ boolean mask, an indexed assignment, `concatenate` and `stack`, and a
 call that binds one name of the callee to two names of the caller
 (`score(ids: I64[K], d: F64[P, K])` given an `I64[B]` and an
 `F64[B, A]`). It does not cover `matmul` inner sizes or shapes with
-`*Ts`. Only names count: a literal, an `int`, an `Any` and an unknown
-(`?U`) against a name stay silent, and so do two names of a callee
-that a call binds to one size. Where two names are known to be one
+`*Ts`. A literal, an `int` and an `Any` against a name stay silent, and
+so do two names of a callee that a call binds to one size. An unknown
+(`?U`) stays silent too, with one exception: the count of a boolean
+mask is a size of its own under this code, so it is reported against a
+named size and against another mask's count (see
+[Unknown dims](#unknown-dims-dynamic-shapes-stay-checkable)). The code
+also covers index positions: positions on one named size used on an
+axis of another, and positions that may run past the axis. Where two names are known to be one
 size, give them one name. The fixture is `tests/fixtures/names_opt_in.py`.
 
 ### Give-up trace and strict mode
@@ -1766,12 +1791,13 @@ subtraction below.
   unified. The opt-in `numty-names` code reports them inside a generic
   body (see [Error codes](#error-codes)).
 - Index *positions* are tracked through `Index[P, N]`, which records
-  that an int array's values index size P, and a recorded bound provably
-  above the indexed axis (`searchsorted` positions on `N+1` over `N`,
-  `arange(5)` on a size-3 axis) errors as `[numty-axis]`, while a
-  different named size (positions on M over N) needs the opt-in
-  `numty-names` code (`enable_error_code = numty-names`) and is silent
-  by default. Producers record the fact themselves when the values are
+  that an int array's values index size P. A recorded size above the
+  indexed axis errors as `[numty-axis]` when the overrun is certain
+  (`arange(5)` on a size-3 axis, an `argsort` of `N+1` values on an
+  axis of `N`). A possible overrun (`searchsorted` positions on `N+1`
+  over `N`) and a different named size (positions on M over N) need the
+  opt-in `numty-names` code (`enable_error_code = numty-names`) and are
+  silent by default. Producers record the fact themselves when the values are
   certainly positions (`argmin`/`argmax` and the `nan` twins,
   `argsort`/`argpartition` on one known axis with a 1-d result,
   0-based `arange`, 1-d `flatnonzero`, per-member `nonzero`/`where`,
@@ -1788,10 +1814,10 @@ subtraction below.
   against the named one, and neither is reported
   ([#289](https://github.com/sofeikov/numty/issues/289)). The check is
   a runtime one ([#17](https://github.com/sofeikov/numty/issues/17)).
-- Index positions are best-effort by design. A recorded bound
-  provably above the indexed axis errors by default (`searchsorted`
-  positions on `N+1` over `N`, `arange(5)` on a size-3 axis); a
-  different named size needs the opt-in `numty-names` code and is
+- Index positions are best-effort by design. A certain overrun errors
+  by default (`arange(5)` on a size-3 axis); a possible one
+  (`searchsorted` positions on `N+1` over `N`) and a
+  different named size need the opt-in `numty-names` code and are
   silent by default, including at a same-module plain call (an actual
   recorded on N passed where the formal declares `Index` on P,
   `tests/fixtures/bad_index_callsite.py`). Records come from the

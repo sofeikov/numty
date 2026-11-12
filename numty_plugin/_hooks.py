@@ -36,10 +36,12 @@ from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
 from ._unknowns import _fresh_unknown
 
 from ._types import (
-    _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _conflict_pairs,
-    _emit_call_site_conflicts, _callsite_formula_return, _mentions_ndarray, _info_mentions_array,
-    _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, TUPLE_FULLNAME,
-    _OPERATOR_DUNDERS,
+    _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _mentions_ndarray,
+    _info_mentions_array, _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME,
+    TUPLE_FULLNAME, _OPERATOR_DUNDERS,
+)
+from ._callbind import (
+    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return,
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
@@ -120,6 +122,7 @@ from ._unions import (
     _union_signature_clash,
 )
 from ._callsite import _relax_dynamic_formals, _report_call_site_names, _report_index_call_site, minmax_function_hook
+from ._returns import _return_sig_for_dynamic
 from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 
 class NumtyPlugin(Plugin):
@@ -423,7 +426,7 @@ class NumtyPlugin(Plugin):
             pass
         if isinstance(sig, CallableType) and not overloaded:
             _report_call_site_names(sig, ctx)
-            sig = _relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx)
+            sig = _return_sig_for_dynamic(_relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx), ctx)
         _note_rank_mismatches(ctx, sig)
         return sig
 
@@ -523,7 +526,7 @@ class NumtyPlugin(Plugin):
             _swallowed(ctx, "_callsite_check")
             pass
         _report_call_site_names(sig, ctx)
-        return _relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx)
+        return _return_sig_for_dynamic(_relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx), ctx)
 
     # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty/__init__.py): the
     # dtype rides the head name, dims ride flat args. Hooked here because

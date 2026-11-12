@@ -1076,7 +1076,7 @@ def _record_arange(
         return
     if not isinstance(stop, (int, TypeVarType)):
         return
-    _record_index_on(ctx, result_dims, stop)
+    _record_index_on(ctx, result_dims, stop, exact=True)
 
 
 def arange_function_hook(ctx: FunctionContext) -> Type:

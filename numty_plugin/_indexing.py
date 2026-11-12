@@ -19,7 +19,7 @@ from ._types import (
     _report_names, _union_members,
 )
 from ._heads import (
-    _index_recorded_exceeds, _recorded_at_site, _recorded_index_on,
+    _index_record_exact, _index_recorded_exceeds, _recorded_at_site, _recorded_index_on,
 )
 from ._unknowns import _fresh_mask_count
 from ._reshape import (
@@ -980,11 +980,22 @@ def _check_index_positions(
     if _dim_eq(recorded, size):
         return False
     if _index_recorded_exceeds(recorded, size):
+        # An error by default only when the overrun is certain: the
+        # operand holds every position below the recorded size (`arange`,
+        # `argsort`). `searchsorted`, `argmax`, `flatnonzero` and an
+        # `Index[...]` annotation give an upper bound on the values, so
+        # `a[np.searchsorted(a, v)]` is wrong only when a value is above
+        # `a[-1]`, and code that clips, guards or fixes the positions in
+        # place is right. That report is under the opt-in code.
+        certain = _index_record_exact(ctx, expr, recorded)
+        if not certain and not _names_enabled(ctx):
+            return False
         ctx.api.fail(
             f"index positions on {_dim_str(recorded)} used on axis {axis} "
-            f"of size {_dim_str(size)} (shape {_dims_str(dims)})",
+            f"of size {_dim_str(size)} (shape {_dims_str(dims)})"
+            + ("" if certain else ": they may run past the axis"),
             ctx.context,
-            code=NUMTY_AXIS,
+            code=NUMTY_AXIS if certain else NUMTY_NAMES,
         )
         return True
     _report_names(

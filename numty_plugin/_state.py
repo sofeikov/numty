@@ -55,6 +55,10 @@ class NumtyState:
     index_on: dict[str, list[tuple[list[int | Type] | None, int | Type]]] = field(
         default_factory=dict
     )
+    # (key of index_on, recorded size) of the records whose array holds
+    # every position below the recorded size (`arange(n)`, `argsort`).
+    # Only those make an overrun certain; the rest only make it possible.
+    index_exact: set[tuple[str, str]] = field(default_factory=set)
 
 
 STATE: NumtyState = NumtyState()

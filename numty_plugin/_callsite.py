@@ -17,10 +17,10 @@ from ._exprs import _iter_tvarlikes
 from ._indexing import _recorded_for_operand
 from ._types import (
     INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _names_enabled, _ndarray_parts, _parts_or_unpack,
-    _report_mask_names,
-    _report_names,
-    _shape_tvar_formals,
-    _strip_optional,
+    _report_mask_names, _report_names,
+)
+from ._callbind import (
+    _shape_tvar_formals, _strip_optional,
 )
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
 from ._linalg import _is_numpy_scalar

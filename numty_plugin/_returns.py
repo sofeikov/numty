@@ -13,9 +13,10 @@ from __future__ import annotations
 import ast
 import os
 
-from mypy.plugin import AttributeContext, FunctionContext, MethodContext
+from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import (
     AnyType,
+    CallableType,
     Instance,
     TupleType,
     Type,
@@ -169,7 +170,9 @@ def _assigned_name_returned(returns: list, assigns: list, line: int, col: int) -
     return None
 
 
-def _return_any_for_dynamic(ctx: FunctionContext | MethodContext | AttributeContext, tp: Type) -> Type:
+def _return_any_for_dynamic(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext, tp: Type
+) -> Type:
     """`tp` with returned dynamic dims written as Any (issues #269/#271).
 
     A plain-`int` dim in a directly returned array value (or in an
@@ -229,3 +232,25 @@ def _return_any_for_dynamic(ctx: FunctionContext | MethodContext | AttributeCont
     except Exception:
         _swallowed(ctx, "_return_any_for_dynamic")
         return tp
+
+
+def _return_sig_for_dynamic(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> CallableType:
+    """`sig` for a call that is returned, with the result's plain `int` sizes as Any.
+
+    `return np.zeros(n)` fits a declared `F64[N]` through the rewrite of
+    the hook's result. `return helper(n)`, with `helper` a function of
+    the project that returns `F64[int]`, has no hook for its result, so
+    it was still an error: the same value passed or failed by where it
+    was built. The call's signature is where its result type can be
+    reached, so the rewrite is done on the return type there, at the
+    same sites (a direct `return`, or one unannotated local that is
+    returned).
+    """
+    try:
+        ret = _return_any_for_dynamic(ctx, sig.ret_type)
+        if ret is sig.ret_type:
+            return sig
+        return sig.copy_modified(ret_type=ret)
+    except Exception:
+        _swallowed(ctx, "_return_sig_for_dynamic")
+        return sig
