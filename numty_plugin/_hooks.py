@@ -95,8 +95,9 @@ from ._broadcast import (
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
+from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 from ._heads import (
-    _FAM_HEAD_DTYPES, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
+    _FAM_HEAD_DTYPES, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string,
 )
 from ._exprs import (
@@ -491,6 +492,14 @@ class NumtyPlugin(Plugin):
                 return self._fam_head(ctx, dtype_fullname)
 
             return hook
+        if fullname == "numty.Arr":
+            # The generic head (issue #278): the dtype rides the first
+            # arg, the dims ride the rest flat.
+
+            def arr_hook(ctx: AnalyzeTypeContext) -> Type:
+                return self._arr_head(ctx)
+
+            return arr_hook
         # Issue #38: a bare shape-carrying generic (e.g. list[Box] where
         # Box has F64[...] fields) silently means Any shapes downstream.
         # Flag the bare use so it can be parameterized instead.
@@ -560,6 +569,9 @@ class NumtyPlugin(Plugin):
     # self._fam_late_bound, mutated in place).
     def _fam_head(self, ctx: AnalyzeTypeContext, dtype_fullname: str) -> Type:
         return _fam_head(ctx, dtype_fullname, self._fam_late_bound)
+
+    def _arr_head(self, ctx: AnalyzeTypeContext) -> Type:
+        return _arr_head(ctx, self._fam_late_bound)
 
     def _fam_arg(
         self, ctx: AnalyzeTypeContext, head: str, arg: Type
@@ -667,6 +679,10 @@ class NumtyPlugin(Plugin):
         return substituted_attribute_hook
 
     def _method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
+        if fullname == POLARS_SERIES_TO_NUMPY:
+            return partial(frame_to_numpy_hook, rank=1)
+        if fullname == POLARS_FRAME_TO_NUMPY:
+            return partial(frame_to_numpy_hook, rank=2)
         reflected = _reflected_name(fullname)
         if reflected is not None:
             # Issues #252, #255, #256: a reflected operator on a union of arrays.

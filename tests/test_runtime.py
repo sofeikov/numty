@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from numty import (
-    F16, F32, F64, I8, I16, I32, I64, U8, Bool, NarrowError, batch, ident, matmul, narrow,
+    F16, F32, F64, I8, I16, I32, I64, U8, Arr, Bool, NarrowError, batch, ident, matmul, narrow,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -141,6 +141,43 @@ def test_isinstance_picks_array_branch() -> None:
 def test_head_is_not_constructible() -> None:
     with pytest.raises(TypeError, match="shape annotation"):
         F64()
+
+
+def test_generic_head_matches_any_ndarray() -> None:
+    # Issue #278: the bare generic head names no dtype, so it matches
+    # any ndarray and rejects non-arrays; rank and dims are erased.
+    assert isinstance(np.zeros(3, dtype=np.float64), Arr)
+    assert isinstance(np.zeros((2, 3, 4), dtype=np.int32), Arr)
+    assert isinstance(np.zeros((), dtype=bool), Arr)
+    assert not isinstance([0.0, 1.0], Arr)
+    assert not isinstance(np.float64(0), Arr)
+
+
+def test_generic_head_is_not_constructible() -> None:
+    with pytest.raises(TypeError, match="shape annotation"):
+        Arr()
+
+
+def test_generic_head_subscript_is_not_usable_with_isinstance() -> None:
+    # A subscripted generic cannot narrow, as for the fixed heads.
+    with pytest.raises(TypeError):
+        isinstance(np.zeros(3), Arr[np.float64, 3])
+
+
+def test_generic_head_runtime_annotations() -> None:
+    # The generic head evaluates at runtime (pyright/ty see a plain
+    # generic class); the origin is Arr with the dtype first.
+    T = typing.TypeVar("T", bound=np.generic)
+    N = typing.TypeVar("N", bound=int)
+
+    def f(x: Arr[T, N], y: Arr[np.float64, 2, N]) -> None: ...
+
+    hints = typing.get_type_hints(f)
+    assert typing.get_origin(hints["x"]) is Arr
+    assert typing.get_origin(hints["y"]) is Arr
+    assert typing.get_args(hints["y"])[0] is np.float64
+    assert isinstance(np.zeros((2, 3)), typing.get_origin(hints["x"]))
+    assert isinstance(np.zeros((2, 3), dtype=np.int32), typing.get_origin(hints["x"]))
 
 
 def test_every_head_is_known_to_plugin_and_codmod() -> None:

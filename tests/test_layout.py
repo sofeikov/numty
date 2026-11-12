@@ -451,6 +451,7 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
         "_exprs",
         "_fft",
         "_forms",
+        "_frames",
         "_heads",
         "_hooks",
         "_indexing",
@@ -511,6 +512,7 @@ _LAYERS = (
     "_fft",
     "_indexing",
     "_unions",
+    "_frames",
     "_hooks",
 )
 

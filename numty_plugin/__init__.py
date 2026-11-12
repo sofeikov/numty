@@ -10,7 +10,8 @@ from mypy.plugin import Plugin
 
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
-    _broadcast, _broadcast_core, _builders, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _heads, _hooks,
+    _broadcast, _broadcast_core, _builders, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _frames,
+    _heads, _hooks,
     _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _state, _trace, _types, _unions,
     _unknowns,
 )
@@ -22,6 +23,9 @@ from ._errors import (  # noqa: F401
     NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION,
     _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning,
     _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed, _warn_startup,
+)
+from ._frames import (  # noqa: F401
+    POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 )
 from ._trace import (  # noqa: F401
     _numty_strict, _numty_trace_path, _trace_event
@@ -84,7 +88,7 @@ from ._broadcast import (  # noqa: F401
     where_function_hook,
 )
 from ._heads import (  # noqa: F401
-    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
+    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
     _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string, _is_fam_int_name,
 )
 from ._types import (  # noqa: F401

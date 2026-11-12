@@ -628,6 +628,10 @@ def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
     if isinstance(proper, Instance) and proper.type.fullname == DTYPE_FULLNAME:
         if len(proper.args) == 1:
             element = get_proper_type(proper.args[0])
+            if isinstance(element, TypeVarType):
+                # `dtype=x.dtype` in a helper generic in its dtype (issue
+                # 278): the result has the dtype variable of `x`.
+                return proper
             if isinstance(element, Instance) and element.type.fullname in _DTYPE_INFO:
                 return _construct_dtype(ctx, element.type.fullname)
             if isinstance(element, Instance) and element.type.fullname in _DATETIME_FULLNAMES:

@@ -80,30 +80,171 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
     try:
         if not raw_args:
             raise _FamFail(f"{head} takes at least one dim")
-        dims: list[int | Type] = []
-        for a in raw_args:
-            parsed = _fam_arg(ctx, head, a, late_bound)
-            if isinstance(parsed, list):
-                dims.extend(parsed)
-            else:
-                dims.append(parsed)
-        # A size is never below 0. A bare `-1` is refused where it
-        # is parsed; this covers every other spelling: `"2-3"`,
-        # `"-1"`, `Literal[-1]`, `"-N-1"`.
-        for d in dims:
-            if isinstance(d, int) and d < 0:
-                raise _FamFail(f"{head} dim {d} is negative; a size cannot be below 0")
-            form = _form_of(d)
-            if form is not None and _form_never_size(form):
-                raise _FamFail(
-                    f"{head} dim {_expr_str(form)} is negative for every size;"
-                    " a size cannot be below 0"
-                )
+        dims = _fam_parse_dims(ctx, head, raw_args, late_bound)
     except _FamFail as bad:
         ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
         return AnyType(TypeOfAny.from_error)
     except _FamBail:
         return AnyType(TypeOfAny.from_error)
+    line, column = ctx.context.line, ctx.context.column
+    # The element may be a stub alias (numpy.int32 is), not a class:
+    # use the alias target itself, so formals match what the numpy
+    # stubs produce for the same scalar (e.g. signedinteger[_32Bit]).
+    element: Type | None = None
+    sym = cast(TypeAnalyser, ctx.api).lookup_fully_qualified(dtype_fullname)
+    node = sym.node if sym is not None else None
+    if isinstance(node, TypeInfo):
+        element = cast(TypeAnalyser, ctx.api).named_type(dtype_fullname, [], line, column)
+    elif isinstance(node, TypeAlias):
+        target = get_proper_type(node.target)
+        if isinstance(target, Instance):
+            element = target
+    if element is None:
+        raise _FamFail(f"{head}: cannot resolve dtype {dtype_fullname}")
+    return _fam_build(ctx, head, dims, element)
+
+
+def _arr_head(ctx: AnalyzeTypeContext, late_bound: set[str]) -> Type:
+    """Build the ndarray type for `Arr[dtype, dims...]` (issue #278).
+
+    The first argument is the dtype: a TypeVar bound to a numpy scalar
+    type (`T` with `bound=np.generic`), a concrete scalar class
+    (`Arr[np.float32, N, M]`), `dtype[...]` of either, or `Any`.
+    The rest are dims, parsed exactly like a fixed head's flat args
+    (`_fam_parse_dims`), so the two spellings share one solver. A
+    size in first position fails loudly instead of solving as a
+    dtype; anything already errored bails silently to Any.
+    """
+    head = ctx.type.name
+    raw_args = list(ctx.type.args)
+    try:
+        if len(raw_args) < 2:
+            raise _FamFail(f"{head} takes a dtype and at least one dim, e.g. {head}[T, N, M]")
+        element = _arr_dtype(ctx, head, raw_args[0])
+        dims = _fam_parse_dims(ctx, head, raw_args[1:], late_bound)
+    except _FamFail as bad:
+        ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
+        return AnyType(TypeOfAny.from_error)
+    except _FamBail:
+        return AnyType(TypeOfAny.from_error)
+    return _fam_build(ctx, head, dims, element)
+
+
+def _arr_dtype(ctx: AnalyzeTypeContext, head: str, arg: Type) -> Type:
+    """The dtype parameter of `Arr[...]`: a TypeVar, a scalar class, or Any.
+
+    A TypeVar must be bound to a numpy scalar type (its bound's MRO
+    must reach `numpy.generic`); an int-bound dim TypeVar in this
+    position names the mistake (sizes go after the dtype). A concrete
+    scalar class is any `numpy.generic` subclass (`np.float64`,
+    `np.floating`, ...); `dtype[...]` of either unwraps one level.
+    """
+    analyzed = ctx.api.analyze_type(arg)
+    proper = get_proper_type(analyzed)
+    if isinstance(proper, AnyType):
+        if proper.type_of_any == TypeOfAny.from_error:
+            raise _FamBail
+        return AnyType(TypeOfAny.explicit)
+    if isinstance(proper, TypeVarType):
+        _check_arr_bound(head, proper)
+        return proper
+    if (
+        isinstance(proper, Instance)
+        and proper.type.fullname == "numpy.dtype"
+        and len(proper.args) == 1
+    ):
+        inner = get_proper_type(proper.args[0])
+        if isinstance(inner, AnyType):
+            if inner.type_of_any == TypeOfAny.from_error:
+                raise _FamBail
+            return AnyType(TypeOfAny.explicit)
+        if isinstance(inner, TypeVarType):
+            _check_arr_bound(head, inner)
+            return inner
+        if isinstance(inner, Instance) and _is_numpy_scalar_class(inner):
+            return inner
+        raise _FamFail(_arr_dtype_msg(head))
+    if isinstance(proper, Instance) and _is_numpy_scalar_class(proper):
+        return proper
+    if isinstance(proper, UnboundType):
+        # A TypeVar used outside any scope that binds it: mypy has
+        # already said 'Type variable "X" is unbound', with hints.
+        raise _FamBail
+    raise _FamFail(_arr_dtype_msg(head))
+
+
+def _is_numpy_scalar_class(inst: Instance) -> bool:
+    """Whether an analyzed class is a numpy scalar type (concrete or abstract)."""
+    return any(base.fullname == "numpy.generic" for base in inst.type.mro)
+
+
+def _check_arr_bound(head: str, tv: TypeVarType) -> None:
+    """The bound of an `Arr` dtype TypeVar must be a numpy scalar type."""
+    bound = get_proper_type(tv.upper_bound)
+    if isinstance(bound, AnyType) and bound.type_of_any != TypeOfAny.from_error:
+        return
+    if isinstance(bound, Instance) and any(
+        base.fullname == "numpy.generic" for base in bound.type.mro
+    ):
+        return
+    if isinstance(bound, Instance) and bound.type.fullname == "builtins.int":
+        raise _FamFail(
+            f'{head} takes a dtype as its first argument, but "{tv.name}" is bound to int;'
+            f" sizes go after the dtype, e.g. {head}[T, {tv.name}]"
+            ' with T = TypeVar("T", bound=np.generic)'
+        )
+    raise _FamFail(
+        f'{head} dtype "{tv.name}" must be a TypeVar bound to a numpy scalar type'
+        ' (e.g. TypeVar("T", bound=np.generic))'
+    )
+
+
+def _arr_dtype_msg(head: str) -> str:
+    """The loud redirect for a non-dtype in `Arr` first position."""
+    return (
+        f"{head} takes a dtype as its first argument, e.g. {head}[T, N]"
+        ' with T = TypeVar("T", bound=np.generic)'
+    )
+
+
+def _fam_parse_dims(
+    ctx: AnalyzeTypeContext, head: str, raw_args: list[Type],
+    late_bound: set[str]) -> list[int | Type]:
+    """Flat dims shared by the fixed heads and `Arr` (after its dtype).
+
+    Each arg resolves by `_fam_arg` (TypeVars, integers, Unpack[Ts],
+    Literal[...], string specs); a negative size in any spelling
+    fails loudly.
+    """
+    dims: list[int | Type] = []
+    for a in raw_args:
+        parsed = _fam_arg(ctx, head, a, late_bound)
+        if isinstance(parsed, list):
+            dims.extend(parsed)
+        else:
+            dims.append(parsed)
+    # A size is never below 0. A bare `-1` is refused where it
+    # is parsed; this covers every other spelling: `"2-3"`,
+    # `"-1"`, `Literal[-1]`, `"-N-1"`.
+    for d in dims:
+        if isinstance(d, int) and d < 0:
+            raise _FamFail(f"{head} dim {d} is negative; a size cannot be below 0")
+        form = _form_of(d)
+        if form is not None and _form_never_size(form):
+            raise _FamFail(
+                f"{head} dim {_expr_str(form)} is negative for every size;"
+                " a size cannot be below 0"
+            )
+    return dims
+
+
+def _fam_build(ctx: AnalyzeTypeContext, head: str, dims: list[int | Type], element: Type) -> Type:
+    """The ndarray type for parsed dims and a resolved dtype element.
+
+    Shared tail of the fixed heads and `Arr`: the shape TupleType
+    (with the plain-int fallback of issue #225) and the dtype, so the
+    two spellings can never diverge.
+    """
     line, column = ctx.context.line, ctx.context.column
     int_inst = cast(TypeAnalyser, ctx.api).named_type("builtins.int", [], line, column)
     int_tuple = cast(TypeAnalyser, ctx.api).named_type("builtins.tuple", [int_inst], line, column)
@@ -144,20 +285,6 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
         line=line,
         column=column,
     )
-    # The element may be a stub alias (numpy.int32 is), not a class:
-    # use the alias target itself, so formals match what the numpy
-    # stubs produce for the same scalar (e.g. signedinteger[_32Bit]).
-    element: Type | None = None
-    sym = cast(TypeAnalyser, ctx.api).lookup_fully_qualified(dtype_fullname)
-    node = sym.node if sym is not None else None
-    if isinstance(node, TypeInfo):
-        element = cast(TypeAnalyser, ctx.api).named_type(dtype_fullname, [], line, column)
-    elif isinstance(node, TypeAlias):
-        target = get_proper_type(node.target)
-        if isinstance(target, Instance):
-            element = target
-    if element is None:
-        raise _FamFail(f"{head}: cannot resolve dtype {dtype_fullname}")
     dtype = cast(TypeAnalyser, ctx.api).named_type("numpy.dtype", [element], line, column)
     return cast(TypeAnalyser, ctx.api).named_type("numpy.ndarray", [shape, dtype], line, column)
 

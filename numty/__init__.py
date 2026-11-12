@@ -63,10 +63,15 @@ class _HeadMeta(type):
     """
 
     _numty_dtype: np.dtype[Any] | None = None
+    # A generic head (`Arr`) takes its dtype as a parameter, so the bare
+    # head names no dtype: it matches any ndarray (issue #278).
+    _numty_any_dtype: bool = False
 
     def __instancecheck__(cls, obj: object) -> bool:
         dtype = cls._numty_dtype
         if dtype is None:
+            if cls._numty_any_dtype:
+                return isinstance(obj, np.ndarray)
             return super().__instancecheck__(obj)
         return isinstance(obj, np.ndarray) and obj.dtype == dtype
 
@@ -149,6 +154,30 @@ class Bool(_StringDims, Generic[Unpack[TsFam]]):
     """boolean array with flat dims, e.g. Bool[batch, mask]."""
 
     _numty_dtype = np.dtype(np.bool_)
+
+
+DT = TypeVar("DT", bound=np.generic)
+
+
+class Arr(_StringDims, Generic[DT, Unpack[TsFam]]):
+    """Array with the dtype as a parameter and flat dims, e.g. Arr[T, batch, features].
+
+    The fixed heads above carry the dtype in the name (`F64`, `I64`);
+    a helper generic in its dtype cannot use them. `Arr` takes the
+    dtype first, then the dims exactly as a fixed head spells them:
+    `Arr[T, N, M]` is `np.ndarray[tuple[N, M], np.dtype[T]]` with
+    `T = TypeVar("T", bound=np.generic)`.
+
+    Dtype-first (rather than dtype-last, `I64[M, N, T]`) so the single
+    dtype parameter stays separate from the variadic dims: everything
+    after the first argument parses by the fixed-head rule (TypeVars,
+    integers, `Unpack[Ts]`, `Literal[...]`, string specs), and a
+    misplaced size in first position fails loudly instead of solving
+    as a dtype. The dtype is a TypeVar bound to a numpy scalar type,
+    a concrete scalar class (`Arr[np.float32, N, M]`), or `Any`.
+    """
+
+    _numty_any_dtype = True
 
 
 # Ready-made dim TypeVars for the heads above: `F64[batch, features]`

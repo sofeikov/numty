@@ -4572,3 +4572,102 @@ def test_integer_timedelta_bitwise_dtypes() -> None:
     # A common integer type exists: no error.
     assert notes[25] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.signedinteger[{nb}_64Bit]]]"', result.stdout
     assert notes[26] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.unsignedinteger[{nb}_64Bit]]]"', result.stdout
+
+
+def test_arr_head_ok() -> None:
+    # Issue #278: the generic head takes the dtype first, then flat dims
+    # like a fixed head: builders with dtype=m.dtype and unary ufuncs
+    # keep the dtype TypeVar, call sites solve the concrete dtype.
+    result = run_mypy(FIXTURES / "arr_head_ok.py")
+    assert result.returncode == 0, result.stdout
+    f32 = "numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]"
+    assert reveals_by_line(result) == {
+        24: '"numpy.ndarray[tuple[E, M], numpy.dtype[T]]"',
+        25: '"numpy.ndarray[tuple[E, Literal[2]], numpy.dtype[T]]"',
+        31: '"numpy.ndarray[tuple[N, M], numpy.dtype[FT]]"',
+        32: '"numpy.ndarray[tuple[N, M], numpy.dtype[FT]]"',
+        33: '"numpy.ndarray[tuple[N, M], numpy.dtype[FT]]"',
+        46: '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"',
+        51: f'"numpy.ndarray[tuple[E, M], {f32}]"',
+        52: f'"numpy.ndarray[tuple[N, M], {f32}]"',
+        53: f'"numpy.ndarray[tuple[E, M], {f32}]"',
+        54: f'"numpy.ndarray[tuple[N, M], {f32}]"',
+    }, result.stdout
+    assert _run_fixture("arr_head_ok.py") == [
+        "(2, 3) float32",
+        "(2, 2) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 2) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+    ]
+
+
+def test_arr_head_wrong_axis() -> None:
+    # Issue #278: a result built on the wrong axis is reported, with the
+    # dtype variable on both sides.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_arr_head.py"),
+        'got "ndarray[tuple[E, N], dtype[T]]", expected "ndarray[tuple[E, M], dtype[T]]"',
+        line=14,
+    )
+
+
+def test_arr_head_misuse() -> None:
+    # Issue #278: a missing dtype, an int-bound dim first, and a literal
+    # first all fail loudly with the dtype-first redirect.
+    result = run_mypy(FIXTURES / "bad_arr_dtype.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [12, 15, 18], result.stdout
+    assert len(errors[12]) == 1 and len(errors[15]) == 1 and len(errors[18]) == 1, result.stdout
+    assert "Arr takes a dtype and at least one dim" in errors[12][0], result.stdout
+    assert "[numty-annotation]" in errors[12][0], result.stdout
+    assert 'Arr takes a dtype as its first argument, but "N" is bound to int' in errors[15][0], (
+        result.stdout
+    )
+    assert "[numty-annotation]" in errors[15][0], result.stdout
+    assert "Arr takes a dtype as its first argument" in errors[18][0], result.stdout
+    assert "[numty-annotation]" in errors[18][0], result.stdout
+
+
+def test_polars_to_numpy() -> None:
+    # Issue #272: DataFrame.to_numpy() is 2-D; Series.to_numpy() is 1-D
+    # after a visible cast to a numeric or boolean dtype, and a float
+    # cast names the dtype. A plain Series.to_numpy(), a cast to Array
+    # or String, and structured=True keep polars' own answer.
+    pytest.importorskip("polars")
+    result = run_mypy(FIXTURES / "polars_to_numpy.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [21], result.stdout
+    assert any("too many indices for 1 dimensions" in line and "[numty-axis]" in line for line in errors[21]), (
+        result.stdout
+    )
+    polars_answer = '"numpy.ndarray[Any, Any]"'
+    assert reveals_by_line(result) == {
+        7: polars_answer,
+        8: '"numpy.ndarray[tuple[int], numpy.dtype[numpy.float64]]"',
+        9: '"numpy.ndarray[tuple[int], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"',
+        10: '"numpy.ndarray[tuple[int], numpy.dtype[Any]]"',
+        11: '"numpy.ndarray[tuple[int], numpy.dtype[numpy.float64]]"',
+        12: polars_answer,
+        13: polars_answer,
+        14: '"numpy.ndarray[tuple[int, int], numpy.dtype[Any]]"',
+        15: '"numpy.ndarray[tuple[int, int], numpy.dtype[Any]]"',
+        16: polars_answer,
+        17: '"numpy.ndarray[tuple[int, int], numpy.dtype[Any]]"',
+        19: '"numpy.ndarray[tuple[?U@19c], numpy.dtype[numpy.float64]]"',
+        20: '"numpy.ndarray[tuple[int, int], numpy.dtype[Any]]"',
+    }, result.stdout
+    assert _run_fixture("polars_to_numpy.py") == [
+        "(3,) float64",
+        "float32 float64",
+        "(3, 2) (3,)",
+        "(3, 2)",
+    ]

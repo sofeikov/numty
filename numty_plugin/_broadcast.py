@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import Expression, ListExpr, OpExpr, TupleExpr
 from mypy.types import (
-    AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, UninhabitedType,
+    AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, UninhabitedType,
     get_proper_type,
 )
 from ._reshape import (
@@ -61,7 +61,7 @@ from ._types import (
     _unpack_shape,
 )
 from ._linalg import (
-    _dtype_base, _kind_of,
+    _dtype_base, _dtype_family, _kind_of,
 )
 from ._broadcast_core import (
     _fallback_dtype, _loose_dtype_name, _merge_unpack_dims, _solve_broadcast, _whole_shape_operands,
@@ -1159,6 +1159,22 @@ def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> 
         return _out(bool_dtype)
     ks = _dtype_kind_size(dtype)
     if ks is None:
+        # A dtype TypeVar (issue #278): the kind comes from its bound,
+        # and where the ufunc keeps the family the result keeps the
+        # variable (`np.exp` of `dtype[FT]` is `dtype[FT]`). Anything
+        # else stays with the stubs.
+        proper = get_proper_type(dtype)
+        element = (
+            get_proper_type(proper.args[0])
+            if isinstance(proper, Instance) and proper.args
+            else None
+        )
+        if isinstance(element, TypeVarType):
+            family = _dtype_family(dtype)
+            if family is not None and (
+                family != "c" if group in ("abs", "real") else family in ("f", "c")
+            ):
+                return _out(dtype)
         return ctx.default_return_type
     kind, size = ks
     if group == "abs":
