@@ -1672,14 +1672,14 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
             if len(dims) != len(first):
                 ctx.api.fail(
                     "stack ranks differ: "
-                    + ", ".join(_dims_str(dims) for dims, _ in items)
-                    + f" (axis {axis})",
+                    + ", ".join(_dims_str(dims) for dims, _ in items),
                     ctx.context,
                     code=NUMTY_SHAPE,
                 )
                 return ctx.default_return_type
             # Same rank: name the first differing dimension and its values,
-            # like concatenate does, plus the stack axis.
+            # like concatenate does. The stack axis is not in the message
+            # (issue #266): it has no effect on this error.
             # A provable difference comes first (issue #251): in (?, 3) vs
             # (?, 4) the error is axis 1, not the two dynamic dims of axis 0.
             diff_at: int | None = None
@@ -1699,7 +1699,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                 x, y = first[diff_at], dims[diff_at]
                 ctx.api.fail(
                     f"stack dimension {diff_at} differs: {_dim_str(x)} vs {_dim_str(y)} "
-                    f"(shapes {_dims_str(first)} vs {_dims_str(dims)}; axis {axis})",
+                    f"(shapes {_dims_str(first)} vs {_dims_str(dims)})",
                     ctx.context,
                     code=NUMTY_SHAPE,
                 )
@@ -1708,7 +1708,7 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                 x, y = first[diff_at], dims[diff_at]
                 ctx.api.fail(
                     f"stack dimension {diff_at} differs: {_dim_str(x)} vs {_dim_str(y)} "
-                    f"(shapes {_dims_str(first)} vs {_dims_str(dims)}; axis {axis})",
+                    f"(shapes {_dims_str(first)} vs {_dims_str(dims)})",
                     ctx.context,
                     code=NUMTY_SHAPE,
                 )
