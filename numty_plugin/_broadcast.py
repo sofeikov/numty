@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE
+from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
 from ._dtypes import _promote_strong as _promote_strong_names
 from ._dtypes import (
     _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE,
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import Expression, FloatExpr, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
+from mypy.nodes import Expression, FloatExpr, IndexExpr, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
 from mypy.subtypes import is_same_type
 from mypy.types import (
     AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, UninhabitedType, UnionType,
@@ -1115,12 +1115,59 @@ def _scalar_items_dtype(
     return dtype if dtype is not None else unknown
 
 
+def _may_be_anything(tp: Type) -> bool:
+    """An `Any`, or a union of `Any` with scalars (`float | Any`)."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, AnyType):
+        return True
+    if isinstance(proper, UnionType):
+        return all(_may_be_anything(item) or _scalar_item(item, None) is not None for item in proper.items)
+    return False
+
+
+def _indexed_scalar(ctx: FunctionContext | MethodContext, expr: Expression | None) -> tuple[str, str | None] | None:
+    """`a[i]` / `m[i, j]`: every axis of an array of known rank indexed with an integer.
+
+    The type of such an item is `Any` when the array's dtype is, but it
+    is one value whatever the dtype: a scalar of unknown width.
+    """
+    if not isinstance(expr, IndexExpr):
+        return None
+    try:
+        base = ctx.api.get_expression_type(expr.base)
+        parts = _ndarray_parts(base) if base is not None else None
+        if parts is None:
+            return None
+        index = expr.index
+        items = list(index.items) if isinstance(index, TupleExpr) else [index]
+        if len(items) != len(parts[0]):
+            return None
+        for item in items:
+            tp = get_proper_type(ctx.api.get_expression_type(item))
+            if not isinstance(tp, Instance):
+                return None
+            if tp.type.fullname != "builtins.int" and not any(b.fullname == "numpy.integer" for b in tp.type.mro):
+                return None
+        return ("strong", None)
+    except Exception:
+        _swallowed(ctx, "_indexed_scalar")
+        return None
+
+
 def _scalar_row_width(tp: Type) -> int | None:
-    """k for a `tuple[T1, ..., Tk]` of scalars: one row of a table (issue #300)."""
+    """k for a `tuple[T1, ..., Tk]` of scalars: one row of a table (issue #300).
+
+    Items typed `Any` count next to at least one certain scalar: were
+    one of them an array, numpy would refuse the ragged row, so the row
+    has k values or the call raises.
+    """
     proper = get_proper_type(tp)
     if not isinstance(proper, TupleType) or not proper.items:
         return None
-    if any(_scalar_item(item, None) is None for item in proper.items):
+    scalars = [_scalar_item(item, None) is not None for item in proper.items]
+    if not any(scalars):
+        return None
+    if not all(ok or _may_be_anything(item) for ok, item in zip(scalars, proper.items)):
         return None
     return len(proper.items)
 
@@ -1210,14 +1257,22 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
     if any(k is None for k in kinds):
         # Numpy scalars among the items (`[v[0], v[1], 0.0]`): no item
         # adds an axis, so the length is the display's (issue #300).
-        specs = [_scalar_item(t, e) for t, e in elems]
-        if all(spec is not None for spec in specs):
+        specs = [_scalar_item(t, e) or _indexed_scalar(ctx, e) for t, e in elems]
+        # An `Any` item next to a certain scalar is one value too, or
+        # numpy refuses the ragged display.
+        loose_any = any(spec is not None for spec in specs) and all(
+            spec is not None or _may_be_anything(t) for spec, (t, _) in zip(specs, elems)
+        )
+        if all(spec is not None for spec in specs) or loose_any:
             dims = _apply_ndmin(ctx, [len(elems)])
             if dims is None:
                 return _asarray_stub(ctx, named)
-            dtype = named if named is not None else _scalar_items_dtype(
-                ctx, [spec for spec in specs if spec is not None]
-            )
+            if named is not None:
+                dtype = named
+            elif all(spec is not None for spec in specs):
+                dtype = _scalar_items_dtype(ctx, [spec for spec in specs if spec is not None])
+            else:
+                dtype = ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)])
             return _ndarray_type(ctx, dims, dtype)
         # Rows written as tuples of scalars: `[(x, y), (x, y)]` is (2, 2).
         widths = [_scalar_row_width(t) for t, _ in elems]

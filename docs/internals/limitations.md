@@ -219,14 +219,16 @@ quiet, where it is approximate, and what to write instead.
     arithmetic), cross-module uses, ambiguous records (two producers on
     one line with same-shaped results), unions that disagree, and scalar
     positions (a `-1`-for-none sentinel is not tracked).
-- A size that is a sum of values is unknown. `np.repeat(x, counts)` with
-    an array of counts has `sum(counts)` entries, and
-    `np.maximum.reduceat(x, starts)` has one per start. So in "reduce per
-    run, then spread back per entry" the correct line and the line that
-    forgot the `np.repeat` get the same types: both are an unknown size
-    against the named one, and neither is reported
-    ([#289](https://github.com/sofeikov/numty/issues/289)). The check is
-    a runtime one ([#17](https://github.com/sofeikov/numty/issues/17)).
+- A size that is a sum of values is not followed. `np.repeat(x, counts)`
+    with an array of counts has `sum(counts)` entries: a plain `int`.
+    That the counts sum to a named size is the author's to state, with
+    an annotated local or the declared return (`per_entry: F64[N] =
+    np.repeat(peak, lengths)`); it is not checked. With it, "reduce per
+    run, then spread back per entry" is checked: the line that forgot
+    the `np.repeat` assigns a per-run size where `N` is declared
+    ([#289](https://github.com/sofeikov/numty/issues/289),
+    `tests/fixtures/repeat_counts.py`). A runtime check is
+    [#17](https://github.com/sofeikov/numty/issues/17).
 - Index positions are best-effort by design. A certain overrun errors
     by default (`arange(5)` on a size-3 axis); a possible one
     (`searchsorted` positions on `N+1` over `N`) and a

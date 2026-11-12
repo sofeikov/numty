@@ -266,12 +266,42 @@ def _report_mask_names(
     Same emission rule as `_report_names`: nothing with the code off, so
     the default stays silent and no `[operator]` duplicate appears.
     """
-    if _names_enabled(ctx) and _mask_counts_differ(a, b):
+    if not _names_enabled(ctx):
+        return
+    if _mask_counts_differ(a, b):
         ctx.api.fail(
             f"{where}: {_dim_str(a)} and {_dim_str(b)} are different names",
             ctx.context,
             code=NUMTY_NAMES,
         )
+        return
+    apart = _unknown_offset(a, b)
+    if apart:
+        ctx.api.fail(
+            f"{where}: {_dim_str(a)} and {_dim_str(b)} are {abs(apart)} apart",
+            ctx.context,
+            code=NUMTY_NAMES,
+        )
+
+
+def _unknown_offset(a: int | Type, b: int | Type) -> int:
+    """`a - b` when both are one formula over unknowns up to a constant, else 0.
+
+    `?U` against `?U-1` (`gap = np.diff(c)`, then `np.r_[np.inf, gap]`
+    against `gap`). An unknown is named after its source site, and one
+    site can stand for several sizes (the items of a comprehension), so
+    this is not a proof and is only reported under the opt-in code.
+    """
+    from numty_plugin import _resolve_dim
+    if not isinstance(a, TypeVarType) or not isinstance(b, TypeVarType):
+        return 0
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if not isinstance(fa, _LinForm) or not isinstance(fb, _LinForm):
+        return 0
+    if not fa.coeffs or fa.coeffs != fb.coeffs or not _form_has_unknown(fa):
+        return 0
+    return fa.const - fb.const
 
 
 def _dim_str(d: int | Type) -> str:
