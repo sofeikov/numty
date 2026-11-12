@@ -17,7 +17,7 @@ from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
 from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import (
-    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeOfAny,
+    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeOfAny, TypeVarId,
     TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
@@ -178,13 +178,38 @@ def _is_mask_count_dim(d: int | Type) -> str | None:
 
     Mask counts mint as unknowns (`__numty_unknown__.maskcount_...`), so
     the default checks treat them like any unknown: silent and unifying.
+    The size a call chose for a name of its return alone (issue 307,
+    `.ownsize_`) is the same kind of size.
     For the opt-in report they are sizes of their own: `?U_keep` against
     a named size, or against another mask's count, is a different-names
     pair, while the same mask variable is the same size.
     """
-    if isinstance(d, TypeVarType) and ".maskcount_" in d.fullname:
+    if isinstance(d, TypeVarType) and (".maskcount_" in d.fullname or ".ownsize_" in d.fullname):
         return d.fullname
     return None
+
+
+# A free return name -> the unknowns that took it in the body (see
+# `_returns._name_born_sizes`): `sel = x[keep]`, returned as `F64[K]`,
+# is `(K,)`, and `K` is the count of `keep`.
+_OWN_NAME_OF: dict[TypeVarId, set[str]] = {}
+
+
+def _same_own_size(a: int | Type, b: int | Type) -> bool:
+    """One selection count, or one size a call chose, on both sides (issues 288, 307).
+
+    Also a free name against the unknown that took it: `sel * y[keep]`
+    with `sel = x[keep]` named `K` is one count on both sides.
+    """
+    if not isinstance(a, TypeVarType) or not isinstance(b, TypeVarType):
+        return False
+    ia = _is_mask_count_dim(a)
+    ib = _is_mask_count_dim(b)
+    if ia is not None and ia == ib:
+        return True
+    if b.fullname in _OWN_NAME_OF.get(a.id, ()) or a.fullname in _OWN_NAME_OF.get(b.id, ()):
+        return True
+    return False
 
 
 def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
@@ -196,6 +221,8 @@ def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
     Generic unknowns, literals, `int` and `Any` never count.
     """
     from numty_plugin import _resolve_dim
+    if _same_own_size(a, b):
+        return False
     ma = _is_mask_count_dim(a)
     mb = _is_mask_count_dim(b)
     if ma is not None and mb is not None:

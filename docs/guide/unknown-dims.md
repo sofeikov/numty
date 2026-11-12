@@ -44,6 +44,8 @@ different unknowns; a variable rebound between uses, a mask from a
 different scope, and an inline mask (`x[x > 0]`, `flatnonzero`, chained
 selections) mint fresh each time — best-effort flow-insensitive
 tracking (same `Name` in the same function, bail on reassignment).
+Two arrays with the count of one mask variable broadcast to that count
+(`ids[keep] + d[0, keep]` keeps it).
 Under the opt-in `numty-names` code a selection count is a size of its
 own: against a named size or another mask's count it is reported where
 the sizes must be equal
@@ -52,11 +54,76 @@ against a name stays silent. A selection that keeps everything still
 has an unknown count, so narrowing is needed where the full size is
 required.
 
-## Unknowns cannot be named in signatures
+## A size the function chooses
 
-The boundary is principled: unknowns flow through bodies but cannot be
-named in signatures — there is no spelling for "somebody else's count".
-Reduce them, or leave the position to inference.
+A name in a return type that no parameter binds is a size the function
+chooses: the number of runs it found, the rows of a frame it read. No
+caller can pick it, so it is the one place where a size born in the
+body gets a name (`tests/fixtures/own_size_return.py`):
+
+```python
+def bounds(segment: I64[N]) -> tuple[I64[K], I64[K]]:
+    "First and one-past-last row of each run of equal values"
+    if not len(segment):
+        return np.zeros(0, dtype=np.intp), np.zeros(0, dtype=np.intp)
+    starts = np.flatnonzero(np.r_[True, segment[1:] != segment[:-1]])
+    return starts, np.r_[starts[1:], len(segment)]
+```
+
+**In the body**, every position a `return` declares with `K` must hold
+one size, whatever it is. Two literals `0` pass, and so does one
+selection count twice. `starts` is a plain local, bound once and
+returned where `K` is declared, so it is `(K,)` for its whole life and
+what is computed from it is in `K`'s terms: `np.r_[starts[1:], n]` is
+`(K,)`. The mistake `np.r_[starts, n]` is `(K+1,)`:
+
+```text
+error: Incompatible return value type (got "tuple[ndarray[tuple[K], ...], ndarray[tuple[K+1], ...]]", expected "tuple[ndarray[tuple[K], ...], ndarray[tuple[K], ...]]")  [return-value]
+```
+
+Two different selection counts, or `0` and `1`, are refused the same
+way: the leftmost position takes the name, and a position that does
+not hold its size keeps its own (`tests/fixtures/bad_own_size_return.py`).
+A plain `int` fits, as it fits any name.
+
+**A local can be given the name**, which is how a size read from
+outside (a column of a frame, a count) is named for the rest of the
+body:
+
+```python
+def distances(events: pl.DataFrame, offsets: F64[O]) -> F64[O, E]:
+    clock: F64[E] = events["t"].cast(pl.Float64).to_numpy()   # (int,) takes the name
+    dist = np.empty((len(offsets), len(clock)))               # (O, E)
+```
+
+An `int` size or an unknown is accepted where a free name is declared;
+a literal is accepted only in a `return`, and a size with a name of the
+signature in it (`N`, `N+1`) never is. The name is the author's word
+that the sizes given it are one size, as an annotation always is.
+
+**At a call**, the positions declared with one free name share one
+unknown, printed with the name and the line of the call: `starts, ends
+= bounds(seg)` gives two arrays of `(?K@12,)`, and `ends - starts` is
+`(?K@12,)` too. Another free name of the same return is another
+unknown, and so is another call.
+
+**A property** that names a size its class does not bind
+(`def rows(self) -> I64[E]` in a class not generic in `E`) gives the
+size of the object. Read through a variable, every property declared
+with `E` gives the same unknown, printed `?ctx.E`, until the variable
+is bound again; `a.rows` and `b.rows` are two sizes. Through any other
+receiver (`self.ctx.rows`, `make().rows`) each read is a fresh unknown,
+and a method call chooses a size per call.
+
+Under the opt-in `numty-names` code these are sizes of their own, as a
+selection count is: `seconds - seconds[starts]` with `seconds: F64[N]`
+is `N and ?K@12 are different names`
+(`tests/fixtures/bad_own_size_optin.py`).
+
+What stays out: a name used only in the body (`Type variable "E" is
+unbound`, mypy's own rule: bind it in the return), a bare parameter
+returned under a free name, and a name a parameter binds, which is the
+caller's and still refuses an unknown.
 
 ## Dynamic sizes in returned values
 
@@ -74,12 +141,14 @@ error; write the parameter with the name. And the size is written as
 `Any` where the value is produced, so a local that is returned has
 `Any` in that size for its whole life, not only at the `return`. A
 name no parameter binds
-(`def flags(n: int) -> Bool[N]`) is still a fresh unknown at each call.
-Literals keep checking: `return np.zeros((0,))` against `F64[N]` stays
-a `[return-value]` error (`tests/fixtures/bad_ret_literal.py`), as do
-unknowns (a mask count returned where `F64[N]` is declared is still
-rejected, `tests/fixtures/bad_mask_ts.py`) and a named size against
-another named size.
+(`def flags(n: int) -> Bool[N]`) is an unknown of its own at each call
+(see [A size the function chooses](#a-size-the-function-chooses)).
+Against a name a parameter binds, literals keep checking: `return
+np.zeros((0,))` against `F64[N]` stays a `[return-value]` error
+(`tests/fixtures/bad_ret_literal.py`), as do unknowns (a mask count
+returned where `F64[N]` is declared is still rejected,
+`tests/fixtures/bad_mask_ts.py`) and a named size against another named
+size.
 
 One case keeps its `int`: a result with a named size on the wrong axis.
 `int` fits a declared name and a name fits a declared `int`, so without

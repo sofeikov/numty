@@ -10,7 +10,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from mypy.nodes import (
-    ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo,
+    ARG_POS, CallExpr, Decorator, Expression, FuncDef, NameExpr, OpExpr, OverloadedFuncDef, TypeInfo,
     TypeVarLikeExpr,
 )
 from mypy.argmap import map_actuals_to_formals
@@ -123,7 +123,8 @@ from ._unions import (
     _union_signature_clash,
 )
 from ._callsite import _relax_dynamic_formals, _report_call_site_names, _report_index_call_site, minmax_function_hook
-from ._returns import _return_sig_for_dynamic
+from ._returns import _holder_key, _return_sig_for_dynamic
+from ._unknowns import _fresh_own_size
 from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 
 class NumtyPlugin(Plugin):
@@ -1542,13 +1543,27 @@ def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
         if not isinstance(getter, CallableType):
             return default
         own = {v.fullname: index for index, v in enumerate(getter.variables) if isinstance(v, TypeVarType)}
+        # Read through a variable, the size belongs to the object in it:
+        # `c.xs` and `c.ys`, both declared with `E`, have one size, and
+        # so have two reads of `c.xs` (issue 306). Any other receiver
+        # (`f().xs`, `self.c.xs`) gives a size per read.
+        holder: tuple[str, str] | None = None
+        receiver = getattr(ctx.context, "expr", None)
+        if isinstance(receiver, NameExpr) and receiver.name:
+            tree = getattr(ctx.api, "tree", None)
+            hkey = _holder_key(getattr(tree, "path", None), ctx.context.line, receiver.name)
+            if hkey is not None:
+                holder = (receiver.name, hkey)
         env: dict[TypeVarId, Type] = {}
         for tv in _iter_tvarlikes(default):
             # mypy gives the getter's variables new ids on each read
             # (no namespace). A caller's variable of the same name has
             # the caller's namespace, and a class one has the class's.
             if isinstance(tv, TypeVarType) and tv.fullname in own and not tv.id.namespace and tv.id not in env:
-                env[tv.id] = _fresh_unknown(ctx, "property", own[tv.fullname])
+                if holder is None:
+                    env[tv.id] = _fresh_unknown(ctx, "property", own[tv.fullname])
+                else:
+                    env[tv.id] = _fresh_own_size(ctx, tv.name, f"{base.type.fullname}::{tv.fullname}", holder)
         if not env:
             return default
         return expand_type(default, env)

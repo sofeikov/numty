@@ -142,3 +142,63 @@ def _fresh_mask_count(
         line=line,
         column=column,
     )
+
+
+_OWN_SIZE_MARK = ".ownsize_"
+_own_size_per_line: dict[tuple[str, int, str], int] = {}
+
+
+def _fresh_own_size(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext,
+    name: str,
+    name_key: str,
+    holder: tuple[str, str] | None = None,
+) -> TypeVarType:
+    """The size a call's result has for a name only the callee's return declares (issue 307).
+
+    With `holder` (a variable's name and a key for it), the size is the
+    one a property of the object in that variable names: every read
+    through the variable gives the same unknown, printed `?var.K`.
+
+    `def bounds(seg: I64[N]) -> tuple[I64[K], I64[K]]`: no argument
+    binds `K`, so the function chooses it. One call gives one unknown
+    for every position declared `K` (keyed by the call site and the
+    name), and another name of the same return gives another. It prints
+    as `?K@line`. The fullname carries `.ownsize_`: like a selection
+    count, it is a size of its own for the opt-in report, and an unknown
+    for every default check.
+    """
+    tree = getattr(ctx.api, "tree", None)
+    module = getattr(tree, "fullname", "") or ""
+    line = ctx.context.line
+    column = ctx.context.column
+    if holder is None:
+        key = f"{module}_ownsize_{line}_{column}_{name_key}"
+    else:
+        key = f"{module}_ownsize_{holder[1]}_{name_key}"
+    vid = _unknown_ids.get(key)
+    if vid is None:
+        vid = TypeVarId.new(0)
+        _unknown_ids[key] = vid
+    fullname = f"__numty_unknown__{_OWN_SIZE_MARK}{key}"
+    display = _unknown_names.get(fullname)
+    if display is None:
+        if holder is None:
+            n = _own_size_per_line.get((module, line, name), 0)
+            _own_size_per_line[(module, line, name)] = n + 1
+            suffix = "" if n == 0 else (chr(ord("a") + n) if n < 26 else f"_{n + 1}")
+            display = f"?{name}@{line}{suffix}"
+        else:
+            display = f"?{holder[0]}.{name}"
+        _unknown_names[fullname] = display
+    upper = ctx.api.named_generic_type("builtins.int", [])
+    return TypeVarType(
+        name=display,
+        fullname=fullname,
+        id=vid,
+        values=[],
+        upper_bound=upper,
+        default=AnyType(TypeOfAny.from_omitted_generics),
+        line=line,
+        column=column,
+    )
