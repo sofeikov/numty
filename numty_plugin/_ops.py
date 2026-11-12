@@ -664,9 +664,29 @@ def _repeat_display_size(
     return sum(counts) if len(counts) == len(entries) else "bail"
 
 
+def _repeat_unknown(
+    ctx: FunctionContext | MethodContext, repeats: tuple[Type, Expression | None] | None, index: int
+) -> int | Type:
+    """The size along the repeated axis when the count is not a literal.
+
+    An array of counts gives the sum of its values, which no shape can
+    say: a plain `int`, a size that is not followed, so a declared name
+    takes it at a `return` or an annotated local (`per_entry: F64[N] =
+    np.repeat(peak, lengths)`, issue #289). A scalar count is one
+    unknown multiple.
+    """
+    from numty_plugin import _fresh_unknown
+    try:
+        parts = _ndarray_parts(repeats[0]) if repeats is not None else None
+        if parts is not None and parts[0]:
+            return ctx.api.named_generic_type("builtins.int", [])
+    except Exception:
+        _swallowed(ctx, "_repeat_unknown")
+    return _fresh_unknown(ctx, "repeat", index)
+
+
 def repeat_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
-    from numty_plugin import _fresh_unknown
     if not pairs:
         return ctx.default_return_type
     parts = _ndarray_parts(pairs[0][0])
@@ -715,7 +735,7 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
             return _ndarray_type(
                 ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
             )
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
+        return _ndarray_type(ctx, [_repeat_unknown(ctx, found_repeats, 0)], dtype)
     target = _normalize_axis_0d(axis, len(dims))
     if target is None:
         ctx.api.fail(
@@ -729,14 +749,14 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
         # A 0-d input with axis 0/-1 repeats the scalar (issue #62).
         if isinstance(count, int):
             return _ndarray_type(ctx, [count], dtype)
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
+        return _ndarray_type(ctx, [_repeat_unknown(ctx, found_repeats, 0)], dtype)
     out = list(dims)
     if isinstance(size, int):
         out[target] = size
     elif isinstance(count, int):
         out[target] = _dim_mul_const(ctx, "repeat", target, out[target], count)
     else:
-        out[target] = _fresh_unknown(ctx, "repeat", target)
+        out[target] = _repeat_unknown(ctx, found_repeats, target)
     return _ndarray_type(ctx, out, dtype)
 
 
@@ -748,7 +768,6 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
     function hook); displays and dynamic counts use the same helpers,
     anything else bails to the stubs.
     """
-    from numty_plugin import _fresh_unknown
     parts = _ndarray_parts(ctx.type)
     if parts is None:
         return ctx.default_return_type
@@ -800,7 +819,7 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
             return _ndarray_type(
                 ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
             )
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
+        return _ndarray_type(ctx, [_repeat_unknown(ctx, repeats_pair, 0)], dtype)
     target = _normalize_axis_0d(axis, len(dims))
     if target is None:
         ctx.api.fail(
@@ -814,14 +833,14 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
         # A 0-d input with axis 0/-1 repeats the scalar (issue #62).
         if isinstance(count, int):
             return _ndarray_type(ctx, [count], dtype)
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "repeat", 0)], dtype)
+        return _ndarray_type(ctx, [_repeat_unknown(ctx, repeats_pair, 0)], dtype)
     out = list(dims)
     if isinstance(size, int):
         out[target] = size
     elif isinstance(count, int):
         out[target] = _dim_mul_const(ctx, "repeat", target, out[target], count)
     else:
-        out[target] = _fresh_unknown(ctx, "repeat", target)
+        out[target] = _repeat_unknown(ctx, repeats_pair, target)
     return _ndarray_type(ctx, out, dtype)
 
 

@@ -5254,6 +5254,44 @@ def test_bad_local_name() -> None:
         assert len(errors[line]) == 1 and errors[line][0].endswith("[assignment]"), result.stdout
 
 
+def test_array_any_items() -> None:
+    # `np.array` of rows or of a display with `Any` items next to a
+    # certain scalar: one value per item, or numpy refuses the ragged
+    # display. An item indexing every axis with an integer is a scalar.
+    fixture = FIXTURES / "array_any_items.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    notes = reveals_by_line(off)
+    assert notes[25] == f'"numpy.ndarray[tuple[?U@22, Literal[6]], {_F64}]"', off.stdout
+    assert notes[26] == f'"numpy.ndarray[tuple[?U@22-1], {_F64}]"', off.stdout
+    assert notes[39] == f'"numpy.ndarray[tuple[Literal[2]], {_F64}]"', off.stdout
+    assert notes[40] == '"numpy.ndarray[tuple[Literal[2]], numpy.dtype[Any]]"', off.stdout
+    # A row of the grid is an array, and a dict is not a scalar: no claim.
+    assert notes[41] == '"numpy.ndarray[tuple[Literal[2], T], numpy.dtype[Any]]"', off.stdout
+    assert "tuple[Any, ...]" in notes[42], off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [27], on.stdout
+    assert "?U@22 and ?U@22-1 are 1 apart" in errors[27][0], on.stdout
+    assert errors[27][0].endswith("[numty-names]"), on.stdout
+    assert _run_fixture("array_any_items.py") == ["(3, 4)", "(3,)", "ragged"]
+
+
+def test_repeat_counts() -> None:
+    # Issue 289: `np.repeat(x, counts)` is `(int,)`, which a declared
+    # name takes at an annotated local and at a `return`; the per-run
+    # array assigned where the per-entry one is declared is refused.
+    result = run_mypy(FIXTURES / "repeat_counts.py")
+    notes = reveals_by_line(result)
+    assert notes[23] == f'"numpy.ndarray[tuple[int], {_F64}]"', result.stdout
+    assert notes[24] == f'"numpy.ndarray[tuple[int], {_F64}]"', result.stdout
+    assert notes[25] == f'"numpy.ndarray[tuple[2*?U@18], {_F64}]"', result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [26], result.stdout
+    assert "tuple[?U@18]" in errors[26][0] and errors[26][0].endswith("[assignment]"), result.stdout
+    assert _run_fixture("repeat_counts.py") == ["[False, True, False, True, False] (5,)"]
+
+
 def test_numba_dispatcher_call() -> None:
     # Issue 281: a call of a jitted function is checked as a call of the
     # function: sizes are solved (they were `Never`), a formula return is
@@ -5388,7 +5426,8 @@ def test_coverage_batch_2() -> None:
         31: f'"{_ND}[tuple[Literal[2]], numpy.dtype[Any]]"',
         32: f'"{_ND}[tuple[Literal[2]], {_F64}]"',
         33: f'"{_ND}[tuple[Any, ...], {_F64}]"',
-        34: f'"{_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+        # an `Any` next to a certain scalar: one value, or numpy refuses the ragged display
+        34: f'"{_ND}[tuple[Literal[2]], numpy.dtype[Any]]"',
         36: f'"{_ND}[tuple[?U@36, Literal[3]], numpy.dtype[Any]]"',
         37: f'"{_ND}[tuple[?U@37, Literal[3]], {_F64}]"',
         38: f'"{_ND}[tuple[Literal[3], Literal[2]], {_F32}]"',

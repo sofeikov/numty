@@ -76,8 +76,9 @@ non-positive sizes error.
 
 `tile` multiplies reps, `repeat` scales the axis
 (flattening to one dim for `axis=None`; a count list of several entries
-must have one per element and literal counts sum to the new size, other
-array repeats give `?U`), `pad`
+must have one per element and literal counts sum to the new size; an
+array of counts gives a plain `int`, a size that is not followed, and a
+scalar count that is not a literal gives `?U`), `pad`
 adds widths per axis, `split` returns a list of equal parts (`?U` for
 uneven index splits); negative counts and uneven divisions error.
 
@@ -117,9 +118,15 @@ arrays, so a Python float counts as float64 there
 where what it really holds cannot change the answer. Rows written as
 tuples of scalars give the width: `np.array(rows)` for `rows:
 list[tuple[float, float, float]]` is `(?U, 3)`, and a display of such
-tuples is `(len, 3)`. An item typed `Any` may be an array, so such a
-display keeps numpy's own answer, with the dtype the call names
-(`dtype=float` as well as `dtype=np.float64`).
+tuples is `(len, 3)`. An item typed `Any` counts as one value next to
+an item that is certainly a scalar: were it an array, numpy would
+refuse the ragged display (`setting an array element with a sequence`).
+So `np.array([a, v[0]])` with `a: Any` is `(2,)`, and a row `(f, x, y)`
+with `x, y: Any` has width 3. An item that indexes every axis of an
+array with an integer (`ball["x"][row]`) is one value whatever the
+array's dtype. A display of `Any` items alone keeps numpy's own answer,
+with the dtype the call names (`dtype=float` as well as
+`dtype=np.float64`), `tests/fixtures/array_any_items.py`.
 
 ## Ufunc methods
 
