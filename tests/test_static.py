@@ -606,6 +606,83 @@ def test_argmax_axis_mismatch() -> None:
     )
 
 
+def test_index_pos_ok() -> None:
+    # Issues #285/#286/#287: recorded index positions check clean, with
+    # and without the opt-in names code. Index[P, N] spells which axis
+    # the values index into; producers (argmin/argmax, arange,
+    # flatnonzero, nonzero, searchsorted) record it themselves.
+    for flags in ((), ("--enable-error-code", "numty-names")):
+        result = run_mypy(FIXTURES / "index_pos_ok.py", flags=flags)
+        assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
+    pi64 = (
+        "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit"
+        " | numpy._typing._nbit_base._64Bit]]"
+    )
+    assert reveals_by_line(run_mypy(FIXTURES / "index_pos_ok.py")) == {
+        17: f'"numpy.ndarray[tuple[J], {i64}]"',
+        18: f'"numpy.ndarray[tuple[K], {i64}]"',
+        20: f'"numpy.ndarray[tuple[?U@19], {f64}]"',
+        22: f'"numpy.ndarray[tuple[P, K], {f64}]"',
+        24: f'"numpy.ndarray[tuple[J, Q], {f64}]"',
+        28: f'"numpy.ndarray[tuple[N_count], {i64}]"',
+        30: f'"numpy.ndarray[tuple[N, N_count], {f64}]"',
+        32: f'"numpy.ndarray[tuple[N_count], {f64}]"',
+        36: f'"numpy.ndarray[tuple[K], {i64}]"',
+        38: f'"numpy.ndarray[tuple[P, K], {f64}]"',
+        43: f'"numpy.ndarray[tuple[N], {pi64}]"',
+        45: f'"numpy.ndarray[tuple[K, N], {f64}]"',
+        50: f'"numpy.ndarray[tuple[N], {pi64}]"',
+        52: f'"numpy.ndarray[tuple[N, M], {f64}]"',
+        58: f'"numpy.ndarray[tuple[?U@56], {f64}]"',
+        64: f'"numpy.ndarray[tuple[?U@63], {f64}]"',
+        69: f'"numpy.ndarray[tuple[K], {i64}]"',
+        71: f'"numpy.ndarray[tuple[K], {f64}]"',
+        76: f'"numpy.ndarray[tuple[K], {f64}]"',
+        82: f'"numpy.ndarray[tuple[J, Q], {f64}]"',
+    }, run_mypy(FIXTURES / "index_pos_ok.py").stdout
+
+
+def test_bad_index_pos() -> None:
+    # Issues #285/#286/#287: recorded positions on one size used on
+    # another. A provably overflowing bound (N+1 on N, 5 on 3) errors by
+    # default; different names need the opt-in code. Mixed slice+fancy
+    # lines also carry mypy's own [index] error, as every mixed-tuple
+    # solver error does (see assert_rank_mismatch).
+    fixture = FIXTURES / "bad_index_pos.py"
+    off = run_mypy(fixture)
+    assert sorted(_errors_by_line(off)) == [38, 44], off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    expected = {
+        17: [
+            "index positions on axis 0 (shape (P, Q)): Q and P are different names",
+            "index positions on axis 1 (shape (P, Q)): P and Q are different names",
+        ],
+        22: ["index positions on axis 1 (shape (P, Q)): M and Q are different names"],
+        23: ["index positions on axis 0 (shape (P, Q)): M and P are different names"],
+        28: ["index positions on axis 1 (shape (M, K)): M and K are different names"],
+        33: [
+            "index positions on axis 0 (shape (N, M)): M and N are different names",
+            "index positions on axis 1 (shape (N, M)): N and M are different names",
+        ],
+        38: ["index positions on N+1 used on axis 0 of size N (shape (N,))"],
+        44: ["index positions on 5 used on axis 0 of size 3 (shape (3,))"],
+        48: ["index positions on axis 1 (shape (P, Q)): M and Q are different names"],
+    }
+    assert sorted(errors) == [17, 22, 23, 28, 33, 38, 44, 48], on.stdout
+    for line, messages in expected.items():
+        assert len(errors[line]) == len(messages) + (1 if line in (22, 23, 28) else 0), on.stdout
+        for message in messages:
+            assert any(
+                message in text and text.endswith("[numty-names]" if "different names" in message else "[numty-axis]")
+                for text in errors[line]
+            ), on.stdout
+    for line in (22, 23, 28):
+        assert any("Invalid index type" in text and text.endswith("[index]") for text in errors[line]), on.stdout
+
+
 def test_einsum_label_conflict() -> None:
     # Issue #148: single targeted error with both shapes, no bool follow-ons.
     assert_single_error(

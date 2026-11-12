@@ -193,7 +193,7 @@ def test_every_head_is_known_to_plugin_and_codmod() -> None:
         for name, obj in vars(numty).items()
         if isinstance(obj, type) and getattr(obj, "_numty_dtype", None) is not None
     }
-    assert set(heads) == {"F64", "F32", "F16", "I64", "I32", "I16", "I8", "U8", "Bool"}
+    assert set(heads) == {"F64", "F32", "F16", "I64", "I32", "I16", "I8", "U8", "Bool", "Index"}
     plugin = {
         full.removeprefix("numty."): scalar
         for full, scalar in numty_plugin._FAM_HEAD_DTYPES.items()

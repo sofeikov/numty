@@ -13,8 +13,11 @@ from ._forms import (
     _LinForm,
 )
 from ._types import (
-    INT_FULLNAME, _dim_eq, _dims_provably_ne, _distribute_solve, _fold_int, _has_unpack, _int_value,
-    _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
+    INT_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int,
+    _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
+)
+from ._heads import (
+    _index_recorded_exceeds, _recorded_index_on, _report_names,
 )
 from ._names import _report_mask_names, _report_names
 from ._unknowns import _fresh_mask_count
@@ -749,6 +752,48 @@ def _solve_getitem_unpack(
     return _ndarray_type(ctx, out, dtype)
 
 
+def _check_index_positions(
+    ctx: MethodContext,
+    pair: tuple[Type, Expression | None],
+    size: int | Type,
+    axis: int,
+    dims: list[int | Type],
+) -> None:
+    """A recorded positions-on size must fit the axis it indexes (issues #285, #287).
+
+    A recorded bound provably above the axis (N+1 positions on an N
+    axis) is an error; a different *named* size is an opt-in
+    [numty-names] error; equal, fitting, unknown, or unrecorded
+    operands stay silent.
+    """
+    tp, expr = pair
+    parts = _ndarray_parts(tp)
+    if parts is None:
+        return
+    idims, _ = parts
+    if len(idims) != 1:
+        return
+    recorded = _recorded_index_on(ctx, idims, expr)
+    if recorded is None:
+        return
+    if _dim_eq(recorded, size):
+        return
+    if _index_recorded_exceeds(recorded, size):
+        ctx.api.fail(
+            f"index positions on {_dim_str(recorded)} used on axis {axis} "
+            f"of size {_dim_str(size)} (shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return
+    _report_names(
+        ctx,
+        recorded,
+        size,
+        f"index positions on axis {axis} (shape {_dims_str(dims)})",
+    )
+
+
 def _solve_getitem(
     ctx: MethodContext,
     dims: list[int | Type],
@@ -855,6 +900,7 @@ def _solve_getitem(
                 adv_seen = adv_seen or is_adv
         elif kind == "fancy":
             shape: list[int | Type] = list(item[1])
+            _check_index_positions(ctx, pairs[n], dims[dim], dim, dims)
             if not adv_block:
                 adv_block = shape
             else:

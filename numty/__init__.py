@@ -167,17 +167,22 @@ class Arr(_StringDims, Generic[DT, Unpack[TsFam]]):
     dtype first, then the dims exactly as a fixed head spells them:
     `Arr[T, N, M]` is `np.ndarray[tuple[N, M], np.dtype[T]]` with
     `T = TypeVar("T", bound=np.generic)`.
-
-    Dtype-first (rather than dtype-last, `I64[M, N, T]`) so the single
-    dtype parameter stays separate from the variadic dims: everything
-    after the first argument parses by the fixed-head rule (TypeVars,
-    integers, `Unpack[Ts]`, `Literal[...]`, string specs), and a
-    misplaced size in first position fails loudly instead of solving
-    as a dtype. The dtype is a TypeVar bound to a numpy scalar type,
-    a concrete scalar class (`Arr[np.float32, N, M]`), or `Any`.
     """
 
     _numty_any_dtype = True
+
+
+class Index(_StringDims, Generic[Unpack[TsFam]]):
+    """Positions array: Index[P, N] holds N int64 values indexing size P.
+
+    The shape says how many; the first arg says which axis the values are
+    positions on (issues #285, #286). Index[P] leaves the count dynamic,
+    Index["P N"] splits a string spec the same way, and a multi-dim shape
+    (Index[P, N, M]) records P but is not checked. A scalar -1-for-none
+    position is not tracked.
+    """
+
+    _numty_dtype = np.dtype(np.int64)
 
 
 # Ready-made dim TypeVars for the heads above: `F64[batch, features]`

@@ -5,7 +5,7 @@ for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import cast
 
 from mypy.nodes import (
@@ -24,6 +24,7 @@ from ._trace import _numty_strict, _numty_trace_path, _trace_event
 from ._dtypes import (
     _DATETIME_FULLNAMES, _DTYPE_INFO, _WEAK_DEFAULT, _datetime_string_kind,
 )
+from ._heads import _record_index_on
 
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
@@ -1029,6 +1030,24 @@ def _arange_symbolic_kw(
     return [stop]
 
 
+def _record_arange(
+    ctx: FunctionContext, stop: int | Type | None, result_dims: Sequence[int | Type]
+) -> None:
+    """Record positions-on for a 0-based arange result (issue #285).
+
+    `arange(n)` (and `arange(0, n[, 1])`) holds 0..n-1, positions on n.
+    A non-positive step, an unknown stop, or a negative literal stop is
+    ignored: the values are not bounded above by the stop then.
+    """
+    if stop is None or len(result_dims) != 1:
+        return
+    if isinstance(stop, int) and stop < 0:
+        return
+    if not isinstance(stop, (int, TypeVarType)):
+        return
+    _record_index_on(ctx, result_dims, stop)
+
+
 def arange_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if len(pairs) > 3:
@@ -1068,10 +1087,12 @@ def arange_function_hook(ctx: FunctionContext) -> Type:
             except ValueError:
                 ctx.api.fail("arange step is zero", ctx.context, code=NUMTY_SHAPE)
                 return ctx.default_return_type
+            _record_arange(ctx, stop_v if step_v > 0 else None, dims)
         else:
             dims = _arange_symbolic_kw(ordered)
             if dims is None:
                 return ctx.default_return_type
+            _record_arange(ctx, dims[0], dims)
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
         if named is None:
