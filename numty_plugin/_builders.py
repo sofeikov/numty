@@ -31,6 +31,7 @@ from ._types import (
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
+from ._returns import _return_any_for_dynamic
 from ._reshape import (
     _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,
     _known_rank_parts, _normalize_axis, _promote_all, _scalar_key,
@@ -408,6 +409,16 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                     )
                 else:
                     _trace_event(ctx, fullname, "solved", "")
+        # Issues #269/#271: a plain-`int` or bare-unknown dim in a value
+        # that is directly returned (or in a plain local it is returned
+        # through) cannot be proven for or against a declared named size,
+        # so it is `Any` there and the return checks. Everywhere else the
+        # precise type is kept.
+        try:
+            result = _return_any_for_dynamic(ctx, result)
+        except Exception:
+            _swallowed(ctx, fullname)
+            pass
         # Only a stub answer holding a Literal or plain `int` dim can be
         # widened, so most calls (np.isscalar, .shape, scalar reductions)
         # skip the operands.

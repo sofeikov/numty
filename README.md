@@ -556,6 +556,18 @@ The boundary is principled: unknowns flow through bodies but cannot be
 named in signatures — there is no spelling for "somebody else's count".
 Reduce them, or leave the position to inference.
 
+A dynamic size in a returned value fits a declared named size. A plain
+`int` (`np.zeros(n)`, `len()` of a non-array) or a bare unknown (a mask
+count) in a directly returned expression — or in an unannotated local it
+is returned through — is `Any` there, so it checks against any declared
+name, bound or not (`tests/fixtures/ret_int_ok.py`). A name no parameter
+binds (`def flags(n: int) -> Bool[N]`) is still a fresh unknown at each
+call. Literals keep checking: `return np.zeros((0,))` against `F64[N]`
+stays a `[return-value]` error (`tests/fixtures/bad_ret_literal.py`), as
+does a named size against another named size. The cost is known: a mask
+count returned where a named size is declared passes too, even though
+the count is provably not that size.
+
 Stacking a list built at runtime works the same way when every item has
 one declared shape: a name typed `list[...]`, or a list comprehension
 (filters, nested loops, and element transforms such as `a * 2` or
@@ -1379,7 +1391,11 @@ subtraction below.
   left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
   `full`, `*_like(shape=...)`) keeps the literal dims of a tuple
   display next to plain `int` ones: `np.zeros((n, 3))` is
-  `tuple[int, Literal[3]]`, also once assigned. A `Generator` sampler's
+  `tuple[int, Literal[3]]`, also once assigned. A dynamic size in a
+  directly returned value (or in an unannotated local it is returned
+  through) is `Any` there instead, so it fits a declared named size
+  (issues #269/#271); annotated locals, attribute or destructured
+  targets, and `yield`ed values keep the precise type and still check. A `Generator` sampler's
   mixed `size=` keeps the stubs' `tuple[Any, ...]`: its answer is final
   (no overload takes the shape from the assignment), so a name first
   bound to `(n, 3, 4)` could not be rebound to `size=(n, d, 4)`. A

@@ -11,8 +11,8 @@ from mypy.plugin import Plugin
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
     _broadcast, _broadcast_core, _builders, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _heads, _hooks,
-    _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _state, _trace, _types, _unions,
-    _unknowns,
+    _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _returns, _state, _trace, _types,
+    _unions, _unknowns,
 )
 from ._state import (  # noqa: F401
     STATE
