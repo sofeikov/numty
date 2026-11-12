@@ -47,6 +47,14 @@ def _ensure_batch() -> None:
         text=True,
         timeout=300,
     )
+    # mypy exits 0 or 1. Anything else is a crash or a killed process
+    # (out of memory on a small runner), and its output stops partway:
+    # the fixtures after that point would read as clean. Fail here, with
+    # the reason; the tests after this one run mypy per file.
+    assert result.returncode in (0, 1), (
+        f"batched mypy run exited with {result.returncode}\n"
+        f"{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+    )
     per_file: dict[str, list[str]] = {f.name: [] for f in files}
     for line in result.stdout.splitlines():
         # mypy prints paths relative to cwd (tests/fixtures/<name>:...).
@@ -4593,11 +4601,13 @@ def test_any_bound_size_is_stable() -> None:
     # Issue 284: with an argument of unknown rank and a union argument,
     # mypy solved `T` by a join whose order changed from run to run, and
     # about one cold run in four reported `cannot be "object"`. Eight
-    # cold runs must all be clean.
+    # cold runs must all be clean. Two at a time: each cold run reads
+    # numpy's stubs from scratch, and eight at once next to the batched
+    # runs of the other workers ran a CI runner out of memory.
     from concurrent.futures import ThreadPoolExecutor
 
     fixture = FIXTURES / "callsite_any_bound_ok.py"
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: run_mypy(fixture, flags=("--cache-dir", os.devnull)), range(8)))
     for result in results:
         assert result.returncode == 0, result.stdout
