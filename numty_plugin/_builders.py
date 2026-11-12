@@ -5,7 +5,7 @@ for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import cast
 
 from mypy.nodes import (
@@ -24,7 +24,6 @@ from ._trace import _numty_strict, _numty_trace_path, _trace_event
 from ._dtypes import (
     _DATETIME_FULLNAMES, _DTYPE_INFO, _WEAK_DEFAULT, _datetime_string_kind,
 )
-from ._heads import _record_index_on
 
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
@@ -472,18 +471,80 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     dims = _builder_shape(ctx, shape_arg, shape_expr, ctx.default_return_type)
     if dims is None:
-        return _stub_shape_named_dtype(ctx, _named_dtype(ctx) if _explicit_dtype(ctx) else None)
+        if _explicit_dtype(ctx):
+            return _stub_shape_named_dtype(ctx, _named_dtype(ctx), (shape_arg, shape_expr))
+        return _stub_shape_named_dtype(ctx, None)
     if not _dims_fit_intp(ctx, dims):
         return ctx.default_return_type
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
+        if dtype is None:
+            # The shape does not depend on the dtype (issue #303).
+            dtype = _unknown_dtype(ctx)
         if dtype is None:
             return ctx.default_return_type
         return _ndarray_type(ctx, dims, dtype)
     return _ndarray_type(ctx, dims, _default_float_dtype(ctx))
 
 
-def _stub_shape_named_dtype(ctx: FunctionContext | MethodContext, dtype: Type | None) -> Type:
+def _unknown_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
+    """dtype[Any] when the dtype= argument is `Any` or `dtype[Any]`, else None.
+
+    Such an argument matches every overload of a builder, and mypy
+    erases what their answers do not share, so `np.full((n, k), x,
+    dtype=other.dtype)` was `ndarray[Any, Any]`: the shape went with the
+    dtype (issue #303). The shape does not depend on the dtype, so the
+    hook answers the same for every overload. Any other dtype= the
+    plugin cannot name (`x.dtype` of an `F32`) is left to the stubs,
+    which do resolve it.
+    """
+    pair = _formal_pair(ctx, "dtype")
+    if pair is None:
+        return None
+    proper = get_proper_type(pair[0])
+    unknown = isinstance(proper, AnyType) or (
+        isinstance(proper, Instance)
+        and proper.type.fullname == DTYPE_FULLNAME
+        and len(proper.args) == 1
+        and isinstance(get_proper_type(proper.args[0]), AnyType)
+    )
+    if not unknown:
+        return None
+    return ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.explicit)])
+
+
+def _plain_int_shape(tp: Type, expr: Expression | None) -> list[int | Type] | None:
+    """Dims of a shape display made of plain `int` items only, else None.
+
+    `(n, k)` with `n: int, k: int` is `(int, int)`. _builder_shape leaves
+    such a display to the stubs, which type it themselves when they know
+    the dtype. With a dtype they cannot resolve they answer
+    `ndarray[Any, Any]`, and the rank went with the dtype (issue #303).
+    """
+    proper = get_proper_type(tp)
+    if (
+        not isinstance(expr, TupleExpr)
+        or not isinstance(proper, TupleType)
+        or len(proper.items) != len(expr.items)
+        or not expr.items
+    ):
+        return None
+    out: list[int | Type] = []
+    for item, item_tp in zip(expr.items, proper.items):
+        plain = get_proper_type(item_tp)
+        if isinstance(item, StarExpr) or not (
+            isinstance(plain, Instance) and plain.type.fullname == INT_FULLNAME
+        ):
+            return None
+        out.append(plain.copy_modified(last_known_value=None))
+    return out
+
+
+def _stub_shape_named_dtype(
+    ctx: FunctionContext | MethodContext,
+    dtype: Type | None,
+    shape_pair: tuple[Type, Expression | None] | None = None,
+) -> Type:
     """The stubs' answer for a builder, with the dtype the call names.
 
     A shape display with no provable size (`np.zeros((n, k))`) stays
@@ -494,19 +555,27 @@ def _stub_shape_named_dtype(ctx: FunctionContext | MethodContext, dtype: Type | 
     """
     default = get_proper_type(ctx.default_return_type)
     if (
-        dtype is None
-        or not isinstance(default, Instance)
+        not isinstance(default, Instance)
         or default.type.fullname != NDARRAY_FULLNAME
         or len(default.args) != 2
     ):
         return ctx.default_return_type
+    if shape_pair is not None and dtype is None:
+        # An explicit dtype= that does not resolve (issue #303). With an
+        # `Any` argument every overload matches, and mypy erases what
+        # their answers do not share: the rank went with the dtype. One
+        # answer for every overload keeps it.
+        plain = _plain_int_shape(*shape_pair)
+        any_dtype = _unknown_dtype(ctx)
+        if plain is not None and any_dtype is not None:
+            return _ndarray_type(ctx, plain, any_dtype)
     stub_dtype = get_proper_type(default.args[1])
     unknown = isinstance(stub_dtype, AnyType) or (
         isinstance(stub_dtype, Instance)
         and len(stub_dtype.args) == 1
         and isinstance(get_proper_type(stub_dtype.args[0]), AnyType)
     )
-    if not unknown:
+    if dtype is None or not unknown:
         return ctx.default_return_type
     return default.copy_modified(args=[default.args[0], dtype])
 
@@ -787,6 +856,8 @@ def _like_types(ctx: FunctionContext, tp: Type) -> Type:
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
         if named is None:
+            named = _unknown_dtype(ctx)
+        if named is None:
             return ctx.default_return_type
         return _ndarray_type(ctx, dims, named)
     return _ndarray_type(ctx, dims, dtype)
@@ -837,11 +908,13 @@ def full_function_hook(ctx: FunctionContext) -> Type:
     dims = _builder_shape(ctx, *shape_pair, ctx.default_return_type)
     if dims is None:
         if _explicit_dtype(ctx):
-            return _stub_shape_named_dtype(ctx, _named_dtype(ctx))
+            return _stub_shape_named_dtype(ctx, _named_dtype(ctx), shape_pair)
         fill_name = _fill_dtype_name(fill_pair[0])
         return _stub_shape_named_dtype(ctx, _construct_dtype(ctx, fill_name) if fill_name is not None else None)
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
+        if named is None:
+            named = _unknown_dtype(ctx)
         if named is None:
             return ctx.default_return_type
         return _ndarray_type(ctx, dims, named)
@@ -1013,127 +1086,6 @@ def tri_function_hook(ctx: FunctionContext) -> Type:
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, [n, m], dtype)
-
-
-def _arange_symbolic(
-    pairs: list[tuple[Type, Expression | None]],
-) -> list[int | TypeVarType] | None:
-    """arange(N) / arange(0, N) / arange(0, N, 1): N elements, else None."""
-    if len(pairs) == 1:
-        start: int | None = 0
-        stop_tp = pairs[0][0]
-        step: int | None = 1
-    elif len(pairs) in (2, 3):
-        start = _fold_single(pairs[0])
-        stop_tp = pairs[1][0]
-        step = _fold_single(pairs[2]) if len(pairs) == 3 else 1
-    else:
-        return None
-    if start != 0 or step != 1:
-        return None
-    stop = _dim_value(stop_tp)
-    if not isinstance(stop, TypeVarType):
-        return None
-    return [stop]
-
-
-def _arange_symbolic_kw(
-    ordered: list[tuple[Type, Expression | None] | None],
-) -> list[int | TypeVarType] | None:
-    """Symbolic arange through keyword-resolved start/stop/step.
-
-    `arange(stop=N)`, `arange(0, stop=N)`, `arange(start=0, stop=N,
-    step=1)`: N elements. Anything else (non-zero start, non-one step,
-    unresolvable stop) stays with the stubs.
-    """
-    if len(ordered) != 3:
-        return None
-    start_p, stop_p, step_p = ordered
-    if stop_p is None:
-        return None
-    if start_p is not None and _fold_single(start_p) != 0:
-        return None
-    if step_p is not None and _fold_single(step_p) != 1:
-        return None
-    stop = _dim_value(stop_p[0])
-    if not isinstance(stop, TypeVarType):
-        return None
-    return [stop]
-
-
-def _record_arange(
-    ctx: FunctionContext, stop: int | Type | None, result_dims: Sequence[int | Type]
-) -> None:
-    """Record positions-on for a 0-based arange result (issue #285).
-
-    `arange(n)` (and `arange(0, n[, 1])`) holds 0..n-1, positions on n.
-    A non-positive step, an unknown stop, or a negative literal stop is
-    ignored: the values are not bounded above by the stop then.
-    """
-    if stop is None or len(result_dims) != 1:
-        return
-    if isinstance(stop, int) and stop < 0:
-        return
-    if not isinstance(stop, (int, TypeVarType)):
-        return
-    _record_index_on(ctx, result_dims, stop, exact=True)
-
-
-def arange_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if len(pairs) > 3:
-        return ctx.default_return_type
-    # start/stop/step may arrive as keywords (issue #46: `stop=`/`step=`
-    # used to be silently ignored). The stubs name the first positional
-    # `start_or_stop`, and it is positional-only (shows up as `None` in
-    # `callee_arg_names`), so take it from call order: with an explicit
-    # `stop` a leading positional is the start, otherwise a lone
-    # positional is the stop (`arange(10)`, `arange(10, step=2)`).
-    step_p = _formal_pair(ctx, "step")
-    stop_p = _formal_pair(ctx, "stop")
-    first_pos = pairs[0] if pairs else None
-    if first_pos is None and stop_p is None and step_p is None:
-        ordered: list[tuple[Type, Expression | None] | None] = list(pairs)
-        by_name = False
-    else:
-        if stop_p is not None:
-            start_p = first_pos
-        else:
-            start_p, stop_p = None, first_pos
-        ordered = [start_p, stop_p, step_p]
-        by_name = True
-    if len(ordered) not in (1, 2, 3):
-        return ctx.default_return_type
-    if by_name:
-        # A name resolved through the formals already accounts for how
-        # mypy bound positionals; a missing stop is an invalid call.
-        if ordered[1] is None:
-            return ctx.default_return_type
-        start_v = 0 if ordered[0] is None else _fold_single(ordered[0])
-        stop_v = _fold_single(ordered[1])
-        step_v = 1 if ordered[2] is None else _fold_single(ordered[2])
-        if start_v is not None and stop_v is not None and step_v is not None:
-            try:
-                dims = [len(range(start_v, stop_v, step_v))]
-            except ValueError:
-                ctx.api.fail("arange step is zero", ctx.context, code=NUMTY_SHAPE)
-                return ctx.default_return_type
-            _record_arange(ctx, stop_v if step_v > 0 else None, dims)
-        else:
-            dims = _arange_symbolic_kw(ordered)
-            if dims is None:
-                return ctx.default_return_type
-            _record_arange(ctx, dims[0], dims)
-    if _explicit_dtype(ctx):
-        named = _named_dtype(ctx)
-        if named is None:
-            return ctx.default_return_type
-        explicit_dtype: Type | None = named
-    else:
-        explicit_dtype = None
-    if explicit_dtype is not None:
-        return _ndarray_type(ctx, dims, explicit_dtype)
-    return _ndarray_type(ctx, dims, _default_dtype(ctx))
 
 
 def _comprehension_parts(

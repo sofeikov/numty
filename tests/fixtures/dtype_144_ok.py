@@ -50,7 +50,8 @@ if __name__ == "__main__":
         np.dtype(np.float32),
     ]
     try:
-        np.mean(dt)
+        # `dt` has its dtype since issue 300, so the stubs see what numpy refuses.
+        np.mean(dt)  # type: ignore[arg-type]
     except Exception as e:
         assert type(e).__name__ == "UFuncTypeError", type(e).__name__
     else:

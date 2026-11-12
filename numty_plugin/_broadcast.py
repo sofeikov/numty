@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE
+from ._dtypes import _promote_strong as _promote_strong_names
 from ._dtypes import (
     _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE,
     _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _WEAK_DEFAULT,
@@ -31,7 +32,7 @@ from ._reshape import (
 )
 from ._builders import (
     _apply_out_dtype, _default_dtype, _element_expr_type, _explicit_dtype, _fold_single, _is_dynamic_sequence,
-    _named_dtype, _scalar_ret_name,
+    _named_dtype, _scalar_ret_name, _stub_shape_named_dtype,
 )
 from ._linalg import (
     _linalg_dtype, _linalg_real_name, _linalg_tuple,
@@ -49,7 +50,7 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import Expression, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
+from mypy.nodes import Expression, FloatExpr, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
 from mypy.subtypes import is_same_type
 from mypy.types import (
     AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, UninhabitedType, UnionType,
@@ -367,7 +368,9 @@ def _broadcast_dims_unpack(
     if sa is None and sb is None:
         if a is None:
             return None
-        if _scalar_key(right) is None:
+        # A numpy scalar of any width is a scalar too (issue #302):
+        # `u >= u[i]` on float32 data, `t == x` with `x: np.floating`.
+        if _scalar_key(right) is None and not _is_numpy_scalar(right):
             return None
         return a[0]
     if sa is not None and sb is not None:
@@ -381,7 +384,7 @@ def _broadcast_dims_unpack(
     sel, other = (sa, right) if sa is not None else (sb, left)
     assert sel is not None
     (prefix, unpack, suffix), _ = sel
-    if _scalar_key(other) is not None:
+    if _scalar_key(other) is not None or _is_numpy_scalar(other):
         return prefix + [unpack] + suffix
     parts = _ndarray_parts(other)
     if parts is not None and parts[0] == []:
@@ -1037,6 +1040,98 @@ def _display_element_kind(tp: Type, expr: Expression | None) -> str | None:
     return None
 
 
+_EXACT_WEAK_DTYPE = {
+    "builtins.bool": "numpy.bool",
+    "builtins.int": "numpy.int64",
+    "builtins.float": "numpy.float64",
+    "builtins.complex": "numpy.complex128",
+}
+
+
+def _scalar_item(tp: Type, expr: Expression | None) -> tuple[str, str | None] | None:
+    """What a display item that is certainly a scalar brings, else None.
+
+    ("exact", dtype name) for a literal (`0.0`, `3`, `True`): numpy reads
+    it in its default dtype. ("loose", builtins name) for a value typed
+    `float` / `int` / `bool` / `complex`: a `float` may hold an int and
+    an `int` a bool. ("strong", dtype name) for a numpy scalar, with
+    None for one of unknown width (`floating[Any]`). An `Any`, an array
+    or a sequence is not a scalar: it may add an axis.
+    """
+    value = _fold_int(expr) if expr is not None else None
+    if isinstance(value, bool):
+        return ("exact", "numpy.bool")
+    if isinstance(value, int):
+        return ("exact", "numpy.int64")
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType):
+        weak = _weak_name(proper)
+        return ("exact", _EXACT_WEAK_DTYPE[weak]) if weak is not None else None
+    if isinstance(expr, FloatExpr):
+        return ("exact", "numpy.float64")
+    weak = _weak_name(tp)
+    if weak is not None:
+        return ("loose", weak)
+    key = _scalar_key(tp)
+    if key is not None:
+        return key
+    if isinstance(proper, Instance) and any(base.fullname == "numpy.generic" for base in proper.type.mro):
+        return ("strong", _scalar_ret_name(proper))
+    return None
+
+
+def _scalar_items_dtype(
+    ctx: FunctionContext | MethodContext, specs: list[tuple[str, str | None]]
+) -> Type:
+    """The dtype `np.array` gives a display of scalars (issue #300).
+
+    numpy promotes the items as arrays: a Python float counts as
+    float64 here, not as a weak scalar (`np.array([np.float32(1), 0.0])`
+    is float64). A value typed `float` or `int` is claimed only where
+    what it may really hold cannot change the answer: next to a float64
+    or complex128 item. Anything else is `dtype[Any]`.
+    """
+    unknown = ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)])
+    current: str | None = None
+    for kind, name in specs:
+        if kind == "loose":
+            continue
+        if name is None:
+            return unknown
+        current = name if current is None else _promote_strong_names(current, name)
+        if current is None:
+            return unknown
+    loose = {name for kind, name in specs if kind == "loose"}
+    if loose:
+        if "builtins.complex" in loose:
+            return unknown
+        if current not in ("numpy.float64", "numpy.complex128"):
+            return unknown
+    if current is None:
+        return unknown
+    dtype = _construct_dtype(ctx, current)
+    return dtype if dtype is not None else unknown
+
+
+def _scalar_row_width(tp: Type) -> int | None:
+    """k for a `tuple[T1, ..., Tk]` of scalars: one row of a table (issue #300)."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, TupleType) or not proper.items:
+        return None
+    if any(_scalar_item(item, None) is None for item in proper.items):
+        return None
+    return len(proper.items)
+
+
+def _asarray_stub(ctx: FunctionContext | MethodContext, named: Type | None) -> Type:
+    """The stubs' answer, with the dtype the call names (issue #300).
+
+    `dtype=np.float64` is typed by the stubs and `dtype=float` is not,
+    whatever the items are.
+    """
+    return _stub_shape_named_dtype(ctx, named) if named is not None else ctx.default_return_type
+
+
 def _apply_ndmin(
     ctx: FunctionContext | MethodContext, dims: list[int | Type]
 ) -> list[int | Type] | None:
@@ -1111,6 +1206,25 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
         return _asarray_dynamic(ctx, tp, expr, named)
     kinds = [_display_element_kind(t, e) for t, e in elems]
     if any(k is None for k in kinds):
+        # Numpy scalars among the items (`[v[0], v[1], 0.0]`): no item
+        # adds an axis, so the length is the display's (issue #300).
+        specs = [_scalar_item(t, e) for t, e in elems]
+        if all(spec is not None for spec in specs):
+            dims = _apply_ndmin(ctx, [len(elems)])
+            if dims is None:
+                return _asarray_stub(ctx, named)
+            dtype = named if named is not None else _scalar_items_dtype(
+                ctx, [spec for spec in specs if spec is not None]
+            )
+            return _ndarray_type(ctx, dims, dtype)
+        # Rows written as tuples of scalars: `[(x, y), (x, y)]` is (2, 2).
+        widths = [_scalar_row_width(t) for t, _ in elems]
+        width = widths[0]
+        if width is not None and all(w == width for w in widths):
+            dims = _apply_ndmin(ctx, [len(elems), width])
+            if dims is None:
+                return _asarray_stub(ctx, named)
+            return _ndarray_type(ctx, dims, named if named is not None else _default_dtype(ctx))
         return _asarray_of_arrays(ctx, [t for t, _ in elems], named)
     if named is None:
         if "builtins.complex" in kinds:
@@ -1141,16 +1255,16 @@ def _asarray_of_arrays(ctx: FunctionContext, items: list[Type], named: Type | No
     """
     parts = [part for part in map(_ndarray_parts, items) if part is not None]
     if not parts or len(parts) != len(items):
-        return ctx.default_return_type
+        return _asarray_stub(ctx, named)
     first_dims, first_dtype = parts[0]
     for dims, dtype in parts[1:]:
         if len(dims) != len(first_dims) or not all(_dim_eq(a, b) for a, b in zip(dims, first_dims)):
-            return ctx.default_return_type
+            return _asarray_stub(ctx, named)
         if named is None and not is_same_type(dtype, first_dtype):
-            return ctx.default_return_type
+            return _asarray_stub(ctx, named)
     out = _apply_ndmin(ctx, [len(items), *first_dims])
     if out is None:
-        return ctx.default_return_type
+        return _asarray_stub(ctx, named)
     return _ndarray_type(ctx, out, named if named is not None else first_dtype)
 
 
@@ -1175,22 +1289,31 @@ def _asarray_dynamic(
         proper = get_proper_type(tp)
         item = proper.args[0] if isinstance(proper, Instance) and proper.args else None
     else:
-        return ctx.default_return_type
+        return _asarray_stub(ctx, named)
     if item is None:
-        return ctx.default_return_type
+        return _asarray_stub(ctx, named)
     lead = _fresh_unknown(ctx, "asarray", 0)
     part = _ndarray_parts(item)
     if part is not None:
         dims = _apply_ndmin(ctx, [lead, *part[0]])
         if dims is None:
-            return ctx.default_return_type
+            return _asarray_stub(ctx, named)
         return _ndarray_type(ctx, dims, named if named is not None else part[1])
+    width = _scalar_row_width(item)
+    if width is not None:
+        # A table built row by row: `list[tuple[float, float, float]]`
+        # is (?U, 3) (issue #300). The dtype is the one the call names;
+        # a `float` item may hold an int, so nothing else is claimed.
+        dims = _apply_ndmin(ctx, [lead, width])
+        if dims is None:
+            return _asarray_stub(ctx, named)
+        return _ndarray_type(ctx, dims, named if named is not None else _default_dtype(ctx))
     key = _scalar_key(item)
     if key is None:
-        return ctx.default_return_type
+        return _asarray_stub(ctx, named)
     dims = _apply_ndmin(ctx, [lead])
     if dims is None:
-        return ctx.default_return_type
+        return _asarray_stub(ctx, named)
     if named is not None:
         return _ndarray_type(ctx, dims, named)
     kind, name = key

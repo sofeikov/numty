@@ -39,7 +39,7 @@ from ._reshape import (
     _construct_dtype, _is_plain_int, _unknown_axis_parts,
 )
 from ._linalg import (
-    _kind_of,
+    _dtype_family, _kind_of,
 )
 from ._linalg import (
     _maybe_scalar, _scalar_of_dtype,
@@ -57,12 +57,7 @@ def _reduction_out_dtype(
     """
     name = _dtype_fullname(dtype)
     if name is None:
-        ks = _dtype_kind_size(dtype)
-        if ks is None:
-            return None
-        kind, _ = ks
-        # Unresolvable generic (e.g. floating[Any]): keep dims with Any? Bail.
-        return None
+        return _family_reduction_dtype(op, dtype)
     kind = _kind_of(name)
     if kind is None:
         return None
@@ -91,6 +86,29 @@ def _reduction_out_dtype(
     return None
 
 
+def _family_reduction_dtype(op: str, dtype: Type) -> Type | None:
+    """Output dtype of a reduction over a float of unknown width (issue #301).
+
+    `floating[Any]` (the `Floating` head, or a dtype TypeVar bound by
+    `np.floating`) is float16, float32 or float64, and every reduction
+    here keeps each of them: the sum, mean, std and max of a float32
+    array are float32. So the family is the answer, as it is for the
+    elementwise operations (issue #277). The integer families are left
+    out: their sum widens by a rule that needs the width.
+    """
+    if _dtype_family(dtype) != "f":
+        return None
+    base = op.removeprefix("nan")
+    if base in ("sum", "prod", "mean", "std", "var", "median", "max", "min", "ptp", "amax", "amin"):
+        return dtype
+    return None
+
+
+def _family_keeps_dtype(dtype: Type) -> bool:
+    """A dtype a reduction may keep as it is: a named one, or the float family."""
+    return _dtype_fullname(dtype) in REDUCTION_DTYPES or _dtype_family(dtype) == "f"
+
+
 def _solve_reduction(
     ctx: FunctionContext | MethodContext,
     dims: list[int | Type],
@@ -103,7 +121,7 @@ def _solve_reduction(
 ) -> Type:
     if not isinstance(axis, list) or keepdims is None or has_dtype:
         return ctx.default_return_type
-    if force_dtype is None and _dtype_fullname(dtype) not in REDUCTION_DTYPES:
+    if force_dtype is None and not _family_keeps_dtype(dtype):
         return ctx.default_return_type
     out_dtype = force_dtype if force_dtype is not None else dtype
     ndim = len(dims)
@@ -224,7 +242,7 @@ def _solve_reduction_unpack(
     # so the shape stays unchecked instead of wrong (issue #185).
     if not isinstance(axis, list) or keepdims is None or has_dtype:
         return AnyType(TypeOfAny.from_omitted_generics)
-    if force_dtype is None and _dtype_fullname(dtype) not in REDUCTION_DTYPES:
+    if force_dtype is None and not _family_keeps_dtype(dtype):
         return AnyType(TypeOfAny.from_omitted_generics)
     out_dtype = force_dtype if force_dtype is not None else dtype
     flat = prefix + [unpack] + suffix
@@ -515,6 +533,8 @@ def _ufunc_any_dtype() -> Type:
 # operand, so the result has the operand's dtype for every dtype.
 # `add` and `multiply` are not here: they widen small integers.
 _UFUNC_PICKS = frozenset({"maximum", "minimum", "fmax", "fmin"})
+_UFUNC_LOGICAL = frozenset({"logical_or", "logical_and", "logical_xor"})
+_UFUNC_SUMS = frozenset({"add", "multiply"})
 
 
 def _ufunc_method_dtype(ctx: FunctionContext | MethodContext, operand_dtype: Type) -> Type:
@@ -529,12 +549,28 @@ def _ufunc_method_dtype(ctx: FunctionContext | MethodContext, operand_dtype: Typ
     if not isinstance(receiver, Instance) or not receiver.args:
         return _ufunc_any_dtype()
     name = get_proper_type(receiver.args[0])
-    if not isinstance(name, LiteralType) or name.value not in _UFUNC_PICKS:
+    if not isinstance(name, LiteralType):
         return _ufunc_any_dtype()
     pair = _formal_pair(ctx, "dtype")
     if pair is not None and not _is_none_type(pair[0]):
         return _ufunc_any_dtype()
-    return operand_dtype
+    if name.value in _UFUNC_PICKS:
+        return operand_dtype
+    # Issue #304, each row checked against numpy for reduce, accumulate
+    # and reduceat. The logical ufuncs answer bool for every operand.
+    # `add` and `multiply` keep a float or complex operand, and widen a
+    # bool or signed one to int64 and an unsigned one to uint64, as `sum`
+    # does: the family is enough, the width is not needed.
+    named: str | None = None
+    if name.value in _UFUNC_LOGICAL:
+        named = "numpy.bool"
+    elif name.value in _UFUNC_SUMS:
+        family = _dtype_family(operand_dtype)
+        if family in ("f", "c"):
+            return operand_dtype
+        named = {"b": "numpy.int64", "i": "numpy.int64", "u": "numpy.uint64"}.get(family or "")
+    dtype = _construct_dtype(ctx, named) if named is not None else None
+    return dtype if dtype is not None else _ufunc_any_dtype()
 
 
 def _reduceat_length(pair: tuple[Type, Expression | None] | None) -> int | Type | None:
@@ -551,10 +587,13 @@ def _reduceat_length(pair: tuple[Type, Expression | None] | None) -> int | Type 
         if any(isinstance(e, (ListExpr, TupleExpr, StarExpr)) for e in expr.items):
             return None
         return len(expr.items)
-    parts = _ndarray_parts(tp)
+    # An index array whose size is a plain `int` (the starts of the
+    # runs, found at runtime) is read too: one result per index, of
+    # whatever kind its size is (issues #270 and #304).
+    parts = _ndarray_parts(tp) or _known_rank_parts(tp)
     if parts is not None:
         dims, _ = parts
-        if len(dims) == 1 and isinstance(dims[0], (int, TypeVarType)):
+        if len(dims) == 1:
             return dims[0]
     return None
 
@@ -1438,7 +1477,7 @@ def _cumsum_solve(
                 if promoted is None:
                     return ctx.default_return_type
                 return _ndarray_type(ctx, [total], promoted)
-            if name is None or name not in REDUCTION_DTYPES:
+            if not _family_keeps_dtype(dtype):
                 return ctx.default_return_type
             return _ndarray_type(ctx, [total], dtype)
         else:
@@ -1472,7 +1511,7 @@ def _cumsum_solve(
         if promoted is None:
             return ctx.default_return_type
         return _ndarray_type(ctx, out_dims, promoted)
-    if name is None or name not in REDUCTION_DTYPES:
+    if not _family_keeps_dtype(dtype):
         # Non-numeric dtypes (strings, datetime64, ...): the stubs own it.
         return ctx.default_return_type
     return _ndarray_type(ctx, out_dims, dtype)

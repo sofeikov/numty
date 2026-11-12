@@ -56,7 +56,12 @@ from one source and float64 from another in code that keeps whichever
 it gets. `Floating[N]` is `ndarray[tuple[N], dtype[floating[Any]]]`.
 Elementwise operations keep the shape and the family: `t + 1.0`,
 `np.abs(t)`, `np.exp(t)`, `t - t.min()` and `t / (t.max() - t.min())`
-are all `Floating[N]` for `t: Floating[N]`. `max(t.max(), 1e-9)` is
+are all `Floating[N]` for `t: Floating[N]`. Reductions over an axis and
+the cumulative functions keep the family too (`t.max(axis=1)`,
+`t.sum(axis=0)`, `t.mean(axis=0)`, `np.nanmax(t, axis=1)`,
+`np.cumsum(t, axis=0)`): the sum, mean and max of a float32 array are
+float32. A comparison with a numpy scalar of any width keeps the shape
+(`t >= t[i]`, `u == y` with `y: np.float32`). `max(t.max(), 1e-9)` is
 `floating[Any] | float`, so a division by it type checks. A float array
 is not an integer array (`[arg-type]`). Whether a family array fits an
 exact head is mypy's reading of numpy's stubs, and numty leaves it as

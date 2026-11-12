@@ -2728,22 +2728,25 @@ def test_ufunc_methods_ok_clean_and_runs() -> None:
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
     any_dt = "numpy.ndarray[tuple[{}], Any]"
+    # Issue 304: add and multiply keep a float operand's dtype in reduce,
+    # accumulate and reduceat. outer is still shape only.
+    f64 = "numpy.ndarray[tuple[{}], numpy.dtype[numpy.float64]]"
     assert reveals_by_line(result) == {
-        20: f'"{any_dt.format("M")}"',
-        21: f'"{any_dt.format("N")}"',
-        22: f'"{any_dt.format("N, M")}"',
+        20: f'"{f64.format("M")}"',
+        21: f'"{f64.format("N")}"',
+        22: f'"{f64.format("N, M")}"',
         23: f'"{any_dt.format("N, M, Literal[2]")}"',
-        28: f'"{any_dt.format("Literal[3]")}"',
-        29: f'"{any_dt.format("Literal[2]")}"',
-        30: f'"{any_dt.format("Literal[2], Literal[1]")}"',
-        31: '"Any"',
-        32: f'"{any_dt.format("Literal[2], Literal[3]")}"',
+        28: f'"{f64.format("Literal[3]")}"',
+        29: f'"{f64.format("Literal[2]")}"',
+        30: f'"{f64.format("Literal[2], Literal[1]")}"',
+        31: '"numpy.float64"',
+        32: f'"{f64.format("Literal[2], Literal[3]")}"',
         33: f'"{any_dt.format("Literal[3], Literal[4]")}"',
         34: f'"{any_dt.format("Literal[3]")}"',
         # Issue 283: minimum picks elements, so the dtype is the operand's.
         35: '"numpy.ndarray[tuple[Literal[2]], numpy.dtype[numpy.float64]]"',
-        36: f'"{any_dt.format("Literal[2]")}"',
-        37: f'"{any_dt.format("Literal[4], Literal[2]")}"',
+        36: f'"{f64.format("Literal[2]")}"',
+        37: f'"{f64.format("Literal[4], Literal[2]")}"',
         38: '"numpy.ndarray[tuple[Literal[2]], '
         'numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"',
         39: '"None"',
@@ -4964,7 +4967,7 @@ def test_coverage_batch() -> None:
         23: f'"{_ND}[tuple[?U@23], {_F32}]"',
         24: f'"{_ND}[tuple[N], {_F32}]"',
         25: f'"{_ND}[tuple[N], {_F64}]"',
-        26: f'"{_ND}[tuple[N], Any]"',
+        26: f'"{_ND}[tuple[N], {_F32}]"',
         27: f'"{_ND}[tuple[int, int], {_BOOL}]"',
         28: f'"{_ND}[tuple[int, int], {_I64}]"',
         29: f'"{_ND}[tuple[int, int], {_F32}]"',
@@ -5244,3 +5247,92 @@ def test_return_of_helper_result() -> None:
     # A local that is returned has `Any` there; one that is not keeps `int`.
     assert notes[30] == '"numpy.ndarray[tuple[Any], numpy.dtype[numpy.float64]]"', result.stdout
     assert notes[44] == '"numpy.ndarray[tuple[int], numpy.dtype[numpy.float64]]"', result.stdout
+
+
+_FAM = "numpy.dtype[numpy.floating[Any]]"
+_INTP = f"numpy.dtype[numpy.signedinteger[{_NB}_32Bit | {_NB}_64Bit]]"
+
+
+def test_coverage_batch_2() -> None:
+    # Issue 298: np.arange with an arithmetic bound or a literal start.
+    # Issue 300: np.array of numpy scalars and of rows written as tuples.
+    # Issue 301: axis reductions and cumsum on the float family.
+    # Issue 302: a comparison with a numpy scalar of any width.
+    # Issue 303: a builder whose dtype= argument is Any keeps its shape.
+    # Issue 304: reduceat with an int-sized index array, and the dtype of
+    # add / multiply / logical_* in reduce, accumulate and reduceat.
+    result = run_mypy(FIXTURES / "coverage_batch_2.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [23, 43, 48, 65], result.stdout
+    assert "cannot assign value of shape (M+1,) into target of shape (M,)" in errors[23][0], result.stdout
+    assert "tuple[Literal[2]]" in errors[43][0] and "tuple[Literal[3]]" in errors[43][0], result.stdout
+    assert "Literal[3]]" in errors[48][0] and "tuple[int, Literal[4]]" in errors[48][0], result.stdout
+    assert "tuple[M]" in errors[65][0] and "tuple[N]" in errors[65][0], result.stdout
+    assert reveals_by_line(result) == {
+        14: f'"{_ND}[tuple[M+1], {_INTP}]"',
+        15: f'"{_ND}[tuple[M], {_INTP}]"',
+        16: f'"{_ND}[tuple[M+1], {_INTP}]"',
+        17: f'"{_ND}[tuple[N+1], {_INTP}]"',
+        18: f'"{_ND}[tuple[Literal[5]], {_INTP}]"',
+        19: f'"{_ND}[tuple[int], {_INTP}]"',
+        20: f'"{_ND}[tuple[int], {_INTP}]"',
+        27: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        28: f'"{_ND}[tuple[Literal[2]], {_F32}]"',
+        29: f'"{_ND}[tuple[Literal[2]], numpy.dtype[Any]]"',
+        30: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        31: f'"{_ND}[tuple[Literal[2]], numpy.dtype[Any]]"',
+        32: f'"{_ND}[tuple[Literal[2]], {_F64}]"',
+        33: f'"{_ND}[tuple[Any, ...], {_F64}]"',
+        34: f'"{_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+        36: f'"{_ND}[tuple[?U@36, Literal[3]], numpy.dtype[Any]]"',
+        37: f'"{_ND}[tuple[?U@37, Literal[3]], {_F64}]"',
+        38: f'"{_ND}[tuple[Literal[3], Literal[2]], {_F32}]"',
+        39: f'"{_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+        52: f'"{_ND}[tuple[N], {_FAM}]"',
+        53: f'"{_ND}[tuple[N], {_FAM}]"',
+        54: f'"{_ND}[tuple[M], {_FAM}]"',
+        55: f'"{_ND}[tuple[Literal[1], M], {_FAM}]"',
+        56: f'"{_ND}[tuple[N], {_FAM}]"',
+        57: f'"{_ND}[tuple[N], {_FAM}]"',
+        58: f'"{_ND}[tuple[N], {_FAM}]"',
+        59: f'"{_ND}[tuple[N, M], {_FAM}]"',
+        60: f'"{_ND}[tuple[M*N], {_FAM}]"',
+        61: '"numpy.floating[Any]"',
+        69: f'"{_ND}[tuple[N], {_BOOL}]"',
+        70: f'"{_ND}[tuple[N], {_BOOL}]"',
+        71: f'"{_ND}[tuple[N], {_BOOL}]"',
+        72: f'"{_ND}[tuple[N], {_BOOL}]"',
+        73: f'"{_ND}[tuple[N], {_BOOL}]"',
+        74: f'"{_ND}[tuple[N], {_BOOL}]"',
+        75: f'"{_ND}[tuple[N], {_BOOL}]"',
+        76: f'"{_ND}[tuple[N], {_BOOL}]"',
+        80: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        81: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        82: f'"{_ND}[tuple[int, int], numpy.dtype[Any]]"',
+        83: f'"{_ND}[tuple[N, Literal[3]], numpy.dtype[Any]]"',
+        84: f'"{_ND}[tuple[N], numpy.dtype[Any]]"',
+        85: f'"{_ND}[tuple[int, int], {_F32}]"',
+        86: f'"{_ND}[tuple[Literal[2], Literal[3]], numpy.dtype[Any]]"',
+        87: f'"{_ND}[tuple[int, Literal[2]], numpy.dtype[Any]]"',
+        91: f'"{_ND}[tuple[int], {_F64}]"',
+        92: f'"{_ND}[tuple[K], {_F64}]"',
+        93: f'"{_ND}[tuple[int], {_F32}]"',
+        94: f'"{_ND}[tuple[K], {_BOOL}]"',
+        95: f'"{_ND}[tuple[int], {_BOOL}]"',
+        96: f'"{_ND}[tuple[K], {_I64}]"',
+        97: f'"{_ND}[tuple[N], {_F32}]"',
+        98: '"numpy.bool[bool]"',
+    }, result.stdout
+    assert _run_fixture("coverage_batch_2.py") == [
+        "(4,) (5,) (5,) (5,)",
+        "float64 float32 float64",
+        "float64 float64 float32",
+        "(2, 3) (2,)",
+        "(3,) (4,) (1, 4) (3, 4)",
+        "float32 float32 float32 float32 (12,)",
+        "(3,) bool (3,)",
+        "(2, 3) float32",
+        "(2,) float32 bool",
+        "int64 float32 bool",
+    ]

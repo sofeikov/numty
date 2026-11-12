@@ -7,7 +7,13 @@ NumPy's own stub type: unknown is never an error.
 
 `zeros_like` keeps shape and dtype, `full((2, 3), 5.0)`
 is a known 2x3 float64, plus `eye(3)`, `arange(6)`, and `atleast_2d`
-promoting `(N,)` to `(1, N)`.
+promoting `(N,)` to `(1, N)`. `np.arange` with a step of 1 has
+`stop - start` entries for a literal start, with the stop folded like a
+builder's size: `np.arange(m + 1)` is `(M+1,)` and `np.arange(1, m + 1)`
+is `(M,)`, as `x[1:]` is `(N-1,)`. A builder keeps its shape when the
+`dtype=` it is given is `Any` (`np.full((n, k), np.nan,
+dtype=other.dtype)` with a bare `np.ndarray` is `(int, int)` with dtype
+`Any`).
 
 ## Joining
 
@@ -102,6 +108,28 @@ whose sizes are all runtime ints keeps the dtype it is given
 (`np.zeros((n, k), dtype=bool)`, `np.full((n, k), np.nan)`), and
 `np.broadcast_to(x, (n, len(x)))` has the shape it is asked for
 (`tests/fixtures/coverage_batch_ok.py`).
+
+A display whose items are numpy scalars has the display's length:
+`np.array([v[0], v[1], 0.0])` is `(3,)`. numpy promotes the items as
+arrays, so a Python float counts as float64 there
+(`np.array([np.float32(1), 0.0])` is float64). The dtype of a value typed
+`float` or `int` is claimed only next to a float64 or complex128 item,
+where what it really holds cannot change the answer. Rows written as
+tuples of scalars give the width: `np.array(rows)` for `rows:
+list[tuple[float, float, float]]` is `(?U, 3)`, and a display of such
+tuples is `(len, 3)`. An item typed `Any` may be an array, so such a
+display keeps numpy's own answer, with the dtype the call names
+(`dtype=float` as well as `dtype=np.float64`).
+
+## Ufunc methods
+
+`reduce` drops the axis, `accumulate` keeps the shape, `outer` joins the
+two shapes, and `reduceat` has one entry per index, whatever kind of size
+the index array has (`I64[K]`, `I64[int]`). `maximum`, `minimum`, `fmax`
+and `fmin` keep the operand's dtype; `add` and `multiply` keep a float or
+complex operand and widen a bool or signed integer to int64 and an
+unsigned one to uint64; the `logical_*` ufuncs give bool
+(`tests/fixtures/coverage_batch_2.py`).
 
 ## Symbolic arithmetic
 

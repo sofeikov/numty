@@ -46,10 +46,11 @@ from ._callbind import (
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
     ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook,
-    identity_function_hook, tri_function_hook, arange_function_hook, concatenate_function_hook,
+    identity_function_hook, tri_function_hook, concatenate_function_hook,
     vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook,
     stack_function_hook, r_getitem_hook,
 )
+from ._arange import arange_function_hook
 from ._matmul import (
     _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, dot_function_hook,
     dot_method_hook, matmul_method_hook, rmatmul_method_hook, imatmul_method_hook,
