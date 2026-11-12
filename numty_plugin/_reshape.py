@@ -1727,6 +1727,25 @@ def _movable_int_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
     return parts
 
 
+def _known_rank_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
+    """(dims, dtype) of a shape with a dynamic (`int`) or unknown (`Any`) dim.
+
+    For the broadcast of two arrays: the rank is known, so the result
+    keeps it and each axis that is not provable becomes a fresh unknown
+    (issue #227 for `int`, issue #249 for `Any`: a call of a shape-generic
+    function with an unknown-shape argument gives `Any` dims, issue #218).
+    """
+    parts = _movable_parts(tp)
+    if parts is None:
+        return None
+    for d in parts[0]:
+        if isinstance(d, int):
+            continue
+        if _is_plain_int(d) or isinstance(get_proper_type(d), AnyType):
+            return parts
+    return None
+
+
 def _unknown_axis_parts(tp: Type) -> tuple[list[int | Type], Type] | None:
     """(dims, dtype) of a shape with an axis of unknown size (`Any`).
 
