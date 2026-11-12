@@ -519,6 +519,7 @@ _LAYERS = (
     "_heads",
     "_reshape",
     "_builders",
+    "_arange",
     "_einsum",
     "_linalg",
     "_reductions",

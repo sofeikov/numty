@@ -995,6 +995,21 @@ def _builder_fold_dim_expr(
         _expr_constituents.update(const_snapshot)
 
 
+def _builder_dim_add_const(
+    ctx: FunctionContext | MethodContext, dim: int | Type, const: int
+) -> int | Type:
+    """dim + const, side-effect free like _builder_fold_dim_expr (issue #298)."""
+    seen_snapshot = dict(_seen_vars)
+    const_snapshot = {k: dict(v) for k, v in _expr_constituents.items()}
+    try:
+        return _dim_add_const(ctx, "arange", 0, dim, const)
+    finally:
+        _seen_vars.clear()
+        _seen_vars.update(seen_snapshot)
+        _expr_constituents.clear()
+        _expr_constituents.update(const_snapshot)
+
+
 def _enum_member_count(info) -> int | None:
     """Member count of an int enum, deduped by value (aliases share one).
 

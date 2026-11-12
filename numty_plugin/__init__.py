@@ -107,6 +107,9 @@ from ._callbind import (  # noqa: F401
     _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _callsite_expr_bindings,
     _substitute_return_exprs, _SEQUENCE_FULLNAMES,
 )
+from ._arange import (  # noqa: F401
+    _arange_symbolic, _arange_symbolic_kw, arange_function_hook,
+)
 from ._builders import (  # noqa: F401
     _operands_have_known_shape, _builder_shape, _stub_shape_named_dtype, _has_literal_dim, _has_int_dim,
     _has_mixed_operand,
@@ -115,7 +118,7 @@ from ._builders import (  # noqa: F401
     _instance_fullname, _scalar_ret_name, _named_dtype, _apply_out_dtype, like_function_hook,
     _like_types, copy_function_hook, ascontiguousarray_function_hook, full_function_hook,
     eye_function_hook, _builder_single_dim, linspace_function_hook, identity_function_hook,
-    tri_function_hook, _arange_symbolic, _arange_symbolic_kw, arange_function_hook,
+    tri_function_hook,
     _comprehension_parts, _sequence_parts, _is_dynamic_sequence, _is_empty_sequence, _concat_axis,
     _single_axis_value, _element_expr_type, _dynamic_sequence_element, concatenate_function_hook,
     _stack_promote, _concat_merge, _stack_solve, vstack_function_hook, hstack_function_hook,
