@@ -264,18 +264,29 @@ def test_head_triple_sync() -> None:
         for name, obj in vars(numty).items()
         if isinstance(obj, type) and getattr(obj, "_numty_dtype", None) is not None
     }
-    assert set(heads) == {"F64", "F32", "F16", "I64", "I32", "I16", "I8", "U8", "Bool"}
+    assert set(heads) == {
+        "F64", "F32", "F16", "I64", "I32", "I16", "I8", "U8", "U16", "U32", "U64", "Intp", "Bool",
+    }
+    # Family heads (issue 277) match a numpy scalar class, not one dtype.
+    families = {
+        name: obj._numty_family
+        for name, obj in vars(numty).items()
+        if isinstance(obj, type) and getattr(obj, "_numty_family", None) is not None
+    }
+    assert set(families) == {"Floating", "Integer"}
     plugin = {
         full.removeprefix("numty."): scalar
         for full, scalar in numty_plugin._FAM_HEAD_DTYPES.items()
     }
-    assert set(plugin) == set(heads)
+    assert set(plugin) == set(heads) | set(families)
     import numpy as np
 
     for name, dtype in heads.items():
         scalar = plugin[name].removeprefix("numpy.")
         assert np.dtype(getattr(np, scalar)) == dtype, name
-    assert set(heads) <= numty_codmod._NUMTY_ARRAY_TYPES
+    for name, family in families.items():
+        assert getattr(np, plugin[name].removeprefix("numpy.")) is family, name
+    assert set(heads) | set(families) <= numty_codmod._NUMTY_ARRAY_TYPES
 
 
 _SEAMS = (
@@ -452,6 +463,7 @@ def test_eager_submodule_imports_and_no_top_level_facade() -> None:
         "_exprs",
         "_fft",
         "_forms",
+        "_frames",
         "_heads",
         "_hooks",
         "_indexing",
@@ -513,6 +525,7 @@ _LAYERS = (
     "_indexing",
     "_unions",
     "_callsite",
+    "_frames",
     "_hooks",
 )
 

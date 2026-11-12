@@ -49,7 +49,15 @@ _FAM_HEAD_DTYPES = {
     "numty.I16": "numpy.int16",
     "numty.I8": "numpy.int8",
     "numty.U8": "numpy.uint8",
+    "numty.U16": "numpy.uint16",
+    "numty.U32": "numpy.uint32",
+    "numty.U64": "numpy.uint64",
+    "numty.Intp": "numpy.intp",
     "numty.Bool": "numpy.bool",
+    # Family heads (issue 277): a dtype of unknown width, `floating[Any]`
+    # and `integer[Any]`.
+    "numty.Floating": "numpy.floating",
+    "numty.Integer": "numpy.integer",
 }
 
 
@@ -201,10 +209,18 @@ def _fam_arg(
         return UnpackType(arg)
     if isinstance(arg, UnpackType):
         if arg.from_star_syntax:
-            raise _FamFail(
-                f"{head} star syntax (*Ts) is not supported;"
-                " write Unpack[Ts] instead"
-            )
+            # `F32[*Ts]`, the spelling ruff's UP044 writes (issue 282).
+            # Like `Unpack[Ts]` in `_fam_applied`: the star does not
+            # analyze alone, so analyze `tuple[*Ts]` and unwrap.
+            wrapped = UnboundType("tuple", [arg], line=arg.line, column=arg.column)
+            proper = get_proper_type(ctx.api.analyze_type(wrapped))
+            if isinstance(proper, TupleType) and len(proper.items) == 1:
+                item = get_proper_type(proper.items[0])
+                if isinstance(item, UnpackType) and isinstance(get_proper_type(item.type), TypeVarTupleType):
+                    return item
+            if isinstance(proper, AnyType) and proper.type_of_any == TypeOfAny.from_error:
+                raise _FamBail
+            raise _FamFail(f"{head} star dims take a TypeVarTuple, e.g. *Ts")
         return arg
     if isinstance(arg, LiteralType):
         if (
@@ -683,8 +699,8 @@ def _fam_bare(
 
 def _fam_applied(
     ctx: AnalyzeTypeContext, head: str, arg: UnboundType,
-    late_bound: set[str]) -> int | Type:
-    """A parameterized dim: `Literal[3]`, `Unpack[Ts]`, never `tuple`."""
+    late_bound: set[str]) -> int | Type | list[int | Type]:
+    """A parameterized dim: `Literal[3]`, `Literal["N+1"]`, `Unpack[Ts]`, never `tuple`."""
     short = arg.name.rpartition(".")[2]
     if short == "tuple":
         raise _FamFail(
@@ -721,6 +737,12 @@ def _fam_applied(
         and not isinstance(proper.value, bool)
     ):
         return proper.value
+    if short == "Literal" and isinstance(proper, LiteralType) and isinstance(proper.value, str):
+        # `U8[Literal["N+1"]]`: the string spec in a spelling that
+        # ruff's UP037 leaves alone (issue 282). Under `from __future__
+        # import annotations` that rule strips the quotes of `U8["N+1"]`,
+        # and `N+1` is not a type that mypy passes on to a plugin.
+        return _fam_string(ctx, head, proper.value, arg, late_bound)
     if isinstance(proper, TypeVarTupleType):
         return UnpackType(proper)
     if isinstance(proper, AnyType):

@@ -5,7 +5,9 @@ to earlier layers only (order in tests/test_layout.py, _LAYERS).
 from __future__ import annotations
 
 from mypy.expandtype import expand_type_by_instance
-from mypy.plugin import FunctionSigContext, MethodSigContext
+from mypy.nodes import ARG_POS
+from mypy.plugin import FunctionContext, FunctionSigContext, MethodSigContext
+from mypy.typeops import make_simplified_union
 from mypy.types import (
     AnyType, CallableType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnionType, get_proper_type,
 )
@@ -13,7 +15,8 @@ from mypy.types import (
 from ._errors import _swallowed
 from ._exprs import _iter_tvarlikes
 from ._types import INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _parts_or_unpack, _strip_optional
-from ._reshape import _is_plain_int, _known_rank_parts
+from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
+from ._linalg import _is_numpy_scalar
 
 
 def _is_int_instance(tp: Type) -> bool:
@@ -142,3 +145,35 @@ def _relax_dynamic_formals(sig: CallableType, ctx: FunctionSigContext | MethodSi
     except Exception:
         _swallowed(ctx, "_relax_dynamic_formals")
         return sig
+
+
+def minmax_function_hook(ctx: FunctionContext) -> Type:
+    """`max(a, b)` / `min(a, b)` of numbers where one is a numpy scalar of unknown width.
+
+    `max(t.max() - t.min(), 1e-9)` with `t` of a family dtype: a
+    `floating[Any]` is not a `float` to mypy (only `np.float64` is), so
+    the builtin's answer is `SupportsDunderLT[Any] | SupportsDunderGT[Any]`
+    and the division that follows has no matching overload (issue 277).
+    The call returns one of its arguments, so the answer here is the
+    union of their types. Every other call keeps the builtin's answer.
+    """
+    try:
+        default = get_proper_type(ctx.default_return_type)
+        if not isinstance(default, UnionType) or not all(
+            isinstance(item := get_proper_type(member), Instance)
+            and item.type.fullname.startswith("_typeshed.SupportsDunder")
+            for member in default.items
+        ):
+            return ctx.default_return_type
+        # The actuals are grouped by formal (`max(arg1, arg2, *args, key=)`).
+        if any(kind != ARG_POS for group in ctx.arg_kinds for kind in group):
+            return ctx.default_return_type
+        types = [tp for group in ctx.arg_types for tp in group]
+        if len(types) < 2:
+            return ctx.default_return_type
+        if not all(_scalar_key(tp) is not None or _is_numpy_scalar(tp) for tp in types):
+            return ctx.default_return_type
+        return make_simplified_union(types)
+    except Exception:
+        _swallowed(ctx, "minmax_function_hook")
+        return ctx.default_return_type

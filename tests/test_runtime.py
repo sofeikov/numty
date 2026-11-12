@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 from numty import (
-    F16, F32, F64, I8, I16, I32, I64, U8, Bool, NarrowError, batch, ident, matmul, narrow,
+    F16, F32, F64, I8, I16, I32, I64, U8, U16, U32, U64, Bool, Floating, Integer, Intp, NarrowError, batch,
+    ident, matmul, narrow,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -117,7 +118,8 @@ def test_narrow_rejects_mismatch_under_O(call: str, message: str) -> None:
     [
         (F64, np.float64), (F32, np.float32), (F16, np.float16),
         (I64, np.int64), (I32, np.int32), (I16, np.int16), (I8, np.int8),
-        (U8, np.uint8), (Bool, np.bool_),
+        (U8, np.uint8), (U16, np.uint16), (U32, np.uint32), (U64, np.uint64), (Intp, np.intp),
+        (Bool, np.bool_),
     ],
 )
 def test_isinstance_against_head_checks_ndarray_and_dtype(head: Any, dtype: Any) -> None:
@@ -126,6 +128,22 @@ def test_isinstance_against_head_checks_ndarray_and_dtype(head: Any, dtype: Any)
     assert not isinstance(np.zeros(3, dtype=np.complex128), head)
     assert not isinstance([0.0, 1.0], head)
     assert not isinstance(dtype(0), head)
+
+
+def test_isinstance_against_family_head() -> None:
+    # Issue 277: a family head matches every dtype of its family.
+    for dtype in (np.float16, np.float32, np.float64):
+        assert isinstance(np.zeros(3, dtype=dtype), Floating)
+        assert not isinstance(np.zeros(3, dtype=dtype), Integer)
+    for dtype in (np.int8, np.int64, np.uint8, np.uint32):
+        assert isinstance(np.zeros((2, 3), dtype=dtype), Integer)
+        assert not isinstance(np.zeros((2, 3), dtype=dtype), Floating)
+    assert not isinstance(np.zeros(3, dtype=np.bool_), Integer)
+    assert not isinstance(np.zeros(3, dtype=np.complex128), Floating)
+    assert not isinstance([0.0, 1.0], Floating)
+    assert not isinstance(np.float32(0), Floating)
+    with pytest.raises(TypeError):
+        Floating()
 
 
 def test_isinstance_picks_array_branch() -> None:
@@ -156,16 +174,27 @@ def test_every_head_is_known_to_plugin_and_codmod() -> None:
         for name, obj in vars(numty).items()
         if isinstance(obj, type) and getattr(obj, "_numty_dtype", None) is not None
     }
-    assert set(heads) == {"F64", "F32", "F16", "I64", "I32", "I16", "I8", "U8", "Bool"}
+    assert set(heads) == {
+        "F64", "F32", "F16", "I64", "I32", "I16", "I8", "U8", "U16", "U32", "U64", "Intp", "Bool",
+    }
+    # Family heads (issue 277) match a numpy scalar class, not one dtype.
+    families = {
+        name: obj._numty_family
+        for name, obj in vars(numty).items()
+        if isinstance(obj, type) and getattr(obj, "_numty_family", None) is not None
+    }
+    assert set(families) == {"Floating", "Integer"}
     plugin = {
         full.removeprefix("numty."): scalar
         for full, scalar in numty_plugin._FAM_HEAD_DTYPES.items()
     }
-    assert set(plugin) == set(heads)
+    assert set(plugin) == set(heads) | set(families)
     for name, dtype in heads.items():
         scalar = plugin[name].removeprefix("numpy.")
         assert np.dtype(getattr(np, scalar)) == dtype, name
-    assert set(heads) <= numty_codmod._NUMTY_ARRAY_TYPES
+    for name, family in families.items():
+        assert getattr(np, plugin[name].removeprefix("numpy.")) is family, name
+    assert set(heads) | set(families) <= numty_codmod._NUMTY_ARRAY_TYPES
 
 
 def test_heads_still_work_as_runtime_annotations() -> None:
