@@ -21,8 +21,32 @@ one count (`a[a > 0]` on `(3, 4)` is `(?U0,)`, numpy returns 1-D), and a
 mask whose length provably mismatches its axis errors with NumPy's
 wording. A full slice on a
 symbolic axis keeps the TypeVar (`a[:, :]` on `(N, K)` stays `(N, K)`);
-a bounded slice on one (`a[:, :k]`) bails out. Indexing every axis
+a slice bounded by a literal on one (`a[:, :3]`) bails out, since numpy
+clips a bound past the end. Indexing every axis
 with integers yields a scalar, which the plugin leaves to the stubs.
+
+## Bounds over `int` variables
+
+A bound that is a formula over `int` variables is read as one: a
+variable bound once is `?name`, a variable assigned once from such a
+formula reads it, `len(x)` and `x.shape[i]` read the size of `x`, and
+`+`, `-` and a literal factor combine them. With `out: F64[N]` and
+`k: int`:
+
+```python
+n_windows = len(values) - k + 1
+values[:n_windows]                   # (N-?k+1,)   printed -?k+N+1
+values[shift : shift + n_windows]    # (N-?k+1,)
+out[k - 1 :]                         # (N-?k+1,)
+out[k:]                              # (N-?k,)
+```
+
+This is the size when the bounds are inside the axis; numpy clips them
+otherwise (`x[i : i + bs]` on the last batch). So it is given only when
+an `int` variable is left in it, and such a size is an unknown: nothing
+is proved from it by default. Under the opt-in `numty-names` code two
+of them a constant apart are reported, `out[k:] = mins` as `-?k+N+1 and
+-?k+N are 1 apart` (`tests/fixtures/symbolic_slice.py`).
 
 ## Fancy indexing
 

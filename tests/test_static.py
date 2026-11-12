@@ -367,9 +367,11 @@ def test_unknown_slice_keeps_sibling_dims() -> None:
     ]
     f64 = "numpy.dtype[numpy.float64]"
     assert notes == [
-        f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
-        f'numpy.ndarray[tuple[?U, Literal[7]], {f64}]"',
-        f'numpy.ndarray[tuple[Literal[5], ?U], {f64}]"',
+        # A bound over `int` variables is a formula over them: still an
+        # unknown, compared only under the opt-in code (symbolic_slice.py).
+        f'numpy.ndarray[tuple[?bs, Literal[3]], {f64}]"',
+        f'numpy.ndarray[tuple[-?i+5, Literal[7]], {f64}]"',
+        f'numpy.ndarray[tuple[Literal[5], ?k], {f64}]"',
         f'numpy.ndarray[tuple[Literal[5], Literal[3]], {f64}]"',
         f'numpy.ndarray[tuple[N, Literal[3]], {f64}]"',
         f'numpy.ndarray[tuple[N-1, Literal[3]], {f64}]"',
@@ -5290,6 +5292,30 @@ def test_repeat_counts() -> None:
     assert sorted(errors) == [26], result.stdout
     assert "tuple[?U@18]" in errors[26][0] and errors[26][0].endswith("[assignment]"), result.stdout
     assert _run_fixture("repeat_counts.py") == ["[False, True, False, True, False] (5,)"]
+
+
+def test_symbolic_slice() -> None:
+    # A slice bound that is a formula over `int` variables gives a size
+    # over them (`N-?k+1`). Nothing is proved from it by default; the
+    # opt-in reports the window written one entry late.
+    fixture = FIXTURES / "symbolic_slice.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    assert "error:" not in off.stdout
+    notes = reveals_by_line(off)
+    assert notes[24] == f'"numpy.ndarray[tuple[-?k+N+1], {_F64}]"', off.stdout
+    assert notes[25] == f'"numpy.ndarray[tuple[-?k+N+1], {_F64}]"', off.stdout
+    assert notes[26] == f'"numpy.ndarray[tuple[-?k+N], {_F64}]"', off.stdout
+    assert notes[27] == f'"numpy.ndarray[tuple[?k-1], {_F64}]"', off.stdout
+    # No `int` variable is left in it: the bounds may be clipped, so nothing is claimed.
+    assert notes[28] == f'"numpy.ndarray[tuple[?U@28], {_F64}]"', off.stdout
+    assert notes[40] == f'"numpy.ndarray[tuple[-?k+N+1], {_F64}]"', off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [29, 41], on.stdout
+    assert "-?k+N+1 and -?k+N are 1 apart" in errors[29][0], on.stdout
+    assert "-?k+N+1 and -?k+N are 1 apart" in errors[41][0], on.stdout
+    assert _run_fixture("symbolic_slice.py") == ["(4,)"]
 
 
 def test_numba_dispatcher_call() -> None:
