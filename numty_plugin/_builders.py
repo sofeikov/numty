@@ -29,7 +29,7 @@ from ._heads import _record_index_on
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
-    _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr,
+    _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
@@ -472,7 +472,7 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     dims = _builder_shape(ctx, shape_arg, shape_expr, ctx.default_return_type)
     if dims is None:
-        return ctx.default_return_type
+        return _stub_shape_named_dtype(ctx, _named_dtype(ctx) if _explicit_dtype(ctx) else None)
     if not _dims_fit_intp(ctx, dims):
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -481,6 +481,34 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         return _ndarray_type(ctx, dims, dtype)
     return _ndarray_type(ctx, dims, _default_float_dtype(ctx))
+
+
+def _stub_shape_named_dtype(ctx: FunctionContext | MethodContext, dtype: Type | None) -> Type:
+    """The stubs' answer for a builder, with the dtype the call names.
+
+    A shape display with no provable size (`np.zeros((n, k))`) stays
+    with the stubs, which is right for the shape. For `dtype=bool`,
+    `dtype=int`, `dtype="float32"` or a Python `float` fill the stubs
+    answer `dtype[Any]`, though the call names the dtype (issue 283).
+    Only an unknown dtype is replaced.
+    """
+    default = get_proper_type(ctx.default_return_type)
+    if (
+        dtype is None
+        or not isinstance(default, Instance)
+        or default.type.fullname != NDARRAY_FULLNAME
+        or len(default.args) != 2
+    ):
+        return ctx.default_return_type
+    stub_dtype = get_proper_type(default.args[1])
+    unknown = isinstance(stub_dtype, AnyType) or (
+        isinstance(stub_dtype, Instance)
+        and len(stub_dtype.args) == 1
+        and isinstance(get_proper_type(stub_dtype.args[0]), AnyType)
+    )
+    if not unknown:
+        return ctx.default_return_type
+    return default.copy_modified(args=[default.args[0], dtype])
 
 
 def _default_dtype(ctx: FunctionContext | MethodContext) -> Type:
@@ -808,7 +836,10 @@ def full_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     dims = _builder_shape(ctx, *shape_pair, ctx.default_return_type)
     if dims is None:
-        return ctx.default_return_type
+        if _explicit_dtype(ctx):
+            return _stub_shape_named_dtype(ctx, _named_dtype(ctx))
+        fill_name = _fill_dtype_name(fill_pair[0])
+        return _stub_shape_named_dtype(ctx, _construct_dtype(ctx, fill_name) if fill_name is not None else None)
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
         if named is None:
@@ -1473,6 +1504,9 @@ def _concat_merge(
                 if _is_plain_int(out[i]) or _is_plain_int(d):
                     out[i] = _fresh_unknown(ctx, op, i)
                     continue
+                _report_names(
+                    ctx, out[i], d, f"{op} dimension {i} (shapes {_dims_str(out)} vs {_dims_str(dims)})"
+                )
                 return ctx.default_return_type
         acc, extra = out[norm], dims[norm]
         if isinstance(acc, int) and isinstance(extra, int):
@@ -1767,6 +1801,12 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
                         minted = True
                 if minted:
                     continue
+                _report_names(
+                    ctx,
+                    first[diff_at],
+                    dims[diff_at],
+                    f"stack dimension {diff_at} (shapes {_dims_str(first)} vs {_dims_str(dims)})",
+                )
             return ctx.default_return_type
     ndim = len(first)
     norm = axis + ndim + 1 if axis < 0 else axis

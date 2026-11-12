@@ -383,8 +383,8 @@ def _ufunc_reduce_types(
     parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
-    dims, _ = parts
-    dtype = _ufunc_any_dtype()
+    dims, operand_dtype = parts
+    dtype = _ufunc_method_dtype(ctx, operand_dtype)
     if _has_unpack(dims):
         if axis == "none":
             return ctx.default_return_type
@@ -424,10 +424,10 @@ def _ufunc_accumulate_types(
     parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
-    dims, _ = parts
+    dims, operand_dtype = parts
     if _has_unpack(dims) or not dims:
         return ctx.default_return_type
-    return _ndarray_type(ctx, list(dims), _ufunc_any_dtype())
+    return _ndarray_type(ctx, list(dims), _ufunc_method_dtype(ctx, operand_dtype))
 
 
 def _ufunc_accumulate_inputs(
@@ -511,6 +511,32 @@ def _ufunc_any_dtype() -> Type:
     return AnyType(TypeOfAny.explicit)
 
 
+# Ufuncs whose reduce, accumulate and reduceat pick elements of the
+# operand, so the result has the operand's dtype for every dtype.
+# `add` and `multiply` are not here: they widen small integers.
+_UFUNC_PICKS = frozenset({"maximum", "minimum", "fmax", "fmin"})
+
+
+def _ufunc_method_dtype(ctx: FunctionContext | MethodContext, operand_dtype: Type) -> Type:
+    """Result dtype of `ufunc.reduce` / `.accumulate` / `.reduceat` (issue 283).
+
+    The operand's dtype for the ufuncs in `_UFUNC_PICKS` with no `dtype=`
+    argument, else unknown. It depends on the operand and on the ufunc
+    only, so it is the same for every overload candidate (see
+    `_ufunc_any_dtype`).
+    """
+    receiver = get_proper_type(getattr(ctx, "type", None))
+    if not isinstance(receiver, Instance) or not receiver.args:
+        return _ufunc_any_dtype()
+    name = get_proper_type(receiver.args[0])
+    if not isinstance(name, LiteralType) or name.value not in _UFUNC_PICKS:
+        return _ufunc_any_dtype()
+    pair = _formal_pair(ctx, "dtype")
+    if pair is not None and not _is_none_type(pair[0]):
+        return _ufunc_any_dtype()
+    return operand_dtype
+
+
 def _reduceat_length(pair: tuple[Type, Expression | None] | None) -> int | Type | None:
     """Length of a reduceat indices argument, else None to bail.
 
@@ -544,7 +570,7 @@ def _ufunc_reduceat_types(
     parts = _parts_or_unpack(array)
     if parts is None:
         return ctx.default_return_type
-    dims, _ = parts
+    dims, operand_dtype = parts
     if _has_unpack(dims) or not dims or length is None:
         # *Ts shapes stay with the stubs, and numpy refuses 0-d input
         # ("cannot reduceat on a scalar") while the stubs accept it.
@@ -562,7 +588,7 @@ def _ufunc_reduceat_types(
         return ctx.default_return_type
     out = list(dims)
     out[norm] = length
-    return _ndarray_type(ctx, out, _ufunc_any_dtype())
+    return _ndarray_type(ctx, out, _ufunc_method_dtype(ctx, operand_dtype))
 
 
 def _ufunc_reduceat_inputs(

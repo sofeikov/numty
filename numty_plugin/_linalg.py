@@ -1272,7 +1272,7 @@ def _dtype_family(dtype: Type) -> str | None:
     Like `_dtype_base`, and also for a dtype that is a TypeVar
     (`np.dtype[FT]` with `FT` bounded by `np.floating`): the family of
     the bound. `np.number`, `np.inexact` and `np.generic` name no one
-    family and give None (issue #278).
+    family and give None (issues 277 and 278).
     """
     proper = get_proper_type(dtype)
     if not isinstance(proper, Instance) or not proper.args:
@@ -1283,6 +1283,24 @@ def _dtype_family(dtype: Type) -> str | None:
     if not isinstance(element, Instance):
         return None
     for base in element.type.mro:
+        family = _FAMILY_OF_BASE.get(base.fullname)
+        if family is not None:
+            return family
+    return None
+
+
+def _is_numpy_scalar(tp: Type) -> bool:
+    """A numpy scalar type of any width: `np.float32`, `floating[Any]`, `np.integer`."""
+    proper = get_proper_type(tp)
+    return isinstance(proper, Instance) and any(base.fullname == "numpy.generic" for base in proper.type.mro)
+
+
+def _scalar_family(tp: Type) -> str | None:
+    """b/i/u/f/c for a numpy scalar type whose width may be unknown, else None."""
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance):
+        return None
+    for base in proper.type.mro:
         family = _FAMILY_OF_BASE.get(base.fullname)
         if family is not None:
             return family

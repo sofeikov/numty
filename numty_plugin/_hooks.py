@@ -13,13 +13,15 @@ from mypy.nodes import (
     ARG_POS, CallExpr, Decorator, Expression, FuncDef, OpExpr, OverloadedFuncDef, TypeInfo,
     TypeVarLikeExpr,
 )
+from mypy.argmap import map_actuals_to_formals
+from mypy.expandtype import expand_type
 from mypy.plugin import (
     AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
     MethodSigContext, Plugin,
 )
 from mypy.types import (
     AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
-    TypeOfAny, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
+    TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
@@ -31,6 +33,7 @@ from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
 from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
+from ._unknowns import _fresh_unknown
 
 from ._types import (
     _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _conflict_pairs,
@@ -38,7 +41,6 @@ from ._types import (
     _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, TUPLE_FULLNAME,
     _OPERATOR_DUNDERS,
 )
-from ._names import _mask_pair_in, _named_pair_in, _names_enabled, _report_call_site_names
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
     ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook,
@@ -60,7 +62,8 @@ from ._ops import (
     repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook,
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook,
     flatnonzero_function_hook, argwhere_function_hook, unique_function_hook, isin_function_hook,
-    searchsorted_function_hook, sliding_window_view_function_hook, atleast_function_hook,
+    histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
+    atleast_function_hook,
 )
 from ._reshape import (
     _reshape_new_dims, _all_positionals, _scalar_key, reshape_method_hook, reshape_function_hook,
@@ -96,7 +99,6 @@ from ._broadcast import (
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
-from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 from ._heads import (
     _FAM_HEAD_DTYPES, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string, _index_head,
@@ -111,12 +113,14 @@ from ._linalg import (
     _dtype_base,
 )
 from ._types import (
-    _enum_member_count,
+    _enum_member_count, _mask_pair_in, _named_pair_in, _names_enabled,
 )
 from ._unions import (
     _UNION_PAIR_METHODS, _reflected_name, _union_pair_hook, _union_reflected_hook,
     _union_signature_clash,
 )
+from ._callsite import _relax_dynamic_formals, _report_call_site_names, minmax_function_hook
+from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 
 class NumtyPlugin(Plugin):
     def __init__(self, options) -> None:
@@ -128,6 +132,7 @@ class NumtyPlugin(Plugin):
         # missing from the analyzed function's variables; the call-site
         # hook adds them back so concrete calls still check and infer.
         self._fam_late_bound: set[str] = set()
+        self._bare_tuple_guard: set[str] = set()
         # Issue #164 step 2: stub canary state, once per module per run.
         self._startup_canary_checked: set[str] = set()
         # Bundle fields mirror the owning plugin's set objects (identity).
@@ -266,6 +271,10 @@ class NumtyPlugin(Plugin):
             return _matmul_signature_hook
         if fullname.startswith("numpy.") or fullname.startswith("numty."):
             return None
+        # mypy names the call after the class of the callee, not after
+        # the class that declares `__call__` (numba._dispatcher.Dispatcher).
+        if fullname in ("numba.core.dispatcher.Dispatcher.__call__", "numba._dispatcher.Dispatcher.__call__"):
+            return partial(self.dispatcher_signature_hook, fullname)
         # A hook here would make every method call in the program (list,
         # dict and str ones included) walk the plugin chain and scan its
         # arguments. A method none of whose parameters is declared with an
@@ -276,10 +285,12 @@ class NumtyPlugin(Plugin):
         return partial(self.method_signature_hook, fullname)
 
     def _method_may_take_array(self, fullname: str) -> bool:
-        """False when `fullname`'s declared parameters mention no ndarray.
+        """False when `fullname`'s declared parameters and return mention no ndarray.
 
         A cheap, conservative look at the declaration: anything it cannot
-        resolve counts as possibly taking an array.
+        resolve counts as possibly taking an array. The return counts
+        (issue 276): `def rows(self) -> I64[E]` names a size nothing
+        binds, and without the hook that size was `Never`.
         """
         class_name, _, method = fullname.rpartition(".")
         if method in _OPERATOR_DUNDERS:
@@ -306,7 +317,37 @@ class NumtyPlugin(Plugin):
             items = tp.items
         else:
             return True
-        return any(_mentions_ndarray(arg) for item in items for arg in item.arg_types)
+        return any(_mentions_ndarray(arg) for item in items for arg in [*item.arg_types, item.ret_type])
+
+    def dispatcher_signature_hook(self, fullname: str, ctx: MethodSigContext) -> FunctionLike:
+        """A call of a numba-jitted function, checked as a call of the function itself.
+
+        `@njit` gives `Dispatcher[F]`, with `F` the function's own
+        signature, and `Dispatcher.__call__` is declared over a ParamSpec
+        taken from `F`. mypy does not solve the function's size variables
+        through that, so every call of a jitted function with named
+        sizes was `expected "Never"` (issue 281). The signature here is
+        `F`, with the call's arguments put in the order of its
+        parameters, so the call-site checks of a plain function apply.
+        """
+        try:
+            receiver = get_proper_type(ctx.type)
+            wrapped = get_proper_type(receiver.args[0]) if isinstance(receiver, Instance) and receiver.args else None
+            call = ctx.context
+            if not isinstance(wrapped, CallableType) or not isinstance(call, CallExpr):
+                return ctx.default_signature
+            formal_to_actual = map_actuals_to_formals(
+                call.arg_kinds,
+                call.arg_names,
+                wrapped.arg_kinds,
+                wrapped.arg_names,
+                lambda i: ctx.api.get_expression_type(call.args[i]),
+            )
+            args = [[call.args[i] for i in actuals] for actuals in formal_to_actual]
+            return self.method_signature_hook(fullname, ctx._replace(args=args, default_signature=wrapped))
+        except Exception:
+            _swallowed(ctx, "dispatcher_signature_hook")
+            return ctx.default_signature
 
     def method_signature_hook(self, fullname: str, ctx: MethodSigContext) -> FunctionLike:
         # This hook covers every method, so first run whatever a later
@@ -381,7 +422,8 @@ class NumtyPlugin(Plugin):
             _swallowed(ctx, "method_signature_hook")
             pass
         if isinstance(sig, CallableType) and not overloaded:
-            sig = _callsite_formula_return(sig, ctx)
+            _report_call_site_names(sig, ctx)
+            sig = _relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx)
         _note_rank_mismatches(ctx, sig)
         return sig
 
@@ -479,7 +521,8 @@ class NumtyPlugin(Plugin):
         except Exception:
             _swallowed(ctx, "_callsite_check")
             pass
-        return _callsite_formula_return(sig, ctx)
+        _report_call_site_names(sig, ctx)
+        return _relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx)
 
     # Familiar-style heads (_FAM_HEAD_DTYPES, defined in numty/__init__.py): the
     # dtype rides the head name, dims ride flat args. Hooked here because
@@ -544,14 +587,34 @@ class NumtyPlugin(Plugin):
         # mypy's default TupleType handling, which carries per-field types for
         # _replace self-checks and tuple unpacking. Rebuilding via named_type
         # loses the TupleType and makes _replace reject and unpacking union
-        # all fields. No hook for those: default handles both bare and
-        # parameterized.
+        # all fields. So the type is mypy's own: the hook reports the bare
+        # use (issue 279: a bare `Box` parameter turned the checks of its
+        # function off without a word) and analyzes the name again with
+        # itself out of the way.
         if (
             getattr(info, "is_named_tuple", False)
             or getattr(info, "tuple_type", None) is not None
             or getattr(info, "typeddict_type", None) is not None
         ):
-            return None
+            if fullname in self._bare_tuple_guard or getattr(info, "typeddict_type", None) is not None:
+                return None
+
+            def bare_tuple_hook(ctx: AnalyzeTypeContext) -> Type:
+                if not ctx.type.args:
+                    short = fullname.rsplit(".", 1)[-1]
+                    ctx.api.fail(
+                        f"{short} used bare (implicit Any); parameterize as "
+                        f"{short}[...] so shapes check instead of silently going Any",
+                        ctx.context,
+                        code=NUMTY_ANNOTATION,
+                    )
+                self._bare_tuple_guard.add(fullname)
+                try:
+                    return ctx.api.analyze_type(ctx.type)
+                finally:
+                    self._bare_tuple_guard.discard(fullname)
+
+            return bare_tuple_hook
 
         def bare_hook(ctx: AnalyzeTypeContext) -> Type:
             try:
@@ -621,7 +684,9 @@ class NumtyPlugin(Plugin):
     def _fam_bare(self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType) -> int | Type:
         return _fam_bare(ctx, head, arg, self._fam_late_bound)
 
-    def _fam_applied(self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType) -> int | Type:
+    def _fam_applied(
+        self, ctx: AnalyzeTypeContext, head: str, arg: UnboundType
+    ) -> int | Type | list[int | Type]:
         return _fam_applied(ctx, head, arg, self._fam_late_bound)
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
@@ -648,6 +713,8 @@ class NumtyPlugin(Plugin):
             return len_function_hook
         if fullname == "builtins.divmod":
             return divmod_function_hook
+        if fullname in ("builtins.max", "builtins.min"):
+            return minmax_function_hook
         reflected = _reflected_name(fullname)
         if reflected is not None:
             # Issues #252, #255, #256: a reflected operator on a union of arrays.
@@ -880,6 +947,8 @@ class NumtyPlugin(Plugin):
             return flatten_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "take":
             return take_method_hook
+        if fullname == "numpy.ndarray.searchsorted":
+            return searchsorted_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "swapaxes":
             return swapaxes_method_hook
         if fullname.startswith("numpy.ndarray.") and short == "dot":
@@ -1431,6 +1500,49 @@ def _subst_attr_type(
     return proper
 
 
+def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
+    """A property's type with the sizes only its getter names made unknown.
+
+    `def rows(self) -> I64[E]` in a class that is not generic in `E`:
+    nothing binds `E`, so the read has no known size. mypy leaves the
+    getter's own variable in the type, and it prints, and compares, like
+    a caller's `E`: `scores + c.rows` with `scores: F64[E]` checked as
+    two arrays of one size (issue 276). Each such variable becomes one
+    unknown for this read, as for a call of a function that names a size
+    in its return alone.
+    """
+    try:
+        if next(_iter_tvarlikes(default), None) is None:
+            return default
+        base = get_proper_type(ctx.type)
+        name = getattr(ctx.context, "name", None)
+        if not isinstance(base, Instance) or not isinstance(name, str):
+            return default
+        member = base.type.get(name)
+        node = member.node if member is not None else None
+        if isinstance(node, OverloadedFuncDef) and node.items:
+            node = node.items[0]
+        if not isinstance(node, Decorator) or not node.var.is_property:
+            return default
+        getter = get_proper_type(node.func.type)
+        if not isinstance(getter, CallableType):
+            return default
+        own = {v.fullname: index for index, v in enumerate(getter.variables) if isinstance(v, TypeVarType)}
+        env: dict[TypeVarId, Type] = {}
+        for tv in _iter_tvarlikes(default):
+            # mypy gives the getter's variables new ids on each read
+            # (no namespace). A caller's variable of the same name has
+            # the caller's namespace, and a class one has the class's.
+            if isinstance(tv, TypeVarType) and tv.fullname in own and not tv.id.namespace and tv.id not in env:
+                env[tv.id] = _fresh_unknown(ctx, "property", own[tv.fullname])
+        if not env:
+            return default
+        return expand_type(default, env)
+    except Exception:
+        _swallowed(ctx, "_own_sizes_unknown")
+        return default
+
+
 def substituted_attribute_hook(ctx: AttributeContext) -> Type:
     """Generic attribute access: substitute class args into expr dims.
 
@@ -1439,7 +1551,7 @@ def substituted_attribute_hook(ctx: AttributeContext) -> Type:
     from the stored form with the base's type arguments; widen to a
     fresh unknown when the result cannot be spelled.
     """
-    default = ctx.default_attr_type
+    default = _own_sizes_unknown(ctx, ctx.default_attr_type)
     if not _has_expr_var(default):
         return default
     base = get_proper_type(ctx.type)
@@ -1704,6 +1816,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "delete": delete_function_hook,
             "sinc": partial(ufunc_function_hook, group="float"),
         },
+        "numpy.lib._histograms_impl": {"histogram": histogram_function_hook},
         "numpy.lib._nanfunctions_impl": {
             "nanargmax": partial(arg_function_hook, op="nanargmax"),
             "nanargmin": partial(arg_function_hook, op="nanargmin"),

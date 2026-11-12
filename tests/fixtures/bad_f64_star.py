@@ -1,12 +1,12 @@
-"""Misuse: jaxtyping-style *Ts star syntax; the solver needs Unpack[Ts]."""
-from typing import TypeVarTuple
+"""Misuse: a star dim takes a TypeVarTuple (`F64[*Ts]`), not a TypeVar."""
+from typing import TypeVar
 
 import numpy as np
 
 from numty import F64
 
-Ts = TypeVarTuple("Ts")
+N = TypeVar("N", bound=int)
 
 
-def s(a: F64[*Ts]) -> F64[*Ts]:
-    return a
+def s(a: F64[*N]) -> None:
+    pass

@@ -10,22 +10,18 @@ from mypy.plugin import Plugin
 
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
-    _broadcast, _broadcast_core, _builders, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _frames,
-    _heads, _hooks,
-    _indexing, _linalg, _matmul, _names, _ops, _reshape, _reductions, _returns, _state, _trace,
-    _types, _unions, _unknowns,
+    _broadcast, _broadcast_core, _builders, _callsite, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _frames,
+    _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _returns, _state, _trace, _types,
+    _unions, _unknowns,
 )
 from ._state import (  # noqa: F401
     STATE
 )
 from ._errors import (  # noqa: F401
-    NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL,
-    NUMTY_NAMES, NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION,
+    NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL, NUMTY_NAMES,
+    NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION,
     _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning,
     _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed, _warn_startup,
-)
-from ._frames import (  # noqa: F401
-    POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 )
 from ._trace import (  # noqa: F401
     _numty_strict, _numty_trace_path, _trace_event
@@ -65,7 +61,8 @@ from ._linalg import (  # noqa: F401
     _linalg_pinv, _linalg_qr, _linalg_real_name, _linalg_same_shape, _linalg_slogdet, _linalg_solve,
     _linalg_solve_dtype, _linalg_svd, _linalg_tensorsolve, _linalg_tuple, _norm_ord_fits,
     _norm_signature_hook, _reject_float16_linalg, cross_function_hook, linalg_cross_function_hook,
-    linalg_function_hook, _dtype_base, _kind_of, _maybe_scalar, _scalar_of_dtype, _string_value,
+    linalg_function_hook, _dtype_base, _dtype_family, _is_numpy_scalar, _kind_of, _maybe_scalar,
+    _scalar_family, _scalar_of_dtype, _string_value,
 )
 from ._indexing import (  # noqa: F401
     _consume_one, _consume_prefix, _consume_suffix, _getitem_types, _index_pairs, _is_scalar_target,
@@ -90,10 +87,12 @@ from ._broadcast import (  # noqa: F401
 )
 from ._heads import (  # noqa: F401
     _FAM_HEAD_DTYPES, _FamBail, _FamFail, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
-    _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string, _is_fam_int_name,
+    _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string, _index_head, _is_fam_int_name,
 )
 from ._types import (  # noqa: F401
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add_const, _dim_add2,
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _is_mask_count_dim, _mask_counts_differ, _mask_pair_in,
+    _named_sizes_differ, _named_pair_in, _names_enabled, _report_mask_names, _report_names, _dim_str,
+    _dim_add_const, _dim_add2,
     _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim, _linear_product, _reshape_total_form,
     _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr,
     _ndarray_parts, _parts_or_unpack, _has_unpack, _union_members, _distribute_pairings,
@@ -107,12 +106,9 @@ from ._types import (  # noqa: F401
     _SEQUENCE_FULLNAMES, _OPERATOR_DUNDERS, _enum_member_count, _fold_dim_expr, _has_unknown_shape,
     _unpack_shape,
 )
-from ._names import (  # noqa: F401
-    _is_mask_count_dim, _mask_counts_differ, _mask_pair_in, _named_pair_in, _named_sizes_differ,
-    _names_enabled, _report_call_site_names, _report_mask_names, _report_names,
-)
 from ._builders import (  # noqa: F401
-    _operands_have_known_shape, _builder_shape, _has_literal_dim, _has_int_dim, _has_mixed_operand,
+    _operands_have_known_shape, _builder_shape, _stub_shape_named_dtype, _has_literal_dim, _has_int_dim,
+    _has_mixed_operand,
     _is_degraded_operand, _undegraded_args, _guard_mixed, _default_float_dtype, _dims_fit_intp,
     zeros_like_hook, _default_dtype, _fill_dtype_name, _fold_single, _explicit_dtype,
     _instance_fullname, _scalar_ret_name, _named_dtype, _apply_out_dtype, like_function_hook,
@@ -144,7 +140,8 @@ from ._ops import (  # noqa: F401
     pad_function_hook, split_function_hook, array_split_function_hook, _select_index_elem,
     _nonzero_like, nonzero_function_hook, count_nonzero_function_hook, flatnonzero_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook, _search_values_dims,
-    searchsorted_function_hook, sliding_window_view_function_hook, atleast_function_hook,
+    histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook,
+    sliding_window_view_function_hook, atleast_function_hook,
     _fft_seq_arg, _fft_seq_entry,
 )
 from ._reshape import (  # noqa: F401
@@ -182,6 +179,12 @@ from ._reductions import (  # noqa: F401
 from ._broadcast_core import (  # noqa: F401
     _broadcast_types, _merge_known_pair, _merge_unpack_dims, _same_unpack, _solve_broadcast,
     _solve_broadcast_scalar, _solve_broadcast_unpack,
+)
+from ._frames import (  # noqa: F401
+    POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
+)
+from ._callsite import (  # noqa: F401
+    _int_sizes_accept_any, _relax_dynamic_formals, _report_call_site_names, minmax_function_hook
 )
 from ._hooks import (  # noqa: F401
     NumtyPlugin, _reshape_signature_hook, _broadcast_signature_hook, _matmul_signature_hook,

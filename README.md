@@ -381,8 +381,8 @@ error: call-site shape conflict for 'hid': 8 (argument 'w', axis 1) vs 2 (argume
 Fixed sizes spell as integers (`F64[3, 4]`), runtime sizes nothing can
 name as `int` (`F32[int, int, Unpack[Ts]]` for a gather over runtime
 counts, see `tests/fixtures/pad_time_ok.py`), rank polymorphism as
-`Unpack[Ts]` with a declared TypeVarTuple, mixed freely with other dims
-(`F32[total, Unpack[Ts]]`) and with no `type: ignore` — unlike
+`Unpack[Ts]` or `*Ts` with a declared TypeVarTuple, mixed freely with
+other dims (`F32[total, *Ts]`) and with no `type: ignore` — unlike
 `FlexArray`, whose `*Ts` numpy's `tuple[int, ...]` stub bound cannot see
 through. Heads cover the compute workhorses and the common
 storage dtypes, so a float16 or int8 block is one head per field rather
@@ -394,7 +394,36 @@ than a spelled-out `FlexArray[..., np.dtype[np.float16]]`:
 | `F32` | `float32` | `I32` | `int32` |
 | `F16` | `float16` | `I16` | `int16` |
 | `Bool` | `bool` | `I8` | `int8` |
-| | | `U8` | `uint8` (images) |
+| `Floating` | any float | `U8` | `uint8` (images) |
+| `Integer` | any integer | `U16` | `uint16` |
+| | | `U32` | `uint32` (polars row indices and counts) |
+| | | `U64` | `uint64` |
+| | | `Intp` | `np.intp` (`argsort`, `argmin`, `arange`) |
+
+`Floating` and `Integer` are family heads, for data that is float32
+from one source and float64 from another in code that keeps whichever
+it gets. `Floating[N]` is `ndarray[tuple[N], dtype[floating[Any]]]`.
+Elementwise operations keep the shape and the family: `t + 1.0`,
+`np.abs(t)`, `np.exp(t)`, `t - t.min()` and `t / (t.max() - t.min())`
+are all `Floating[N]` for `t: Floating[N]`. `max(t.max(), 1e-9)` is
+`floating[Any] | float`, so a division by it type checks. A float array
+is not an integer array (`[arg-type]`). Whether a family array fits an
+exact head is mypy's reading of numpy's stubs, and numty leaves it as
+it is: `Floating[N]` is accepted where `F32[N]` or `F16[N]` is declared
+(`float32` is `floating[_32Bit]`, which an unknown width fits) and
+refused where `F64[N]` is (`float64` is a class of its own); `Integer[N]`
+is refused by every exact integer head. An `F64` array with a
+`Floating` one gives `Floating`: the result is float64 unless the other
+array is a longdouble, so write `.astype(np.float64)` where `F64` is
+declared. At runtime `isinstance(x, Floating)` is true for an ndarray
+of any float dtype (`tests/fixtures/bad_family_dtype.py`).
+
+A helper that keeps the dtype it is given spells it with a dtype
+TypeVar, `np.ndarray[tuple[N, M], np.dtype[T]]`. Builders and ufuncs
+keep the variable: `np.full(shape, fill, dtype=m.dtype)` and
+`np.exp(-x * 0.5)` have the dtype of the argument, so a result built on
+the wrong axis is reported in the body
+(`tests/fixtures/bad_dtype_generic.py`).
 
 Storage blocks are usually built from runtime sizes. A builder keeps the
 literal dims of its shape next to the dynamic ones, so a fixed channel
@@ -695,8 +724,9 @@ pack(np.zeros((5, 10, 2)), np.zeros((5, 10)) > 0)  # (5, 10, 2), precise
 Two arguments sharing one shape TypeVar are checked at the call site,
 where the actual shapes are still visible: `f(x_5, y_6)` against `(A[N],
 A[N])` errors with the two sizes named. Different TypeVars (`N` vs `M`)
-stay silent by design — their equality is unprovable, and unknown is not
-an error. The same holds for `matmul` inner dims between distinct free
+stay silent by default — their equality is unprovable, and unknown is not
+an error (the opt-in `numty-names` code reports them, see
+[Error codes](#error-codes)). The same holds for `matmul` inner dims between distinct free
 symbolics (`(S,F)@(S,T)` keeps `(S,T)` "if legal", issue #127): a generic
 function whose body needs `F == S` but declares them independent cannot
 be proven wrong inside the body, so the check stays at the call site,
@@ -705,6 +735,26 @@ where concrete sizes are visible. Apply the alias explicitly at each use (`A[N, 
 for a dataclass holding shapes: `list[Box]` with `Box(Generic[N])`
 holding `F64[N, 3]` is an error (`Box used bare ... [numty-annotation]`,
 issue #38) — write `list[Box[T_ctx]]` so the field checks end to end.
+A generic `NamedTuple` of arrays is reported the same way, a bare
+parameter (`def f(box: Box)`) included.
+
+`int` in a size position of such a container means "not followed", as
+it does in an array. At a call, a parameter `box: Box[int]` accepts a
+`Box[N]` and a `Box[Literal[1]]`, although mypy itself treats a class as
+invariant in its parameters. This holds for a `NamedTuple`, a dataclass
+or any generic class of arrays, also as `Box[int] | None` and inside
+`list[...]`. It holds at calls only: an assignment or a `return` of a
+`Box[N]` where `Box[int]` is declared is still mypy's `[assignment]` or
+`[return-value]` error. An array argument whose size is `int` does not
+bind a name that a container argument binds too: `pair(flags: F64[int,
+S], box: Box[S])` called with `np.zeros((n, n))` and a `Box[S]` takes
+`S` from the container (`tests/fixtures/bad_container_int_sizes.py`).
+
+A size that only the return of a property or of a method names (`def
+rows(self) -> I64[E]` in a class that is not generic in `E`) is unknown
+at each read: `c.rows` is `tuple[?U@line]`, and adding it to a caller's
+`F64[E]` does not check as two arrays of one size
+(`tests/fixtures/property_own_size.py`).
 
 ## Coming from jaxtyping? Convert once, check forever
 
@@ -824,7 +874,11 @@ Indexed assignment checks the write: the target solves like a read
 (out-of-range and mask-length errors fire), and the value must
 broadcast one-directionally into it (`m[:, 0] = col` with `(5,) <- (4,)`
 errors; `a[:] = v` with `(5, 3) <- (3,)` stays clean, scalars always
-fit).
+fit). Symbolic sizes are compared by the rule of a broadcast: `out[i] =
+v[:-1]` with `out: F64[S, C]` and `v: F64[C]` is `cannot assign value of
+shape (C-1,) into target of shape (C,)`. Two different names (`S` into
+`C`), an unknown and an `int` size are not provable and stay silent
+(`tests/fixtures/bad_setitem_symbolic.py`).
 
 ## Unions that check every member
 
@@ -919,7 +973,45 @@ uneven index splits); negative counts and uneven divisions error.
 `axis=`), `nonzero`/`where` with one argument return per-dim `?U` tuples
 (`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the input shape
 with a bool dtype, `searchsorted` follows the values shape; 0-d nonzero
-errors.
+errors. `histogram` returns `(counts, edges)` with one edge more than
+counts: `bins=16` gives `(16,)` and `(17,)`, an array of `B` edges gives
+`(B-1,)` and `(B,)`. The counts are int64, and the edges have the dtype
+of the edges array, or of the data for a count of bins (float64 for
+integer data). `split` and `array_split` at a 1-D array of positions
+return a list of pieces with a `?U` size on the axis.
+
+**Arrays from lists built at runtime.** `np.array` of a list
+comprehension or of a `list[...]` value has one `?U` axis in front:
+`np.array([i == 1 for i in kinds])` is `(?U,)` bool, and a list of
+`F64[N]` items is `(?U, N)`, as for `np.stack`. `np.array([a, b])` of
+two arrays of one shape is `(2, *shape)`. The dtype is the one the call
+names, else `bool` for `bool` items, else the item arrays' dtype; for
+`int` and `float` items it is left to numpy's stubs, because a
+`list[int]` may hold bools and a `list[float]` may hold ints. A builder
+whose sizes are all runtime ints keeps the dtype it is given
+(`np.zeros((n, k), dtype=bool)`, `np.full((n, k), np.nan)`), and
+`np.broadcast_to(x, (n, len(x)))` has the shape it is asked for
+(`tests/fixtures/coverage_batch_ok.py`).
+
+**Arrays from a polars frame.** polars types every `to_numpy()` as
+`ndarray[Any, Any]`. `DataFrame.to_numpy()` is `tuple[int, int]` here,
+and `Series.to_numpy()` is `tuple[int]` when the receiver is a visible
+cast to a numeric or boolean dtype: `df["x"].cast(pl.Float64).to_numpy()`
+is `ndarray[tuple[int], dtype[float64]]`. A float cast names the dtype;
+an integer cast does not, because a null makes the result float64. A
+plain `s.to_numpy()` keeps polars' answer: a column of `pl.Array` or
+`pl.Struct` gives a 2-D array, and the type of a Series does not say
+what it holds. Annotate the local where the rank matters
+(`x: F64[int] = df["x"].to_numpy()`). `structured=True` and
+`masked=True` also keep polars' answer
+(`tests/fixtures/polars_to_numpy.py`).
+
+**numba.** A call of an `@njit` function is checked as a call of the
+function itself: named sizes are solved, a formula return is put in the
+caller's terms, and the call-site checks apply. Without numty every
+such call is `expected "Never"` to mypy, because the function's size
+variables are not solved through `Dispatcher.__call__`
+(`tests/fixtures/numba_dispatch.py`).
 
 **Symbolic arithmetic.** Dims stay exact through arithmetic:
 `repeat`/`tile` multiply (`N*2`), `pad` adds (`N+2`), `convolve` adds
@@ -1084,6 +1176,20 @@ plugins = numty_plugin
 allow_redefinition = True
 ```
 
+With ruff's `UP` rules on, two spellings are rewritten. `UP044` turns
+`F32[Unpack[Ts]]` into `F32[*Ts]`, which numty reads as the same type.
+`UP037` strips the quotes of a formula (`U8["N+1"]` becomes `U8[N+1]`)
+in a file with `from __future__ import annotations`, and its fix is
+applied by `ruff check --fix`. mypy does not pass an unquoted `N+1` on
+to a plugin, so the result is a `[numty-annotation]` error. Either
+write the formula as `U8[Literal["N+1"]]`, which the rule leaves alone
+(`tests/fixtures/bad_literal_formula.py`), or turn the rule off:
+
+```toml
+[tool.ruff.lint]
+ignore = ["UP037"]
+```
+
 Editable installs are
 a single `.pth` to the checkout, so `numty` and the tools all import
 live from one place.
@@ -1106,7 +1212,7 @@ can be silenced or selected on its own:
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
-| `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a generic function (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
+| `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
 
@@ -1148,9 +1254,9 @@ disable_error_code = numty-bail
 ```
 
 or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
-reports a shape error on that line. All but `numty-names` are sub-codes of `misc`, so
-an existing `# type: ignore[misc]` or `disable_error_code = misc` keeps
-covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
+reports a shape error on that line. All but `numty-names` are sub-codes of
+`misc`, so an existing `# type: ignore[misc]` or `disable_error_code = misc`
+keeps covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
 then asks for the narrower code (`Unused "type: ignore" comment, use
 narrower [numty-shape] instead of [misc] code`), so switch those
 comments to the `numty-*` code when upgrading.
@@ -1160,14 +1266,43 @@ comments to the `numty-*` code when upgrading.
 `F64[N] + F64[M]` runs when `N == M`, so it is not provably wrong, and
 by default numty says nothing about it. A function generic in `N` and
 `M` has to work when they differ, though, and most plausible mistakes
-in such a body pair two different names. Turn the check on to have them
-reported (issue #280), including selection counts (issue #288):
+in such a body pair two different names: a mask on the wrong axis, a
+transposed matrix, a per-row array against a per-group one. Turn the
+check on to have them reported (issue #280), including selection counts
+(issue #288):
 
 ```ini
 [mypy]
 plugins = numty_plugin
 enable_error_code = numty-names
 ```
+
+
+```python
+def f(d: F64[A, B], mask: Bool[B], v: F64[B], w: F64[A]) -> None:
+    d[:, mask]       # fine
+    d[mask]          # a mask of length B on an axis of size A
+    d.T - v          # (B, A) - (B,)
+    d[0] = w         # A into B
+    np.concatenate([d, d.T], axis=1)
+```
+
+```text
+error: boolean index on axis 0 (shape (A, B)): B and A are different names  [numty-names]
+error: broadcast at trailing axis 0 (shapes (B, A) vs (B,)): A and B are different names  [numty-names]
+error: assignment of shape (A,) into target of shape (B,): A and B are different names  [numty-names]
+error: concatenate dimension 0 (shapes (A, B) vs (B, A)): A and B are different names  [numty-names]
+```
+
+It covers a broadcast (operators, comparisons, ufuncs, `where`), a
+boolean mask, an indexed assignment, `concatenate` and `stack`, and a
+call that binds one name of the callee to two names of the caller
+(`score(ids: I64[K], d: F64[P, K])` given an `I64[B]` and an
+`F64[B, A]`). It does not cover `matmul` inner sizes or shapes with
+`*Ts`. Only names count: a literal, an `int`, an `Any` and an unknown
+(`?U`) against a name stay silent, and so do two names of a callee
+that a call binds to one size. Where two names are known to be one
+size, give them one name. The fixture is `tests/fixtures/names_opt_in.py`.
 
 ### Give-up trace and strict mode
 
@@ -1523,7 +1658,12 @@ subtraction below.
   dims (`(n, 3)` by `(3, 3)` is `tuple[int, Literal[3]]`, while 3 against
   4 is an error as for literal shapes; an `int` dim landing on an axis
   where an operand has a literal turns unknown, so `(n, 3)` by `(3, k)`
-  is `tuple[Any, Any]`); transposes move the literal with its axis.
+  is `tuple[Any, Any]`); transposes move the literal with its axis;
+  arithmetic, comparisons, `&`, `|` and `^` between two arrays keep the
+  rank, make each `int` axis unknown and still check the named axes
+  (`a[:, 1:] | a` with `a: Bool[int, N]` is `N-1 vs N`);
+  `np.searchsorted(a, v)` and `a.searchsorted(v)` have the shape of `v`
+  as it stands.
   Other ops on such an array (or on one annotated that way) use numpy's
   stubs. Shape-keeping ones (arithmetic, `astype`, `copy`, `flip`, sorts
   along an axis, ...) keep the literal. For the rest the stubs' answer turns
@@ -1613,11 +1753,13 @@ subtraction below.
   member; per-name precision needs the tuple display (or
   `python -m numty_codmod --unpack-displays`, which unrolls mapped comprehensions
   over bare names to the display).
-- Different TypeVars (`N` vs `M`) never conflict, even when provably
-  different at a call site — only same-name TypeVars are unified.
-  Index *positions* are the exception: `Index[P, N]` records that an
-  int array's values index size P, and a recorded bound provably above
-  the indexed axis (`searchsorted` positions on `N+1` over `N`,
+- Different TypeVars (`N` vs `M`) never conflict by default, even when
+  provably different at a call site — only same-name TypeVars are
+  unified. The opt-in `numty-names` code reports them inside a generic
+  body (see [Error codes](#error-codes)).
+- Index *positions* are tracked through `Index[P, N]`, which records
+  that an int array's values index size P, and a recorded bound provably
+  above the indexed axis (`searchsorted` positions on `N+1` over `N`,
   `arange(5)` on a size-3 axis) errors as `[numty-axis]`, while a
   different named size (positions on M over N) needs the opt-in
   `numty-names` code (`enable_error_code = numty-names`) and is silent
@@ -1630,6 +1772,22 @@ subtraction below.
   arithmetic), cross-module uses, ambiguous records (two producers on
   one line with same-shaped results), unions that disagree, and scalar
   positions (a `-1`-for-none sentinel is not tracked).
+- A size that is a sum of values is unknown. `np.repeat(x, counts)` with
+  an array of counts has `sum(counts)` entries, and
+  `np.maximum.reduceat(x, starts)` has one per start. So in "reduce per
+  run, then spread back per entry" the correct line and the line that
+  forgot the `np.repeat` get the same types: both are an unknown size
+  against the named one, and neither is reported
+  ([#289](https://github.com/sofeikov/numty/issues/289)). The check is
+  a runtime one ([#17](https://github.com/sofeikov/numty/issues/17)).
+- The values of a plain index array are not followed, only its shape.
+  `d[rows, cols]` and `d[cols, rows]` have the same type when both
+  index arrays have the same length, and positions that run one past
+  the end (`np.searchsorted` returns `0..N` inclusive) are not reported
+  for plain arrays without an `Index` annotation
+  ([#285](https://github.com/sofeikov/numty/issues/285),
+  [#286](https://github.com/sofeikov/numty/issues/286),
+  [#287](https://github.com/sofeikov/numty/issues/287)).
 - Bare ints are rejected in alias definitions by mypy itself, before
   any plugin runs (`Mat34 = F64[3, 4]` errors exactly like
   `X = list[3]` does). Spell the sizes with `Literal`

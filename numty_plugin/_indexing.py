@@ -14,12 +14,12 @@ from ._forms import (
 )
 from ._types import (
     INT_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int,
-    _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _union_members,
+    _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_mask_names,
+    _report_names, _union_members,
 )
 from ._heads import (
     _index_recorded_exceeds, _recorded_index_on,
 )
-from ._names import _report_mask_names, _report_names
 from ._unknowns import _fresh_mask_count
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _known_rank_parts, _movable_parts,
@@ -1121,7 +1121,7 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
             continue
         if isinstance(v, int) and v == 1:
             continue
-        # The rule of a broadcast (issue #290): two literal sizes, or two
+        # The rule of a broadcast (issue 290): two literal sizes, or two
         # symbolic ones that no sizes make equal (`C-1` into `C`). Only
         # literal sizes were compared, so `out[i] = v[:-1]` was silent
         # while `out[i] + v[:-1]` was an error.

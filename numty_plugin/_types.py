@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, cast
 
 from mypy.errorcodes import ARG_TYPE
+from mypy.expandtype import expand_type
 from mypy.nodes import (
     ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, CallExpr, Context, Expression, IntExpr,
     ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var,
@@ -24,7 +25,7 @@ from mypy.types import (
 if TYPE_CHECKING:
     from mypy.checker import TypeChecker
 
-from ._errors import NUMTY_CALLSITE, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_CALLSITE, NUMTY_NAMES, NUMTY_SHAPE, _swallowed
 from ._forms import (
     _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul,
     _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize,
@@ -122,6 +123,133 @@ def _dims_provably_ne(a: int | Type, b: int | Type, nonzero: bool = False) -> bo
     fa = _resolve_dim(a)
     fb = _resolve_dim(b)
     return _forms_provably_ne(fa, fb, nonzero)
+
+
+def _named_sizes_differ(a: int | Type, b: int | Type) -> bool:
+    """Two sizes spelled over names, neither with an unknown, that are not the same size.
+
+    `N` against `M`, `N+1` against `M`. A literal, an `int`, an `Any`
+    and an unknown (`?U`) never count: nothing is known about them. A
+    pair that is provably unequal (`N` against `N-1`) is an error
+    already, under the code of its check.
+    """
+    from numty_plugin import _resolve_dim
+    if not isinstance(a, TypeVarType) or not isinstance(b, TypeVarType):
+        return False
+    if _dim_eq(a, b) or _dims_provably_ne(a, b):
+        return False
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if fa is None or fb is None or _form_has_unknown(fa) or _form_has_unknown(fb):
+        return False
+    return True
+
+
+def _names_enabled(ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext) -> bool:
+    """Whether `enable_error_code = numty-names` is set for the module being checked."""
+    options = getattr(ctx.api, "options", None)
+    return options is not None and NUMTY_NAMES in options.enabled_error_codes
+
+
+def _named_pair_in(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
+    """Whether the broadcast of two shapes pairs two different named sizes."""
+    return any(_named_sizes_differ(x, y) for x, y in zip(reversed(a), reversed(b)))
+
+
+def _report_names(
+    ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext,
+    a: int | Type,
+    b: int | Type,
+    where: str,
+) -> None:
+    """The opt-in `[numty-names]` report for a pair of different named sizes (issue 280).
+
+    Called where a check finds two sizes that must be equal and cannot
+    prove them equal or unequal. Nothing is emitted with the code off
+    (the default): mypy counts a message of a disabled code as a failure
+    of the overload it is checking, so `v + w` would get mypy's own
+    `[operator]` error. The result of the check is the same either way.
+    """
+    if _names_enabled(ctx) and _named_sizes_differ(a, b):
+        ctx.api.fail(
+            f"{where}: {_dim_str(a)} and {_dim_str(b)} are different names",
+            ctx.context,
+            code=NUMTY_NAMES,
+        )
+
+
+def _is_mask_count_dim(d: int | Type) -> str | None:
+    """The mask-count identity of a selection count, else None (issue 288).
+
+    Mask counts mint as unknowns (`__numty_unknown__.maskcount_...`), so
+    the default checks treat them like any unknown: silent and unifying.
+    For the opt-in report they are sizes of their own: `?U_keep` against
+    a named size, or against another mask's count, is a different-names
+    pair, while the same mask variable is the same size.
+    """
+    if isinstance(d, TypeVarType) and ".maskcount_" in d.fullname:
+        return d.fullname
+    return None
+
+
+def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
+    """Whether two dims are different selection counts under the opt-in (issue 288).
+
+    A mask count against a named size, or two different masks' counts,
+    must be equal where they meet (broadcast, assignment, call) and are
+    reported with the code on. The same mask variable is the same count.
+    Generic unknowns, literals, `int` and `Any` never count.
+    """
+    from numty_plugin import _resolve_dim
+    ma = _is_mask_count_dim(a)
+    mb = _is_mask_count_dim(b)
+    if ma is not None and mb is not None:
+        return ma != mb
+    other: int | Type | None = None
+    if ma is not None:
+        other = b
+    elif mb is not None:
+        other = a
+    else:
+        return False
+    if not isinstance(other, TypeVarType):
+        return False
+    if _is_unknown_fullname(other.fullname) and _is_mask_count_dim(other) is None:
+        return False
+    if _dim_eq(a, b) or _dims_provably_ne(a, b):
+        return False
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if fa is None or fb is None:
+        return False
+    named_form = fb if ma is not None else fa
+    if _form_has_unknown(named_form):
+        return False
+    return True
+
+
+def _mask_pair_in(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
+    """Whether the broadcast of two shapes pairs a reportable mask count (issue 288)."""
+    return any(_mask_counts_differ(x, y) for x, y in zip(reversed(a), reversed(b)))
+
+
+def _report_mask_names(
+    ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext,
+    a: int | Type,
+    b: int | Type,
+    where: str,
+) -> None:
+    """The opt-in `[numty-names]` report for a selection count (issue 288).
+
+    Same emission rule as `_report_names`: nothing with the code off, so
+    the default stays silent and no `[operator]` duplicate appears.
+    """
+    if _names_enabled(ctx) and _mask_counts_differ(a, b):
+        ctx.api.fail(
+            f"{where}: {_dim_str(a)} and {_dim_str(b)} are different names",
+            ctx.context,
+            code=NUMTY_NAMES,
+        )
 
 
 def _dim_str(d: int | Type) -> str:
@@ -817,22 +945,51 @@ def _callsite_formula_return(
         formals = _shape_tvar_formals(sig)
         bindings = _callsite_expr_bindings(sig, formals, ctx)
         new_ret = _substitute_return_exprs(sig, bindings, ctx)
-        if new_ret is None:
-            return sig
-        # Formula variables only the old return mentioned are no longer
-        # the callee's to bind (see the note in `_substitute_return_exprs`).
-        formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
-        return sig.copy_modified(
-            ret_type=new_ret,
-            variables=[
-                v
-                for v in sig.variables
-                if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
-            ],
-        )
+        if new_ret is not None:
+            # Formula variables only the old return mentioned are no longer
+            # the callee's to bind (see the note in `_substitute_return_exprs`).
+            formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
+            sig = sig.copy_modified(
+                ret_type=new_ret,
+                variables=[
+                    v
+                    for v in sig.variables
+                    if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
+                ],
+            )
+        return _settle_any_bound(sig, bindings)
     except Exception:
         _swallowed(ctx, "_callsite_formula_return")
         return sig
+
+
+def _settle_any_bound(sig: CallableType, bindings: dict[str, int | Type | _LinForm]) -> CallableType:
+    """`sig` with every size the call bound to `Any` written as `Any`.
+
+    An argument of unknown rank binds the sizes of its formal to `Any`
+    (see `_callsite_expr_bindings`). Left as variables, mypy solves them
+    again from every argument, by a join of the lower bounds in the
+    order of a set of types. With `Any`, a caller's name and a literal
+    among the bounds the join is `Any` in one order and `object` in
+    another, so the same call was an error (`Value of type variable "T"
+    cannot be "object"`) in some runs and clean in others (issue 284).
+    Written as `Any` in the formals and the return, and dropped from the
+    variables, the size is not solved a second time.
+    """
+    env: dict[TypeVarId, Type] = {}
+    for v in sig.variables:
+        if not isinstance(v, TypeVarType):
+            continue
+        bound = bindings.get(v.fullname)
+        if isinstance(bound, Type) and isinstance(get_proper_type(bound), AnyType):
+            env[v.id] = AnyType(TypeOfAny.explicit)
+    if not env:
+        return sig
+    return sig.copy_modified(
+        arg_types=[expand_type(tp, env) for tp in sig.arg_types],
+        ret_type=expand_type(sig.ret_type, env),
+        variables=[v for v in sig.variables if v.id not in env],
+    )
 
 
 def _callsite_expr_bindings(
@@ -1271,6 +1428,7 @@ def _substitute_return_exprs(
     rdims, _dtype = ret_parts
     new_dims: list[int | Type] = []
     changed = False
+    own_ids = {v.id for v in sig.variables}
     # For building new expr vars we need constituent objects by fullname.
     # Caller-ns first (Phase 4 Phase 1 namespaced B keys), then any-ns.
     obj_by_fullname: dict[str, TypeVarType] = {}
@@ -1305,7 +1463,12 @@ def _substitute_return_exprs(
             if form_early is None:
                 bound = bindings.get(d.fullname)
                 if bound is None:
-                    if d.fullname in inferred:
+                    if d.fullname in inferred or d.id not in own_ids:
+                        # Not this call's to bind (issue 274): a size of
+                        # the receiver's class, already written in the
+                        # caller's terms. Made unknown here, the items of
+                        # a returned NamedTuple no longer matched its
+                        # fallback (`Block[P, Any]` is not `Block[P, Any]`).
                         new_dims.append(d)
                     else:
                         new_dims.append(_fresh_unknown(ctx, "callsite-return", index))

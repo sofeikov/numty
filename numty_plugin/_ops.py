@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from mypy.nodes import Expression, ListExpr, StarExpr, TupleExpr
 from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import Instance, TupleType, Type, TypeVarType, get_proper_type
+from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, get_proper_type
 
 from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
 from ._dtypes import _DTYPE_INFO
@@ -30,7 +30,7 @@ from ._matmul import (
     _matmul_promoted,
 )
 from ._reshape import (
-    _construct_dtype, _mixed_parts,
+    _construct_dtype, _known_rank_parts, _mixed_parts,
 )
 from ._reshape import (
     _check_unique_axes, _int_or_none, _picture_complete, _positionals_only,
@@ -1051,10 +1051,15 @@ def split_function_hook(ctx: FunctionContext) -> Type:
         seq = _fft_seq_arg(found_sections)
         if seq == "bail" or isinstance(seq, str):
             proper = get_proper_type(found_sections[0])
+            index_array = _ndarray_parts(found_sections[0]) or _known_rank_parts(found_sections[0])
             if (
                 isinstance(proper, Instance)
                 and proper.type.fullname == "builtins.int"
             ) or isinstance(proper, TypeVarType):
+                out[target] = _fresh_unknown(ctx, "split", target)
+            elif index_array is not None and len(index_array[0]) == 1:
+                # A 1-D array of split points, like a list of them
+                # (issue 283): each piece has an unknown size on the axis.
                 out[target] = _fresh_unknown(ctx, "split", target)
             else:
                 return ctx.default_return_type
@@ -1122,10 +1127,13 @@ def array_split_function_hook(ctx: FunctionContext) -> Type:
         seq = _fft_seq_arg(found_sections)
         if seq == "bail" or isinstance(seq, str):
             proper = get_proper_type(found_sections[0])
+            index_array = _ndarray_parts(found_sections[0]) or _known_rank_parts(found_sections[0])
             if (
                 isinstance(proper, Instance)
                 and proper.type.fullname == "builtins.int"
             ) or isinstance(proper, TypeVarType):
+                out[target] = _fresh_unknown(ctx, "array_split", target)
+            elif index_array is not None and len(index_array[0]) == 1:
                 out[target] = _fresh_unknown(ctx, "array_split", target)
             else:
                 return ctx.default_return_type
@@ -1396,7 +1404,9 @@ def _search_values_dims(
         # Only the nested-literal recursion passes None, and that
         # case returns above.
         return None
-    parts = _ndarray_parts(tp)
+    # The result has the shape of the values as it stands, so a size
+    # that is `int` or `Any` is kept too (issue 270).
+    parts = _ndarray_parts(tp) or _known_rank_parts(tp)
     if parts is not None:
         return list(parts[0])
     proper = get_proper_type(tp)
@@ -1418,9 +1428,23 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if len(pairs) < 2:
         return ctx.default_return_type
+    return _searchsorted_types(ctx, pairs[0][0], pairs[1])
+
+
+def searchsorted_method_hook(ctx: MethodContext) -> Type:
+    """`a.searchsorted(v)`: the same answer as `np.searchsorted(a, v)`."""
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    return _searchsorted_types(ctx, ctx.type, pairs[0])
+
+
+def _searchsorted_types(
+    ctx: FunctionContext | MethodContext, sorted_tp: Type, values: tuple[Type, Expression | None]
+) -> Type:
     # numpy only searches a 1-D array ("object too deep for desired
     # array" otherwise): a known other rank is an error, not a shape.
-    sorted_parts = _ndarray_parts(pairs[0][0])
+    sorted_parts = _ndarray_parts(sorted_tp)
     if sorted_parts is not None and not _has_unpack(sorted_parts[0]):
         if len(sorted_parts[0]) != 1:
             ctx.api.fail(
@@ -1430,7 +1454,7 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
                 code=NUMTY_SHAPE,
             )
             return ctx.default_return_type
-    values_dims = _search_values_dims(pairs[1][0], pairs[1][1])
+    values_dims = _search_values_dims(values[0], values[1])
     if values_dims is None:
         return ctx.default_return_type
     dtype = _construct_dtype(ctx, "numpy.int64")
@@ -1438,6 +1462,77 @@ def searchsorted_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     _record_searchsorted(ctx, sorted_parts, values_dims)
     return _ndarray_type(ctx, values_dims, dtype)
+
+
+def histogram_function_hook(ctx: FunctionContext) -> Type:
+    """`np.histogram(a, bins)`: `(counts, edges)` with one edge more than counts (issue 283).
+
+    `bins` is a count (10 when left out), a 1-D array of edges or a
+    display of them. The counts are int64 (numpy's `intp`), or unknown
+    with `weights=` or `density=`, which make them floats. The edges of
+    an array of edges have its dtype. For a count they have the dtype of
+    `a` when that is a float and float64 when it is an integer or a
+    bool. The answer does not depend on the overload candidate.
+    """
+    from numty_plugin import _fresh_unknown
+
+    pairs = _all_positionals(ctx)
+    if not pairs:
+        return ctx.default_return_type
+    any_dtype = ctx.api.named_generic_type("numpy.dtype", [AnyType(TypeOfAny.special_form)])
+    pair = _formal_pair(ctx, "bins")
+    edges: int | Type | None
+    edges_dtype: Type | None = None
+    count: int | None = 10
+    if pair is not None:
+        count = _fold_int(pair[1]) if pair[1] is not None else None
+        if count is None:
+            count = _int_value(pair[0])
+    if count is not None:
+        if count < 1:
+            return ctx.default_return_type
+        edges = count + 1
+    else:
+        assert pair is not None
+        proper = get_proper_type(pair[0])
+        parts = _ndarray_parts(pair[0])
+        if isinstance(proper, Instance) and proper.type.fullname == "builtins.int":
+            edges = None
+        elif isinstance(pair[1], (ListExpr, TupleExpr)) and pair[1].items:
+            if any(isinstance(item, (ListExpr, TupleExpr, StarExpr)) for item in pair[1].items):
+                return ctx.default_return_type
+            edges, edges_dtype = len(pair[1].items), any_dtype
+        elif parts is not None and len(parts[0]) == 1:
+            edges, edges_dtype = parts[0][0], parts[1]
+        else:
+            return ctx.default_return_type
+    if edges_dtype is None:
+        # A count of bins: the edges are computed from the data.
+        data = _ndarray_parts(pairs[0][0]) or _known_rank_parts(pairs[0][0])
+        ks = _dtype_kind_size(data[1]) if data is not None else None
+        if ks is not None and ks[0] == "f":
+            assert data is not None
+            edges_dtype = data[1]
+        elif ks is not None and ks[0] in ("b", "i", "u"):
+            edges_dtype = _construct_dtype(ctx, "numpy.float64")
+        if edges_dtype is None:
+            edges_dtype = any_dtype
+    if edges is None:
+        n_counts: int | Type = _fresh_unknown(ctx, "histogram", 0)
+        n_edges: int | Type = _fresh_unknown(ctx, "histogram", 1)
+    elif isinstance(edges, int):
+        n_counts, n_edges = edges - 1, edges
+    else:
+        n_counts, n_edges = _dim_add_const(ctx, "histogram", 0, edges, -1), edges
+    counts_dtype: Type | None = None
+    if all((found := _formal_pair(ctx, name)) is None or _is_none_type(found[0]) for name in ("weights", "density")):
+        counts_dtype = _construct_dtype(ctx, "numpy.int64")
+    if counts_dtype is None:
+        counts_dtype = any_dtype
+    fallback = ctx.api.named_generic_type("builtins.tuple", [AnyType(TypeOfAny.explicit)])
+    return TupleType(
+        [_ndarray_type(ctx, [n_counts], counts_dtype), _ndarray_type(ctx, [n_edges], edges_dtype)], fallback
+    )
 
 
 def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
