@@ -11,8 +11,8 @@ from mypy.plugin import Plugin
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
     _broadcast, _broadcast_core, _builders, _callsite, _dtypes, _einsum, _errors, _exprs, _fft, _forms, _frames,
-    _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _state, _trace, _types, _unions,
-    _unknowns,
+    _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _returns, _state, _trace, _types,
+    _unions, _unknowns,
 )
 from ._state import (  # noqa: F401
     STATE
@@ -38,7 +38,8 @@ from ._forms import (  # noqa: F401
     _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize,
 )
 from ._unknowns import (  # noqa: F401
-    _fresh_unknown, _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names, _unknown_per_line
+    _fresh_mask_count, _fresh_unknown, _is_same_unknown, _unknown_display_name, _unknown_ids, _unknown_names,
+    _unknown_per_line
 )
 from ._exprs import (  # noqa: F401
     _EXPR_PREFIX, _LATE_PREFIXES, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _expr_var,
@@ -85,12 +86,12 @@ from ._broadcast import (  # noqa: F401
     where_function_hook,
 )
 from ._heads import (  # noqa: F401
-    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
-    _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string, _is_fam_int_name,
+    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
+    _fam_ensure_implicit, _fam_expr, _fam_head, _fam_string, _index_head, _is_fam_int_name,
 )
 from ._types import (  # noqa: F401
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _named_sizes_differ, _named_pair_in, _names_enabled,
-    _report_names, _dim_str,
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _is_mask_count_dim, _mask_counts_differ, _mask_pair_in,
+    _named_sizes_differ, _named_pair_in, _names_enabled, _report_mask_names, _report_names, _dim_str,
     _dim_add_const, _dim_add2,
     _dim_mul_const, _dim_div, _mul_dims, _is_bare_name_dim, _linear_product, _reshape_total_form,
     _check_dim_eq, _shape_dims, _shape_dims_unpack, _fold_int, _fold_len_arg, _fold_shape_expr,

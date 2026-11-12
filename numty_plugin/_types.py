@@ -178,6 +178,80 @@ def _report_names(
         )
 
 
+def _is_mask_count_dim(d: int | Type) -> str | None:
+    """The mask-count identity of a selection count, else None (issue 288).
+
+    Mask counts mint as unknowns (`__numty_unknown__.maskcount_...`), so
+    the default checks treat them like any unknown: silent and unifying.
+    For the opt-in report they are sizes of their own: `?U_keep` against
+    a named size, or against another mask's count, is a different-names
+    pair, while the same mask variable is the same size.
+    """
+    if isinstance(d, TypeVarType) and ".maskcount_" in d.fullname:
+        return d.fullname
+    return None
+
+
+def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
+    """Whether two dims are different selection counts under the opt-in (issue 288).
+
+    A mask count against a named size, or two different masks' counts,
+    must be equal where they meet (broadcast, assignment, call) and are
+    reported with the code on. The same mask variable is the same count.
+    Generic unknowns, literals, `int` and `Any` never count.
+    """
+    from numty_plugin import _resolve_dim
+    ma = _is_mask_count_dim(a)
+    mb = _is_mask_count_dim(b)
+    if ma is not None and mb is not None:
+        return ma != mb
+    other: int | Type | None = None
+    if ma is not None:
+        other = b
+    elif mb is not None:
+        other = a
+    else:
+        return False
+    if not isinstance(other, TypeVarType):
+        return False
+    if _is_unknown_fullname(other.fullname) and _is_mask_count_dim(other) is None:
+        return False
+    if _dim_eq(a, b) or _dims_provably_ne(a, b):
+        return False
+    fa = _resolve_dim(a)
+    fb = _resolve_dim(b)
+    if fa is None or fb is None:
+        return False
+    named_form = fb if ma is not None else fa
+    if _form_has_unknown(named_form):
+        return False
+    return True
+
+
+def _mask_pair_in(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
+    """Whether the broadcast of two shapes pairs a reportable mask count (issue 288)."""
+    return any(_mask_counts_differ(x, y) for x, y in zip(reversed(a), reversed(b)))
+
+
+def _report_mask_names(
+    ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext,
+    a: int | Type,
+    b: int | Type,
+    where: str,
+) -> None:
+    """The opt-in `[numty-names]` report for a selection count (issue 288).
+
+    Same emission rule as `_report_names`: nothing with the code off, so
+    the default stays silent and no `[operator]` duplicate appears.
+    """
+    if _names_enabled(ctx) and _mask_counts_differ(a, b):
+        ctx.api.fail(
+            f"{where}: {_dim_str(a)} and {_dim_str(b)} are different names",
+            ctx.context,
+            code=NUMTY_NAMES,
+        )
+
+
 def _dim_str(d: int | Type) -> str:
     if isinstance(d, int):
         return str(d)

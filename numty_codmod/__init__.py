@@ -107,6 +107,7 @@ _NUMTY_ARRAY_TYPES = {
     "I16",
     "I32",
     "I64",
+    "Index",
     "Integer",
     "Intp",
     "LooseArray",

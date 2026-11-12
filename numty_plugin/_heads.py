@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import keyword
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from ._errors import NUMTY_ANNOTATION, _swallowed
@@ -14,9 +15,11 @@ from ._exprs import (
     _normalize_ns, _seen_vars,
 )
 from ._forms import _LinForm, _form_never_size
+from ._state import STATE
 from ._types import (
-    INT_FULLNAME, _dim_value,
+    INT_FULLNAME, _dim_eq, _dim_str, _dim_value,
 )
+from ._unknowns import _is_same_unknown
 
 
 def _is_fam_int_name(fullname: str) -> bool:
@@ -29,11 +32,12 @@ def _is_fam_int_name(fullname: str) -> bool:
     return fullname == "builtins.int"
 
 if TYPE_CHECKING:
-    from mypy.plugin import AnalyzeTypeContext
+    from mypy.nodes import Expression
+    from mypy.plugin import AnalyzeTypeContext, FunctionContext, MethodContext
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.types import Type, TypeVarLikeType
 
-from mypy.nodes import TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var
+from mypy.nodes import Expression, NameExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var
 from mypy.typeanal import TypeAnalyser
 from mypy.types import (
     AnyType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny,
@@ -58,6 +62,10 @@ _FAM_HEAD_DTYPES = {
     # and `integer[Any]`.
     "numty.Floating": "numpy.floating",
     "numty.Integer": "numpy.integer",
+    # Issue #286: Index[P, N] is positions on P, N of them. It analyzes
+    # through its own hook (see get_type_analyze_hook), but its dtype
+    # rides here with the other heads so the head/plugin/codmod sync holds.
+    "numty.Index": "numpy.int64",
 }
 
 
@@ -88,30 +96,178 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
     try:
         if not raw_args:
             raise _FamFail(f"{head} takes at least one dim")
-        dims: list[int | Type] = []
-        for a in raw_args:
-            parsed = _fam_arg(ctx, head, a, late_bound)
-            if isinstance(parsed, list):
-                dims.extend(parsed)
-            else:
-                dims.append(parsed)
-        # A size is never below 0. A bare `-1` is refused where it
-        # is parsed; this covers every other spelling: `"2-3"`,
-        # `"-1"`, `Literal[-1]`, `"-N-1"`.
-        for d in dims:
-            if isinstance(d, int) and d < 0:
-                raise _FamFail(f"{head} dim {d} is negative; a size cannot be below 0")
-            form = _form_of(d)
-            if form is not None and _form_never_size(form):
-                raise _FamFail(
-                    f"{head} dim {_expr_str(form)} is negative for every size;"
-                    " a size cannot be below 0"
-                )
+        dims = _fam_parse_dims(ctx, head, raw_args, late_bound)
     except _FamFail as bad:
         ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
         return AnyType(TypeOfAny.from_error)
     except _FamBail:
         return AnyType(TypeOfAny.from_error)
+    return _finish_fam(ctx, head, dims, dtype_fullname)
+
+
+def _finish_fam(
+    ctx: AnalyzeTypeContext, head: str, dims: list[int | Type], dtype_fullname: str
+) -> Type:
+    """Build the ndarray type for flat familiar-style dims."""
+    line, column = ctx.context.line, ctx.context.column
+    # The element may be a stub alias (numpy.int32 is), not a class:
+    # use the alias target itself, so formals match what the numpy
+    # stubs produce for the same scalar (e.g. signedinteger[_32Bit]).
+    element: Type | None = None
+    sym = cast(TypeAnalyser, ctx.api).lookup_fully_qualified(dtype_fullname)
+    node = sym.node if sym is not None else None
+    if isinstance(node, TypeInfo):
+        element = cast(TypeAnalyser, ctx.api).named_type(dtype_fullname, [], line, column)
+    elif isinstance(node, TypeAlias):
+        target = get_proper_type(node.target)
+        if isinstance(target, Instance):
+            element = target
+    if element is None:
+        raise _FamFail(f"{head}: cannot resolve dtype {dtype_fullname}")
+    return _fam_build(ctx, head, dims, element)
+
+
+def _arr_head(ctx: AnalyzeTypeContext, late_bound: set[str]) -> Type:
+    """Build the ndarray type for `Arr[dtype, dims...]` (issue #278).
+
+    The first argument is the dtype: a TypeVar bound to a numpy scalar
+    type (`T` with `bound=np.generic`), a concrete scalar class
+    (`Arr[np.float32, N, M]`), `dtype[...]` of either, or `Any`.
+    The rest are dims, parsed exactly like a fixed head's flat args
+    (`_fam_parse_dims`), so the two spellings share one solver. A
+    size in first position fails loudly instead of solving as a
+    dtype; anything already errored bails silently to Any.
+    """
+    head = ctx.type.name
+    raw_args = list(ctx.type.args)
+    try:
+        if len(raw_args) < 2:
+            raise _FamFail(f"{head} takes a dtype and at least one dim, e.g. {head}[T, N, M]")
+        element = _arr_dtype(ctx, head, raw_args[0])
+        dims = _fam_parse_dims(ctx, head, raw_args[1:], late_bound)
+    except _FamFail as bad:
+        ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
+        return AnyType(TypeOfAny.from_error)
+    except _FamBail:
+        return AnyType(TypeOfAny.from_error)
+    return _fam_build(ctx, head, dims, element)
+
+
+def _arr_dtype(ctx: AnalyzeTypeContext, head: str, arg: Type) -> Type:
+    """The dtype parameter of `Arr[...]`: a TypeVar, a scalar class, or Any.
+
+    A TypeVar must be bound to a numpy scalar type (its bound's MRO
+    must reach `numpy.generic`); an int-bound dim TypeVar in this
+    position names the mistake (sizes go after the dtype). A concrete
+    scalar class is any `numpy.generic` subclass (`np.float64`,
+    `np.floating`, ...); `dtype[...]` of either unwraps one level.
+    """
+    analyzed = ctx.api.analyze_type(arg)
+    proper = get_proper_type(analyzed)
+    if isinstance(proper, AnyType):
+        if proper.type_of_any == TypeOfAny.from_error:
+            raise _FamBail
+        return AnyType(TypeOfAny.explicit)
+    if isinstance(proper, TypeVarType):
+        _check_arr_bound(head, proper)
+        return proper
+    if (
+        isinstance(proper, Instance)
+        and proper.type.fullname == "numpy.dtype"
+        and len(proper.args) == 1
+    ):
+        inner = get_proper_type(proper.args[0])
+        if isinstance(inner, AnyType):
+            if inner.type_of_any == TypeOfAny.from_error:
+                raise _FamBail
+            return AnyType(TypeOfAny.explicit)
+        if isinstance(inner, TypeVarType):
+            _check_arr_bound(head, inner)
+            return inner
+        if isinstance(inner, Instance) and _is_numpy_scalar_class(inner):
+            return inner
+        raise _FamFail(_arr_dtype_msg(head))
+    if isinstance(proper, Instance) and _is_numpy_scalar_class(proper):
+        return proper
+    if isinstance(proper, UnboundType):
+        # A TypeVar used outside any scope that binds it: mypy has
+        # already said 'Type variable "X" is unbound', with hints.
+        raise _FamBail
+    raise _FamFail(_arr_dtype_msg(head))
+
+
+def _is_numpy_scalar_class(inst: Instance) -> bool:
+    """Whether an analyzed class is a numpy scalar type (concrete or abstract)."""
+    return any(base.fullname == "numpy.generic" for base in inst.type.mro)
+
+
+def _check_arr_bound(head: str, tv: TypeVarType) -> None:
+    """The bound of an `Arr` dtype TypeVar must be a numpy scalar type."""
+    bound = get_proper_type(tv.upper_bound)
+    if isinstance(bound, AnyType) and bound.type_of_any != TypeOfAny.from_error:
+        return
+    if isinstance(bound, Instance) and any(
+        base.fullname == "numpy.generic" for base in bound.type.mro
+    ):
+        return
+    if isinstance(bound, Instance) and bound.type.fullname == "builtins.int":
+        raise _FamFail(
+            f'{head} takes a dtype as its first argument, but "{tv.name}" is bound to int;'
+            f" sizes go after the dtype, e.g. {head}[T, {tv.name}]"
+            ' with T = TypeVar("T", bound=np.generic)'
+        )
+    raise _FamFail(
+        f'{head} dtype "{tv.name}" must be a TypeVar bound to a numpy scalar type'
+        ' (e.g. TypeVar("T", bound=np.generic))'
+    )
+
+
+def _arr_dtype_msg(head: str) -> str:
+    """The loud redirect for a non-dtype in `Arr` first position."""
+    return (
+        f"{head} takes a dtype as its first argument, e.g. {head}[T, N]"
+        ' with T = TypeVar("T", bound=np.generic)'
+    )
+
+
+def _fam_parse_dims(
+    ctx: AnalyzeTypeContext, head: str, raw_args: list[Type],
+    late_bound: set[str]) -> list[int | Type]:
+    """Flat dims shared by the fixed heads and `Arr` (after its dtype).
+
+    Each arg resolves by `_fam_arg` (TypeVars, integers, Unpack[Ts],
+    Literal[...], string specs); a negative size in any spelling
+    fails loudly.
+    """
+    dims: list[int | Type] = []
+    for a in raw_args:
+        parsed = _fam_arg(ctx, head, a, late_bound)
+        if isinstance(parsed, list):
+            dims.extend(parsed)
+        else:
+            dims.append(parsed)
+    # A size is never below 0. A bare `-1` is refused where it
+    # is parsed; this covers every other spelling: `"2-3"`,
+    # `"-1"`, `Literal[-1]`, `"-N-1"`.
+    for d in dims:
+        if isinstance(d, int) and d < 0:
+            raise _FamFail(f"{head} dim {d} is negative; a size cannot be below 0")
+        form = _form_of(d)
+        if form is not None and _form_never_size(form):
+            raise _FamFail(
+                f"{head} dim {_expr_str(form)} is negative for every size;"
+                " a size cannot be below 0"
+            )
+    return dims
+
+
+def _fam_build(ctx: AnalyzeTypeContext, head: str, dims: list[int | Type], element: Type) -> Type:
+    """The ndarray type for parsed dims and a resolved dtype element.
+
+    Shared tail of the fixed heads and `Arr`: the shape TupleType
+    (with the plain-int fallback of issue #225) and the dtype, so the
+    two spellings can never diverge.
+    """
     line, column = ctx.context.line, ctx.context.column
     int_inst = cast(TypeAnalyser, ctx.api).named_type("builtins.int", [], line, column)
     int_tuple = cast(TypeAnalyser, ctx.api).named_type("builtins.tuple", [int_inst], line, column)
@@ -152,20 +308,6 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
         line=line,
         column=column,
     )
-    # The element may be a stub alias (numpy.int32 is), not a class:
-    # use the alias target itself, so formals match what the numpy
-    # stubs produce for the same scalar (e.g. signedinteger[_32Bit]).
-    element: Type | None = None
-    sym = cast(TypeAnalyser, ctx.api).lookup_fully_qualified(dtype_fullname)
-    node = sym.node if sym is not None else None
-    if isinstance(node, TypeInfo):
-        element = cast(TypeAnalyser, ctx.api).named_type(dtype_fullname, [], line, column)
-    elif isinstance(node, TypeAlias):
-        target = get_proper_type(node.target)
-        if isinstance(target, Instance):
-            element = target
-    if element is None:
-        raise _FamFail(f"{head}: cannot resolve dtype {dtype_fullname}")
     dtype = cast(TypeAnalyser, ctx.api).named_type("numpy.dtype", [element], line, column)
     return cast(TypeAnalyser, ctx.api).named_type("numpy.ndarray", [shape, dtype], line, column)
 
@@ -756,3 +898,279 @@ def _fam_applied(
 
 # Every numpy hook goes through _guard_mixed (see there); the solver
 # dispatch itself lives in the underscored getters below.
+
+
+# Index positions (issues #285, #286, #287). An int array's shape says how
+# many entries it holds, never which axis its values index into. The
+# Index[P, N] head spells the missing half (positions on size P, N of
+# them), and producer calls whose values are certainly positions
+# (argmin/argmax, argsort, arange, flatnonzero, nonzero, searchsorted)
+# record the same fact. The getitem fancy-index path reads the record:
+# a recorded size used on a provably different axis is an error, a
+# different *named* size is an opt-in [numty-names] error, and anything
+# unrecorded or ambiguous stays silent.
+_index_on = STATE.index_on
+
+
+def _index_module(ctx: object) -> str:
+    """Module holding the checked code, or "" when unknowable."""
+    api = getattr(ctx, "api", None)
+    tree = getattr(api, "tree", None)
+    if tree is not None:
+        return str(getattr(tree, "fullname", "") or "")
+    mod = getattr(api, "cur_mod_node", None)
+    return str(getattr(mod, "fullname", "") or "")
+
+
+def _index_dims_match(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
+    """Same shape for index-record purposes: equal, or the same unknown."""
+    return len(a) == len(b) and all(
+        _dim_eq(x, y) or _is_same_unknown(x, y) for x, y in zip(a, b)
+    )
+
+
+def _index_recorded_eq(a: int | Type, b: int | Type) -> bool:
+    """Same recorded size: same ints, or the same named size."""
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    return isinstance(a, TypeVarType) and isinstance(b, TypeVarType) and a.fullname == b.fullname
+
+
+def _record_index_on(
+    ctx: AnalyzeTypeContext | FunctionContext | MethodContext,
+    dims: Sequence[int | Type] | None,
+    recorded: int | Type,
+) -> None:
+    """Remember that a dims-shaped int array holds positions on `recorded`.
+
+    Best-effort and silent: anything that cannot be keyed (a multi-dim
+    result, a non-size dim, a non-size recorded) is ignored. The exact
+    producer-call site serves direct uses (`d[np.argsort(x)]`); line
+    entries serve stored results (`rows = ...; d[rows]`) and Index[...]
+    annotations. Duplicate (recheck/overload) records collapse.
+    """
+    try:
+        if dims is not None and (
+            len(dims) != 1 or not all(isinstance(d, (int, TypeVarType)) for d in dims)
+        ):
+            return
+        if not isinstance(recorded, (int, TypeVarType)):
+            return
+        module = _index_module(ctx)
+        context = ctx.context
+        exact = f"{module}@{context.line}@{context.column}"
+        bucket = _index_on.get(exact)
+        if bucket is None:
+            bucket = []
+            _index_on[exact] = bucket
+        if not any(first is None and _index_recorded_eq(second, recorded) for first, second in bucket):
+            bucket.append((None, recorded))
+        if dims is not None:
+            line_key = f"{module}@{context.line}"
+            entries = _index_on.get(line_key)
+            if entries is None:
+                entries = []
+                _index_on[line_key] = entries
+            if not any(
+                first is not None
+                and _index_dims_match(first, dims)
+                and _index_recorded_eq(second, recorded)
+                for first, second in entries
+            ):
+                entries.append((list(dims), recorded))
+    except Exception:
+        _swallowed(ctx, "_record_index_on")
+
+
+def _recorded_index_on(
+    ctx: MethodContext, dims: list[int | Type], expr: Expression | None
+) -> int | Type | None:
+    """The size a 1-d fancy-index operand's values are positions on, else None.
+
+    Exact call-site records serve direct producer calls; line entries
+    serve stored results and Index[...] annotations (matched by shape, so
+    entries that name no shape match nothing). Zero or several matches
+    stay silent.
+    """
+    try:
+        if len(dims) != 1 or not all(isinstance(d, (int, TypeVarType)) for d in dims):
+            return None
+        module = _index_module(ctx)
+        if expr is not None:
+            seen = _index_on.get(f"{module}@{expr.line}@{expr.column}")
+            if seen:
+                first = [second for first, second in seen if first is None]
+                if len(first) == 1:
+                    return first[0]
+                if first:
+                    return None
+        line = None
+        if isinstance(expr, NameExpr):
+            node = expr.node
+            raw = getattr(node, "line", None)
+            if isinstance(raw, int):
+                line = raw
+        if line is None:
+            return None
+        found = [
+            second
+            for first, second in _index_on.get(f"{module}@{line}", [])
+            if first is not None and _index_dims_match(first, dims)
+        ]
+        if len(found) != 1:
+            return None
+        return found[0]
+    except Exception:
+        _swallowed(ctx, "_recorded_index_on")
+        return None
+
+
+def _index_recorded_exceeds(rec: int | Type, size: int | Type) -> bool:
+    """The recorded exclusive bound provably exceeds the axis size.
+
+    Position values run below the recorded size, so `arange(5)` on a
+    size-22 axis is fine (5 < 22) while `searchsorted` positions on N+1
+    over an N axis always overflow. Strictly below zero for every size
+    (`_form_never_size`), so the empty-axis edge (2*N vs N, equal at
+    N == 0) stays silent like every other check.
+    """
+    from numty_plugin import _resolve_dim
+    from ._forms import _form_has_unknown, _lin_add, _lin_scale
+    try:
+        if isinstance(rec, int) and isinstance(size, int):
+            return rec > size
+        fa = _resolve_dim(rec)
+        fb = _resolve_dim(size)
+        if not isinstance(fa, _LinForm) or not isinstance(fb, _LinForm):
+            return False
+        if _form_has_unknown(fa) or _form_has_unknown(fb):
+            return False
+        return _form_never_size(_lin_add(fb, _lin_scale(fa, -1)))
+    except Exception:
+        _swallowed(None, "_index_recorded_exceeds")
+        return False
+
+
+def _index_head(ctx: AnalyzeTypeContext, late_bound: set[str]) -> Type:
+    """Index[P, ...dims]: positions on size P with a 1-d-or-more shape.
+
+    `Index[P, N]` is a 1-d int64 array of length N whose values index
+    size P (issue #286: the spelling that says which axis, not how
+    many). `Index[P]` leaves the count dynamic. A multi-word string
+    splits the same way (`Index["P N"]`); a lone recorded size may be a
+    linear form (`Index["P+1"]`). The shape analyzes exactly like the
+    other heads; the recorded size is remembered for the getitem check
+    (issue #285). A scalar `-1`-for-none position is not tracked.
+    """
+    head = ctx.type.name
+    try:
+        raw_args = list(ctx.type.args)
+        recorded, dims = _index_split_args(ctx, head, raw_args, late_bound)
+        if not dims:
+            dims = [_index_fresh_count(ctx, head, recorded, raw_args[0], late_bound)]
+        for d in dims:
+            if isinstance(d, int) and d < 0:
+                raise _FamFail(f"{head} dim {d} is negative; a size cannot be below 0")
+            form = _form_of(d)
+            if form is not None and _form_never_size(form):
+                raise _FamFail(
+                    f"{head} dim {_expr_str(form)} is negative for every size;"
+                    " a size cannot be below 0"
+                )
+        _record_index_on(ctx, dims if all(isinstance(d, (int, TypeVarType)) for d in dims) else None, recorded)
+    except _FamFail as bad:
+        ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
+        return AnyType(TypeOfAny.from_error)
+    except _FamBail:
+        return AnyType(TypeOfAny.from_error)
+    return _finish_fam(ctx, head, dims, "numpy.int64")
+
+
+def _index_split_args(
+    ctx: AnalyzeTypeContext, head: str, raw_args: list[Type], late_bound: set[str]
+) -> tuple[int | Type, list[int | Type]]:
+    """The recorded size (first dim overall) plus the shape dims."""
+    if not raw_args:
+        raise _FamFail(f"{head} takes a recorded size and optional shape dims: {head}[P, N]")
+    first = raw_args[0]
+    extra: list[int | Type] = []
+    if isinstance(first, RawExpressionType) and isinstance(first.literal_value, str):
+        words = _fam_string(ctx, head, first.literal_value, first, late_bound)
+        recorded, extra = words[0], words[1:]
+    elif (
+        isinstance(first, UnboundType)
+        and first.original_str_expr is not None
+        and not first.args
+    ):
+        words = _fam_string(ctx, head, first.name, first, late_bound)
+        recorded, extra = words[0], words[1:]
+    else:
+        recorded = _index_recorded_one(ctx, head, first, late_bound)
+    dims = list(extra)
+    for a in raw_args[1:]:
+        parsed = _fam_arg(ctx, head, a, late_bound)
+        if isinstance(parsed, list):
+            dims.extend(parsed)
+        else:
+            dims.append(parsed)
+    return recorded, dims
+
+
+def _index_recorded_one(
+    ctx: AnalyzeTypeContext, head: str, arg: Type, late_bound: set[str]
+) -> int | Type:
+    """One recorded-size arg: an integer, a size name, or a linear form."""
+    if isinstance(arg, RawExpressionType):
+        value = arg.literal_value
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise _FamFail(
+                f"{head} recorded size must be a TypeVar, a non-negative integer,"
+                ' or a string spec like "P N"'
+            )
+        return value
+    if isinstance(arg, UnboundType):
+        if arg.args:
+            short = arg.name.rpartition(".")[2]
+            if short == "Literal":
+                got = _fam_applied(ctx, head, arg, late_bound)
+                if isinstance(got, int):
+                    return got
+            raise _FamFail(
+                f"{head} recorded size must be a TypeVar, a non-negative integer,"
+                ' or a string spec like "P N"'
+            )
+        return _fam_bare(ctx, head, arg, late_bound)
+    if isinstance(arg, TypeVarType):
+        return arg
+    if isinstance(arg, AnyType):
+        return arg
+    raise _FamFail(
+        f"{head} recorded size must be a TypeVar, a non-negative integer,"
+        ' or a string spec like "P N"'
+    )
+
+
+def _index_fresh_count(
+    ctx: AnalyzeTypeContext,
+    head: str,
+    recorded: int | Type,
+    node: Type,
+    late_bound: set[str],
+) -> Type:
+    """A dynamic count dim for a bare `Index[P]` (issue #286).
+
+    A plain `int` dim never proves equal, so the record could never be
+    read back; mint an implicit dim exactly like a string-spec word, so
+    one bare Index is one count that still unifies.
+    """
+    del head
+    stem = _dim_str(recorded)
+    word = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in stem)
+    if not word or word[0].isdigit():
+        word = f"pos_{word}" if word else "pos"
+    word = f"{word}_count"
+    analyzer = cast(TypeAnalyser, ctx.api)
+    scope = analyzer.tvar_scope
+    if not isinstance(node, (RawExpressionType, UnboundType)):
+        raise _FamFail("Index[P] needs a recorded size")
+    return _fam_ensure_implicit(ctx, analyzer, scope, word, node, late_bound)

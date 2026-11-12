@@ -511,6 +511,68 @@ Second, misuse fails loudly with a redirect, never a silent `Any`:
 tell you what's wrong. Quoted or bare is a style choice, not a semantic
 one.
 
+### Generic in dtype: `Arr[T, N, M]`
+
+The fixed heads carry the dtype in the name. A helper generic in its
+dtype cannot use them — `Arr` takes the dtype as a parameter instead,
+then the dims exactly as a fixed head spells them:
+
+```python
+from typing import Any, TypeVar
+import numpy as np
+from numty import Arr, I64
+
+N = TypeVar("N", bound=int)
+M = TypeVar("M", bound=int)
+E = TypeVar("E", bound=int)
+T = TypeVar("T", bound=np.generic)
+
+def per_row(m: Arr[T, N, M], rows: I64[E], fill: Any) -> Arr[T, E, M]:
+    out = np.full((len(rows), m.shape[1]), fill, dtype=m.dtype)
+    return out
+
+def wrong_axis(m: Arr[T, N, M], rows: I64[E]) -> Arr[T, E, M]:
+    return np.full((len(rows), m.shape[0]), 0, dtype=m.dtype)
+```
+
+```text
+error: Incompatible return value type (got "ndarray[tuple[E, N], dtype[T]]", expected "ndarray[tuple[E, M], dtype[T]]")  [return-value]
+```
+
+`dtype=m.dtype` keeps the dtype variable through builders, and unary
+ufuncs keep it too, so the body checks with the variable intact and
+call sites solve the concrete dtype (`tests/fixtures/arr_head_ok.py`
+is clean and runs; `tests/fixtures/bad_arr_head.py` pins the error).
+
+Dtype-first (`Arr[T, N, M]`, not dtype-last) keeps the single dtype
+parameter separate from the variadic dims: everything after the first
+argument parses by the fixed-head rule — TypeVars, integers,
+`Unpack[Ts]`, `Literal[...]`, string specs — and a size in first
+position fails loudly instead of solving as a dtype. The dtype is a
+TypeVar bound to a numpy scalar type, a concrete scalar class
+(`Arr[np.float32, N, M]`), or `Any`; `Arr[np.dtype[T], N]` unwraps one
+level. Anything else redirects: `Arr[T]` wants a dim, `Arr[N, M]`
+tells you sizes go after the dtype, `Arr[Literal[3], N]` is not a
+dtype. The raw spelling keeps working — `Arr[T, N, M]` is exactly
+`np.ndarray[tuple[N, M], np.dtype[T]]`, and the two check identically.
+At runtime the head erases to the bare class (`Arr` matches any
+ndarray in `isinstance`, a subscripted `Arr` cannot narrow, calling
+one raises), so pyright and ty see a plain generic class.
+
+### Arrays from a polars frame
+
+`Series.to_numpy()` and `DataFrame.to_numpy()` leave polars typed as
+`ndarray[Any, Any]`. What is certain is pinned, nothing more:
+`DataFrame.to_numpy()` is 2-D, and `Series.to_numpy()` is 1-D after a
+visible cast to a numeric or boolean dtype — with the dtype named for
+a float cast (`s.cast(pl.Float64).to_numpy()` is `(int,)` float64; an
+integer cast stays `dtype[Any]`, since a null comes out float64). A
+plain `s.to_numpy()` keeps polars' own answer on purpose: a column of
+`pl.Array` or `pl.Struct` is 2-D, and the type of a Series does not
+say what it holds, so rank 1 would be a lie with no clean way out.
+Pinned by `tests/fixtures/polars_to_numpy.py` (needs polars; the test
+skips without it).
+
 ## Named sizes: one name, everywhere it matters
 
 Magic numbers in two places drift apart. A `Literal` alias gives a
@@ -581,9 +643,37 @@ same line gets a letter: `a, b = x[x > 0.0], x[x > 1.5]` on line 7
 of a file gives `?U@7` and `?U@7b` (numpy: `(4,)` and `(3,)` for
 `x = [1., 2., 2., 3.]`).
 
+One count per mask variable (issue #288): the same mask variable in
+the same function reuses one unknown, so `ids[keep]` and `d[0, keep]`
+share `?U` and their sum stays clean
+(`tests/fixtures/mask_count_ok.py`). Different variables mint
+different unknowns; a variable rebound between uses, a mask from a
+different scope, and an inline mask (`x[x > 0]`, `flatnonzero`, chained
+selections) mint fresh each time — best-effort flow-insensitive
+tracking (same `Name` in the same function, bail on reassignment).
+Under the opt-in `numty-names` code a selection count is a size of its
+own: against a named size or another mask's count it is reported where
+the sizes must be equal
+(`tests/fixtures/bad_mask_count_optin.py`), while a generic unknown
+against a name stays silent. A selection that keeps everything still
+has an unknown count, so narrowing is needed where the full size is
+required.
+
 The boundary is principled: unknowns flow through bodies but cannot be
 named in signatures — there is no spelling for "somebody else's count".
 Reduce them, or leave the position to inference.
+
+A dynamic size in a returned value fits a declared named size. A plain
+`int` (`np.zeros(n)`, `len()` of a non-array) or a bare unknown (a mask
+count) in a directly returned expression — or in an unannotated local it
+is returned through — is `Any` there, so it checks against any declared
+name, bound or not (`tests/fixtures/ret_int_ok.py`). A name no parameter
+binds (`def flags(n: int) -> Bool[N]`) is still a fresh unknown at each
+call. Literals keep checking: `return np.zeros((0,))` against `F64[N]`
+stays a `[return-value]` error (`tests/fixtures/bad_ret_literal.py`), as
+does a named size against another named size. The cost is known: a mask
+count returned where a named size is declared passes too, even though
+the count is provably not that size.
 
 Stacking a list built at runtime works the same way when every item has
 one declared shape: a name typed `list[...]`, or a list comprehension
@@ -761,6 +851,23 @@ b[np.arange(5), actor]            # (5,): broadcast (5,) + (5,)
 np.take_along_axis(a, idx, axis=1)  # broadcast shape, arr's dtype
 b[np.zeros(3)]                    # error: integer (or boolean) type required
 np.take_along_axis(a, idx2d, axis=1)  # error: same number of dimensions
+```
+
+Integer arrays can also carry *which* axis their values index into,
+not just how many entries they hold. `Index[P, N]` spells positions on
+size P, N of them (`Index[P]` leaves the count dynamic, `Index["P N"]`
+splits a string the same way); `argmin`/`argmax`, `argsort`,
+`arange`, `flatnonzero`, `nonzero` and `searchsorted` record the same
+fact themselves when the values are certainly positions. A recorded
+bound provably above the axis errors; a different *named* size is an
+opt-in `[numty-names]` error (`enable_error_code = numty-names`),
+silent by default:
+
+```python
+table[row, col]                   # clean: positions on the right axes
+table[col, row]                   # error (opt-in): Q on P, P on Q
+plain[np.searchsorted(a, v)]      # error: positions run to N+1 over N
+padded[np.searchsorted(a, v)]     # clean: the axis spells N+1
 ```
 
 Indexed assignment checks the write: the target solves like a read
@@ -1105,7 +1212,7 @@ can be silenced or selected on its own:
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
-| `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
+| `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
 
@@ -1161,13 +1268,15 @@ by default numty says nothing about it. A function generic in `N` and
 `M` has to work when they differ, though, and most plausible mistakes
 in such a body pair two different names: a mask on the wrong axis, a
 transposed matrix, a per-row array against a per-group one. Turn the
-check on to have them reported:
+check on to have them reported (issue #280), including selection counts
+(issue #288):
 
 ```ini
 [mypy]
 plugins = numty_plugin
 enable_error_code = numty-names
 ```
+
 
 ```python
 def f(d: F64[A, B], mask: Bool[B], v: F64[B], w: F64[A]) -> None:
@@ -1527,7 +1636,11 @@ subtraction below.
   left alone. Unknown is not an error. A builder (`zeros`/`ones`/`empty`/
   `full`, `*_like(shape=...)`) keeps the literal dims of a tuple
   display next to plain `int` ones: `np.zeros((n, 3))` is
-  `tuple[int, Literal[3]]`, also once assigned. A `Generator` sampler's
+  `tuple[int, Literal[3]]`, also once assigned. A dynamic size in a
+  directly returned value (or in an unannotated local it is returned
+  through) is `Any` there instead, so it fits a declared named size
+  (issues #269/#271); annotated locals, attribute or destructured
+  targets, and `yield`ed values keep the precise type and still check. A `Generator` sampler's
   mixed `size=` keeps the stubs' `tuple[Any, ...]`: its answer is final
   (no overload takes the shape from the assignment), so a name first
   bound to `(n, 3, 4)` could not be rebound to `size=(n, d, 4)`. A
@@ -1644,6 +1757,21 @@ subtraction below.
   provably different at a call site — only same-name TypeVars are
   unified. The opt-in `numty-names` code reports them inside a generic
   body (see [Error codes](#error-codes)).
+- Index *positions* are tracked through `Index[P, N]`, which records
+  that an int array's values index size P, and a recorded bound provably
+  above the indexed axis (`searchsorted` positions on `N+1` over `N`,
+  `arange(5)` on a size-3 axis) errors as `[numty-axis]`, while a
+  different named size (positions on M over N) needs the opt-in
+  `numty-names` code (`enable_error_code = numty-names`) and is silent
+  by default. Producers record the fact themselves when the values are
+  certainly positions (`argmin`/`argmax` and the `nan` twins,
+  `argsort`/`argpartition` on one known axis with a 1-d result,
+  0-based `arange`, 1-d `flatnonzero`, per-member `nonzero`/`where`,
+  `searchsorted`). Everything else stays silent: multi-dim results,
+  records flowing through value-preserving ops (`reshape`, `astype`,
+  arithmetic), cross-module uses, ambiguous records (two producers on
+  one line with same-shaped results), unions that disagree, and scalar
+  positions (a `-1`-for-none sentinel is not tracked).
 - A size that is a sum of values is unknown. `np.repeat(x, counts)` with
   an array of counts has `sum(counts)` entries, and
   `np.maximum.reduceat(x, starts)` has one per start. So in "reduce per
@@ -1652,10 +1780,11 @@ subtraction below.
   against the named one, and neither is reported
   ([#289](https://github.com/sofeikov/numty/issues/289)). The check is
   a runtime one ([#17](https://github.com/sofeikov/numty/issues/17)).
-- The values of an index array are not followed, only its shape.
+- The values of a plain index array are not followed, only its shape.
   `d[rows, cols]` and `d[cols, rows]` have the same type when both
   index arrays have the same length, and positions that run one past
   the end (`np.searchsorted` returns `0..N` inclusive) are not reported
+  for plain arrays without an `Index` annotation
   ([#285](https://github.com/sofeikov/numty/issues/285),
   [#286](https://github.com/sofeikov/numty/issues/286),
   [#287](https://github.com/sofeikov/numty/issues/287)).

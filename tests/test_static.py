@@ -614,6 +614,103 @@ def test_argmax_axis_mismatch() -> None:
     )
 
 
+def test_index_pos_ok() -> None:
+    # Issues #285/#286/#287: recorded index positions check clean by
+    # default; producers (argmin/argmax, arange, flatnonzero, nonzero,
+    # searchsorted) record it themselves. Index[P, N] spells which axis
+    # the values index into.
+    # Under the opt-in names code (issue #288, shared with #280) the
+    # order_ok pair broadcasts two different counts (J,) vs (K,), so
+    # line 19 reports the broadcast names error there while everything
+    # else stays clean. The default run keeps the full reveal pins.
+    off = run_mypy(FIXTURES / "index_pos_ok.py")
+    assert off.returncode == 0, off.stdout
+    on = run_mypy(FIXTURES / "index_pos_ok.py", flags=("--enable-error-code", "numty-names"))
+    on_errors = _errors_by_line(on)
+    assert sorted(on_errors) == [19], on.stdout
+    assert len(on_errors[19]) == 1, on.stdout
+    assert (
+        "broadcast at trailing axis 0 (shapes (J,) vs (K,)): J and K are different names"
+        in on_errors[19][0]
+    ), on.stdout
+    assert on_errors[19][0].endswith("[numty-names]"), on.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
+    pi64 = (
+        "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit"
+        " | numpy._typing._nbit_base._64Bit]]"
+    )
+    assert reveals_by_line(run_mypy(FIXTURES / "index_pos_ok.py")) == {
+        17: f'"numpy.ndarray[tuple[J], {i64}]"',
+        18: f'"numpy.ndarray[tuple[K], {i64}]"',
+        20: f'"numpy.ndarray[tuple[?U@19], {f64}]"',
+        22: f'"numpy.ndarray[tuple[P, K], {f64}]"',
+        24: f'"numpy.ndarray[tuple[J, Q], {f64}]"',
+        28: f'"numpy.ndarray[tuple[N_count], {i64}]"',
+        30: f'"numpy.ndarray[tuple[N, N_count], {f64}]"',
+        32: f'"numpy.ndarray[tuple[N_count], {f64}]"',
+        36: f'"numpy.ndarray[tuple[K], {i64}]"',
+        38: f'"numpy.ndarray[tuple[P, K], {f64}]"',
+        43: f'"numpy.ndarray[tuple[N], {pi64}]"',
+        45: f'"numpy.ndarray[tuple[K, N], {f64}]"',
+        50: f'"numpy.ndarray[tuple[N], {pi64}]"',
+        52: f'"numpy.ndarray[tuple[N, M], {f64}]"',
+        58: f'"numpy.ndarray[tuple[?U@56], {f64}]"',
+        64: f'"numpy.ndarray[tuple[?U@63], {f64}]"',
+        69: f'"numpy.ndarray[tuple[K], {i64}]"',
+        71: f'"numpy.ndarray[tuple[K], {f64}]"',
+        76: f'"numpy.ndarray[tuple[K], {f64}]"',
+        82: f'"numpy.ndarray[tuple[J, Q], {f64}]"',
+    }, run_mypy(FIXTURES / "index_pos_ok.py").stdout
+
+
+def test_bad_index_pos() -> None:
+    # Issues #285/#286/#287: recorded positions on one size used on
+    # another. A provably overflowing bound (N+1 on N, 5 on 3) errors by
+    # default; different names need the opt-in code. Mixed slice+fancy
+    # lines also carry mypy's own [index] error, as every mixed-tuple
+    # solver error does (see assert_rank_mismatch).
+    # Merged with issue #288: two fancy indices broadcast their counts,
+    # so (J,) vs (K,) is a broadcast names error too — line 17 gains one
+    # alongside its two position errors and the correct-positions line 18
+    # reports only the broadcast.
+    fixture = FIXTURES / "bad_index_pos.py"
+    off = run_mypy(fixture)
+    assert sorted(_errors_by_line(off)) == [38, 44], off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    expected = {
+        17: [
+            "index positions on axis 0 (shape (P, Q)): Q and P are different names",
+            "index positions on axis 1 (shape (P, Q)): P and Q are different names",
+            "broadcast at trailing axis 0 (shapes (K,) vs (J,)): K and J are different names",
+        ],
+        18: [
+            "broadcast at trailing axis 0 (shapes (J,) vs (K,)): J and K are different names",
+        ],
+        22: ["index positions on axis 1 (shape (P, Q)): M and Q are different names"],
+        23: ["index positions on axis 0 (shape (P, Q)): M and P are different names"],
+        28: ["index positions on axis 1 (shape (M, K)): M and K are different names"],
+        33: [
+            "index positions on axis 0 (shape (N, M)): M and N are different names",
+            "index positions on axis 1 (shape (N, M)): N and M are different names",
+        ],
+        38: ["index positions on N+1 used on axis 0 of size N (shape (N,))"],
+        44: ["index positions on 5 used on axis 0 of size 3 (shape (3,))"],
+        48: ["index positions on axis 1 (shape (P, Q)): M and Q are different names"],
+    }
+    assert sorted(errors) == [17, 18, 22, 23, 28, 33, 38, 44, 48], on.stdout
+    for line, messages in expected.items():
+        assert len(errors[line]) == len(messages) + (1 if line in (22, 23, 28) else 0), on.stdout
+        for message in messages:
+            assert any(
+                message in text and text.endswith("[numty-names]" if "different names" in message else "[numty-axis]")
+                for text in errors[line]
+            ), on.stdout
+    for line in (22, 23, 28):
+        assert any("Invalid index type" in text and text.endswith("[index]") for text in errors[line]), on.stdout
+
+
 def test_einsum_label_conflict() -> None:
     # Issue #148: single targeted error with both shapes, no bool follow-ons.
     assert_single_error(
@@ -1198,27 +1295,56 @@ def test_generic_namedtuple_box_unknown_arg() -> None:
     assert "var-annotated" not in result.stdout, result.stdout
 
 
-def test_builder_int_return_checked() -> None:
-    # Issue 233: a plain-int builder size checks like the named value.
-    # Single-dim inline and named both fail ([int] vs [R]).
-    result = run_mypy(FIXTURES / "bad_builder_int_return.py")
-    assert result.returncode == 1, result.stdout
-    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    assert len(errors) == 2, result.stdout
-    for line in errors:
-        assert "[return-value]" in line, result.stdout
+def test_ret_int_ok() -> None:
+    # Issues #269/#271: a plain-`int` (or mask-count) size in a returned
+    # value fits a declared named size, inline and through a name, bound
+    # or unbound. Each call of an unbound-name function still returns a
+    # fresh unknown; literals keep checking (see bad_ret_literal).
+    result = run_mypy(FIXTURES / "ret_int_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    notes = {
+        line: re.sub(r"\?U@\d+[a-z]?", "?U", shape)
+        for line, shape in reveals_by_line(result).items()
+    }
+    f64 = "numpy.dtype[numpy.float64]"
+    assert notes == {
+        98: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        99: '"numpy.ndarray[tuple[?U], numpy.dtype[numpy.bool[Any]]]"',
+        100: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
+        101: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
+    }, result.stdout
+    assert _run_fixture("ret_int_ok.py") == [
+        "(5,)",
+        "(6,)",
+        "(4,)",
+        "(4,)",
+    ]
+
+
+def test_bad_ret_literal() -> None:
+    # Issues #269/#271: a literal size in a returned value still checks
+    # against a declared named size.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_ret_literal.py"),
+        "Incompatible return value",
+        "tuple[Literal[0]]",
+        "tuple[N]",
+    )
 
 
 def test_builder_int_tuple_return_checked() -> None:
     # Issue 233: a tuple with one plain-int size reports the R-vs-A swap
-    # both inline and through a name (same [return-value] twice).
+    # both inline and through a name (same [return-value] twice). The
+    # dynamic dim itself is `Any` at the return (issues #269/#271), so
+    # only the named-against-named swap is reported.
     result = run_mypy(FIXTURES / "bad_builder_int_tuple.py")
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 2, result.stdout
     for line in errors:
         assert "[return-value]" in line, result.stdout
-        assert "tuple[int, R]" in line, result.stdout
+        assert "tuple[Any, R]" in line, result.stdout
         assert "tuple[R, A]" in line, result.stdout
 
 
@@ -1637,10 +1763,13 @@ def test_pad_time_kernel_clean_and_runs() -> None:
 
 
 def test_pad_time_kernel_keeps_time_axis() -> None:
+    # The padded block keeps the time axis (`*frames.shape`, not `[1:]`).
+    # The two dynamic dims are `Any` at the return (issues #269/#271), so
+    # the error names the kept `total` axis against the declared shape.
     assert_single_error(
         run_mypy(FIXTURES / "bad_pad_time_axis.py"),
         "Incompatible return value",
-        "tuple[int, int, total, *Ts]",
+        "tuple[Any, Any, total, *Ts]",
         "tuple[int, int, *Ts]",
     )
 
@@ -1661,16 +1790,6 @@ def test_gather_over_ts_prefix_solves() -> None:
         "Incompatible return value",
         "tuple[K, *Ts]",
         "tuple[total, *Ts]",
-    )
-
-
-def test_mask_over_ts_prefix_counts_once() -> None:
-    # A k-d mask consumes k prefix axes for one data-dependent count.
-    assert_single_error(
-        run_mypy(FIXTURES / "bad_mask_ts.py"),
-        "Incompatible return value",
-        "tuple[?U@12, *Ts]",
-        "tuple[N, *Ts]",
     )
 
 
@@ -4597,6 +4716,68 @@ def test_integer_timedelta_bitwise_dtypes() -> None:
     assert notes[26] == f'"numpy.ndarray[tuple[N], numpy.dtype[numpy.unsignedinteger[{nb}_64Bit]]]"', result.stdout
 
 
+def test_arr_head_ok() -> None:
+    # Issue #278: the generic head takes the dtype first, then flat dims
+    # like a fixed head: builders with dtype=m.dtype and unary ufuncs
+    # keep the dtype TypeVar, call sites solve the concrete dtype.
+    result = run_mypy(FIXTURES / "arr_head_ok.py")
+    assert result.returncode == 0, result.stdout
+    f32 = "numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]"
+    assert reveals_by_line(result) == {
+        24: '"numpy.ndarray[tuple[E, M], numpy.dtype[T]]"',
+        25: '"numpy.ndarray[tuple[E, Literal[2]], numpy.dtype[T]]"',
+        31: '"numpy.ndarray[tuple[N, M], numpy.dtype[FT]]"',
+        32: '"numpy.ndarray[tuple[N, M], numpy.dtype[FT]]"',
+        33: '"numpy.ndarray[tuple[N, M], numpy.dtype[FT]]"',
+        46: '"numpy.ndarray[tuple[N], numpy.dtype[Any]]"',
+        51: f'"numpy.ndarray[tuple[E, M], {f32}]"',
+        52: f'"numpy.ndarray[tuple[N, M], {f32}]"',
+        53: f'"numpy.ndarray[tuple[E, M], {f32}]"',
+        54: f'"numpy.ndarray[tuple[N, M], {f32}]"',
+    }, result.stdout
+    assert _run_fixture("arr_head_ok.py") == [
+        "(2, 3) float32",
+        "(2, 2) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+        "(2, 2) float32",
+        "(2, 3) float32",
+        "(2, 3) float32",
+    ]
+
+
+def test_arr_head_wrong_axis() -> None:
+    # Issue #278: a result built on the wrong axis is reported, with the
+    # dtype variable on both sides.
+    assert_single_error(
+        run_mypy(FIXTURES / "bad_arr_head.py"),
+        'got "ndarray[tuple[E, N], dtype[T]]", expected "ndarray[tuple[E, M], dtype[T]]"',
+        line=14,
+    )
+
+
+def test_arr_head_misuse() -> None:
+    # Issue #278: a missing dtype, an int-bound dim first, and a literal
+    # first all fail loudly with the dtype-first redirect.
+    result = run_mypy(FIXTURES / "bad_arr_dtype.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [12, 15, 18], result.stdout
+    assert len(errors[12]) == 1 and len(errors[15]) == 1 and len(errors[18]) == 1, result.stdout
+    assert "Arr takes a dtype and at least one dim" in errors[12][0], result.stdout
+    assert "[numty-annotation]" in errors[12][0], result.stdout
+    assert 'Arr takes a dtype as its first argument, but "N" is bound to int' in errors[15][0], (
+        result.stdout
+    )
+    assert "[numty-annotation]" in errors[15][0], result.stdout
+    assert "Arr takes a dtype as its first argument" in errors[18][0], result.stdout
+    assert "[numty-annotation]" in errors[18][0], result.stdout
+
+
 def test_any_bound_size_is_stable() -> None:
     # Issue 284: with an argument of unknown rank and a union argument,
     # mypy solved `T` by a join whose order changed from run to run, and
@@ -4846,6 +5027,7 @@ def test_literal_formula_spelling() -> None:
 
 def test_polars_to_numpy() -> None:
     # Issue 272: DataFrame.to_numpy() is 2-D; Series.to_numpy() is 1-D
+
     # after a visible cast to a numeric or boolean dtype, and a float
     # cast names the dtype. A plain Series.to_numpy(), a cast to Array
     # or String, and structured=True keep polars' own answer.
@@ -4879,6 +5061,54 @@ def test_polars_to_numpy() -> None:
         "(3, 2) (3,)",
         "(3, 2)",
     ]
+def test_mask_count_reuses_one_unknown_per_variable() -> None:
+    # Issue #288 (1): the same mask variable gives the same unknown, so
+    # ids[keep] and d[0, keep] share ?U and their sum stays clean. Index
+    # arrays keep reusing their named size (K). Different masks, a
+    # rebinding, different scopes and inline masks all mint fresh.
+    result = run_mypy(FIXTURES / "mask_count_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
+    f64 = "numpy.dtype[numpy.float64]"
+    assert notes[11] == f'"numpy.ndarray[tuple[K], {i64}]"', result.stdout
+    assert notes[12] == f'"numpy.ndarray[tuple[P, K], {f64}]"', result.stdout
+    assert notes[13] == f'"numpy.ndarray[tuple[K], {i64}]"', result.stdout
+    # Line 14 pairs (N,) against (K,): silent by default.
+    assert notes[14] == f'"numpy.ndarray[tuple[?U@14], {f64}]"', result.stdout
+    # Lines 15-16 share one count for `keep`; line 17 keeps it.
+    assert notes[15] == f'"numpy.ndarray[tuple[?U@15], {i64}]"', result.stdout
+    assert notes[16] == f'"numpy.ndarray[tuple[?U@15], {f64}]"', result.stdout
+    assert notes[17] == f'"numpy.ndarray[tuple[?U@17], {f64}]"', result.stdout
+    assert _run_fixture("mask_count_ok.py") == ["ok"]
+    # Under the opt-in only line 14 reports (N vs K); line 17 stays clean.
+    on = run_mypy(FIXTURES / "mask_count_ok.py", flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [14], on.stdout
+    assert "N and K are different names" in errors[14][0], on.stdout
+    assert errors[14][0].endswith("[numty-names]"), on.stdout
+
+
+def test_mask_count_optin_reports_selection_counts() -> None:
+    # Issue #288 (2): under the opt-in `numty-names` code a selection
+    # count is a size of its own. A mask count against a named size, two
+    # different masks' counts, and a call-site binding of a count against
+    # a name are errors; the same mask variable stays clean. By default
+    # all of it is silent (unknown is not an error).
+    fixture = FIXTURES / "bad_mask_count_optin.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    assert "error:" not in off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [28, 29, 31, 32], on.stdout
+    assert "N and ?U@28 are different names" in errors[28][0], on.stdout
+    assert "?U@28 and ?U@29 are different names" in errors[29][0], on.stdout
+    assert "N and P are different names" in errors[31][0], on.stdout
+    assert "?U@28 and N are different names" in errors[32][0], on.stdout
+    for line in (28, 29, 31, 32):
+        assert len(errors[line]) == 1, on.stdout
+        assert errors[line][0].endswith("[numty-names]"), on.stdout
 
 
 def test_numba_dispatcher_call() -> None:
@@ -4927,6 +5157,7 @@ def test_names_opt_in() -> None:
         28: "call-site binding of 'K' (argument 'ids', axis 0, and argument 'd', axis 1): "
         "B and A are different names",
         29: "broadcast at trailing axis 0 (shapes (A,) vs (B,)): A and B are different names",
+        31: "broadcast at trailing axis 0 (shapes (?U@18,) vs (A,)): ?U@18 and A are different names",
         34: "broadcast at trailing axis 0 (shapes (B-1,) vs (A,)): B-1 and A are different names",
     }
     assert sorted(errors) == sorted([*expected, 30]), on.stdout

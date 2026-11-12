@@ -15,7 +15,8 @@ from mypy.types import (
 from ._errors import _swallowed
 from ._exprs import _iter_tvarlikes
 from ._types import (
-    INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _parts_or_unpack, _report_names, _shape_tvar_formals,
+    INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _parts_or_unpack, _report_mask_names, _report_names,
+    _shape_tvar_formals,
     _strip_optional,
 )
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
@@ -151,13 +152,14 @@ def _relax_dynamic_formals(sig: CallableType, ctx: FunctionSigContext | MethodSi
 
 
 def _report_call_site_names(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> None:
-    """The opt-in `[numty-names]` report at a call (issue 280).
+    """The opt-in `[numty-names]` report at a call (issue 280, reused by 288).
 
     `score(ids: I64[K], d: F64[P, K])` called with an `I64[N]` and an
     `F64[N, P]` binds `K` to the caller's `N` and to its `P`. The
     callee's names are being solved here, so two of them may be one
     size; one of them cannot be two of the caller's names. The first
     array argument that names the size is compared with the later ones.
+    Selection counts (issue 288) are compared the same way.
     """
     try:
         if len(ctx.args) != len(sig.arg_types):
@@ -179,6 +181,13 @@ def _report_call_site_names(sig: CallableType, ctx: FunctionSigContext | MethodS
                 seen = first.setdefault(tvar.fullname, (name, dim, adim))
                 if seen[2] is not adim:
                     _report_names(
+                        ctx,
+                        seen[2],
+                        adim,
+                        f"call-site binding of '{tvar.name}' (argument '{seen[0]}', axis {seen[1]}, "
+                        f"and argument '{name}', axis {dim})",
+                    )
+                    _report_mask_names(
                         ctx,
                         seen[2],
                         adim,

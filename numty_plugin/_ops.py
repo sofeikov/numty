@@ -5,14 +5,15 @@ for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
-
+from collections.abc import Sequence
 from mypy.nodes import Expression, ListExpr, StarExpr, TupleExpr
 from mypy.plugin import FunctionContext, MethodContext
 from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, get_proper_type
 
-from ._errors import NUMTY_AXIS, NUMTY_SHAPE
+from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
 from ._dtypes import _DTYPE_INFO
-from ._forms import _LinForm
+from ._forms import _LinForm, _form_has_unknown, _lin_add
+from ._heads import _record_index_on
 
 from ._types import (
     _int_value, _dim_value, _dim_eq, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims,
@@ -1155,6 +1156,69 @@ def _select_index_elem(
     return _ndarray_type(ctx, [_fresh_unknown(ctx, op, index)], dtype)
 
 
+def _record_flat_positions(
+    ctx: FunctionContext, result_elem: Type, axis_size: int | Type
+) -> None:
+    """Record positions-on for one 1-d integer result (issue #285).
+
+    flatnonzero/nonzero members hold positions on one input axis; the
+    result's own ?U dim keys the record, so unrelated arrays never match.
+    """
+    if not isinstance(axis_size, (int, TypeVarType)):
+        return
+    parts = _ndarray_parts(result_elem)
+    if parts is None:
+        return
+    dims, _ = parts
+    if len(dims) != 1:
+        return
+    _record_index_on(ctx, dims, axis_size)
+
+
+def _record_searchsorted(
+    ctx: FunctionContext,
+    sorted_parts: tuple[list[int | Type], Type] | None,
+    values_dims: Sequence[int | Type],
+) -> None:
+    """Record positions-on for a searchsorted result (issue #287).
+
+    np.searchsorted(a, v) holds positions on len(a) + 1, so indexing an
+    axis of size len(a) with them is provably wrong; an axis spelled
+    len(a)+1 stays clean.
+    """
+    if sorted_parts is None or _has_unpack(sorted_parts[0]):
+        return
+    sorted_dims = sorted_parts[0]
+    if len(sorted_dims) != 1 or len(values_dims) != 1:
+        return
+    if not all(isinstance(d, (int, TypeVarType)) for d in values_dims):
+        return
+    size = sorted_dims[0]
+    if isinstance(size, int):
+        if size < 0:
+            return
+        recorded: int | Type = size + 1
+    elif isinstance(size, TypeVarType):
+        from numty_plugin import _materialize_dim, _resolve_dim
+        try:
+            form = _resolve_dim(size)
+        except Exception:
+            _swallowed(ctx, "_record_searchsorted")
+            return
+        if not isinstance(form, _LinForm) or _form_has_unknown(form):
+            return
+        try:
+            recorded = _materialize_dim(ctx, "searchsorted", 0, _lin_add(form, _LinForm((), 1)))
+        except Exception:
+            _swallowed(ctx, "_record_searchsorted")
+            return
+        if not isinstance(recorded, (int, TypeVarType)):
+            return
+    else:
+        return
+    _record_index_on(ctx, values_dims, recorded)
+
+
 def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
     """Tuple of 1-d int ?U arrays, one per dim; 0-d fails loudly."""
     parts = _ndarray_parts(arg)
@@ -1173,6 +1237,7 @@ def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
         elem = _select_index_elem(ctx, op, i)
         if elem is None:
             return ctx.default_return_type
+        _record_flat_positions(ctx, elem, dims[i])
         elems.append(elem)
     return _linalg_tuple(ctx, elems)
 
@@ -1226,9 +1291,12 @@ def flatnonzero_function_hook(ctx: FunctionContext) -> Type:
     parts = _ndarray_parts(pairs[0][0])
     if parts is None:
         return ctx.default_return_type
+    dims, _ = parts
     elem = _select_index_elem(ctx, "flatnonzero", 0)
     if elem is None:
         return ctx.default_return_type
+    if len(dims) == 1:
+        _record_flat_positions(ctx, elem, dims[0])
     return elem
 
 
@@ -1392,6 +1460,7 @@ def _searchsorted_types(
     dtype = _construct_dtype(ctx, "numpy.int64")
     if dtype is None:
         return ctx.default_return_type
+    _record_searchsorted(ctx, sorted_parts, values_dims)
     return _ndarray_type(ctx, values_dims, dtype)
 
 

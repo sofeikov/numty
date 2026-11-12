@@ -8,14 +8,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE
+from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
 from ._forms import (
     _LinForm,
 )
 from ._types import (
-    INT_FULLNAME, _dim_eq, _dims_provably_ne, _distribute_solve, _fold_int, _has_unpack, _int_value,
-    _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_names, _union_members,
+    INT_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int,
+    _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_mask_names,
+    _report_names, _union_members,
 )
+from ._heads import (
+    _index_recorded_exceeds, _recorded_index_on,
+)
+from ._unknowns import _fresh_mask_count
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _known_rank_parts, _movable_parts,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
@@ -38,6 +43,183 @@ from ._linalg import (
 from ._types import (
     _unpack_shape,
 )
+
+
+def _enclosing_func(
+    ctx: MethodContext,
+    use_line: int,
+) -> tuple[str, object | None]:
+    """Innermost function containing `use_line`: (fullname, node).
+
+    Best-effort flow-insensitive scope for mask-var reuse (issue #288):
+    the same mask variable in the same function reuses one count; a
+    variable rebound between uses must not. Different scopes never share
+    (documented limit: a global mask reused in two functions mints one
+    count per function).
+    """
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import FuncDef as _FuncDef
+
+    try:
+        tree = getattr(ctx.api, "tree", None)
+        module = getattr(tree, "fullname", "") or ""
+        if tree is None or use_line <= 0:
+            return f"{module}::<module>", None
+        best: tuple[str, object | None] = (f"{module}::<module>", None)
+        best_span = -1
+
+        def _visit_func(node: object, prefix: str) -> None:
+            nonlocal best, best_span
+            line = getattr(node, "line", 0) or 0
+            end = getattr(node, "end_line", 0) or line
+            if not (line <= use_line <= end):
+                return
+            span = end - line
+            fullname = getattr(node, "fullname", "") or f"{module}::{prefix}"
+            if best[1] is None or span < best_span or best_span < 0:
+                best = (fullname, node)
+                best_span = span
+            body = getattr(getattr(node, "body", None), "body", []) or []
+            for stmt in body:
+                if isinstance(stmt, _FuncDef):
+                    _visit_func(stmt, getattr(stmt, "name", "?") or "?")
+
+        defs = getattr(tree, "defs", []) or []
+        for top in defs:
+            if isinstance(top, _FuncDef):
+                _visit_func(top, getattr(top, "name", "?") or "?")
+            elif isinstance(top, _ClassDef):
+                members = getattr(getattr(top, "defs", None), "body", []) or []
+                for member in members:
+                    if isinstance(member, _FuncDef):
+                        _visit_func(member, getattr(member, "name", "?") or "?")
+        return best
+    except Exception:
+        _swallowed(ctx, "_enclosing_func")
+        tree = getattr(ctx.api, "tree", None)
+        module = getattr(tree, "fullname", "") or "" if tree is not None else ""
+        return f"{module}::<module>", None
+
+
+def _count_var_assignments(func_node: object | None, varname: str) -> tuple[int, bool]:
+    """(assignments to `varname`, is_param) in one function body.
+
+    Flow-insensitive: any `Name = ...`, `for Name in ...`, `with ... as
+    Name` or `+=` counts. Nested functions/classes are different scopes
+    and are skipped (documented limit). `is_param` is whether the name is
+    a parameter of the function.
+    """
+    from mypy.nodes import AssignmentStmt as _AssignmentStmt
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import ForStmt as _ForStmt
+    from mypy.nodes import FuncDef as _FuncDef
+    from mypy.nodes import OperatorAssignmentStmt as _OpAssign
+    from mypy.nodes import WithStmt as _WithStmt
+
+    if func_node is None:
+        return 0, False
+    arg_names = getattr(func_node, "arg_names", []) or []
+    is_param = varname in (arg_names or [])
+    count = 0
+
+    def _targets(lvalue: object) -> list[str]:
+        if isinstance(lvalue, NameExpr):
+            return [lvalue.name]
+        if isinstance(lvalue, (TupleExpr, ListExpr)):
+            out: list[str] = []
+            for item in getattr(lvalue, "items", []) or []:
+                out.extend(_targets(item))
+            return out
+        if isinstance(lvalue, StarExpr):
+            return _targets(getattr(lvalue, "expr", None))
+        return []
+
+    def _walk(stmts: object) -> None:
+        nonlocal count
+        items = list(stmts) if isinstance(stmts, list) else []
+        for stmt in items:
+            if isinstance(stmt, (_FuncDef, _ClassDef)):
+                continue
+            if isinstance(stmt, _AssignmentStmt):
+                for lv in getattr(stmt, "lvalues", []) or []:
+                    if varname in _targets(lv):
+                        count += 1
+            elif isinstance(stmt, _OpAssign):
+                if varname in _targets(getattr(stmt, "lvalue", None)):
+                    count += 1
+            elif isinstance(stmt, _ForStmt):
+                if varname in _targets(getattr(stmt, "index", None)):
+                    count += 1
+            elif isinstance(stmt, _WithStmt):
+                for item in getattr(stmt, "items", []) or []:
+                    target = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
+                    if target is not None and varname in _targets(target):
+                        count += 1
+            for attr in ("body", "else_body", "finally_body"):
+                sub = getattr(stmt, attr, None)
+                inner = getattr(sub, "body", None) if sub is not None else None
+                if isinstance(inner, list) and inner:
+                    _walk(inner)
+            handlers = getattr(stmt, "handlers", None)
+            if isinstance(handlers, list):
+                for handler in handlers:
+                    hbody = getattr(getattr(handler, "body", None), "body", None)
+                    if isinstance(hbody, list) and hbody:
+                        _walk(hbody)
+
+    top_body = getattr(getattr(func_node, "body", None), "body", []) or []
+    if isinstance(top_body, list):
+        _walk(top_body)
+    return count, is_param
+
+
+def _mask_var_key(ctx: MethodContext, mask_expr: Expression | None) -> str | None:
+    """Stable key for a mask variable use, else None to mint per site (issue #288).
+
+    Same `Name` in the same function (module::func::name), not rebound
+    between uses, reuses one unknown. Inline masks (`x[x > 0]`), member
+    access, `flatnonzero` results and any rebinding bail to a fresh
+    per-site unknown (documented limits).
+    """
+    if not isinstance(mask_expr, NameExpr):
+        return None
+    varname = mask_expr.name
+    if not varname or varname in ("True", "False", "None"):
+        return None
+    try:
+        use_line = getattr(mask_expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+        func_fullname, func_node = _enclosing_func(ctx, use_line)
+        count, is_param = _count_var_assignments(func_node, varname)
+        if is_param:
+            if count >= 1:
+                return None
+        elif count > 1:
+            return None
+        tree = getattr(ctx.api, "tree", None)
+        module = getattr(tree, "fullname", "") or ""
+        return f"{module}::{func_fullname}::{varname}"
+    except Exception:
+        _swallowed(ctx, "_mask_var_key")
+        return None
+
+
+def _mask_count_for(ctx: MethodContext, mask_expr: Expression | None, dim: int) -> Type:
+    """The count dim for one boolean-mask use (issue #288).
+
+    Same variable without rebinding shares one unknown; everything else
+    mints a fresh per-site unknown as before.
+    """
+    from numty_plugin import _fresh_unknown
+
+    key = _mask_var_key(ctx, mask_expr)
+    if key is None:
+        return _fresh_unknown(ctx, "mask", dim)
+    try:
+        return _fresh_mask_count(ctx, key)
+    except Exception:
+        _swallowed(ctx, "_mask_count_for")
+        return _fresh_unknown(ctx, "mask", dim)
+
 
 def _take_indices(
     pair: tuple[Type, Expression | None],
@@ -415,12 +597,12 @@ def _consume_prefix(
     items: list[tuple],
     prefix: list[int | Type],
     shape_repr: str,
+    exprs: list[Expression | None] | None = None,
 ) -> tuple[list[int | Type], list[int | Type]] | None:
     """Items before ... consume the known prefix; (kept, unmatched)."""
-    from numty_plugin import _fresh_unknown
     out: list[int | Type] = []
     i = 0
-    for item in items:
+    for pos, item in enumerate(items):
         if item[0] == "newaxis":
             out.append(1)
             continue
@@ -465,7 +647,8 @@ def _consume_prefix(
                     )
                     return None
                 _report_names(ctx, md, pd, f"boolean index on axis {i + off} (shape {shape_repr})")
-            out.append(_fresh_unknown(ctx, "mask", i))
+            mask_expr = exprs[pos] if exprs is not None and pos < len(exprs) else None
+            out.append(_mask_count_for(ctx, mask_expr, i))
             i += rank
             continue
         frag = _consume_one(ctx, item, prefix[i], str(i), shape_repr, i, "slice")
@@ -552,12 +735,13 @@ def _solve_getitem_unpack(
         return ctx.default_return_type
     positions = [n for n, item in enumerate(items) if item[0] == "ellipsis"]
     if not positions:
-        leading = _consume_prefix(ctx, items, prefix, shape_repr)
+        exprs = [p[1] for p in pairs]
+        leading = _consume_prefix(ctx, items, prefix, shape_repr, exprs)
         if leading is None:
             return ctx.default_return_type
         return _ndarray_type(ctx, leading[0] + leading[1] + [unpack] + suffix, dtype)
     pos = positions[0]
-    left = _consume_prefix(ctx, items[:pos], prefix, shape_repr)
+    left = _consume_prefix(ctx, items[:pos], prefix, shape_repr, [p[1] for p in pairs[:pos]])
     if left is None:
         return ctx.default_return_type
     right = _consume_suffix(ctx, items[pos + 1 :], suffix, shape_repr)
@@ -565,6 +749,48 @@ def _solve_getitem_unpack(
         return ctx.default_return_type
     out = left[0] + left[1] + [unpack] + right[0] + right[1]
     return _ndarray_type(ctx, out, dtype)
+
+
+def _check_index_positions(
+    ctx: MethodContext,
+    pair: tuple[Type, Expression | None],
+    size: int | Type,
+    axis: int,
+    dims: list[int | Type],
+) -> None:
+    """A recorded positions-on size must fit the axis it indexes (issues #285, #287).
+
+    A recorded bound provably above the axis (N+1 positions on an N
+    axis) is an error; a different *named* size is an opt-in
+    [numty-names] error; equal, fitting, unknown, or unrecorded
+    operands stay silent.
+    """
+    tp, expr = pair
+    parts = _ndarray_parts(tp)
+    if parts is None:
+        return
+    idims, _ = parts
+    if len(idims) != 1:
+        return
+    recorded = _recorded_index_on(ctx, idims, expr)
+    if recorded is None:
+        return
+    if _dim_eq(recorded, size):
+        return
+    if _index_recorded_exceeds(recorded, size):
+        ctx.api.fail(
+            f"index positions on {_dim_str(recorded)} used on axis {axis} "
+            f"of size {_dim_str(size)} (shape {_dims_str(dims)})",
+            ctx.context,
+            code=NUMTY_AXIS,
+        )
+        return
+    _report_names(
+        ctx,
+        recorded,
+        size,
+        f"index positions on axis {axis} (shape {_dims_str(dims)})",
+    )
 
 
 def _solve_getitem(
@@ -673,6 +899,7 @@ def _solve_getitem(
                 adv_seen = adv_seen or is_adv
         elif kind == "fancy":
             shape: list[int | Type] = list(item[1])
+            _check_index_positions(ctx, pairs[n], dims[dim], dim, dims)
             if not adv_block:
                 adv_block = shape
             else:
@@ -722,7 +949,8 @@ def _solve_getitem(
                         )
                         return ctx.default_return_type
                     _report_names(ctx, md, pd, f"boolean index on axis {dim + off} (shape {_dims_str(dims)})")
-                unk = _fresh_unknown(ctx, "mask", dim)
+                mask_expr = pairs[n][1] if n < len(pairs) else None
+                unk = _mask_count_for(ctx, mask_expr, dim)
                 if not adv_block:
                     adv_block = [unk]
                 else:
@@ -908,6 +1136,9 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
         # Unknown, or two names that may be equal: unprovable. The
         # other axes are still compared.
         _report_names(
+            ctx, v, t, f"assignment of shape {_dims_str(value_dims)} into target of shape {_dims_str(target_dims)}"
+        )
+        _report_mask_names(
             ctx, v, t, f"assignment of shape {_dims_str(value_dims)} into target of shape {_dims_str(target_dims)}"
         )
     return ctx.default_return_type

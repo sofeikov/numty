@@ -19,7 +19,8 @@ from ._dtypes import (
 )
 from ._types import (
     DTYPE_FULLNAME, INT_FULLNAME, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
-    _fold_int, _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_names,
+    _fold_int, _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_mask_names,
+    _report_names,
     _shape_from_arg,
     _split_flat, _union_members,
 )
@@ -110,6 +111,9 @@ def _broadcast_result(
             return None, None
         else:
             _report_names(
+                ctx, x, y, f"broadcast at trailing axis {k} (shapes {_dims_str(a)} vs {_dims_str(b)})"
+            )
+            _report_mask_names(
                 ctx, x, y, f"broadcast at trailing axis {k} (shapes {_dims_str(a)} vs {_dims_str(b)})"
             )
             out.append(_fresh_unknown(ctx, "bcast", k))

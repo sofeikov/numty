@@ -100,8 +100,8 @@ from ._broadcast import (
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
 from ._heads import (
-    _FAM_HEAD_DTYPES, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
-    _fam_expr, _fam_head, _fam_string,
+    _FAM_HEAD_DTYPES, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
+    _fam_expr, _fam_head, _fam_string, _index_head,
 )
 from ._exprs import (
     _iter_tvarlikes,
@@ -113,7 +113,7 @@ from ._linalg import (
     _dtype_base,
 )
 from ._types import (
-    _enum_member_count, _named_pair_in, _names_enabled,
+    _enum_member_count, _mask_pair_in, _named_pair_in, _names_enabled,
 )
 from ._unions import (
     _UNION_PAIR_METHODS, _reflected_name, _union_pair_hook, _union_reflected_hook,
@@ -417,6 +417,7 @@ class NumtyPlugin(Plugin):
         try:
             if isinstance(sig, CallableType) and not overloaded:
                 _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
+                _report_call_site_names(sig, ctx)
         except Exception:
             _swallowed(ctx, "method_signature_hook")
             pass
@@ -516,6 +517,7 @@ class NumtyPlugin(Plugin):
         # fall back to the default, unrepaired signature).
         try:
             _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
+            _report_call_site_names(sig, ctx)
         except Exception:
             _swallowed(ctx, "_callsite_check")
             pass
@@ -529,6 +531,15 @@ class NumtyPlugin(Plugin):
     def get_type_analyze_hook(
         self, fullname: str
     ) -> Callable[[AnalyzeTypeContext], Type] | None:
+        # Issue #286: Index[P, N] spells positions on P, N of them. Flat
+        # args like the other heads (a nested Index[P][N] cannot round-trip
+        # through analyze hooks), so it dispatches before the dtype map.
+        if fullname == "numty.Index":
+
+            def index_hook(ctx: AnalyzeTypeContext) -> Type:
+                return self._index_head(ctx)
+
+            return index_hook
         dtype_fullname = _FAM_HEAD_DTYPES.get(fullname)
         if dtype_fullname is not None:
 
@@ -536,6 +547,14 @@ class NumtyPlugin(Plugin):
                 return self._fam_head(ctx, dtype_fullname)
 
             return hook
+        if fullname == "numty.Arr":
+            # The generic head (issue #278): the dtype rides the first
+            # arg, the dims ride the rest flat.
+
+            def arr_hook(ctx: AnalyzeTypeContext) -> Type:
+                return self._arr_head(ctx)
+
+            return arr_hook
         # Issue #38: a bare shape-carrying generic (e.g. list[Box] where
         # Box has F64[...] fields) silently means Any shapes downstream.
         # Flag the bare use so it can be parameterized instead.
@@ -625,6 +644,12 @@ class NumtyPlugin(Plugin):
     # self._fam_late_bound, mutated in place).
     def _fam_head(self, ctx: AnalyzeTypeContext, dtype_fullname: str) -> Type:
         return _fam_head(ctx, dtype_fullname, self._fam_late_bound)
+
+    def _arr_head(self, ctx: AnalyzeTypeContext) -> Type:
+        return _arr_head(ctx, self._fam_late_bound)
+
+    def _index_head(self, ctx: AnalyzeTypeContext) -> Type:
+        return _index_head(ctx, self._fam_late_bound)
 
     def _fam_arg(
         self, ctx: AnalyzeTypeContext, head: str, arg: Type
@@ -1161,18 +1186,23 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         def _any_mismatch(
             a_list: list[list[int | Type]], b_list: list[list[int | Type]]
         ) -> bool:
+            try:
+                names_on = _names_enabled(ctx)
+            except Exception:
+                _swallowed(ctx, "_any_mismatch")
+                names_on = False
             for da in a_list:
                 for db in b_list:
                     _, msg = _broadcast_result(list(da), list(db), None)
                     if msg is not None:
                         return True
-                    # The opt-in report for two different names (issue
-                    # 280) is an error of the method hook as well.
-                    if names_on and _named_pair_in(da, db):
+                    # The opt-in reports for two different names (issue
+                    # #280) and for selection counts (issue #288) are
+                    # errors of the method hook as well.
+                    if names_on and (_named_pair_in(da, db) or _mask_pair_in(da, db)):
                         return True
             return False
 
-        names_on = _names_enabled(ctx)
         other_expr = None
         call = ctx.context
         if isinstance(call, _OpExpr):

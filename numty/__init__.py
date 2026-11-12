@@ -63,6 +63,9 @@ class _HeadMeta(type):
     """
 
     _numty_dtype: np.dtype[Any] | None = None
+    # A generic head (`Arr`) takes its dtype as a parameter, so the bare
+    # head names no dtype: it matches any ndarray (issue #278).
+    _numty_any_dtype: bool = False
     # A family head (`Floating`, `Integer`) has no one dtype: it matches
     # the arrays whose dtype is a subtype of this numpy scalar class.
     _numty_family: type[np.generic] | None = None
@@ -74,6 +77,8 @@ class _HeadMeta(type):
         family = cls._numty_family
         if family is not None:
             return isinstance(obj, np.ndarray) and np.issubdtype(obj.dtype, family)
+        if cls._numty_any_dtype:
+            return isinstance(obj, np.ndarray)
         return super().__instancecheck__(obj)
 
     def __call__(cls, *args: Any, **kwargs: Any) -> Any:
@@ -182,6 +187,35 @@ class Bool(_StringDims, Generic[Unpack[TsFam]]):
     """boolean array with flat dims, e.g. Bool[batch, mask]."""
 
     _numty_dtype = np.dtype(np.bool_)
+
+
+DT = TypeVar("DT", bound=np.generic)
+
+
+class Arr(_StringDims, Generic[DT, Unpack[TsFam]]):
+    """Array with the dtype as a parameter and flat dims, e.g. Arr[T, batch, features].
+
+    The fixed heads above carry the dtype in the name (`F64`, `I64`);
+    a helper generic in its dtype cannot use them. `Arr` takes the
+    dtype first, then the dims exactly as a fixed head spells them:
+    `Arr[T, N, M]` is `np.ndarray[tuple[N, M], np.dtype[T]]` with
+    `T = TypeVar("T", bound=np.generic)`.
+    """
+
+    _numty_any_dtype = True
+
+
+class Index(_StringDims, Generic[Unpack[TsFam]]):
+    """Positions array: Index[P, N] holds N int64 values indexing size P.
+
+    The shape says how many; the first arg says which axis the values are
+    positions on (issues #285, #286). Index[P] leaves the count dynamic,
+    Index["P N"] splits a string spec the same way, and a multi-dim shape
+    (Index[P, N, M]) records P but is not checked. A scalar -1-for-none
+    position is not tracked.
+    """
+
+    _numty_dtype = np.dtype(np.int64)
 
 
 class Floating(_StringDims, Generic[Unpack[TsFam]]):

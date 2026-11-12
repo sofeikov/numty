@@ -5,7 +5,7 @@ for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
-
+from collections.abc import Sequence
 from mypy.nodes import AssignmentStmt, CallExpr, Expression, ListExpr, MemberExpr, NameExpr, StarExpr, TupleExpr, Var
 from mypy.plugin import FunctionContext, MethodContext
 from mypy.types import (
@@ -31,6 +31,7 @@ from ._builders import (
     _apply_out_dtype, _builder_shape, _default_dtype, _dims_fit_intp, _explicit_dtype, _named_dtype,
     _scalar_ret_name,
 )
+from ._heads import _record_index_on
 from ._linalg import (
     _linalg_real_name, _linalg_tuple,
 )
@@ -722,6 +723,43 @@ def _final_slice_call(
     return None
 
 
+def _record_single_axis_positions(
+    ctx: FunctionContext | MethodContext,
+    dims: Sequence[int | Type],
+    norm: int | None,
+    result_dims: Sequence[int | Type],
+) -> None:
+    """Record positions-on for a single-axis integer result (issue #285).
+
+    argmin/argmax drop the reduced axis and argsort keeps the shape; when
+    the result is 1-d its values are positions on the reduced axis size.
+    Anything else (several axes, unknown axis, non-size axis) is ignored.
+    """
+    if norm is None or len(result_dims) != 1 or not 0 <= norm < len(dims):
+        return
+    rec = dims[norm]
+    if not isinstance(rec, (int, TypeVarType)):
+        return
+    _record_index_on(ctx, result_dims, rec)
+
+
+def _record_argsort_positions(
+    ctx: FunctionContext | MethodContext,
+    dims: Sequence[int | Type],
+    norm: int | None,
+    result_dims: Sequence[int | Type],
+    int_out: bool,
+) -> None:
+    """Record positions-on for an argsort/argpartition result (issue #285).
+
+    sort/partition keep values, not positions, so only the integer-out
+    twins record, through the shared single-axis helper.
+    """
+    if not int_out:
+        return
+    _record_single_axis_positions(ctx, dims, norm, result_dims)
+
+
 def _solve_argdrop(
     ctx: FunctionContext | MethodContext,
     dims: list[int | Type],
@@ -741,7 +779,9 @@ def _solve_argdrop(
             if keepdims is None:
                 return ctx.default_return_type
             if keepdims:
-                return _ndarray_type(ctx, [1] * len(dims), _default_dtype(ctx))
+                out: list[int | Type] = [1] * len(dims)
+                _record_single_axis_positions(ctx, dims, 0 if len(dims) == 1 else None, out)
+                return _ndarray_type(ctx, out, _default_dtype(ctx))
             return ctx.default_return_type
         return ctx.default_return_type
     if keepdims is None:
@@ -768,11 +808,14 @@ def _solve_argdrop(
             return ctx.default_return_type
         normalized.append(norm)
     chosen = set(normalized)
+    single = normalized[0] if len(normalized) == 1 else None
     if keepdims:
-        return _ndarray_type(
-            ctx, [d if i not in chosen else 1 for i, d in enumerate(dims)], _default_dtype(ctx)
-        )
-    return _ndarray_type(ctx, [d for i, d in enumerate(dims) if i not in chosen], _default_dtype(ctx))
+        out = [d if i not in chosen else 1 for i, d in enumerate(dims)]
+        _record_single_axis_positions(ctx, dims, single, out)
+        return _ndarray_type(ctx, out, _default_dtype(ctx))
+    dropped = [d for i, d in enumerate(dims) if i not in chosen]
+    _record_single_axis_positions(ctx, dims, single, dropped)
+    return _ndarray_type(ctx, dropped, _default_dtype(ctx))
 
 
 def _solve_same_or_flat(
@@ -790,15 +833,19 @@ def _solve_same_or_flat(
         dims = [1]
     if axis == "absent":
         # The default axis is -1, which never changes the shape.
+        _record_argsort_positions(ctx, dims, len(dims) - 1, dims, int_out)
         return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
     if not isinstance(axis, list):
         if axis == "none":
             total = _mul_dims(ctx, "sort", 0, dims)
+            _record_argsort_positions(ctx, dims, 0 if len(dims) == 1 else None, [total], int_out)
             return _ndarray_type(ctx, [total], _default_dtype(ctx) if int_out else dtype)
         return ctx.default_return_type
     ndim = len(dims)
+    normed: list[int] = []
     for ax in axis:
-        if _normalize_axis(ax, ndim) is None:
+        norm = _normalize_axis(ax, ndim)
+        if norm is None:
             ctx.api.fail(
                 f"{op} axis {ax} is out of range for {ndim} dimensions "
                 f"(shape {_dims_str(dims)})",
@@ -806,6 +853,10 @@ def _solve_same_or_flat(
                 code=NUMTY_AXIS,
             )
             return ctx.default_return_type
+        normed.append(norm)
+    _record_argsort_positions(
+        ctx, dims, normed[0] if len(normed) == 1 else None, dims, int_out
+    )
     return _ndarray_type(ctx, dims, _default_dtype(ctx) if int_out else dtype)
 
 
