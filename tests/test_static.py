@@ -5715,3 +5715,71 @@ def test_inplace_setitem_int_ok() -> None:
     assert notes[24] == f'"numpy.ndarray[tuple[N, N, M], {_F64}]"', result.stdout
     assert notes[43] == f'"numpy.ndarray[tuple[N, int], {_F64}]"', result.stdout
     assert _run_fixture("inplace_setitem_int_ok.py") == ["ok"]
+
+
+def test_own_size_bindings() -> None:
+    # Issue 332: a local returned under a free name takes it at every
+    # binding that holds one size (a tuple target, a conditional, both
+    # branches of an `if`, where an `int` fits); `np.nonzero(m)[0]` is a
+    # selection count as `np.flatnonzero(m)` is, and fits `I64[K]` and
+    # `Intp[K]`; a free name next to an `int` axis is an unknown at the
+    # call (it was `Never`); a property read through a union receiver
+    # is the object's size (it leaked the class's raw `K`).
+    result = run_mypy(FIXTURES / "own_size_bindings.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    notes = reveals_by_line(result)
+    assert notes[86] == f'"numpy.ndarray[tuple[?k.K], {_F64}]"', result.stdout
+    assert notes[103] == f'"numpy.ndarray[tuple[?R@102, int], {_F64}]"', result.stdout
+    assert notes[104] == (
+        f'"tuple[numpy.ndarray[tuple[?R@104, int], {_F64}], numpy.ndarray[tuple[?R@104], {_F64}]]"'
+    ), result.stdout
+    assert _run_fixture("own_size_bindings.py") == [
+        "(2,) (2,) (2,)",
+        "(0,) (2,)",
+        "(2,) (2,) (2,)",
+        "(3, 2) (3, 2) (3,)",
+        "(4,) 3",
+    ]
+    on = run_mypy(FIXTURES / "own_size_bindings.py", flags=("--enable-error-code", "numty-names"))
+    assert "error:" not in on.stdout, on.stdout
+
+
+def test_own_size_rebound() -> None:
+    # Issue 332: a rebound parameter or local takes the free name where
+    # it is rebound. mypy's default keeps a variable's first type, so
+    # there the rebinding is mypy's own [assignment] error, and so is
+    # the second branch of `grad` (its (N, N, D) is not (N, N, K)): the
+    # binding that disagrees, not the first `return`. With redefinition
+    # allowed the file checks clean.
+    fixture = FIXTURES / "own_size_rebound.py"
+    errors = _errors_by_line(run_mypy(fixture))
+    assert sorted(errors) == [21, 22, 27, 28, 35], errors
+    for line in (21, 27):
+        assert errors[line][0].endswith("[assignment]") and '"ndarray[tuple[K]' in errors[line][0], errors
+    assert errors[35][0].endswith("[assignment]") and "tuple[N, N, D]" in errors[35][0], errors
+    clean = run_mypy(fixture, flags=("--allow-redefinition",))
+    assert clean.returncode == 0, clean.stdout
+    assert _run_fixture("own_size_rebound.py") == ["(2,) (2,) (2, 2, 1)"]
+
+
+def test_bad_own_size_bindings() -> None:
+    # Issue 332: two selection counts under one free name are still
+    # refused when a local holds them: the binding that disagrees keeps
+    # its own size and is reported there (at the `return` with
+    # redefinition allowed). A plain local is no declaration, so a
+    # rebinding of one that holds `K` does not take `K` from it, and a
+    # name a parameter binds still refuses `np.nonzero(m)[0]`.
+    fixture = FIXTURES / "bad_own_size_bindings.py"
+    errors = _errors_by_line(run_mypy(fixture))
+    assert sorted(errors) == [17, 27, 33, 42, 46, 50, 56], errors
+    for line in (17, 27, 56):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[assignment]"), errors
+    for line in (33, 42, 46, 50):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), errors
+    assert "?J@41" in errors[42][0], errors
+    assert '"ndarray[tuple[?U@50]' in errors[50][0] and "tuple[N]" in errors[50][0], errors
+    redef = _errors_by_line(run_mypy(fixture, flags=("--allow-redefinition",)))
+    assert sorted(redef) == [18, 28, 33, 42, 46, 50], redef
+    assert all(text.endswith("[return-value]") for texts in redef.values() for text in texts), redef
+    assert _run_fixture("bad_own_size_bindings.py") == ["(2,) (1,)"]

@@ -22,7 +22,7 @@ from ._exprs import (
     _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _iter_tvarlikes,
     _lookup_ns, _ns_of_ctx, _seen_vars, _short_var,
 )
-from ._types import INT_FULLNAME, NDARRAY_FULLNAME, _has_unknown_shape, _parts_or_unpack
+from ._types import INT_FULLNAME, NDARRAY_FULLNAME, _dim_value, _has_unknown_shape, _parts_or_unpack
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
@@ -471,6 +471,40 @@ def _callsite_expr_bindings(
     return bindings
 
 
+def _is_plain_int(d: int | Type) -> bool:
+    if isinstance(d, int):
+        return False
+    proper = get_proper_type(d)
+    return isinstance(proper, Instance) and proper.type.fullname == INT_FULLNAME and proper.last_known_value is None
+
+
+def _parts_with_int(tp: Type) -> tuple[list[int | Type], Type] | None:
+    """(dims, dtype) of an array whose shape mixes names with plain `int` axes (`F64[R, int]`), else None.
+
+    An `int` axis is kept as the type it is. Without this, the return
+    `F64[R, int]` of a function that chooses `R` was left to mypy, which
+    has nothing to bind `R` to and made it `Never` (issue 332).
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance) or proper.type.fullname != NDARRAY_FULLNAME or len(proper.args) != 2:
+        return None
+    shape = get_proper_type(proper.args[0])
+    if not isinstance(shape, TupleType):
+        return None
+    dims: list[int | Type] = []
+    for item in shape.items:
+        if _is_plain_int(item):
+            dims.append(item)
+            continue
+        value = _dim_value(item)
+        if value is None:
+            return None
+        dims.append(value)
+    if not any(isinstance(d, TypeVarType) for d in dims):
+        return None
+    return dims, proper.args[1]
+
+
 def _substitute_return_exprs(
     sig: CallableType,
     bindings: dict[str, int | Type | _LinForm],
@@ -535,6 +569,8 @@ def _substitute_return_exprs(
             _swallowed(ctx, "_substitute_return_exprs")
     try:
         ret_parts = _parts_or_unpack(sig.ret_type)
+        if ret_parts is None:
+            ret_parts = _parts_with_int(sig.ret_type)
     except Exception:
         _swallowed(ctx, "_substitute_return_exprs")
         return None
@@ -791,6 +827,10 @@ def _substitute_return_exprs(
                 continue
             if isinstance(get_proper_type(d), UnpackType):
                 # A *Ts segment passes through untouched (issue #185).
+                new_dims.append(d)
+                continue
+            if _is_plain_int(d):
+                # An `int` axis is no name to bind (issue 332).
                 new_dims.append(d)
                 continue
             if not isinstance(d, TypeVarType):

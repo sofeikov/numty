@@ -86,7 +86,28 @@ error: Incompatible return value type (got "tuple[ndarray[tuple[K], ...], ndarra
 Two different selection counts, or `0` and `1`, are refused the same
 way: the leftmost position takes the name, and a position that does
 not hold its size keeps its own (`tests/fixtures/bad_own_size_return.py`).
-A plain `int` fits, as it fits any name.
+A plain `int` fits, as it fits any name, and is not the size the others
+are held to: `int`, then two selection counts, is still two sizes.
+
+**A returned local bound more than once** takes the name at each
+binding: both branches of an `if`, a conditional (`a = t * 2.0 if flag
+else t * 3.0`), a tuple target (`t, _ = pick(x)`, `v, z = x[m], 0`), a
+rebound parameter (`x = x[m]`). Every binding must hold the size the
+first one holds (an unknown, a literal, or `int`, which fits). A binding
+that holds another size keeps it, so the error is on that binding: an
+`[assignment]` error, since mypy gives a variable the type of its first
+binding, or the `return` under `--allow-redefinition`
+(`tests/fixtures/own_size_bindings.py`, `tests/fixtures/own_size_rebound.py`,
+`tests/fixtures/bad_own_size_bindings.py`). With mypy's default, a
+rebound parameter keeps its declared type, so `x = x[m]` is mypy's own
+`[assignment]` error whatever the plugin does; give the selection a
+name of its own, or allow redefinition. A local the function does not
+annotate is no declaration: rebinding one that holds `K` to another
+count does not make that count `K`.
+
+`np.nonzero(m)[0]` (an item a constant subscript or a tuple target
+picks from a returned tuple) is followed like any other value, so for
+a 1-D mask it fits `I64[K]` or `Intp[K]` as `np.flatnonzero(m)` does.
 
 **A local can be given the name**, which is how a size read from
 outside (a column of a frame, a count) is named for the rest of the
@@ -107,7 +128,8 @@ that the sizes given it are one size, as an annotation always is.
 unknown, printed with the name and the line of the call: `starts, ends
 = bounds(seg)` gives two arrays of `(?K@12,)`, and `ends - starts` is
 `(?K@12,)` too. Another free name of the same return is another
-unknown, and so is another call.
+unknown, and so is another call. An `int` axis next to it stays `int`:
+`def rows_of(c: int) -> F64[R, int]` gives `(?R@12, int)` at a call.
 
 **A property** that names a size its class does not bind
 (`def rows(self) -> I64[E]` in a class not generic in `E`) gives the
@@ -115,7 +137,16 @@ size of the object. Read through a variable, every property declared
 with `E` gives the same unknown, printed `?ctx.E`, until the variable
 is bound again; `a.rows` and `b.rows` are two sizes. Through any other
 receiver (`self.ctx.rows`, `make().rows`) each read is a fresh unknown,
-and a method call chooses a size per call.
+and a method call chooses a size per call. A variable of a union type
+(`k: A | B`, both with the property) holds one object too: its reads
+give one unknown, `?k.E`.
+
+Such a property cannot be matched by a `Protocol` that declares it with
+the same free name: mypy compares the getter's own variable on each
+side as two names (`expected "ndarray[tuple[K], ...]", got
+"ndarray[tuple[K], ...]"`), with or without numty, and that check is
+not one a plugin can reach. Declare the protocol's property with `int`
+(`def theta(self) -> F64[int]`), which every class's own name fits.
 
 Under the opt-in `numty-names` code these are sizes of their own, as a
 selection count is: `seconds - seconds[starts]` with `seconds: F64[N]`
