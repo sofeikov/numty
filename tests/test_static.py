@@ -588,10 +588,11 @@ def test_union_genexp_member_mismatch() -> None:
 
 
 def test_index_too_many_mismatch() -> None:
-    assert_rank_mismatch(
+    # One error: mypy's `[index]` on top was the overload trial our error
+    # failed, which no longer happens (issue 333, `_past_overload_trial`).
+    assert_single_error(
         run_mypy(FIXTURES / "bad_index_too_many.py"),
         "too many indices for 2 dimensions",
-        "Invalid index type",
     )
 
 
@@ -691,9 +692,9 @@ def test_bad_index_pos() -> None:
     # Issues #285/#286/#287: recorded positions on one size used on
     # another. A certain overrun (`arange(5)` on a size-3 axis) errors by
     # default. A possible one (`searchsorted` positions run to N on an
-    # axis of size N) and different names need the opt-in code. Mixed slice+fancy
-    # lines also carry mypy's own [index] error, as every mixed-tuple
-    # solver error does (see assert_rank_mismatch).
+    # axis of size N) and different names need the opt-in code. Mixed
+    # slice+fancy lines no longer carry a mechanical [index] error: the
+    # report does not fail mypy's overload trial (issue 333).
     # Merged with issue #288: two fancy indices broadcast their counts,
     # so (J,) vs (K,) is a broadcast names error too — line 17 gains one
     # alongside its two position errors and the correct-positions line 18
@@ -725,7 +726,7 @@ def test_bad_index_pos() -> None:
     }
     assert sorted(errors) == [17, 18, 22, 23, 28, 33, 38, 44, 48], on.stdout
     for line, messages in expected.items():
-        assert len(errors[line]) == len(messages) + (1 if line in (22, 23, 28) else 0), on.stdout
+        assert len(errors[line]) == len(messages), on.stdout
         for message in messages:
             assert any(
                 message in text
@@ -734,8 +735,7 @@ def test_bad_index_pos() -> None:
                 )
                 for text in errors[line]
             ), on.stdout
-    for line in (22, 23, 28):
-        assert any("Invalid index type" in text and text.endswith("[index]") for text in errors[line]), on.stdout
+    assert not any("Invalid index type" in text for texts in errors.values() for text in texts), on.stdout
 
 
 def test_einsum_label_conflict() -> None:
@@ -1590,10 +1590,11 @@ def test_callsite_conflict_survives_dmypy_recheck(tmp_path: Path) -> None:
 
 
 def test_fancy_dtype_mismatch() -> None:
-    assert_rank_mismatch(
+    # One error: mypy's `[index]` on top was the overload trial our error
+    # failed, which no longer happens (issue 333, `_past_overload_trial`).
+    assert_single_error(
         run_mypy(FIXTURES / "bad_fancy_dtype.py"),
         "arrays used as indices must be of integer (or boolean) type",
-        "Invalid index type",
     )
 
 
@@ -1612,10 +1613,11 @@ def test_len_unsized_object() -> None:
 
 
 def test_symbolic_too_many_indices() -> None:
-    assert_rank_mismatch(
+    # One error: mypy's `[index]` on top was the overload trial our error
+    # failed, which no longer happens (issue 333, `_past_overload_trial`).
+    assert_single_error(
         run_mypy(FIXTURES / "bad_sym_too_many.py"),
         "too many indices for 2 dimensions",
-        "Invalid index type",
     )
 
 
@@ -5318,8 +5320,9 @@ def test_symbolic_slice() -> None:
     assert notes[25] == f'"numpy.ndarray[tuple[-?k+N+1], {_F64}]"', off.stdout
     assert notes[26] == f'"numpy.ndarray[tuple[-?k+N], {_F64}]"', off.stdout
     assert notes[27] == f'"numpy.ndarray[tuple[?k-1], {_F64}]"', off.stdout
-    # No `int` variable is left in it: the bounds may be clipped, so nothing is claimed.
-    assert notes[28] == f'"numpy.ndarray[tuple[?U@28], {_F64}]"', off.stdout
+    # Bounds over names alone inside the axis (issue 333): `len(values) - 1`
+    # is `N-1`, as `values[:-1]` is (the axis is assumed long enough).
+    assert notes[28] == f'"numpy.ndarray[tuple[N-1], {_F64}]"', off.stdout
     assert notes[40] == f'"numpy.ndarray[tuple[-?k+N+1], {_F64}]"', off.stdout
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
     errors = _errors_by_line(on)
@@ -5640,16 +5643,18 @@ def test_index_record_survives_a_selection() -> None:
     off = run_mypy(fixture)
     assert off.returncode == 0, off.stdout
     on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
-    assert sorted(on) == [15, 17, 19, 20, 34], on
+    assert sorted(on) == [15, 17, 19, 20, 31], on
     for line in (15, 17, 19, 20):
         assert len(on[line]) == 2, on
         assert "index positions on axis 0 (shape (P, E)): E and P are different names" in on[line][0], on
         assert "index positions on axis 1 (shape (P, E)): P and E are different names" in on[line][1], on
         assert all(text.endswith("[numty-names]") for text in on[line]), on
     # The demo's IndexError line: since issue 333 `np.array([True, ...])`
-    # is a bool mask, so `c[k]` keeps the record of `np.arange(5)`.
-    assert len(on[34]) == 1, on
-    assert "index positions on 5 used on axis 0 of size 3 (shape (3, 5))" in on[34][0], on
+    # is a bool mask, so `c[k]` keeps the record of `np.arange(5)`. The
+    # tuple target `r, c = np.array(...), np.arange(5)` gives that record
+    # to `c` alone, so `t[r[k], c[k]]` on line 29 is clean.
+    assert len(on[31]) == 1, on
+    assert "index positions on 5 used on axis 0 of size 3 (shape (3, 5))" in on[31][0], on
     assert _run_fixture("index_selection.py") == ["(3,)", "IndexError"]
 
 
@@ -6559,3 +6564,46 @@ def test_kept_names_catch_later_bugs() -> None:
         "corresponding boolean axis is (N+1,) (shape (N,))  [numty-axis]"
     ], result.stdout
     assert _run_fixture("bad_kept_names.py") == ["(2, 4, 1) (2, 2, 2)", "ValueError", "ValueError", "IndexError"]
+
+
+# Issue 333, indexing: a slice bound over names inside the axis is a size
+# over names; a step that is a size divides the axis exactly or takes the
+# flat diagonal; a slice object in a variable keeps its axis; `range(k)`
+# indexes like `np.arange(k)`; a tuple target gives each name the record
+# of its own item.
+def test_index_kept_names_ok() -> None:
+    result = run_mypy(FIXTURES / "index_kept_names_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    for line in (23, 24, 47):
+        assert notes[line] == f'"{_ND}[tuple[M], {_F64}]"', result.stdout
+    assert notes[25] == f'"{_ND}[tuple[M-1], {_F64}]"', result.stdout
+    assert notes[32] == notes[33] == f'"{_ND}[tuple[c, f], {_F64}]"', result.stdout
+    assert notes[40] == f'"{_ND}[tuple[?U@40, N], {_F64}]"', result.stdout
+    assert notes[41] == f'"{_ND}[tuple[N-1, M], {_F64}]"', result.stdout
+    assert notes[42] == f'"{_ND}[tuple[N, ?U@42], {_F64}]"', result.stdout
+    assert notes[48] == f'"{_ND}[tuple[Literal[3], N], {_F64}]"', result.stdout
+    # `r, k = np.zeros(n, ...), np.arange(n)`: `r` used on the other axis is
+    # clean; `fps[sl]` and `fns[sl]` share one count where `K` is declared.
+    names = run_mypy(FIXTURES / "index_kept_names_ok.py", flags=("--enable-error-code", "numty-names"))
+    assert names.returncode == 0, names.stdout
+    assert _run_fixture("index_kept_names_ok.py") == ["(3,) (2, 3)", "[-3.  2.  1.]", "[(2,), (2,)]"]
+
+
+def test_index_kept_names_catch_later_bugs() -> None:
+    result = run_mypy(FIXTURES / "bad_index_kept_names.py")
+    assert _messages_by_line(result) == {
+        15: ["broadcast shapes disagree at trailing axis 0: M vs M+1 (shapes (M,) vs (M+1,))  [numty-broadcast]"],
+        20: ["broadcast shapes disagree at trailing axis 0: f vs f-1 (shapes (c, f) vs (c, f-1))  [numty-broadcast]"],
+        25: ["broadcast shapes disagree at trailing axis 1: N-1 vs N (shapes (N-1, M) vs (N, M))  [numty-broadcast]"],
+        # One error: no mechanical `[index]` from the `range` key.
+        29: ["index positions on M+1 used on axis 0 of size M (shape (M, N))  [numty-axis]"],
+    }, result.stdout
+    on = _messages_by_line(run_mypy(FIXTURES / "bad_index_kept_names.py", flags=("--enable-error-code", "numty-names")))
+    assert sorted(on) == [15, 20, 25, 29, 34], on
+    assert on[34] == [
+        "index positions on axis 1 (shape (M, N)): M and N are different names  [numty-names]",
+        "broadcast at trailing axis 0 (shapes (M,) vs (N,)): M and N are different names  [numty-names]",
+    ], on
+    raised = ["ValueError", "ValueError", "ValueError", "IndexError", "IndexError"]
+    assert _run_fixture("bad_index_kept_names.py") == raised

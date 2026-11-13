@@ -51,11 +51,32 @@ out[k:]                              # (N-?k,)
 ```
 
 This is the size when the bounds are inside the axis; numpy clips them
-otherwise (`x[i : i + bs]` on the last batch). So it is given only when
-an `int` variable is left in it, and such a size is an unknown: nothing
+otherwise (`x[i : i + bs]` on the last batch). So it is given when an
+`int` variable is left in it, and such a size is an unknown: nothing
 is proved from it by default. Under the opt-in `numty-names` code two
 of them a constant apart are reported, `out[k:] = mins` as `-?k+N+1 and
 -?k+N are 1 apart` (`tests/fixtures/symbolic_slice.py`).
+
+A bound over names alone is given when it is inside the axis (issue
+333): with `n = X.shape[1]` of size `M` and `coef: F64["M+1"]`,
+`coef[:n]` is `(M,)` (the intercept split of a linear model), and so is
+`coef[: coef.shape[0] - 1]`. As for `x[1:]`, the axis is assumed long
+enough for a constant (`x[: len(x) - 1]` is `(N-1,)`), but one name is
+never assumed larger than another: `x[:n]` with `n` of size `N` on an
+`M` axis is unknown. A step that is a size gives the exact count when it
+divides the axis (`r[:, ::f]` of `(c, f*f)` is `(c, f)`), or when the
+axis is the square of the step less one: the flat diagonal
+`m.reshape(c, -1)[:, :: f + 1]` of an `(f, f)` block is `(c, f)`
+(`tests/fixtures/index_kept_names_ok.py`).
+
+A slice object held in a variable is read like the slice it was built
+from when the variable is bound once to `slice(...)`
+(`head = slice(0, X.shape[0] - 1)` makes `X[head]` `(N-1, M)`); any
+other slice object (a parameter, `rows = slice(bs * i, bs * (i + 1))`)
+keeps its axis with an unknown size, `(?U, M)`. Like a mask variable, a
+slice variable bound once takes one count from every axis of one size:
+with `sl = slice(first, last)`, `fps[sl]` and `fns[sl]` of two `(N,)`
+arrays share it, so both fit one free name `K` in a returned tuple.
 
 ## Fancy indexing
 
@@ -74,6 +95,10 @@ np.take_along_axis(a, idx, axis=1)  # broadcast shape, arr's dtype
 b[np.zeros(3)]                    # error: integer (or boolean) type required
 np.take_along_axis(a, idx2d, axis=1)  # error: same number of dimensions
 ```
+
+`range(k)` indexes like `np.arange(k)` (issue 333): `u[range(u.shape[0]),
+j]` is `(M,)`, its positions are on `M`, and `u[range(u.shape[0] + 1)]`
+is the same certain overrun as the `arange` spelling.
 
 ## Index positions: `Index[P, N]`
 
@@ -120,7 +145,10 @@ and arithmetic do not carry it. A selection does carry it: `rows[known]`,
 `rows[1:]` and `rows[order]` hold fewer positions, or the same ones in
 another order, on the size `rows` holds them on, so
 `table[cols[known], rows[known]]` is reported like `table[cols, rows]`
-(`tests/fixtures/index_selection.py`).
+(`tests/fixtures/index_selection.py`). A tuple target gives each name
+the record of its own item: after `r, c = np.array([...]),
+np.arange(5)` only `c` holds positions on 5, although both are `(5,)`
+and the records are kept per line (issue 333).
 
 ## Indexed assignment
 

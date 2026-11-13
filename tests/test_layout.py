@@ -533,6 +533,7 @@ _LAYERS = (
     "_broadcast",
     "_fft",
     "_casts",
+    "_index_sources",
     "_indexing",
     "_unions",
     "_callsite",

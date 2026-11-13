@@ -42,9 +42,11 @@ quiet, where it is approximate, and what to write instead.
 
 - On lines the solver rejects, mypy may add its own follow-on error next
     to ours (an overload complaint for tuple `reshape`, `Unsupported
-    operand` for broadcast ops, `Invalid index type` for an out-of-range
-    tuple index, a `DTypeT` type-var complaint for `fft` with a bad `n`).
-    Ours is the readable one.
+    operand` for broadcast ops, a `DTypeT` type-var complaint for `fft`
+    with a bad `n`). Ours is the readable one. An index error no longer
+    gets mypy's `Invalid index type` on top (issue 333): it is reported
+    past the overload trial that mypy runs for a key that is not all
+    arrays, so the trial does not fail.
 - Test runs use a dedicated mypy cache dir cleared per suite run (see
     `test_static.py`): mypy does not reliably invalidate plugin results
     across plugin edits, so never trust the default cache while hacking

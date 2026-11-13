@@ -25,6 +25,7 @@ import ast
 
 from ._returns import _module_ast
 from ._casts import _report_cast
+from ._index_sources import _past_overload_trial, _strided_count, _symbolic_slice, _tuple_target_value
 from ._unknowns import _fresh_mask_count
 from ._ops import flatnonzero_function_hook
 from ._reshape import (
@@ -388,51 +389,6 @@ def _int_expr_dim(ctx: MethodContext | FunctionContext, expr: Expression | None,
     return _fresh_int_symbol(ctx, expr.name, key)
 
 
-def _symbolic_slice(
-    ctx: MethodContext, dim: int, size: int | Type, begin: object, end: object, stride: object
-) -> int | Type | None:
-    """The size of `a[b:e]` with a bound that is a formula over `int` variables, else None.
-
-    `e - b`, with the axis size for a missing end and a negative literal
-    counted from the end. This holds when the bounds are inside the
-    axis; numpy clips them otherwise. So the answer is given only when
-    an `int` variable is left in it: such a size is an unknown, nothing
-    is proved from it, and it is compared only under the opt-in code
-    (`N-?k` against `N-?k+1` are 1 apart).
-    """
-    from numty_plugin import _materialize_dim, _resolve_dim
-    from ._forms import _form_has_unknown, _lin_add, _lin_scale
-
-    if not isinstance(begin, Type) and not isinstance(end, Type):
-        return None
-    if stride not in ("missing", 1):
-        return None
-    whole = _resolve_dim(size)
-    if not isinstance(whole, _LinForm):
-        return None
-
-    def position(bound: object, missing: _LinForm) -> _LinForm | None:
-        if bound == "missing":
-            return missing
-        if isinstance(bound, bool):
-            return None
-        if isinstance(bound, int):
-            return _LinForm((), bound) if bound >= 0 else _lin_add(whole, _LinForm((), bound))
-        if isinstance(bound, Type):
-            form = _resolve_dim(bound)
-            return form if isinstance(form, _LinForm) else None
-        return None
-
-    lo = position(begin, _LinForm((), 0))
-    hi = position(end, whole)
-    if lo is None or hi is None:
-        return None
-    form = _lin_add(hi, _lin_scale(lo, -1))
-    if not _form_has_unknown(form):
-        return None
-    return _materialize_dim(ctx, "slice", dim, form)
-
-
 def _own_index_annotation(func_node: object | None, varname: str, var_line: int) -> tuple[bool, bool, object | None]:
     """(has_ann, is_index, ann) for `varname`'s own annotation.
 
@@ -626,7 +582,15 @@ def _recorded_for_operand(
         # nested in it: `idx = np.clip(np.searchsorted(a, v), 0, n - 1)`
         # and `np.minimum(np.searchsorted(a, v), n - 1)` changed the
         # values, as a rebinding would (issue 315).
+        # A tuple target pairs the name with one item of the display
+        # (`r, c = a, np.arange(5)`): that item's record, not the line's.
         rvalue = _single_rvalue(func_node, varname)
+        paired = _tuple_target_value(ctx, node) if rvalue is None else None
+        if isinstance(paired, (NameExpr, IndexExpr)) and depth < 4:
+            return _recorded_for_operand(ctx, module, func_node, paired, idims, depth + 1)
+        if paired is not None and not isinstance(paired, (CallExpr, OpExpr)):
+            return None
+        rvalue = rvalue or paired
         if isinstance(rvalue, (CallExpr, OpExpr)):
             return _recorded_at_site(ctx, module, getattr(rvalue, "line", 0) or 0, getattr(rvalue, "column", 0) or 0)
         found = _recorded_index_on(ctx, idims, expr)
@@ -690,6 +654,25 @@ def _mask_count_for(ctx: MethodContext, mask_expr: Expression | None, dim: int) 
     except Exception:
         _swallowed(ctx, "_mask_count_for")
         return _fresh_unknown(ctx, "mask", dim)
+
+
+def _slice_var_count(ctx: MethodContext, expr: Expression | None, size: int | Type) -> Type | None:
+    """One count per slice variable and axis size, else None (issue 333).
+
+    `sl = slice(first, last)` takes as many items from every axis of one
+    size, so `fps[sl]` and `fns[sl]` share a count, as one mask variable
+    does (`_mask_count_for`). An axis of `int` or `Any` size is not one size.
+    """
+    if not isinstance(expr, NameExpr) or not isinstance(size, (int, TypeVarType)):
+        return None
+    key = _mask_var_key(ctx, expr)
+    if key is None:
+        return None
+    try:
+        return _fresh_mask_count(ctx, f"{key}@{_dim_str(size)}", _mask_repeats(ctx, expr))
+    except Exception:
+        _swallowed(ctx, "_slice_var_count")
+        return None
 
 
 def flatnonzero_mask_hook(ctx: FunctionContext) -> Type:
@@ -947,52 +930,25 @@ def _parse_index_item(
         if all(_fold_int(e) is not None for e in expr.items):
             return ("fancy", [len(expr.items)])
     if isinstance(expr, SliceExpr):
-        begin = _fold_index_bound(ctx, expr.begin_index)
-        end = _fold_index_bound(ctx, expr.end_index)
-        stride = _fold_index_bound(ctx, expr.stride)
-        # A bound that is a formula over `int` variables (`k - 1`,
-        # `shift + n_windows`): kept as a size for `_symbolic_slice`.
-        try:
-            if begin is None:
-                begin = _int_expr_dim(ctx, expr.begin_index)
-            if end is None:
-                end = _int_expr_dim(ctx, expr.end_index)
-        except Exception:
-            _swallowed(ctx, "_parse_index_item")
         # Unprovable bounds no longer bail the whole getitem (issue #57):
         # they become "unknown" and the consumer mints a fresh unknown
         # for that axis while keeping the sibling dims.
-        return (
-            "slice",
-            "unknown" if begin is None else begin,
-            "unknown" if end is None else end,
-            "unknown" if stride is None else stride,
-        )
+        return _slice_item(ctx, expr.begin_index, expr.end_index, expr.stride)
+    proper_tp = get_proper_type(tp)
     if expr is not None:
-        init = _final_slice_call(ctx, expr)
-        if init is not None and all(k == ARG_POS for k in init.arg_kinds):
-            if len(init.args) == 1:
-                raw = (None, init.args[0], None)
-            elif len(init.args) == 2:
-                raw = (init.args[0], init.args[1], None)
-            elif len(init.args) == 3:
-                raw = (init.args[0], init.args[1], init.args[2])
-            else:
-                return None
-            # An explicit None inside slice(...) means missing, exactly
-            # like an omitted bound; an unprovable bound is "unknown"
-            # (issue #57) rather than a whole-getitem bail.
-            bounds: list[int | str] = []
-            for b in raw:
-                if b is None:
-                    bounds.append("missing")
-                elif isinstance(b, NameExpr) and b.name == "None":
-                    bounds.append("missing")
-                else:
-                    value = _fold_int(b)
-                    bounds.append(value if value is not None else "unknown")
-            begin, end, stride = bounds
-            return ("slice", begin, end, stride)
+        # `slice(...)` behind a Final name, or a local bound once to it (issue 333).
+        init = _final_slice_call(ctx, expr) or _local_call(ctx, expr, "builtins.slice")
+        if init is not None and all(k == ARG_POS for k in init.arg_kinds) and 1 <= len(init.args) <= 3:
+            raw = (None, init.args[0], None) if len(init.args) == 1 else (*init.args, None)[:3]
+            return _slice_item(ctx, *raw)
+    if isinstance(proper_tp, Instance) and proper_tp.type.fullname == "builtins.slice":
+        return ("slice", "unknown", "unknown", "unknown")  # any slice object keeps the axis
+    if isinstance(proper_tp, Instance) and proper_tp.type.fullname == "builtins.range":
+        # `u[range(M), j]` is `u[np.arange(M), j]` (issue 333).
+        from numty_plugin import _fresh_unknown
+
+        length = _range_length(ctx, expr)
+        return ("fancy", [_fresh_unknown(ctx, "range", 0) if length is None else length])
     if isinstance(expr, StarExpr):
         return None
     value = _fold_int(expr) if expr is not None else None
@@ -1006,7 +962,6 @@ def _parse_index_item(
     if value is not None:
         return ("int", value)
     # Unknown-value integer index: consumes the axis, no bounds check.
-    proper_tp = get_proper_type(tp)
     if isinstance(proper_tp, Instance):
         if proper_tp.type.fullname == INT_FULLNAME:
             return ("int_any",)
@@ -1024,6 +979,54 @@ def _parse_index_item(
             if key is not None and key[0] == "strong" and _kind_of(key[1]) in ("i", "u"):
                 return ("int_any",)
     return None
+
+
+def _slice_item(
+    ctx: FunctionContext | MethodContext, begin: Expression | None, end: Expression | None, stride: Expression | None
+) -> tuple:
+    """("slice", begin, end, stride): "missing", a literal, a size, or "unknown".
+
+    A bound that is a formula over `int` variables or a size (`k - 1`,
+    `X.shape[1]`) is kept as a size for `_symbolic_slice`.
+    """
+    out: list[object] = []
+    for i, bound in enumerate((begin, end, stride)):
+        value: object = _fold_index_bound(ctx, bound)
+        if value is None and i < 2:
+            try:
+                value = _int_expr_dim(ctx, bound)
+            except Exception:
+                _swallowed(ctx, "_slice_item")
+        out.append("unknown" if value is None else value)
+    return ("slice", *out)
+
+
+def _local_call(ctx: FunctionContext | MethodContext, expr: Expression, callee: str) -> CallExpr | None:
+    """The `callee(...)` call a local is bound to once (`rows = slice(a, b)`), else None."""
+    if not isinstance(expr, NameExpr):
+        return None
+    line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+    rvalue = _single_rvalue(_enclosing_func(ctx, line)[1], expr.name)
+    if isinstance(rvalue, CallExpr) and isinstance(rvalue.callee, NameExpr) and rvalue.callee.fullname == callee:
+        return rvalue
+    return None
+
+
+def _range_length(ctx: FunctionContext | MethodContext, expr: Expression | None) -> int | Type | None:
+    """The length of `range(k)` (inline or bound once to a local) as a size, else None."""
+    if expr is None:
+        return None
+    call = expr if isinstance(expr, CallExpr) else _local_call(ctx, expr, "builtins.range")
+    if not (isinstance(call, CallExpr) and isinstance(call.callee, NameExpr)):
+        return None
+    if call.callee.fullname != "builtins.range" or call.arg_kinds != [ARG_POS]:
+        return None
+    try:
+        size = _int_expr_dim(ctx, call.args[0])
+    except Exception:
+        _swallowed(ctx, "_range_length")
+        return None
+    return max(size, 0) if isinstance(size, int) else size
 
 
 def _index_pairs(
@@ -1306,9 +1309,11 @@ def _check_index_positions(
                 return True
         return False
     parts = _ndarray_parts(tp)
-    if parts is None:
+    # `range(k)` holds every position below k, as `np.arange(k)` does (issue 333).
+    span = _range_length(ctx, expr) if parts is None else None
+    if parts is None and span is None:
         return False
-    idims, _ = parts
+    idims: list[int | Type] = parts[0] if parts is not None else [span] if span is not None else []
     if len(idims) != 1:
         return False
     try:
@@ -1316,7 +1321,7 @@ def _check_index_positions(
         module = getattr(tree, "fullname", "") or ""
         use_line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
         _, func_node = _enclosing_func(ctx, use_line)
-        recorded = _recorded_for_operand(ctx, module, func_node, expr, list(idims))
+        recorded = span if span is not None else _recorded_for_operand(ctx, module, func_node, expr, list(idims))
     except Exception:
         _swallowed(ctx, "_check_index_positions")
         return False
@@ -1353,7 +1358,7 @@ def _check_index_positions(
         # `a[np.searchsorted(a, v)]` is wrong only when a value is above
         # `a[-1]`, and code that clips, guards or fixes the positions in
         # place is right. That report is under the opt-in code.
-        certain = _index_record_exact(ctx, expr, recorded)
+        certain = span is not None or _index_record_exact(ctx, expr, recorded)
         if not certain and not _names_enabled(ctx):
             return False
         ctx.api.fail(
@@ -1582,11 +1587,20 @@ def _solve_getitem(
                     _swallowed(ctx, "_solve_getitem")
                 begin = "unknown" if isinstance(begin, Type) else begin
                 end = "unknown" if isinstance(end, Type) else end
+            slice_expr = pairs[n][1] if n < len(pairs) else None
+            shared = _slice_var_count(ctx, slice_expr, size)
+            if stride == "unknown" and begin == end == "missing" and isinstance(slice_expr, SliceExpr):
+                try:  # a step that is a size (`::f + 1`, issue 333)
+                    step = _int_expr_dim(ctx, slice_expr.stride)
+                    if isinstance(step, Type):
+                        symbolic = _strided_count(ctx, dim, size, step)
+                except Exception:
+                    _swallowed(ctx, "_solve_getitem")
             if symbolic is not None:
                 frag = symbolic
             elif isinstance(size, int):
                 if "unknown" in (begin, end, stride):
-                    frag = _fresh_unknown(ctx, "slice", dim)
+                    frag = _fresh_unknown(ctx, "slice", dim) if shared is None else shared
                 else:
                     bounds = tuple(
                         None if b == "missing" else b for b in (begin, end, stride)
@@ -1607,7 +1621,7 @@ def _solve_getitem(
                     )
                     return ctx.default_return_type
                 else:
-                    frag = _fresh_unknown(ctx, "slice", dim)
+                    frag = _fresh_unknown(ctx, "slice", dim) if shared is None else shared
             elif (stride == "missing" or stride == 1) and (
                 begin == "missing" or (isinstance(begin, int) and begin >= 0)
             ) and (end == "missing" or (isinstance(end, int) and end < 0)):
@@ -1628,9 +1642,9 @@ def _solve_getitem(
                         prefer=size if isinstance(size, TypeVarType) else None,
                     )
                 else:
-                    frag = _fresh_unknown(ctx, "slice", dim)
+                    frag = _fresh_unknown(ctx, "slice", dim) if shared is None else shared
             else:
-                frag = _fresh_unknown(ctx, "slice", dim)
+                frag = _fresh_unknown(ctx, "slice", dim) if shared is None else shared
             (kept_after if (has_trigger and not front and adv_seen) else kept_before).append(frag)
             dim += 1
     if not has_trigger:
@@ -1657,10 +1671,9 @@ def getitem_method_hook(ctx: MethodContext) -> Type:
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return ctx.default_return_type
-    dist = _distribute_solve([ctx.type], lambda t: _getitem_types(ctx, t, pairs[0]))
-    if dist is not None:
-        return dist
-    return _getitem_types(ctx, ctx.type, pairs[0])
+    with _past_overload_trial(ctx):
+        dist = _distribute_solve([ctx.type], lambda t: _getitem_types(ctx, t, pairs[0]))
+        return dist if dist is not None else _getitem_types(ctx, ctx.type, pairs[0])
 
 
 def iter_method_hook(ctx: MethodContext) -> Type:
