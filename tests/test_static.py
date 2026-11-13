@@ -5925,3 +5925,72 @@ def test_bad_strspec_declared_word() -> None:
     assert "tuple[Literal[3], Literal[3]]" in errors[35][0], result.stdout
     assert all(text.endswith("[assignment]") for line in errors.values() for text in line), result.stdout
     assert _run_fixture("bad_strspec_declared_word.py") == ["(3, 3)"]
+
+
+def _run_mypy_env(
+    path: Path, cache: Path, *, strict: bool
+) -> "subprocess.CompletedProcess[str]":
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    env.pop("NUMTY_STRICT", None)
+    if strict:
+        env["NUMTY_STRICT"] = "1"
+    return subprocess.run(
+        [sys.executable, "-m", "mypy", "--cache-dir", str(cache), str(path)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_strict_mode_keeps_every_type(tmp_path: Path) -> None:
+    # Issue 334: NUMTY_STRICT=1 changed what was inferred. Its report was
+    # raised inside mypy's overload, union and operator checks, which
+    # take any error as "this does not match": correct calls got
+    # [call-overload] / [operator] / [arg-type] and other types. The
+    # same file now gives identical output apart from [numty-unsolved].
+    fixture = FIXTURES / "strict_mode.py"
+    plain = _run_mypy_env(fixture, tmp_path / "plain", strict=False)
+    strict = _run_mypy_env(fixture, tmp_path / "strict", strict=True)
+    assert plain.returncode == 1 and strict.returncode == 1, strict.stdout
+    assert reveals_by_line(plain) == reveals_by_line(strict), (plain.stdout, strict.stdout)
+    lines = strict.stdout.splitlines()
+    unsolved = [line for line in lines if line.endswith("[numty-unsolved]")]
+    others = [line for line in lines if not line.endswith("[numty-unsolved]") and not line.startswith("Found ")]
+    assert others == [line for line in plain.stdout.splitlines() if not line.startswith("Found ")], (
+        plain.stdout,
+        strict.stdout,
+    )
+    # Only calls numty does not solve: not `.dtype`, `finfo(...).eps` or
+    # a `for` over range() (lines 35-38), and not the in-place ops, whose
+    # shapes are checked (39-42; 42 is the broadcast error).
+    assert sorted(int(line.split(":")[1]) for line in unsolved) == [22, 27, 29, 31], strict.stdout
+    errors = _errors_by_line(plain)
+    assert sorted(errors) == [42], plain.stdout
+    assert "H vs H-1" in errors[42][0] and errors[42][0].endswith("[numty-broadcast]"), plain.stdout
+
+
+def test_function_on_array_union_is_solved_per_member() -> None:
+    # Issue 334: argsort / diff / flip of an if-joined `(N,) | (?U,)`
+    # array were `ndarray[Any, Any]` (strict mode, by accident, was
+    # precise). The hook now runs once per union member.
+    notes = reveals_by_line(run_mypy(FIXTURES / "strict_mode.py"))
+    assert notes[14] == f'"{_ND}[tuple[?U@13], {_INTP}] | {_ND}[tuple[N], {_INTP}]"', notes
+    assert notes[15] == f'"{_ND}[tuple[?U@13-1], {_F64}] | {_ND}[tuple[N-1], {_F64}]"', notes
+    assert notes[16] == f'"{_ND}[tuple[?U@13], {_F64}] | {_ND}[tuple[N], {_F64}]"', notes
+    # The eps sum keeps its shape (strict made it Any, with an [operator]).
+    assert notes[21] == f'"{_ND}[tuple[c], {_F64}]"', notes
+
+
+def test_strict_mode_is_in_the_cache_key(tmp_path: Path) -> None:
+    # Issue 334: a NUMTY_STRICT=1 run on a cache written without it
+    # reported the cached success. The setting is plugin config data now.
+    fixture = FIXTURES / "strict_mode.py"
+    cache = tmp_path / "cache"
+    first = _run_mypy_env(fixture, cache, strict=False)
+    assert "[numty-unsolved]" not in first.stdout, first.stdout
+    second = _run_mypy_env(fixture, cache, strict=True)
+    assert "[numty-unsolved]" in second.stdout, second.stdout
+    third = _run_mypy_env(fixture, cache, strict=False)
+    assert "[numty-unsolved]" not in third.stdout, third.stdout

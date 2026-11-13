@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import Expression, FloatExpr, IndexExpr, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
+from mypy.copytype import copy_type
 from mypy.subtypes import is_same_type
 from mypy.types import (
     AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, UninhabitedType, UnionType,
@@ -295,8 +296,11 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
 
     Broadcast mismatches fail with the binary wording; a broadcast that
     succeeds but would grow the target fails as non-broadcastable output.
-    Scalars, unpack shapes and unprovable symbolic dims bail silently,
-    keeping the stubs' dtype checking and Self return.
+    The result is always the stubs' Self (the target keeps its type), so
+    a call whose shapes were compared (a scalar, a fit, or a reported
+    mismatch) returns it as checked, not as a give-up: strict mode does
+    not report it (issue 334). Unpack shapes and unprovable symbolic
+    dims bail silently, keeping the stubs' dtype checking and Self return.
     """
     args = _positional_actuals(ctx, 1)
     if args is None:
@@ -307,7 +311,7 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
         return ctx.default_return_type
     lhs_dims, _ = lhs
     if _scalar_key(args[0]) is not None:
-        return ctx.default_return_type
+        return _checked_stub_type(ctx)
     members = _union_members(args[0])
     if members is not None:
         # Issue #263: a union of arrays on the right. An error when no
@@ -317,39 +321,52 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
             part = _ndarray_parts(member) or _known_rank_parts(member)
             if part is None:
                 return ctx.default_return_type
-            message = _inplace_message(lhs_dims, part[0], None)
+            checked, message = _inplace_check(lhs_dims, part[0], None)
             if message is None:
-                return ctx.default_return_type
+                return _checked_stub_type(ctx) if checked else ctx.default_return_type
             if first is None:
                 first = message
         if first is not None:
             ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
-        return ctx.default_return_type
+        return _checked_stub_type(ctx)
     rhs = _ndarray_parts(args[0]) or _known_rank_parts(args[0])
     if rhs is None:
         return ctx.default_return_type
-    message = _inplace_message(lhs_dims, rhs[0], ctx)
+    checked, message = _inplace_check(lhs_dims, rhs[0], ctx)
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
-    return ctx.default_return_type
+    return _checked_stub_type(ctx) if checked else ctx.default_return_type
 
 
-def _inplace_message(
+def _checked_stub_type(ctx: MethodContext) -> Type:
+    """The stubs' return type, as a result the hook has checked.
+
+    A hook result that *is* ctx.default_return_type counts as a give-up
+    (traced as a bail, reported under NUMTY_STRICT=1); a copy of it is
+    the same type, counted as solved.
+    """
+    return copy_type(get_proper_type(ctx.default_return_type))
+
+
+def _inplace_check(
     lhs_dims: list[int | Type], rhs_dims: list[int | Type], ctx: MethodContext | None
-) -> str | None:
-    """The error of `lhs <op>= rhs` for two known shapes, else None."""
+) -> tuple[bool, str | None]:
+    """(checked, error) of `lhs <op>= rhs` for two known shapes.
+
+    checked is False when the broadcast cannot be proven either way.
+    """
     from numty_plugin import _broadcast_result
     dims, message = _broadcast_result(lhs_dims, rhs_dims, ctx)
     if message is not None:
-        return message
+        return True, message
     if len(rhs_dims) <= len(lhs_dims) and _inplace_never_fits(lhs_dims, rhs_dims):
         shown = [
             *lhs_dims[: len(lhs_dims) - len(rhs_dims)],
             *(_inplace_shown_dim(l, r) for l, r in zip(lhs_dims[len(lhs_dims) - len(rhs_dims):], rhs_dims)),
         ]
-        return f"in-place result {_dims_str(shown)} does not fit target {_dims_str(lhs_dims)}"
+        return True, f"in-place result {_dims_str(shown)} does not fit target {_dims_str(lhs_dims)}"
     if dims is None:
-        return None
+        return False, None
     if len(dims) != len(lhs_dims) or any(
         not _dim_eq(d, l) for d, l in zip(dims, lhs_dims)
     ):
@@ -360,8 +377,9 @@ def _inplace_message(
             isinstance(d, int) and isinstance(l, int) and d != l
             for d, l in zip(dims, lhs_dims)
         ):
-            return f"in-place result {_dims_str(dims)} does not fit target {_dims_str(lhs_dims)}"
-    return None
+            return True, f"in-place result {_dims_str(dims)} does not fit target {_dims_str(lhs_dims)}"
+        return False, None
+    return True, None
 
 
 def _broadcast_dims_unpack(

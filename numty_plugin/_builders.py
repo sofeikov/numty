@@ -18,9 +18,9 @@ from mypy.types import (
     UnionType, get_proper_type,
 )
 
-from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, NUMTY_UNSOLVED, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, _report_unsolved, _swallowed, _trial_failed
 from ._state import STATE
-from ._trace import _numty_strict, _numty_trace_path, _trace_event
+from ._trace import _numty_trace_path, _trace_event
 from ._dtypes import (
     _DATETIME_FULLNAMES, _DTYPE_INFO, _WEAK_DEFAULT, _datetime_string_kind,
 )
@@ -299,7 +299,66 @@ def _undegraded_args(
     return ctx._replace(arg_types=new_types)
 
 
-def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..., Type] | None:
+def _solve_union_arg(
+    ctx: FunctionContext, hook: Callable[[FunctionContext], Type]
+) -> Type | None:
+    """Solve a call on a union of arrays one member at a time (issue 334).
+
+    `np.argsort(x)` with `x: F64[N] | F64[?U]` (an if-joined selection)
+    is not a union mypy splits itself: the stubs accept the union as a
+    whole, so a function hook that only reads one array bails and the
+    call is `ndarray[Any, Any]`. When exactly one argument is a pure
+    union of arrays, the hook runs once per member and the results are
+    joined, as mypy does when it has to split a union for an overload.
+    Any member the hook cannot solve keeps the stubs' answer for all.
+    """
+    slots = [
+        (i, j)
+        for i, types in enumerate(ctx.arg_types)
+        for j, tp in enumerate(types)
+        if _union_members(tp) is not None
+    ]
+    if len(slots) != 1:
+        return None
+    i, j = slots[0]
+    members = _union_members(ctx.arg_types[i][j])
+    if members is None:
+        return None
+    results: list[Type] = []
+    for member in members:
+        arg_types = [list(types) for types in ctx.arg_types]
+        arg_types[i][j] = member
+        sub = ctx._replace(arg_types=arg_types)
+        result = hook(sub)
+        if result is sub.default_return_type:
+            return None
+        results.append(result)
+    return _union_results(results)
+
+
+def _may_lose_shape(
+    ctx: FunctionContext | MethodContext | AttributeContext,
+    fullname: str,
+    default: Type,
+    operands: list[Type],
+) -> bool:
+    """Whether a hook's give-up may have dropped a shape (strict gate).
+
+    Every numpy call counts, even a scalar-only one like np.sqrt(8):
+    its Any poisons the next known-shape op. An attribute read counts
+    only when its type holds an array, a builtin only with an array
+    operand.
+    """
+    if isinstance(ctx, AttributeContext):
+        return any(True for _ in _ndarrays_in(default))
+    if fullname.startswith(("numpy.", "numty.")):
+        return True
+    return any(True for t in operands for _ in _ndarrays_in(t))
+
+
+def _guard_mixed(
+    fullname: str, hook: Callable[..., Type] | None, *, strict_reports: bool = True
+) -> Callable[..., Type] | None:
     """Wrap a numpy hook so a mixed-shape operand cannot leak misplaced dims.
 
     Mixed shapes (tuple[int, Literal[3]]) come from builders over (n, 3)
@@ -316,6 +375,10 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
     well: the stubs answer int there for ops that keep or rebuild the
     shape (np.resize), and int would not fit back where the literal is
     expected. A result the plugin built itself is never touched.
+
+    strict_reports=False keeps a hook out of NUMTY_STRICT=1 (it is still
+    traced): the generic attribute hook only rewrites expression dims,
+    so its reads (`.dtype`, a dataclass field) have nothing to prove.
     """
     if hook is None and not fullname.startswith("numpy."):
         return None
@@ -358,6 +421,9 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                 _trace_event(ctx, fullname, "unhooked", "no hook for this op")
             result = default
         else:
+            # Issue 334: whether the check around this call had already
+            # failed before the hook ran (strict reports nothing then).
+            failed_before = _trial_failed(ctx)
             try:
                 if not isinstance(ctx, AttributeContext):
                     ctx = _undegraded_args(ctx)
@@ -365,6 +431,10 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                     if isinstance(ctx, MethodContext):
                         operands.append(ctx.type)
                 result = hook(ctx)
+                if result is default and isinstance(ctx, FunctionContext):
+                    split = _solve_union_arg(ctx, hook)
+                    if split is not None:
+                        result = split
             except Exception:
                 _swallowed(ctx, fullname)
                 # Crash barrier (issue #41): no shape hook may abort the
@@ -382,16 +452,17 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                 # no known-shape input itself, but its Any poisons the
                 # known-shape truediv whose hook mypy then skips, so
                 # gating on known inputs would leave the repro silent.
+                # Issue 334: strict reports only a give-up that could have
+                # had a shape to prove. Not a generic attribute read
+                # (`.dtype`, `finfo(...).eps`, the `__next__` of a `for`
+                # over range()), not an attribute whose type holds no
+                # array, and not a builtin (len, min, ...) with no array
+                # operand: those stay in the trace only.
                 _trace_event(
                     ctx, fullname, "bail", "unsolved (default stub type kept)"
                 )
-                if _numty_strict():
-                    ctx.api.fail(
-                        f"numty could not prove {short}: "
-                        "unsolved (result is unchecked)",
-                        ctx.context,
-                        code=NUMTY_UNSOLVED,
-                    )
+                if strict_reports and _may_lose_shape(ctx, fullname, default, operands):
+                    _report_unsolved(ctx, short, "unsolved", failed_before)
             elif _numty_trace_path() is not None:
                 # Issue 234: explicit [numty-bail] errors return Any (to
                 # hide downstream assignment noise, keeping a single error)
