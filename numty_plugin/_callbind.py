@@ -28,14 +28,19 @@ from ._types import INT_FULLNAME, NDARRAY_FULLNAME, _has_unknown_shape, _parts_o
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
     """Formals with shape TypeVars: (formal index, [(dim index, tvar)]).
 
-    Only plain positional-or-defaulted ndarray formals; anything
-    fancier (star args, non-array shapes) stays out of the check.
+    Plain ndarray formals, positional, defaulted or keyword-only, and
+    `X | None` of one; anything fancier (star args, non-array shapes)
+    stays out of the check.
     """
     out: list[tuple[int, list[tuple[int, TypeVarType]]]] = []
     for i, (tp, kind) in enumerate(zip(sig.arg_types, sig.arg_kinds)):
-        if kind not in (ARG_POS, ARG_OPT):
+        if kind not in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT):
             continue
         parts = _parts_or_unpack(tp)
+        if parts is None:
+            # `breaks: Bool[N] | None = None`: the array member names the size.
+            stripped = _strip_optional(tp)
+            parts = _parts_or_unpack(stripped) if stripped is not tp else None
         if parts is None:
             continue
         positions = [(d, t) for d, t in enumerate(parts[0]) if isinstance(t, TypeVarType)]

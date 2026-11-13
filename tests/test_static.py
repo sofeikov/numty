@@ -5400,6 +5400,20 @@ def test_local_only_name() -> None:
     assert _run_fixture("local_only_name.py") == ["7.0"]
 
 
+def test_callsite_symbolic_conflict() -> None:
+    # A callee's size name bound to `R` and to `R-1` at one call was
+    # silent: only literal sizes were compared (issue #53). Positional,
+    # keyword and `X | None` formals are all covered.
+    result = run_mypy(FIXTURES / "bad_callsite_symbolic.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [21, 22, 23, 24], result.stdout
+    for line in errors:
+        assert len(errors[line]) == 1, result.stdout
+        want = "call-site shape conflict for 'N': R (argument 'values', axis 0) vs R-1"
+        assert want in errors[line][0], result.stdout
+        assert errors[line][0].endswith("[numty-callsite]"), result.stdout
+
+
 def test_numba_dispatcher_call() -> None:
     # Issue 281: a call of a jitted function is checked as a call of the
     # function: sizes are solved (they were `Never`), a formula return is
