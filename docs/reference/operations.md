@@ -29,7 +29,8 @@ union of arrays of one rank join too: `np.hstack([l.ravel() for l in
 (W, b)])` is `(?U,)`. An axis the join does not grow keeps a name one
 item has there against an `int` or unknown size, since the items must
 agree: `np.hstack` of two `(N, N, ?U)` arrays is `(N, 2*N, ?U)`. Two
-unknowns, or two different names, make it unknown.
+unknowns, or two different names (a `[numty-names]` report), make it
+unknown.
 
 ## Reshape
 
@@ -129,7 +130,7 @@ of the edges array, or of the data for a count of bins (float64 for
 integer data). `split` and `array_split` at a 1-D array of positions
 return a list of pieces with a `?U` size on the axis. `bincount(x,
 weights=w)` needs one weight per entry of `x`: provably different
-lengths are an error, two different names an opt-in report.
+lengths are an error, two different names a `[numty-names]` report.
 
 ## Arrays from lists built at runtime
 
@@ -215,8 +216,8 @@ result to fit the target (`(3,) += (2, 3)` errors). With symbolic sizes
 the result must be the target too: a size over names that grows a
 `1` axis (`(N, 1, M) *= (N, N, 1)`) and literal sizes that set one name
 to two values (`(d, d) += (2, 3)`) are errors, while a literal against
-one name (`(d, d) += (3, 3)`), two different names and an `int` or
-unknown axis stay silent. Promotion matches
+one name (`(d, d) += (3, 3)`) and an `int` or unknown axis stay
+silent, and two different names are a `[numty-names]` report. Promotion matches
 NumPy (`np.result_type` over the full dtype matrix, plus weak Python
 and numpy scalars; a size taken from a shape, `X.shape[0]` or
 `len(X)`, is a Python `int`, so `X / len(X)` keeps `X`'s shape): float ufuncs pick the smallest float (`sqrt(uint8)`

@@ -24,7 +24,7 @@ from mypy.types import (
 if TYPE_CHECKING:
     from mypy.checker import TypeChecker
 
-from ._errors import NUMTY_NAMES, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_NAMES, NUMTY_SHAPE, _code_enabled, _swallowed
 from ._forms import (
     _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul,
     _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize,
@@ -172,9 +172,12 @@ def _kept_name(x: int | Type, y: int | Type) -> int | Type | None:
 
 
 def _names_enabled(ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext) -> bool:
-    """Whether `enable_error_code = numty-names` is set for the module being checked."""
-    options = getattr(ctx.api, "options", None)
-    return options is not None and NUMTY_NAMES in options.enabled_error_codes
+    """Whether `numty-names` is on for the module being checked (issue 327).
+
+    On by default; `disable_error_code = numty-names`, the command-line
+    flag, a per-module section or a `# mypy:` comment turns it off.
+    """
+    return _code_enabled(getattr(ctx.api, "options", None), NUMTY_NAMES)
 
 
 def _named_pair_in(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
@@ -188,13 +191,14 @@ def _report_names(
     b: int | Type,
     where: str,
 ) -> None:
-    """The opt-in `[numty-names]` report for a pair of different named sizes (issue 280).
+    """The `[numty-names]` report for a pair of different named sizes (issues 280, 327).
 
     Called where a check finds two sizes that must be equal and cannot
-    prove them equal or unequal. Nothing is emitted with the code off
-    (the default): mypy counts a message of a disabled code as a failure
-    of the overload it is checking, so `v + w` would get mypy's own
-    `[operator]` error. The result of the check is the same either way.
+    prove them equal or unequal. Nothing is emitted with the code
+    disabled (`disable_error_code = numty-names`): mypy counts a message
+    of a disabled code as a failure of the overload it is checking, so
+    `v + w` would get mypy's own `[operator]` error. The result of the
+    check is the same either way.
     """
     if _names_enabled(ctx) and _named_sizes_differ(a, b):
         ctx.api.fail(
@@ -211,7 +215,7 @@ def _is_mask_count_dim(d: int | Type) -> str | None:
     the default checks treat them like any unknown: silent and unifying.
     The size a call chose for a name of its return alone (issue 307,
     `.ownsize_`) is the same kind of size.
-    For the opt-in report they are sizes of their own: `?U_keep` against
+    For the `[numty-names]` report they are sizes of their own: `?U_keep` against
     a named size, or against another mask's count, is a different-names
     pair, while the same mask variable is the same size.
     """
@@ -244,7 +248,7 @@ def _same_own_size(a: int | Type, b: int | Type) -> bool:
 
 
 def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
-    """Whether two dims are different selection counts under the opt-in (issue 288).
+    """Whether two dims are different selection counts under `[numty-names]` (issue 288).
 
     A mask count against a named size, or two different masks' counts,
     must be equal where they meet (broadcast, assignment, call) and are
@@ -305,10 +309,10 @@ def _report_mask_names(
     b: int | Type,
     where: str,
 ) -> None:
-    """The opt-in `[numty-names]` report for a selection count (issue 288).
+    """The `[numty-names]` report for a selection count (issue 288).
 
     Same emission rule as `_report_names`: nothing with the code off, so
-    the default stays silent and no `[operator]` duplicate appears.
+    the names-off mode stays silent and no `[operator]` duplicate appears.
     """
     if not _names_enabled(ctx):
         return
@@ -334,7 +338,7 @@ def _unknown_offset(a: int | Type, b: int | Type) -> int:
     `?U` against `?U-1` (`gap = np.diff(c)`, then `np.r_[np.inf, gap]`
     against `gap`). An unknown is named after its source site, and one
     site can stand for several sizes (the items of a comprehension), so
-    this is not a proof and is only reported under the opt-in code.
+    this is not a proof and is only reported under `[numty-names]`.
     """
     from numty_plugin import _resolve_dim
     if not isinstance(a, TypeVarType) or not isinstance(b, TypeVarType):

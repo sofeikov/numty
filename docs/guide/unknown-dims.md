@@ -52,10 +52,10 @@ a constant is an error by default, as `N-1` against `N` is:
 `np.diff(sel) * sel` with `sel = x[keep]` is `?U@12-1 vs ?U@12`
 (`tests/fixtures/bad_own_size_offset.py`). A mask variable bound in a
 loop holds a mask per run, so there the count proves nothing and the
-pair is left to the opt-in code (`1 apart`,
+pair is left to the `numty-names` code (`1 apart`,
 `tests/fixtures/own_size_offset_loop_ok.py`).
-Under the opt-in `numty-names` code a selection count is a size of its
-own: against a named size or another mask's count it is reported where
+Under the `numty-names` code (on by default) a selection count is a
+size of its own: against a named size or another mask's count it is reported where
 the sizes must be equal
 (`tests/fixtures/bad_mask_count_optin.py`), while a generic unknown
 against a name stays silent. A selection that keeps everything still
@@ -158,7 +158,7 @@ side as two names (`expected "ndarray[tuple[K], ...]", got
 not one a plugin can reach. Declare the protocol's property with `int`
 (`def theta(self) -> F64[int]`), which every class's own name fits.
 
-Under the opt-in `numty-names` code these are sizes of their own, as a
+Under the `numty-names` code (on by default) these are sizes of their own, as a
 selection count is: `seconds - seconds[starts]` with `seconds: F64[N]`
 is `N and ?K@12 are different names`
 (`tests/fixtures/bad_own_size_optin.py`).
@@ -279,7 +279,7 @@ where `F64[N, N]` or `F64[n, c]` is declared, as the `int` operand alone
 does. The same goes for the axes a join does not grow: `np.hstack` of
 two `(N, N, ?U)` arrays is `(N, 2*N, ?U)`. A literal against an unknown,
 `int` against `int`, two unknowns, and two different names still give a
-fresh unknown (the names are an opt-in `[numty-names]` report). A name
+fresh unknown (the names are also a `[numty-names]` report, on by default). A name
 that is 1 at run time is the one case this misses: `(1,) * (5,)` is
 `(5,)`, so `(N,) * (int,)` is `(N,)` only when `N` is not 1. The kept
 name checks what follows: `np.diff(x * w) + x` with `w: F64[int]` is

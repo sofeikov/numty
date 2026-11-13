@@ -394,10 +394,11 @@ def test_ts_families_agree_with_the_signature(tmp_path: Path) -> None:
     n_sizes = len(d.SIZE_ASSIGNMENTS)
     n_prefix = len(d.TS_PREFIXES)
     # Three exact families plus the generic call are exact at every
-    # (size, prefix) combination; the reshape clash is flagged and the
-    # prefix conflict is allowed (numpy raises, not flagged) or special.
+    # (size, prefix) combination; the reshape clash is flagged, and so is
+    # the N/M conflict at the call (a [numty-names] report, on by default
+    # since issue 327; the assignments give N and M different sizes).
     assert stats["agree: exact shape"] == 4 * n_sizes * n_prefix, stats
-    assert stats["numpy raises, flagged"] == 1 * n_sizes * n_prefix, stats
+    assert stats["numpy raises, flagged"] == 2 * n_sizes * n_prefix, stats
 
 
 def test_known_gaps_are_narrow() -> None:
@@ -503,8 +504,11 @@ def test_empty_axis_is_not_a_size_mismatch(tmp_path: Path) -> None:
     assert isinstance(d.evaluate(cases[3], empty), Exception)
     findings, stats = d.check(cases, tmp_path)
     assert not findings, "\n".join(str(f) for f in findings)
-    # Only the pad case is flagged, under all four assignments.
-    assert stats["numpy raises, flagged"] == len(d.SIZE_ASSIGNMENTS), stats
+    # The pad case is flagged under all four assignments. `2*M` against
+    # `M` is a [numty-names] report (on by default since issue 327), not
+    # a claim: it counts as flagged where numpy raises (M > 0) and is
+    # judged by the shape where numpy accepts it (M == 0).
+    assert stats["numpy raises, flagged"] == 2 * len(d.SIZE_ASSIGNMENTS) - 1, stats
 
 
 def test_regressions_stay_fixed(tmp_path: Path) -> None:

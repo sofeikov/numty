@@ -584,7 +584,9 @@ def _check_converted(name: str, tmp_path: Path) -> tuple[Path, list[str]]:
     return converted, warnings
 
 
-def _run_mypy(*paths: Path, tmp_path: Path) -> "subprocess.CompletedProcess[str]":
+def _run_mypy(
+    *paths: Path, tmp_path: Path, flags: tuple[str, ...] = ()
+) -> "subprocess.CompletedProcess[str]":
     # Shared incremental cache (per xdist worker): converted files differ
     # per test but numpy/plugin parsing is cached, so the 2nd/3rd e2e run
     # is warm instead of cold with --no-incremental.
@@ -596,6 +598,7 @@ def _run_mypy(*paths: Path, tmp_path: Path) -> "subprocess.CompletedProcess[str]
             "-m",
             "mypy",
             f"--cache-dir={cache_dir}",
+            *flags,
             *map(str, paths),
         ],
         cwd=ROOT,
@@ -627,18 +630,27 @@ def test_e2e_converted_mlp_is_clean_and_runs(tmp_path: Path) -> None:
 def test_e2e_seeded_bias_bug_is_caught(tmp_path: Path) -> None:
     converted, warnings = _check_converted("jaxtyping_mlp_bug.py", tmp_path)
     assert warnings == []
+    # The HID/OUT mismatch surfaces at the call site. By default
+    # (numty-names on, issue 327) it is also reported where it is made:
+    # the (BATCH, OUT) + (HID,) broadcast pairs two different names.
     result = _run_mypy(converted, tmp_path=tmp_path)
     assert result.returncode == 1, result.stdout
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    # The HID/OUT mismatch surfaces at the call site; the unprovable
-    # (BATCH, OUT) + (HID) broadcast mints ?U, and an unknown in a
-    # returned value still checks against the declared (BATCH, OUT)
-    # (only plain `int` is rewritten to Any at a return, issues
-    # #269/#271), so the [return-value] echo stays too.
+    assert len(errors) == 2, result.stdout
+    assert "(shapes (BATCH, OUT) vs (HID,)): OUT and HID are different names" in errors[0], result.stdout
+    assert errors[0].endswith("[numty-names]"), result.stdout
+    assert "call-site shape conflict for 'HID'" in errors[1], result.stdout
+    assert "8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)" in errors[1], result.stdout
+    # With numty-names off the unprovable broadcast mints ?U, and an
+    # unknown in a returned value still checks against the declared
+    # (BATCH, OUT) (only plain `int` is rewritten to Any at a return,
+    # issues #269/#271), so the [return-value] echo stands instead.
+    result = _run_mypy(converted, tmp_path=tmp_path, flags=("--disable-error-code", "numty-names"))
+    assert result.returncode == 1, result.stdout
+    errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     assert len(errors) == 2, result.stdout
     assert "tuple[BATCH, ?U@" in errors[0] and "[return-value]" in errors[0], result.stdout
     assert "call-site shape conflict for 'HID'" in errors[1], result.stdout
-    assert "8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)" in errors[1], result.stdout
 
 
 # A stand-in for jaxtyping at runtime. Without `@jaxtyped` real jaxtyping

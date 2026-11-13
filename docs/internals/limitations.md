@@ -267,18 +267,20 @@ quiet, where it is approximate, and what to write instead.
 
 ## Named sizes and index positions
 
-- Different TypeVars (`N` vs `M`) never conflict by default, even when
-    provably different at a call site — only same-name TypeVars are
-    unified. The opt-in `numty-names` code reports them inside a generic
-    body (see [Error codes](../reference/error-codes.md)).
+- Different TypeVars (`N` vs `M`) are never a provable conflict, even
+    when provably different at a call site — only same-name TypeVars are
+    unified. The `numty-names` code, on by default since
+    [#327](https://github.com/sofeikov/numty/issues/327), reports them
+    inside a generic body as a likely mistake, not a proof; with it off
+    they meet silently (see [Error codes](../reference/error-codes.md)).
 - Index *positions* are tracked through `Index[P, N]`, which records
     that an int array's values index size P. A recorded size above the
     indexed axis errors as `[numty-axis]` when the overrun is certain
     (`arange(5)` on a size-3 axis, an `argsort` of `N+1` values on an
     axis of `N`). A possible overrun (`searchsorted` positions on `N+1`
-    over `N`) and a different named size (positions on M over N) need the
-    opt-in `numty-names` code (`enable_error_code = numty-names`) and are
-    silent by default. Producers record the fact themselves when the values are
+    over `N`) and a different named size (positions on M over N) are
+    `numty-names` reports (on by default) and are silent with
+    `disable_error_code = numty-names`. Producers record the fact themselves when the values are
     certainly positions (`argmin`/`argmax` and the `nan` twins,
     `argsort`/`argpartition` on one known axis with a 1-d result,
     0-based `arange`, 1-d `flatnonzero`, per-member `nonzero`/`where`,
@@ -300,8 +302,8 @@ quiet, where it is approximate, and what to write instead.
 - Index positions are best-effort by design. A certain overrun errors
     by default (`arange(5)` on a size-3 axis); a possible one
     (`searchsorted` positions on `N+1` over `N`) and a
-    different named size need the opt-in `numty-names` code and are
-    silent by default, including at a same-module plain call (an actual
+    different named size are `numty-names` reports and are silent
+    with that code off, including at a same-module plain call (an actual
     recorded on N passed where the formal declares `Index` on P,
     `tests/fixtures/bad_index_callsite.py`). Records come from the
     `Index[P, N]` annotation (resolved off the enclosing function, so

@@ -53,7 +53,8 @@ out[k:]                              # (N-?k,)
 This is the size when the bounds are inside the axis; numpy clips them
 otherwise (`x[i : i + bs]` on the last batch). So it is given when an
 `int` variable is left in it, and such a size is an unknown: nothing
-is proved from it by default. Under the opt-in `numty-names` code two
+is proved from it with `numty-names` off. Under the `numty-names` code
+(on by default) two
 of them a constant apart are reported, `out[k:] = mins` as `-?k+N+1 and
 -?k+N are 1 apart` (`tests/fixtures/symbolic_slice.py`).
 
@@ -112,9 +113,9 @@ size above the axis is an error by default only when the overrun is
 certain: the index holds every position below its size, as `arange(n)`
 and `argsort` do. For `searchsorted`, `argmax`, `flatnonzero` and an
 `Index[...]` annotation the size is an upper bound on the values, so
-the overrun is only possible, and that report is under the opt-in
-`[numty-names]` code (`enable_error_code = numty-names`), like a
-different *named* size. A variable rebound between uses loses its
+the overrun is only possible, and that report is under the
+`[numty-names]` code (on by default; `disable_error_code = numty-names`
+turns it off), like a different *named* size. A variable rebound between uses loses its
 record (`idx = searchsorted(...); idx = clip(idx, ...)` checks clean),
 and so does a call wrapped in another one where it is assigned
 (`idx = np.clip(np.searchsorted(a, v), 0, len(a) - 1)`,
@@ -122,13 +123,13 @@ and so does a call wrapped in another one where it is assigned
 of an `if` is checked for each branch
 (`tests/fixtures/union_index_optin.py`),
 and a same-module plain call checks the actual's record against the
-formal's `Index` under the same opt-in code:
+formal's `Index` under the same code:
 
 ```python
 table[row, col]                   # clean: positions on the right axes
-table[col, row]                   # error (opt-in): Q on P, P on Q
+table[col, row]                   # error (numty-names): Q on P, P on Q
 small[np.arange(len(small) + 1)]  # error: every position 0..N occurs
-plain[np.searchsorted(a, v)]      # error (opt-in): they may run past the axis
+plain[np.searchsorted(a, v)]      # error (numty-names): they may run past the axis
 padded[np.searchsorted(a, v)]     # clean: the axis spells N+1
 ```
 
@@ -159,7 +160,9 @@ errors; `a[:] = v` with `(5, 3) <- (3,)` stays clean, scalars always
 fit). Symbolic sizes are compared by the rule of a broadcast: `out[i] =
 v[:-1]` with `out: F64[S, C]` and `v: F64[C]` is `cannot assign value of
 shape (C-1,) into target of shape (C,)`. Two different names (`S` into
-`C`), an unknown and an `int` size are not provable and stay silent
+`C`) and a mask's count against a name are not provable either: they
+are `[numty-names]` reports (on by default), silent with that code off.
+Other unknowns and an `int` size stay silent
 (`tests/fixtures/bad_setitem_symbolic.py`). An `int` axis is skipped on
 its own, not the whole write: in a buffer `a = np.empty((x.shape[0], n))`
 of shape `(N, int)`, `a[:, -1] = np.ones(x.shape[0] + 1)` is `cannot

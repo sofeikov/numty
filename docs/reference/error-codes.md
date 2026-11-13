@@ -11,7 +11,7 @@ can be silenced or selected on its own:
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 needs its dims, e.g. F64[N, M], or F64[()] for a 0-d array` |
-| `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
+| `numty-names` | on by default (turn off with `disable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
 | `numty-cast` | opt-in (`enable_error_code = numty-cast`): an indexed assignment whose value has a kind the target cannot hold without loss (floats into an integer array) | `assignment casts float32 into int64 (values are truncated); use .astype(...) if this is meant` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
@@ -56,19 +56,27 @@ disable_error_code = numty-bail
 or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
 reports a shape error on that line. All but `numty-names` and `numty-cast` are sub-codes of
 `misc`, so an existing `# type: ignore[misc]` or `disable_error_code = misc`
-keeps covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
+keeps covering them (and does not cover `numty-names`). Under `--warn-unused-ignores` (part of `--strict`), mypy
 then asks for the narrower code (`Unused "type: ignore" comment, use
 narrower [numty-shape] instead of [misc] code`), so switch those
 comments to the `numty-*` code when upgrading.
 
-## Different names: the opt-in `numty-names` code
+## Different names: the `numty-names` code
 
-`F64[N] + F64[M]` runs when `N == M`, so it is not provably wrong, and
-by default numty says nothing about it. A function generic in `N` and
-`M` has to work when they differ, though, and most plausible mistakes
-in such a body pair two different names: a mask on the wrong axis, a
-transposed matrix, a per-row array against a per-group one. Turn the
-check on to have them reported (issue #280), including selection counts
+!!! note "Behaviour change: on by default"
+    `numty-names` used to be opt-in (`enable_error_code = numty-names`)
+    and is now on by default (issue #327). On about 3,600 lines of
+    annotated scikit-learn code it caught 41 more of 149 seeded shape
+    bugs (66 to 107), for 3 false positives on the correct code. Code
+    that checked clean before may now get `[numty-names]` errors; to keep
+    the old behaviour, [turn the code off](#turning-it-off). An existing
+    `enable_error_code = numty-names` is harmless.
+
+`F64[N] + F64[M]` runs when `N == M`, so it is not provably wrong. A
+function generic in `N` and `M` has to work when they differ, though,
+and most plausible mistakes in such a body pair two different names: a
+mask on the wrong axis, a transposed matrix, a per-row array against a
+per-group one. numty reports them (issue #280), including selection counts
 (issue #288) and the sizes a function or an object chose (`?K@12`,
 `?ctx.E`, see [A size the function chooses](../guide/unknown-dims.md#a-size-the-function-chooses)), and one unknown
 against itself plus a constant (`?U@12 and ?U@12-1 are 1 apart`). One
@@ -76,13 +84,7 @@ selection count or one size a function chose against itself plus a
 constant (`?K@12-1` against `?K@12-2`) is wrong for every size, like
 `N-1` against `N-2`, and is a default `[numty-broadcast]` error; only
 where it is minted in a loop or a comprehension, and so stands for a
-size per run, is it left to this code (issue 328):
-
-```ini
-[mypy]
-plugins = numty_plugin
-enable_error_code = numty-names
-```
+size per run, is it left to this code (issue 328).
 
 
 ```python
@@ -119,7 +121,7 @@ def f(a: F64[N, H], w: F64[K, H]) -> None:
 error: matmul inner dimensions (shapes (N, H) vs (K, H)): H and K are different names  [numty-names]
 ```
 
-Without the code a contraction over two names is silent and keeps the
+With the code off a contraction over two names is silent and keeps the
 outer dims, `(N, H)` here, which are the result's whenever the call
 runs (`tests/fixtures/bad_matmul_names_optin.py`). It does not cover
 shapes with `*Ts`, nor a contraction with an operand that is a union
@@ -132,6 +134,31 @@ named size and against another mask's count (see
 also covers index positions: positions on one named size used on an
 axis of another, and positions that may run past the axis. Where two names are known to be one
 size, give them one name. The fixture is `tests/fixtures/names_opt_in.py`.
+
+### Turning it off
+
+```ini
+[mypy]
+plugins = numty_plugin
+disable_error_code = numty-names
+```
+
+or `--disable-error-code numty-names` on the command line, a per-module
+section (`[mypy-mypackage.legacy]` with `disable_error_code =
+numty-names`), a `# mypy: disable-error-code="numty-names"` comment at
+the top of one file, or `# type: ignore[numty-names]` on one line.
+mypy's usual rules apply: an enable beats a disable at the same level,
+and a per-module setting beats the global one.
+
+With the code off, two different names meet silently, as before issue
+#327: nothing is reported (not even mypy's own `[operator]` error), and
+an axis where they meet is a fresh unknown, so `x - y` with
+`x: F64[N, 3]` and `y: F64[M, 3]` is `(?U, 3)`. A wrong shape then
+shows up later if at all: at a `return` or an annotated local that
+declares a name (`?U@12 vs N`), or at a provable clash further on. A
+contraction keeps its outer dims, selection counts and the sizes a
+function chose are plain unknowns, and positions that may run past an
+axis are silent.
 
 ## Lossy indexed assignment: the opt-in `numty-cast` code
 

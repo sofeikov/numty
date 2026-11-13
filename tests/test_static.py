@@ -107,6 +107,12 @@ def _cache_for_flags(flags: tuple[str, ...]) -> Path:
     return CACHE.parent / f"{CACHE.name}-flags-{digest}"
 
 
+# `numty-names` is on by default (issue 327). A test of the names-off
+# mode (two different names meet silently, a broadcast of them is `?U`)
+# passes this; such runs bypass the batch and share one flagged cache.
+NAMES_OFF = ("--disable-error-code", "numty-names")
+
+
 def run_mypy(*paths: Path, flags: tuple[str, ...] = ()) -> "subprocess.CompletedProcess[str]":
     # Fast path: default-flag single-fixture checks are served from the
     # session batch (no new subprocess, no cache thrashing).
@@ -298,7 +304,7 @@ def test_unknown_broadcast_keeps_rank_and_dtype() -> None:
     # and dtype survive. Issue #138: a literal against a symbolic dim
     # is likewise unprovable, so it mints a fresh unknown instead of
     # claiming the literal.
-    result = run_mypy(FIXTURES / "unknown_broadcast_ok.py")
+    result = run_mypy(FIXTURES / "unknown_broadcast_ok.py", flags=NAMES_OFF)
     assert result.returncode == 0, result.stdout
     notes = [
         re.sub(r"\?U@\d+[a-z]?", "?U", line.split('Revealed type is "', 1)[1])
@@ -313,6 +319,12 @@ def test_unknown_broadcast_keeps_rank_and_dtype() -> None:
         f'numpy.ndarray[tuple[P, D], {f64}]"',
         f'numpy.ndarray[tuple[?U, Literal[3]], {f64}]"',
     ], result.stdout
+    # By default (numty-names on, issue 327) the two different names are
+    # reported where they meet: N vs M twice, and D vs P in the matmul.
+    on = _errors_by_line(run_mypy(FIXTURES / "unknown_broadcast_ok.py"))
+    assert sorted(on) == [34, 36, 37], on
+    assert all(len(on[line]) == 1 and on[line][0].endswith("[numty-names]") for line in on), on
+    assert "N and M are different names" in on[34][0] and "D and P are different names" in on[36][0], on
     assert _run_fixture("unknown_broadcast_ok.py") == [
         "(3, 3) float64",
         "(4, 3)",
@@ -622,11 +634,12 @@ def test_index_pos_ok() -> None:
     # default; producers (argmin/argmax, arange, flatnonzero, nonzero,
     # searchsorted) record it themselves. Index[P, N] spells which axis
     # the values index into.
-    # Under the opt-in names code (issue #288, shared with #280) the
-    # order_ok pair broadcasts two different counts (J,) vs (K,), so
-    # line 19 reports the broadcast names error there while everything
-    # else stays clean. The default run keeps the full reveal pins.
-    off = run_mypy(FIXTURES / "index_pos_ok.py")
+    # Under the names code (issue #288, shared with #280; on by default
+    # since #327) the order_ok pair broadcasts two different counts
+    # (J,) vs (K,), so line 19 reports the broadcast names error there
+    # while everything else stays clean. The names-off run keeps the
+    # full reveal pins.
+    off = run_mypy(FIXTURES / "index_pos_ok.py", flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     on = run_mypy(FIXTURES / "index_pos_ok.py", flags=("--enable-error-code", "numty-names"))
     on_errors = _errors_by_line(on)
@@ -643,7 +656,7 @@ def test_index_pos_ok() -> None:
         "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit"
         " | numpy._typing._nbit_base._64Bit]]"
     )
-    assert reveals_by_line(run_mypy(FIXTURES / "index_pos_ok.py")) == {
+    assert reveals_by_line(run_mypy(FIXTURES / "index_pos_ok.py", flags=NAMES_OFF)) == {
         17: f'"numpy.ndarray[tuple[J], {i64}]"',
         18: f'"numpy.ndarray[tuple[K], {i64}]"',
         20: f'"numpy.ndarray[tuple[?U@19], {f64}]"',
@@ -666,17 +679,18 @@ def test_index_pos_ok() -> None:
         82: f'"numpy.ndarray[tuple[J, Q], {f64}]"',
         90: f'"numpy.ndarray[tuple[K], {f64}]"',
         97: f'"numpy.ndarray[tuple[K], {f64}]"',
-    }, run_mypy(FIXTURES / "index_pos_ok.py").stdout
+    }, run_mypy(FIXTURES / "index_pos_ok.py", flags=NAMES_OFF).stdout
 
 
 def test_bad_index_callsite() -> None:
     # Issue #286: an index recorded for one size passed where an Index
     # formal declares another is an opt-in [numty-names] error at the
     # call. Same-module plain positional calls only; producers, stored
-    # results and matching positions stay clean, and the default run
+    # results and matching positions stay clean, and the names-off run
     # stays silent everywhere (unknown is not an error).
     fixture = FIXTURES / "bad_index_callsite.py"
-    assert run_mypy(fixture).returncode == 0, run_mypy(fixture).stdout
+    off = run_mypy(fixture, flags=NAMES_OFF)
+    assert off.returncode == 0, off.stdout
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
     errors = _errors_by_line(on)
     assert sorted(errors) == [31], on.stdout
@@ -700,7 +714,7 @@ def test_bad_index_pos() -> None:
     # alongside its two position errors and the correct-positions line 18
     # reports only the broadcast.
     fixture = FIXTURES / "bad_index_pos.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert sorted(_errors_by_line(off)) == [44], off.stdout
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
     errors = _errors_by_line(on)
@@ -3288,9 +3302,14 @@ def test_named_dims_weights_mismatch() -> None:
 
 
 def test_dot18_ok_clean() -> None:
-    result = run_mypy(FIXTURES / "dot18_ok.py")
+    result = run_mypy(FIXTURES / "dot18_ok.py", flags=NAMES_OFF)
     assert result.returncode == 0, result.stdout
     assert "error:" not in result.stdout
+    # `np.dot(u, b)` contracts N against M: by default (numty-names on,
+    # issue 327) that one line is reported.
+    on = _errors_by_line(run_mypy(FIXTURES / "dot18_ok.py"))
+    assert sorted(on) == [24], on
+    assert len(on[24]) == 1 and on[24][0].endswith("N and M are different names  [numty-names]"), on
 
 
 def test_dot_nd_mismatch() -> None:
@@ -4499,8 +4518,26 @@ def test_ok_fixtures_clean_under_allow_redefinition() -> None:
     # mypy run, not one subprocess per file).
     ok_files = sorted(FIXTURES.glob("*_ok.py"))
     assert ok_files, "no *_ok fixtures found"
-    result = run_mypy(*ok_files, flags=("--allow-redefinition",))
+    result = run_mypy(*ok_files, flags=("--allow-redefinition", *NAMES_OFF))
     assert result.returncode == 0, result.stdout
+    # With numty-names on (the default, issue 327) the only errors are
+    # the names reports these fixtures pin for two different sizes that
+    # meet on purpose (their tests check the names-off mode as well).
+    result = run_mypy(*ok_files, flags=("--allow-redefinition",))
+    names_lines: dict[str, list[int]] = {}
+    for line in result.stdout.splitlines():
+        if ": error:" in line:
+            assert line.endswith("[numty-names]"), result.stdout
+            path, number = line.split(":")[:2]
+            names_lines.setdefault(Path(path).name, []).append(int(number))
+    assert names_lines == {
+        "dot18_ok.py": [24],
+        "index_clip_ok.py": [23, 28],
+        "index_pos_ok.py": [19],
+        "mask_count_ok.py": [14],
+        "own_size_offset_loop_ok.py": [17, 22, 24],
+        "unknown_broadcast_ok.py": [34, 36, 37],
+    }, result.stdout
 
 
 def test_sklearn_clean_under_allow_redefinition() -> None:
@@ -4885,7 +4922,7 @@ def test_property_and_method_own_size_is_unknown() -> None:
     # Issue 276: a size that only the return of a property or a method
     # names is unknown at each read. A property gave the caller's size of
     # the same name, a method gave `Never`.
-    result = run_mypy(FIXTURES / "property_own_size.py")
+    result = run_mypy(FIXTURES / "property_own_size.py", flags=NAMES_OFF)
     assert result.returncode == 0, result.stdout
     notes = reveals_by_line(result)
     # Read through a variable, the size is the object's: two properties
@@ -4904,6 +4941,11 @@ def test_property_and_method_own_size_is_unknown() -> None:
     ), result.stdout
     assert notes[51] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
     assert notes[52] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
+    # By default (numty-names on, issue 327) the property's own size
+    # against the caller's E is two different sizes.
+    on = _errors_by_line(run_mypy(FIXTURES / "property_own_size.py"))
+    assert sorted(on) == [48], on
+    assert len(on[48]) == 1 and on[48][0].endswith("E and ?c.E are different names  [numty-names]"), on
 
 
 def test_int_dims_keep_shape_in_bitwise_and_searchsorted() -> None:
@@ -4934,8 +4976,9 @@ def test_int_dims_keep_shape_in_bitwise_and_searchsorted() -> None:
 def test_setitem_symbolic_sizes() -> None:
     # Issue 290: an assignment compared sizes only when both were
     # literal, so `out[i] = v[:-1]` was silent and `out[i] + v[:-1]` was
-    # an error. Two names, an unknown and an `int` stay silent.
-    result = run_mypy(FIXTURES / "bad_setitem_symbolic.py")
+    # an error. Two names, an unknown and an `int` stay silent with
+    # numty-names off; by default the first two are names reports.
+    result = run_mypy(FIXTURES / "bad_setitem_symbolic.py", flags=NAMES_OFF)
     assert result.returncode == 1, result.stdout
     errors = _errors_by_line(result)
     assert sorted(errors) == [13, 14, 15, 16, 18, 19], result.stdout
@@ -4950,6 +4993,10 @@ def test_setitem_symbolic_sizes() -> None:
     for line, message in expected.items():
         assert len(errors[line]) == 1, result.stdout
         assert message in errors[line][0] and "[numty-broadcast]" in errors[line][0], result.stdout
+    on = _errors_by_line(run_mypy(FIXTURES / "bad_setitem_symbolic.py"))
+    assert sorted(on) == [13, 14, 15, 16, 18, 19, 20, 21], on
+    assert "S and C are different names  [numty-names]" in on[20][0], on
+    assert "?U@21 and C are different names  [numty-names]" in on[21][0], on
 
 
 def test_container_int_sizes_and_bare_container() -> None:
@@ -5138,7 +5185,7 @@ def test_mask_count_reuses_one_unknown_per_variable() -> None:
     # ids[keep] and d[0, keep] share ?U and their sum stays clean. Index
     # arrays keep reusing their named size (K). Different masks, a
     # rebinding, different scopes and inline masks all mint fresh.
-    result = run_mypy(FIXTURES / "mask_count_ok.py")
+    result = run_mypy(FIXTURES / "mask_count_ok.py", flags=NAMES_OFF)
     assert result.returncode == 0, result.stdout
     notes = reveals_by_line(result)
     i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
@@ -5146,14 +5193,14 @@ def test_mask_count_reuses_one_unknown_per_variable() -> None:
     assert notes[11] == f'"numpy.ndarray[tuple[K], {i64}]"', result.stdout
     assert notes[12] == f'"numpy.ndarray[tuple[P, K], {f64}]"', result.stdout
     assert notes[13] == f'"numpy.ndarray[tuple[K], {i64}]"', result.stdout
-    # Line 14 pairs (N,) against (K,): silent by default.
+    # Line 14 pairs (N,) against (K,): silent with numty-names off.
     assert notes[14] == f'"numpy.ndarray[tuple[?U@14], {f64}]"', result.stdout
     # Lines 15-16 share one count for `keep`; line 17 keeps it.
     assert notes[15] == f'"numpy.ndarray[tuple[?U@15], {i64}]"', result.stdout
     assert notes[16] == f'"numpy.ndarray[tuple[?U@15], {f64}]"', result.stdout
     assert notes[17] == f'"numpy.ndarray[tuple[?U@15], {f64}]"', result.stdout
     assert _run_fixture("mask_count_ok.py") == ["ok"]
-    # Under the opt-in only line 14 reports (N vs K); line 17 stays clean.
+    # With numty-names on only line 14 reports (N vs K); line 17 stays clean.
     on = run_mypy(FIXTURES / "mask_count_ok.py", flags=("--enable-error-code", "numty-names"))
     errors = _errors_by_line(on)
     assert sorted(errors) == [14], on.stdout
@@ -5162,13 +5209,13 @@ def test_mask_count_reuses_one_unknown_per_variable() -> None:
 
 
 def test_mask_count_optin_reports_selection_counts() -> None:
-    # Issue #288 (2): under the opt-in `numty-names` code a selection
+    # Issue #288 (2): under the `numty-names` code (on by default since #327) a selection
     # count is a size of its own. A mask count against a named size, two
     # different masks' counts, and a call-site binding of a count against
-    # a name are errors; the same mask variable stays clean. By default
-    # all of it is silent (unknown is not an error).
+    # a name are errors; the same mask variable stays clean. With the code
+    # off all of it is silent (unknown is not an error).
     fixture = FIXTURES / "bad_mask_count_optin.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     assert "error:" not in off.stdout
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
@@ -5229,9 +5276,9 @@ def test_bad_own_size_return() -> None:
 
 def test_bad_own_size_optin() -> None:
     # Issues 306/307 (opt-in): the size a call chose, and the size an
-    # object's properties name, are sizes of their own. Silent by default.
+    # object's properties name, are sizes of their own. Silent with numty-names off.
     fixture = FIXTURES / "bad_own_size_optin.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     assert "error:" not in off.stdout
     assert reveals_by_line(off)[74] == f'"numpy.ndarray[tuple[?ctx.E, T], {_F64}]"', off.stdout
@@ -5253,9 +5300,9 @@ def test_bad_own_size_optin() -> None:
 def test_local_name_and_flatnonzero_count() -> None:
     # An `int` size fits a declared name at an annotated local, as at a
     # `return`, and `np.flatnonzero(mask)` has the count of the mask
-    # variable. Silent by default; the opt-in reports the two mistakes.
+    # variable. Silent with numty-names off; the names code reports the two mistakes.
     fixture = FIXTURES / "local_name_flatnonzero.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     notes = reveals_by_line(off)
     assert notes[20] == f'"numpy.ndarray[tuple[S, C], {_F64}]"', off.stdout
@@ -5286,7 +5333,7 @@ def test_array_any_items() -> None:
     # certain scalar: one value per item, or numpy refuses the ragged
     # display. An item indexing every axis with an integer is a scalar.
     fixture = FIXTURES / "array_any_items.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     notes = reveals_by_line(off)
     assert notes[25] == f'"numpy.ndarray[tuple[?U@22, Literal[6]], {_F64}]"', off.stdout
@@ -5321,10 +5368,10 @@ def test_repeat_counts() -> None:
 
 def test_symbolic_slice() -> None:
     # A slice bound that is a formula over `int` variables gives a size
-    # over them (`N-?k+1`). Nothing is proved from it by default; the
-    # opt-in reports the window written one entry late.
+    # over them (`N-?k+1`). Nothing is proved from it with numty-names
+    # off; the names code reports the window written one entry late.
     fixture = FIXTURES / "symbolic_slice.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     assert "error:" not in off.stdout
     notes = reveals_by_line(off)
@@ -5384,7 +5431,7 @@ def test_union_index_optin() -> None:
     # union under allow_redefinition. It is solved member by member,
     # and the positions check runs for each.
     fixture = FIXTURES / "union_index_optin.py"
-    off = run_mypy(fixture, flags=("--allow-redefinition",))
+    off = run_mypy(fixture, flags=("--allow-redefinition", *NAMES_OFF))
     assert off.returncode == 0, off.stdout
     notes = reveals_by_line(off)
     assert notes[20] == f'"numpy.ndarray[tuple[?U@20, A, Literal[3]], {_F64}]"', off.stdout
@@ -5401,7 +5448,7 @@ def test_index_clip_ok() -> None:
     # `np.minimum(...)` changed the values, so the name assigned from
     # them holds no record; the plain call and the method still do.
     fixture = FIXTURES / "index_clip_ok.py"
-    assert run_mypy(fixture).returncode == 0
+    assert run_mypy(fixture, flags=NAMES_OFF).returncode == 0
     errors = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
     assert sorted(errors) == [23, 28], errors
     for line in (23, 28):
@@ -5413,7 +5460,7 @@ def test_local_only_name() -> None:
     # body (mypy alone: `Type variable "Rows" is unbound`). One name is
     # one size per function; at module level it is still unbound.
     fixture = FIXTURES / "local_only_name.py"
-    off = _errors_by_line(run_mypy(fixture))
+    off = _errors_by_line(run_mypy(fixture, flags=NAMES_OFF))
     assert sorted(off) == [26, 37], off
     assert "Rows-1 vs Rows" in off[26][0] and off[26][0].endswith("[numty-broadcast]"), off
     assert 'Rows" is unbound' in off[37][0], off
@@ -5466,12 +5513,13 @@ def test_numba_dispatcher_call() -> None:
 
 
 def test_names_opt_in() -> None:
-    # Issue 280: two different names where one size is needed. Off by
-    # default: `F64[N] + F64[M]` runs when N == M, and nothing is said
-    # (not even mypy's own [operator] error). With the code on, each
-    # such line of a generic body has one [numty-names] error.
+    # Issue 280: two different names where one size is needed. With the
+    # code off: `F64[N] + F64[M]` runs when N == M, and nothing is said
+    # (not even mypy's own [operator] error). With the code on (the
+    # default since issue 327), each such line of a generic body has one
+    # [numty-names] error.
     fixture = FIXTURES / "names_opt_in.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert sorted(_errors_by_line(off)) == [30], off.stdout
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
     errors = _errors_by_line(on)
@@ -5496,15 +5544,73 @@ def test_names_opt_in() -> None:
     assert errors[30][0].endswith("[numty-broadcast]"), on.stdout
 
 
+def _names_route_run(
+    tmp_path: Path, config: str, header: str = "", flags: tuple[str, ...] = ()
+) -> dict[int, list[str]]:
+    """Messages per line for names_opt_in.py checked as module `gen` under `config`."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "gen.py").write_text(header + (FIXTURES / "names_opt_in.py").read_text())
+    (tmp_path / "mypy.ini").write_text("[mypy]\nplugins = numty_plugin\n" + config)
+    result = subprocess.run(
+        [sys.executable, "-m", "mypy", "--config-file", "mypy.ini",
+         "--cache-dir", str(tmp_path / "cache"), *flags, "gen.py"],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode in (0, 1), result.stdout + result.stderr
+    shift = header.count("\n")
+    return {line - shift: texts for line, texts in _messages_by_line(result).items()}
+
+
+def test_names_on_by_default_and_disable_restores_names_off(tmp_path: Path) -> None:
+    # Issue 327: numty-names is on by default. `--disable-error-code
+    # numty-names` gives back the old default exactly: no names report,
+    # and no mypy [operator] error either (the plugin asks mypy's own
+    # rule whether the code is on before it reports).
+    fixture = FIXTURES / "names_opt_in.py"
+    default = _messages_by_line(run_mypy(fixture))
+    on = _messages_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    off = _messages_by_line(run_mypy(fixture, flags=NAMES_OFF))
+    assert default == on, default
+    assert len(default) == 12 and sum("[numty-names]" in t for ts in default.values() for t in ts) == 11, default
+    assert sorted(off) == [30] and len(off[30]) == 1 and off[30][0].endswith("[numty-broadcast]"), off
+    # Every other way to turn it off is the same names-off mode: the
+    # config file, a per-module section, and a `# mypy:` comment.
+    routes = {
+        "config": ("disable_error_code = numty-names\n", ""),
+        "per-module": ("[mypy-gen]\ndisable_error_code = numty-names\n", ""),
+        "inline": ("", '# mypy: disable-error-code="numty-names"\n'),
+    }
+    for name, (config, header) in routes.items():
+        assert _names_route_run(tmp_path / name, config, header) == off, name
+    # A per-module section for another module leaves this one on, and an
+    # enable beats a disable, as everywhere in mypy.
+    assert _names_route_run(tmp_path / "other", "[mypy-elsewhere]\ndisable_error_code = numty-names\n") == on
+    assert _names_route_run(
+        tmp_path / "both", "", flags=("--disable-error-code", "numty-names", "--enable-error-code", "numty-names")
+    ) == on
+    assert _names_route_run(
+        tmp_path / "module-on",
+        "disable_error_code = numty-names\n[mypy-gen]\nenable_error_code = numty-names\n",
+    ) == on
+    # numty-names is not a sub-code of misc: disabling misc leaves it on
+    # (and turns off line 30's [numty-broadcast], which is one).
+    names_only = {line: texts for line, texts in on.items() if line != 30}
+    assert _names_route_run(tmp_path / "misc", "disable_error_code = misc\n") == names_only
+
+
 def test_index_overrun_certain_or_possible() -> None:
     # A recorded size above the axis is an error by default only when the
     # index holds every position below it (`arange`, `argsort`). For
     # `searchsorted`, `argmax` and `flatnonzero` the size is an upper
     # bound on the values: the usual ways to use such positions safely
     # (fix in place, `out=`, a guard, values known to be in range) are
-    # clean, and the possible overrun is an opt-in report.
+    # clean, and the possible overrun is a numty-names report (on by default).
     fixture = FIXTURES / "bad_index_overrun.py"
-    off = _errors_by_line(run_mypy(fixture))
+    off = _errors_by_line(run_mypy(fixture, flags=NAMES_OFF))
     assert sorted(off) == [13, 14, 16], off
     for line in (13, 14, 16):
         assert len(off[line]) == 1 and off[line][0].endswith("[numty-axis]"), off
@@ -5649,10 +5755,10 @@ def test_return_transposed_is_not_let_through() -> None:
 
 def test_index_record_survives_a_selection() -> None:
     # Issue 305: `rows[known]`, `rows[1:]` and `rows[order]` still hold
-    # positions on the size `rows` does. Silent by default, like every
+    # positions on the size `rows` does. Silent with numty-names off, like every
     # report of one named size on an axis of another.
     fixture = FIXTURES / "index_selection.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
     assert sorted(on) == [15, 17, 19, 20, 31], on
@@ -5825,7 +5931,7 @@ def test_optional_average_weights() -> None:
     # Issue 331: `weights: F64[7] | None` is checked and solved per member
     # (it was `ndarray[Any, Any]` and silent); named sizes are numty-names.
     fixture = FIXTURES / "bad_optional_weights.py"
-    result = run_mypy(fixture)
+    result = run_mypy(fixture, flags=NAMES_OFF)
     errors = _errors_by_line(result)
     assert sorted(errors) == [15, 16], result.stdout
     for line in (15, 16):
@@ -5895,7 +6001,7 @@ def test_bad_union_callsite() -> None:
     # Issue 331: a union (or optional) actual is checked per member at a
     # call of a user function; co-derived actuals pair index-wise.
     fixture = FIXTURES / "bad_union_callsite.py"
-    result = run_mypy(fixture)
+    result = run_mypy(fixture, flags=NAMES_OFF)
     errors = _errors_by_line(result)
     assert sorted(errors) == [23, 24], result.stdout
     for line in (23, 24):
@@ -6075,7 +6181,7 @@ def test_own_size_a_constant_apart() -> None:
     # worded like `N-2` against `N-1`, not two names, and the `np.where`
     # around one no longer gets a `tuple[Never, ...]` [arg-type].
     fixture = FIXTURES / "bad_own_size_offset.py"
-    for result in (run_mypy(fixture), run_mypy(fixture, flags=("--enable-error-code", "numty-names"))):
+    for result in (run_mypy(fixture, flags=NAMES_OFF), run_mypy(fixture)):
         assert result.returncode == 1, result.stdout
         errors = _errors_by_line(result)
         assert sorted(errors) == [16, 18, 19, 21, 24], result.stdout
@@ -6091,10 +6197,10 @@ def test_own_size_a_constant_apart() -> None:
         "operands could not be broadcast together with shapes (3,) (4,)",
     ]
     # A call or a mask variable in a loop or a comprehension gives a size
-    # per run: two runs may differ by one, so only the opt-in reports it,
+    # per run: two runs may differ by one, so only numty-names reports it,
     # as `1 apart` and with no [operator] follow-on.
     fixture = FIXTURES / "own_size_offset_loop_ok.py"
-    assert run_mypy(fixture).returncode == 0
+    assert run_mypy(fixture, flags=NAMES_OFF).returncode == 0
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
     errors = _errors_by_line(on)
     assert sorted(errors) == [17, 22, 24], on.stdout
@@ -6222,7 +6328,7 @@ def test_bad_callsite_posonly() -> None:
         "call-site shape conflict for 'U': 3 (argument 'Z', axis 1)"
         " vs 4 (argument 'delta', axis 1)  [numty-callsite]"
     )
-    assert _messages_by_line(run_mypy(fixture)) == {27: [conflict]}
+    assert _messages_by_line(run_mypy(fixture, flags=NAMES_OFF)) == {27: [conflict]}
     on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
     names = (
         "call-site binding of 'U' (argument 'Z', axis 1, and argument 'delta', axis 1):"
@@ -6337,18 +6443,19 @@ def test_held_function_and_masked_array() -> None:
         "MaskedArray (2,) (2,)",
     ]
     bad = FIXTURES / "bad_aliases.py"
-    for flags in ((), ("--enable-error-code", "numty-names")):
+    for flags in (NAMES_OFF, ()):
+        names_on = flags != NAMES_OFF
         result = run_mypy(bad, flags=flags)
         assert result.returncode == 1, result.stdout
         errors = _errors_by_line(result)
-        assert sorted(errors) == ([13, 18, 23, 28, 30] if flags else [13, 18, 23]), result.stdout
+        assert sorted(errors) == ([13, 18, 23, 28, 30] if names_on else [13, 18, 23]), result.stdout
         assert 'got "ndarray[tuple[M], dtype[float64]]", expected "ndarray[tuple[N]' in errors[13][0]
         assert 'got "MaskedArray[tuple[Literal[3]], dtype[float64]]"' in errors[18][0], result.stdout
         # The MaskedArray operator also gets mypy's [operator] follow-on:
         # the duplicate suppression (issue 148) covers ndarray's only.
         assert errors[23][0].endswith("N-1 vs N (shapes (N-1, M) vs (N, M))  [numty-broadcast]"), result.stdout
         assert len(errors[23]) == 2 and errors[23][1].endswith("[operator]"), result.stdout
-        if flags:
+        if names_on:
             assert "(shapes (M,) vs (N,)): M and N are different names  [numty-names]" in errors[28][0]
             assert "(shapes (N,) vs (N, M)): N and M are different names  [numty-names]" in errors[30][0]
     assert _run_fixture("bad_aliases.py") == [
@@ -6360,12 +6467,12 @@ def test_held_function_and_masked_array() -> None:
 
 def test_matmul_names_optin() -> None:
     # Issue 326: a contraction over two different names (the forgotten
-    # `.T`) was silent even under numty-names. By default it stays silent
+    # `.T`) was silent even under numty-names. With the code off it stays silent
     # and keeps the outer dims, which are the result's own whenever the
-    # call runs; under the opt-in code each spelling is reported once,
+    # call runs; under numty-names (the default) each spelling is reported once,
     # with no [operator] or [arg-type] follow-on.
     fixture = FIXTURES / "bad_matmul_names_optin.py"
-    off = run_mypy(fixture)
+    off = run_mypy(fixture, flags=NAMES_OFF)
     assert off.returncode == 0, off.stdout
     notes = reveals_by_line(off)
     for line in (19, 20, 21, 22):

@@ -380,3 +380,32 @@ def test_numpy_alias_is_shared_by_convert_and_codmod() -> None:
     assert numpy_alias(ast.parse("import os, numpy\n")) == "numpy"
     assert numpy_alias(ast.parse("from numpy import zeros\n")) is None
     assert numty_codmod.numpy_alias is numpy_alias
+
+
+def test_code_enabled_follows_mypys_rule() -> None:
+    # Issue 327: numty-names is on by default, and a hook that reports
+    # it while mypy has it disabled fails the overload mypy is checking
+    # (an [operator] error out of nowhere). `_code_enabled` must agree
+    # with mypy's own `Errors.is_error_code_enabled` for every mix of
+    # enabled and disabled codes, parent codes included.
+    import itertools
+
+    from mypy.errorcodes import MISC
+    from mypy.errors import Errors
+    from mypy.options import Options
+
+    from numty_plugin._errors import NUMTY_CAST, NUMTY_NAMES, NUMTY_SHAPE, _code_enabled
+
+    assert NUMTY_NAMES.default_enabled and not NUMTY_CAST.default_enabled
+    codes = (NUMTY_NAMES, NUMTY_CAST, NUMTY_SHAPE)
+    for code in codes:
+        others = (code, MISC)
+        for disabled, enabled in itertools.product(
+            itertools.product((False, True), repeat=len(others)), repeat=2
+        ):
+            options = Options()
+            options.disabled_error_codes = {c for c, on in zip(others, disabled) if on}
+            options.enabled_error_codes = {c for c, on in zip(others, enabled) if on}
+            expected = Errors(options).is_error_code_enabled(code)
+            assert _code_enabled(options, code) == expected, (code, disabled, enabled)
+    assert not _code_enabled(None, NUMTY_NAMES)
