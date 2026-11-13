@@ -184,7 +184,9 @@ one declared shape: a name typed `list[...]`, or a list comprehension
 `t.field` all count). `stack` inserts an unknown at the stacked axis.
 `concatenate`, `vstack`, `hstack`, `dstack` and `column_stack` make the
 joined axis unknown. Every other dim and the item dtype carry over, and
-an out-of-range axis is still an error. Items with no declared shape (a
+an out-of-range axis is still an error. An `int` size in the items is a
+shape too and stays `int` (`np.column_stack(columns)` with `columns:
+list[F64[int]]` is `(int, ?U)`, `tests/fixtures/join_int_items.py`). Items with no declared shape (a
 bare `np.ndarray`) or with different shapes still bail with
 `[numty-bail]` (see [Error codes](../reference/error-codes.md)).
 

@@ -16,6 +16,7 @@ from ._forms import _LinForm, _form_has_unknown, _lin_add
 from ._heads import _record_index_on
 
 from ._types import (
+    _dims_provably_ne, _report_mask_names, _report_names,
     _int_value, _dim_value, _dim_eq, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims,
     _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg,
 )
@@ -1300,6 +1301,38 @@ def count_nonzero_function_hook(ctx: FunctionContext) -> Type:
                 code=NUMTY_AXIS,
             )
             return ctx.default_return_type
+    return ctx.default_return_type
+
+
+def bincount_function_hook(ctx: FunctionContext) -> Type:
+    """`np.bincount(x, weights=w)`: one weight per entry of `x` (issue 317).
+
+    numpy raises "The weights and list don't have the same length", with
+    no broadcasting. Provably different sizes are an error; two
+    different names, or a selection count against a name, are reported
+    under the opt-in code. The result keeps the stubs' type.
+    """
+    try:
+        pairs = _all_positionals(ctx)
+        found = _formal_pair(ctx, "weights")
+        if not pairs or found is None or _is_none_type(found[0]):
+            return ctx.default_return_type
+        xs, ws = _ndarray_parts(pairs[0][0]), _ndarray_parts(found[0])
+        if xs is None or ws is None or len(xs[0]) != 1 or len(ws[0]) != 1:
+            return ctx.default_return_type
+        a, b = xs[0][0], ws[0][0]
+        differ = (a != b) if isinstance(a, int) and isinstance(b, int) else _dims_provably_ne(a, b)
+        if differ:
+            ctx.api.fail(
+                f"bincount weights must have the length of x: {_dims_str([b])} vs {_dims_str([a])}",
+                ctx.context,
+                code=NUMTY_SHAPE,
+            )
+        elif not _dim_eq(a, b):
+            _report_names(ctx, a, b, "bincount x and weights")
+            _report_mask_names(ctx, a, b, "bincount x and weights")
+    except Exception:
+        _swallowed(ctx, "bincount_function_hook")
     return ctx.default_return_type
 
 

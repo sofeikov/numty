@@ -1308,9 +1308,11 @@ def _dynamic_sequence_element(
     expression. Anything else (bare lists, generators, unknown or
     mixed elements) stays unprovable.
     """
+    # An `int` size in the items is a shape too (issue 316): the rank is
+    # known, and that axis stays `int` in the result.
     if isinstance(expr, ListComprehension):
         item = _element_expr_type(ctx, expr.generator.left_expr)
-        return _ndarray_parts(item) if item is not None else None
+        return (_ndarray_parts(item) or _known_rank_parts(item)) if item is not None else None
     proper = get_proper_type(tp)
     if not (
         isinstance(proper, Instance)
@@ -1318,7 +1320,7 @@ def _dynamic_sequence_element(
         and proper.args
     ):
         return None
-    return _ndarray_parts(proper.args[0])
+    return _ndarray_parts(proper.args[0]) or _known_rank_parts(proper.args[0])
 
 
 def concatenate_function_hook(ctx: FunctionContext) -> Type:

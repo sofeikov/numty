@@ -25,6 +25,15 @@ a slice bounded by a literal on one (`a[:, :3]`) bails out, since numpy
 clips a bound past the end. Indexing every axis
 with integers yields a scalar, which the plugin leaves to the stubs.
 
+## Iterating and unpacking
+
+`for row in m` and `xs, ys = points.T` give items with the first axis
+removed: a row of `F64[3, 2]` is `(2,)`, and the two halves of a
+`(2, ?U)` array are `(?U,)` each. With a literal first axis, an
+unpacking into another number of names is an error (`a, b =
+np.zeros((3, 2))`, `tests/fixtures/array_unpack.py`). A rank-1 array
+gives scalars, which stay with the stubs.
+
 ## Bounds over `int` variables
 
 A bound that is a formula over `int` variables is read as one: a
@@ -82,6 +91,11 @@ the overrun is only possible, and that report is under the opt-in
 `[numty-names]` code (`enable_error_code = numty-names`), like a
 different *named* size. A variable rebound between uses loses its
 record (`idx = searchsorted(...); idx = clip(idx, ...)` checks clean),
+and so does a call wrapped in another one where it is assigned
+(`idx = np.clip(np.searchsorted(a, v), 0, len(a) - 1)`,
+`tests/fixtures/index_clip_ok.py`). An index assigned in both branches
+of an `if` is checked for each branch
+(`tests/fixtures/union_index_optin.py`),
 and a same-module plain call checks the actual's record against the
 formal's `Index` under the same opt-in code:
 
