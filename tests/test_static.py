@@ -6726,3 +6726,17 @@ def test_index_kept_names_catch_later_bugs() -> None:
     ], on
     raised = ["ValueError", "ValueError", "ValueError", "IndexError", "IndexError"]
     assert _run_fixture("bad_index_kept_names.py") == raised
+
+
+def test_clash_unknown_is_not_absorbed_by_a_later_name() -> None:
+    # Follow-up to issue 333: a name against an unknown keeps the name,
+    # but not against the unknown minted where two different names met
+    # (role "clash"), nor one carried from it; otherwise a missing
+    # `[:, None]` reaches a declared return unnoticed with names off.
+    off = _messages_by_line(run_mypy(FIXTURES / "bad_clash_unknown.py", flags=NAMES_OFF))
+    assert sorted(off) == [22, 26], off
+    assert all("[return-value]" in m and "?U@" in m for line in off.values() for m in line), off
+    on = _messages_by_line(run_mypy(FIXTURES / "bad_clash_unknown.py"))
+    assert sorted(on) == [21, 26], on
+    assert all("D and N are different names  [numty-names]" in m for line in on.values() for m in line), on
+    assert _run_fixture("bad_clash_unknown.py") == ["ValueError", "[2.0, 1.5, 1.3333333333333333]", "(3, 3)", "(2, 3)"]
