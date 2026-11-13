@@ -152,11 +152,14 @@ quiet, where it is approximate, and what to write instead.
     so is an `int` target size on an axis where the input had a literal:
     `x.reshape(-1, d)` is `tuple[Any, Any]`); `gradient` along one axis
     keeps the operand's type and still checks the axis;
-    `np.dot`/`np.matmul` take an `int` dim as matching and keep the outer
+    `np.dot`/`np.matmul`/`@` take an `int` dim as matching and keep the outer
     dims (`(n, 3)` by `(3, 3)` is `tuple[int, Literal[3]]`, while 3 against
     4 is an error as for literal shapes; an `int` dim landing on an axis
     where an operand has a literal turns unknown, so `(n, 3)` by `(3, k)`
-    is `tuple[Any, Any]`); transposes move the literal with its axis;
+    is `tuple[Any, Any]`). Next to named dims it is the same rule:
+    `(N, int) @ (int, H)` is `(N, H)` and `(int, N) @ (N, M)` is `(int, M)`
+    (issue 333, `tests/fixtures/matmul_int_dim_ok.py`); `linalg.svd` and
+    `linalg.qr` read an `int` dim as a size too; transposes move the literal with its axis;
     arithmetic, comparisons, `&`, `|` and `^` between two arrays keep the
     rank, make each `int` axis unknown and still check the named axes
     (`a[:, 1:] | a` with `a: Bool[int, N]` is `N-1 vs N`);

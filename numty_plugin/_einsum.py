@@ -11,7 +11,8 @@ from ._errors import (
     _swallowed,
 )
 from ._types import (
-    _dim_eq, _dim_str, _dims_provably_ne, _ndarray_parts, _ndarray_type,
+    _dim_eq, _dim_str, _dims_provably_ne, _mask_counts_differ, _named_sizes_differ, _names_enabled,
+    _ndarray_parts, _ndarray_type, _report_mask_names, _report_names,
 )
 from ._reshape import (
     _all_positionals_expanded, _dims_str, _formal_pair, _promote_all,
@@ -19,7 +20,7 @@ from ._reshape import (
 
 if TYPE_CHECKING:
     from mypy.errorcodes import ErrorCode
-    from mypy.nodes import CallExpr, StrExpr
+    from mypy.nodes import CallExpr, Expression, StrExpr
     from mypy.plugin import FunctionContext, FunctionSigContext
     from mypy.types import CallableType, FunctionLike, Type
 
@@ -168,7 +169,14 @@ def _einsum_solve(
                         NUMTY_SHAPE,
                     )
                 else:
-                    # Symbolic vs anything unprovable: bail out.
+                    # Symbolic vs anything unprovable: bail out. Two
+                    # different names on one label are the opt-in
+                    # report (issue 326), as a matmul's inner pair is.
+                    if ctx is not None:
+                        first_dims = label_first_dims.get(label, [])
+                        where = f"einsum label '{label}' (shapes {_dims_str(first_dims)} vs {_dims_str(dims)})"
+                        _report_names(ctx, known, size, where)
+                        _report_mask_names(ctx, known, size, where)
                     return None, None
             bound_labels_seen.add(label)
     broadcast: list[int | Type] | None = None
@@ -208,6 +216,37 @@ def _einsum_solve(
         + ell_out
         + [label_size[label] for label in post]
     ), None
+
+
+def _widen_operands(sig: CallableType) -> CallableType:
+    """sig with Any for *operands, so mypy's fallback adds no arg-type errors."""
+    for i, kind in enumerate(sig.arg_kinds):
+        if kind == ARG_STAR:
+            new_arg_types = list(sig.arg_types)
+            new_arg_types[i] = AnyType(TypeOfAny.explicit)
+            return sig.copy_modified(arg_types=new_arg_types)
+    return sig
+
+
+def _einsum_names_clash(ctx: FunctionSigContext, operand_exprs: list[Expression], terms: list[str]) -> bool:
+    """Whether the function hook makes the opt-in names report (issue 326).
+
+    One label over two different names (`ij,jk` on (M, K) and (M, K)),
+    with `numty-names` on. Ellipsis terms and anything unreadable: no.
+    """
+    if not _names_enabled(ctx):
+        return False
+    label_size: dict[str, int | Type] = {}
+    for expr, term in zip(operand_exprs, terms):
+        part = _ndarray_parts(ctx.api.get_expression_type(expr))
+        parsed = _parse_einsum_term(term)
+        if part is None or parsed is None or parsed[2] or len(parsed[0]) != len(part[0]):
+            return False
+        for label, size in zip(parsed[0], part[0]):
+            known = label_size.setdefault(label, size)
+            if _named_sizes_differ(known, size) or _mask_counts_differ(known, size):
+                return True
+    return False
 
 
 def _einsum_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
@@ -250,13 +289,13 @@ def _einsum_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
                 return ctx.default_signature
             shapes.append(list(part[0]))
         _, problem = _einsum_solve(shapes, eq_expr.value, None)
-        if problem is None:
-            return ctx.default_signature
-        for i, kind in enumerate(sig.arg_kinds):
-            if kind == ARG_STAR:
-                new_arg_types = list(sig.arg_types)
-                new_arg_types[i] = AnyType(TypeOfAny.explicit)
-                return sig.copy_modified(arg_types=new_arg_types)
+        if problem is not None:
+            return _widen_operands(sig)
+        # The dry run bails on two different names; the function hook makes
+        # the opt-in names report there (issue 326), so widen for it too.
+        terms = "".join(eq_expr.value.split()).split("->")[0].split(",")
+        if _einsum_names_clash(ctx, operand_exprs, terms):
+            return _widen_operands(sig)
         return ctx.default_signature
     except Exception:
         _swallowed(ctx, "_einsum_signature_hook")

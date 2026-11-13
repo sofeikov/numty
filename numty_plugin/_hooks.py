@@ -53,9 +53,9 @@ from ._builders import (
 )
 from ._arange import arange_function_hook
 from ._matmul import (
-    _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, dot_function_hook,
-    dot_method_hook, matmul_method_hook, rmatmul_method_hook, imatmul_method_hook,
-    inner_function_hook, kron_function_hook, vdot_function_hook,
+    _matmul_names_report, _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook,
+    dot_function_hook, contraction_signature_hook, dot_method_hook, matmul_method_hook, rmatmul_method_hook,
+    imatmul_method_hook, inner_function_hook, kron_function_hook, vdot_function_hook,
     tensordot_function_hook,
 )
 from ._ops import (
@@ -207,8 +207,8 @@ class NumtyPlugin(Plugin):
             return _einsum_signature_hook
         if fullname == "numpy.linalg._linalg.cross":
             return _linalg_cross_signature_hook
-        if fullname.startswith("numpy.") or fullname.startswith("numty."):
-            return None
+        if fullname.startswith(("numpy.", "numty.")):
+            return contraction_signature_hook(fullname)  # np.dot, np.inner (issue 326), else None
         return self.callsite_signature_hook
 
     def callsite_signature_hook(self, ctx: FunctionSigContext) -> FunctionLike:
@@ -1366,7 +1366,7 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         if parts_a is not None and parts_b is not None:
             (dims_a, _), (dims_b, _) = parts_a, parts_b
             _, message = _matmul_result(dims_a, dims_b, None)
-            if message is None:
+            if message is None and not _matmul_names_report(ctx, dims_a, dims_b):
                 return ctx.default_signature
         else:
             _, message, _, _ = _matmul_unpack_dims(left_tp, right_tp)
