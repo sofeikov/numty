@@ -13,10 +13,11 @@ from mypy.types import (
 from mypy.subtypes import is_same_type
 
 from ._errors import NUMTY_BROADCAST, _swallowed
+from ._forms import _DivForm, _form_has_unknown, _forms_provably_ne, _LinForm
 from ._dtypes import _promote_strong, _promote_weak
 from ._types import (
     DTYPE_FULLNAME, NDARRAY_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve,
-    _ndarray_parts, _ndarray_type, _unpack_shape,
+    _ndarray_parts, _ndarray_type, _same_own_size, _unpack_shape,
 )
 from ._reshape import (
     _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _known_rank_parts, _promote_dtypes,
@@ -694,3 +695,61 @@ def _broadcast_types(
     if dtype is None:
         return _ndarray_type(ctx, dims, _default_dtype(ctx))
     return _ndarray_type(ctx, dims, dtype)
+
+
+def _named_size(d: int | Type) -> bool:
+    """A size spelled over names alone: no literal, `int`, `Any` or unknown."""
+    from numty_plugin import _resolve_dim
+    if not isinstance(d, TypeVarType):
+        return False
+    form = _resolve_dim(d)
+    return form is not None and not _form_has_unknown(form)
+
+
+def _inplace_never_fits(lhs_dims: list[int | Type], rhs_dims: list[int | Type]) -> bool:
+    """Whether no sizes make `rhs` broadcast into `lhs` unchanged (issue 329).
+
+    The result of `lhs <op>= rhs` must be `lhs` itself, so each value axis
+    is the target's size or 1. Two symbolic cases are errors the broadcast
+    rule does not see: a value size over names that grows a literal-1
+    target axis (`(N, 1, M) *= (N, N, 1)`: it fits only when N is 1, as
+    `4` into `1` does not), and literal value sizes that set one target
+    size to two values (`(d, d) += (2, 3)`: d would be 2 and 3). A literal
+    against one symbolic size alone, an `int`, an `Any` and an unknown
+    (`?U`) never count: some size fits them.
+    """
+    from numty_plugin import _resolve_dim
+    pinned: list[tuple[object, int]] = []
+    for l, r in zip(reversed(lhs_dims), reversed(rhs_dims)):
+        if isinstance(r, int) and r == 1:
+            continue
+        if _dim_eq(l, r) or _same_own_size(l, r):
+            continue
+        if isinstance(l, int) and l == 1 and _named_size(r):
+            return True
+        if isinstance(r, int) and _named_size(l):
+            pinned.append((_resolve_dim(l), r))
+    for i, (fa, ka) in enumerate(pinned):
+        for fb, kb in pinned[i + 1:]:
+            # fa == ka and fb == kb at once: fa-ka and fb-kb both zero.
+            if _forms_provably_ne(_shift_form(fa, -ka), _shift_form(fb, -kb)):
+                return True
+    return False
+
+
+def _shift_form(form: object, k: int) -> object:
+    """`form + k` for a linear or floored-division form, else None."""
+    if isinstance(form, _LinForm):
+        return form._replace(const=form.const + k)
+    if isinstance(form, _DivForm):
+        return form._replace(plus=form.plus + k)
+    return None
+
+
+def _inplace_shown_dim(l: int | Type, r: int | Type) -> int | Type:
+    """One axis of the in-place result as the message shows it."""
+    if (isinstance(r, int) and r == 1) or _dim_eq(l, r):
+        return l
+    if isinstance(l, int) and l == 1:
+        return r
+    return r if isinstance(r, int) else l

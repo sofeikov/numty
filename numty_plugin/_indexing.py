@@ -27,7 +27,7 @@ from ._returns import _module_ast
 from ._unknowns import _fresh_mask_count
 from ._ops import flatnonzero_function_hook
 from ._reshape import (
-    _all_positionals, _dims_str, _formal_pair, _is_none_type, _known_rank_parts, _movable_parts,
+    _all_positionals, _dims_str, _formal_pair, _is_none_type, _is_plain_int, _known_rank_parts, _movable_parts,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
 )
 from ._reductions import (
@@ -208,6 +208,62 @@ def _count_var_assignments(func_node: object | None, varname: str, deep: bool = 
     if isinstance(top_body, list):
         _walk(top_body)
     return count, is_param
+
+
+def _bound_in_loop(func_node: object | None, varname: str) -> bool:
+    """Whether `varname` may hold a value per run of a loop (issue 328).
+
+    A binding inside a `for` / `while` body, or as a `for` target, does;
+    so does a name with no binding of its own in the function that is
+    not a parameter (a comprehension variable, a walrus, a global).
+    """
+    from mypy.nodes import AssignmentStmt as _AssignmentStmt
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import ForStmt as _ForStmt
+    from mypy.nodes import FuncDef as _FuncDef
+    from mypy.nodes import WhileStmt as _WhileStmt
+
+    count, is_param = _count_var_assignments(func_node, varname, deep=True)
+    if count == 0:
+        return not is_param
+
+    def _names(lvalue: object) -> list[str]:
+        if isinstance(lvalue, NameExpr):
+            return [lvalue.name]
+        if isinstance(lvalue, (TupleExpr, ListExpr)):
+            return [n for item in getattr(lvalue, "items", []) or [] for n in _names(item)]
+        if isinstance(lvalue, StarExpr):
+            return _names(getattr(lvalue, "expr", None))
+        return []
+
+    def _walk(stmts: object, in_loop: bool) -> bool:
+        for stmt in stmts if isinstance(stmts, list) else []:
+            if isinstance(stmt, (_FuncDef, _ClassDef)):
+                continue
+            loop = in_loop or isinstance(stmt, (_ForStmt, _WhileStmt))
+            if loop:
+                if isinstance(stmt, _ForStmt) and varname in _names(stmt.index):
+                    return True
+                if isinstance(stmt, _AssignmentStmt) and any(varname in _names(lv) for lv in stmt.lvalues):
+                    return True
+            for inner in _nested_bodies(stmt):
+                if _walk(inner, loop):
+                    return True
+        return False
+
+    return _walk(getattr(getattr(func_node, "body", None), "body", None), False)
+
+
+def _mask_repeats(ctx: MethodContext | FunctionContext, mask_expr: Expression | None) -> bool:
+    """Whether the mask variable may hold a mask per run of a loop, so its count is several sizes."""
+    if not isinstance(mask_expr, NameExpr):
+        return True
+    try:
+        use_line = getattr(mask_expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+        return _bound_in_loop(_enclosing_func(ctx, use_line)[1], mask_expr.name)
+    except Exception:
+        _swallowed(ctx, "_mask_repeats")
+        return True
 
 
 def _single_rvalue(func_node: object | None, varname: str) -> Expression | None:
@@ -629,7 +685,7 @@ def _mask_count_for(ctx: MethodContext, mask_expr: Expression | None, dim: int) 
     if key is None:
         return _fresh_unknown(ctx, "mask", dim)
     try:
-        return _fresh_mask_count(ctx, key)
+        return _fresh_mask_count(ctx, key, _mask_repeats(ctx, mask_expr))
     except Exception:
         _swallowed(ctx, "_mask_count_for")
         return _fresh_unknown(ctx, "mask", dim)
@@ -652,7 +708,7 @@ def flatnonzero_mask_hook(ctx: FunctionContext) -> Type:
             if isinstance(expr, NameExpr) and parts is not None and _dtype_base(parts[1]) == "b":
                 key = _mask_var_key(ctx, expr)
                 if key is not None:
-                    count = _fresh_mask_count(ctx, key)
+                    count = _fresh_mask_count(ctx, key, _mask_repeats(ctx, expr))
     except Exception:
         _swallowed(ctx, "flatnonzero_mask_hook")
         count = None
@@ -1678,21 +1734,24 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
     if _union_members(ctx.type) is not None:
         _distribute_solve([ctx.type], lambda t: _getitem_types(ctx, t, index_pair))
         return ctx.default_return_type
-    parts = _ndarray_parts(ctx.type)
+    # Issue 329: a buffer with an `int` (or `Any`) axis has a known rank,
+    # so the axes that are known are still compared; the `int` axis
+    # itself is never an error (see `_unchecked_axis`).
+    parts = _ndarray_parts(ctx.type) or _movable_parts(ctx.type)
     if parts is None:
         # Unpack or unknown LHS: still solve for target errors, no value check.
         _getitem_types(ctx, ctx.type, index_pair)
         return ctx.default_return_type
     lhs_dims, lhs_dtype = parts
-    target_type = _solve_getitem(ctx, lhs_dims, lhs_dtype, index_pair)
-    target_parts = _ndarray_parts(target_type)
+    target_type = _solve_getitem(ctx, list(lhs_dims), lhs_dtype, index_pair)
+    target_parts = _ndarray_parts(target_type) or _movable_parts(target_type)
     if target_parts is None:
         # Scalar target (all ints), an error already emitted, or a bail.
         # Only the scalar case needs a value check here.
         if _scalar_key(value_type) is not None:
             return ctx.default_return_type
         if _is_scalar_target(ctx, ctx.type, index_pair):
-            value_parts = _ndarray_parts(value_type)
+            value_parts = _ndarray_parts(value_type) or _movable_parts(value_type)
             if value_parts is None or not value_parts[0]:
                 return ctx.default_return_type
             ctx.api.fail(
@@ -1705,7 +1764,7 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
     target_dims = target_parts[0]
     if _scalar_key(value_type) is not None:
         return ctx.default_return_type
-    value_parts = _ndarray_parts(value_type)
+    value_parts = _ndarray_parts(value_type) or _movable_parts(value_type)
     if value_parts is None:
         return ctx.default_return_type
     value_dims = value_parts[0]
@@ -1719,7 +1778,7 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
         return ctx.default_return_type
     offset = len(target_dims) - len(value_dims)
     for t, v in zip(target_dims[offset:], value_dims):
-        if _dim_eq(t, v):
+        if _dim_eq(t, v) or _unchecked_axis(t) or _unchecked_axis(v):
             continue
         if isinstance(v, int) and v == 1:
             continue
@@ -1746,6 +1805,14 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
     return ctx.default_return_type
 
 
+def _unchecked_axis(d: int | Type) -> bool:
+    """A plain `int` or `Any` size: nothing is known, so never an error (issue 329)."""
+    if isinstance(d, int):
+        return False
+    proper = get_proper_type(d)
+    return isinstance(proper, AnyType) or _is_plain_int(proper)
+
+
 def _is_scalar_target(
     ctx: MethodContext, tp: Type, pair: tuple[Type, Expression | None]
 ) -> bool:
@@ -1753,7 +1820,7 @@ def _is_scalar_target(
 
     Only for the fixed-rank path; unpack or unknown bails as non-scalar.
     """
-    parts = _ndarray_parts(tp)
+    parts = _ndarray_parts(tp) or _movable_parts(tp)
     if parts is None:
         return False
     dims, _ = parts

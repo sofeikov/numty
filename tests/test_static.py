@@ -5048,7 +5048,9 @@ def test_family_dtype_heads() -> None:
         38: f'"{_ND}[tuple[int, N], numpy.dtype[numpy.floating[Any]]]"',
         39: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
         40: '"numpy.floating[Any] | float"',
-        41: f'"{_ND}[tuple[N], numpy.dtype[Any]]"',
+        # Issue 331: the `floating | float` divisor distributes per member;
+        # both members keep the floating family (was dtype[Any]).
+        41: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
         42: f'"{_ND}[tuple[N], numpy.dtype[numpy.integer[Any]]]"',
         43: f'"{_ND}[tuple[N], numpy.dtype[Any]]"',
         44: f'"{_ND}[tuple[N], numpy.dtype[numpy.unsignedinteger[{_NB}_32Bit]]]"',
@@ -5673,3 +5675,406 @@ def test_polars_to_numpy_cast_chain() -> None:
         "(2,) float64",
         "float64 (3,)",
     ]
+
+
+# Issue 329: in-place results must equal a symbolic target, and indexed
+# assignment into a buffer with an `int` axis checks the known axes.
+def test_bad_inplace_symbolic_fit() -> None:
+    # A size over names that grows a literal-1 axis fits only at size 1,
+    # as `4` into `1` does not; literal value sizes that set one target
+    # size to two values fit no size. An `int` target axis keeps the
+    # other axes checked.
+    result = run_mypy(FIXTURES / "bad_inplace_symbolic_fit.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [15, 19, 23, 28], result.stdout
+    assert "in-place result (N, N, M) does not fit target (N, 1, M)" in errors[15][0], result.stdout
+    assert "in-place result (2, 3) does not fit target (d, d)" in errors[19][0], result.stdout
+    assert "in-place result (3, 3) does not fit target (N, N+1)" in errors[23][0], result.stdout
+    assert "N vs N+1" in errors[28][0], result.stdout
+    for line in errors:
+        assert errors[line][0].endswith("[numty-broadcast]"), result.stdout
+    assert _run_fixture("bad_inplace_symbolic_fit.py") == [
+        "non-broadcastable output operand",
+        "operands could not be broadcast together",
+    ]
+
+
+def test_bad_setitem_int_axis() -> None:
+    result = run_mypy(FIXTURES / "bad_setitem_int_axis.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 19], result.stdout
+    assert "cannot assign value of shape (N+1,) into target of shape (N,)" in errors[14][0], result.stdout
+    assert "cannot assign value of shape (N, 4) into target of shape (N, 3)" in errors[19][0], result.stdout
+    assert _run_fixture("bad_setitem_int_axis.py") == ["could not broadcast input array from shape (5,)"]
+
+
+def test_inplace_setitem_int_ok() -> None:
+    # A literal against one symbolic size, two different names, and an
+    # `int` axis on either side are never errors by themselves.
+    result = run_mypy(FIXTURES / "inplace_setitem_int_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[24] == f'"numpy.ndarray[tuple[N, N, M], {_F64}]"', result.stdout
+    assert notes[43] == f'"numpy.ndarray[tuple[N, int], {_F64}]"', result.stdout
+    assert _run_fixture("inplace_setitem_int_ok.py") == ["ok"]
+
+
+def test_own_size_bindings() -> None:
+    # Issue 332: a local returned under a free name takes it at every
+    # binding that holds one size (a tuple target, a conditional, both
+    # branches of an `if`, where an `int` fits); `np.nonzero(m)[0]` is a
+    # selection count as `np.flatnonzero(m)` is, and fits `I64[K]` and
+    # `Intp[K]`; a free name next to an `int` axis is an unknown at the
+    # call (it was `Never`); a property read through a union receiver
+    # is the object's size (it leaked the class's raw `K`).
+    result = run_mypy(FIXTURES / "own_size_bindings.py")
+    assert result.returncode == 0, result.stdout
+    assert "error:" not in result.stdout
+    notes = reveals_by_line(result)
+    assert notes[86] == f'"numpy.ndarray[tuple[?k.K], {_F64}]"', result.stdout
+    assert notes[103] == f'"numpy.ndarray[tuple[?R@102, int], {_F64}]"', result.stdout
+    assert notes[104] == (
+        f'"tuple[numpy.ndarray[tuple[?R@104, int], {_F64}], numpy.ndarray[tuple[?R@104], {_F64}]]"'
+    ), result.stdout
+    assert _run_fixture("own_size_bindings.py") == [
+        "(2,) (2,) (2,)",
+        "(0,) (2,)",
+        "(2,) (2,) (2,)",
+        "(3, 2) (3, 2) (3,)",
+        "(4,) 3",
+    ]
+    on = run_mypy(FIXTURES / "own_size_bindings.py", flags=("--enable-error-code", "numty-names"))
+    assert "error:" not in on.stdout, on.stdout
+
+
+def test_own_size_rebound() -> None:
+    # Issue 332: a rebound parameter or local takes the free name where
+    # it is rebound. mypy's default keeps a variable's first type, so
+    # there the rebinding is mypy's own [assignment] error, and so is
+    # the second branch of `grad` (its (N, N, D) is not (N, N, K)): the
+    # binding that disagrees, not the first `return`. With redefinition
+    # allowed the file checks clean.
+    fixture = FIXTURES / "own_size_rebound.py"
+    errors = _errors_by_line(run_mypy(fixture))
+    assert sorted(errors) == [21, 22, 27, 28, 35], errors
+    for line in (21, 27):
+        assert errors[line][0].endswith("[assignment]") and '"ndarray[tuple[K]' in errors[line][0], errors
+    assert errors[35][0].endswith("[assignment]") and "tuple[N, N, D]" in errors[35][0], errors
+    clean = run_mypy(fixture, flags=("--allow-redefinition",))
+    assert clean.returncode == 0, clean.stdout
+    assert _run_fixture("own_size_rebound.py") == ["(2,) (2,) (2, 2, 1)"]
+
+
+def test_bad_own_size_bindings() -> None:
+    # Issue 332: two selection counts under one free name are still
+    # refused when a local holds them: the binding that disagrees keeps
+    # its own size and is reported there (at the `return` with
+    # redefinition allowed). A plain local is no declaration, so a
+    # rebinding of one that holds `K` does not take `K` from it, and a
+    # name a parameter binds still refuses `np.nonzero(m)[0]`.
+    fixture = FIXTURES / "bad_own_size_bindings.py"
+    errors = _errors_by_line(run_mypy(fixture))
+    assert sorted(errors) == [17, 27, 33, 42, 46, 50, 56], errors
+    for line in (17, 27, 56):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[assignment]"), errors
+    for line in (33, 42, 46, 50):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), errors
+    assert "?J@41" in errors[42][0], errors
+    assert '"ndarray[tuple[?U@50]' in errors[50][0] and "tuple[N]" in errors[50][0], errors
+    redef = _errors_by_line(run_mypy(fixture, flags=("--allow-redefinition",)))
+    assert sorted(redef) == [18, 28, 33, 42, 46, 50], redef
+    assert all(text.endswith("[return-value]") for texts in redef.values() for text in texts), redef
+    assert _run_fixture("bad_own_size_bindings.py") == ["(2,) (1,)"]
+
+
+# Issue 331: unions with `None` or a scalar, `.T`, call-site binding and
+# co-derived pairing on unions.
+
+
+def test_optional_average_weights() -> None:
+    # Issue 331: `weights: F64[7] | None` is checked and solved per member
+    # (it was `ndarray[Any, Any]` and silent); named sizes are numty-names.
+    fixture = FIXTURES / "bad_optional_weights.py"
+    result = run_mypy(fixture)
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [15, 16], result.stdout
+    for line in (15, 16):
+        assert "average weights length 7 does not match axis 1 size 2" in errors[line][0], result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[Literal[2]], {_F64}]"',
+        13: f'"{_ND}[tuple[Literal[2]], {_F64}]"',
+        14: f'"{_ND}[tuple[K], {_F64}]"',
+    }, result.stdout
+    on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    assert sorted(on) == [15, 16, 17], on
+    assert "N and K are different names  [numty-names]" in on[17][0], on
+
+
+def test_union_scalar_ok() -> None:
+    # Issue 331: `F64[M] | float` and a `float | int` threshold keep the
+    # shape (they were `ndarray[Any, Any]` and `(Any, ...)`).
+    result = run_mypy(FIXTURES / "union_scalar_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[N, M], {_F64}]"',
+        13: f'"{_ND}[tuple[N, M], {_F64}]"',
+        14: f'"{_ND}[tuple[N, M], {_F64}]"',
+        20: f'"{_ND}[tuple[N], {_BOOL}]"',
+        21: f'"{_ND}[tuple[N], {_BOOL}]"',
+    }, result.stdout
+
+
+def test_bad_union_scalar() -> None:
+    # Issue 331: the array member of `F64[3] | float` is checked.
+    result = run_mypy(FIXTURES / "bad_union_scalar.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [6, 7], result.stdout
+    assert all(len(errors[line]) == 1 for line in (6, 7)), result.stdout
+    assert "(shapes (2, 2) vs (3,))  [numty-broadcast]" in errors[6][0], result.stdout
+    assert "(shapes (3,) vs (2, 2))  [numty-broadcast]" in errors[7][0], result.stdout
+
+
+def test_union_concat_ok() -> None:
+    # Issue 331: concatenate / hstack over an if-joined union distribute
+    # per member (they were `(Any, ...)`); a loop accumulator still ends
+    # on the stubs, not on the members of the last pass.
+    result = run_mypy(FIXTURES / "union_concat_ok.py", flags=("--allow-redefinition",))
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        13: f'"{_ND}[tuple[N+1], {_F64}] | {_ND}[tuple[?U@12+1], {_F64}]"',
+        14: f'"{_ND}[tuple[2*N], {_F64}] | {_ND}[tuple[2*?U@12], {_F64}]"',
+        15: f'"{_ND}[tuple[N+1], {_F64}] | {_ND}[tuple[?U@12+1], {_F64}]"',
+        23: (
+            f'"{_ND}[tuple[Literal[0], Literal[3]], {_F64}] | {_ND}[tuple[Literal[1], Literal[3]], {_F64}]'
+            f' | {_ND}[tuple[Any, ...], numpy.dtype[Any]]"'
+        ),
+    }, result.stdout
+
+
+def test_union_transpose_ok() -> None:
+    # Issue 331: `.T` of `(M, N) | (Any, ...)` had the untransposed (M, N)
+    # as a third member, which failed the return.
+    result = run_mypy(FIXTURES / "union_transpose_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[N, M], {_F64}] | {_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+    }, result.stdout
+
+
+def test_bad_union_callsite() -> None:
+    # Issue 331: a union (or optional) actual is checked per member at a
+    # call of a user function; co-derived actuals pair index-wise.
+    fixture = FIXTURES / "bad_union_callsite.py"
+    result = run_mypy(fixture)
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [23, 24], result.stdout
+    for line in (23, 24):
+        assert len(errors[line]) == 1, result.stdout
+        assert "call-site shape conflict for 'N': 3" in errors[line][0], result.stdout
+        assert errors[line][0].endswith("[numty-callsite]"), result.stdout
+    on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    assert sorted(on) == [23, 24, 29], on
+    assert "call-site binding of 'T'" in on[29][0] and "T and N are different names" in on[29][0], on
+
+
+def test_union_append_ok() -> None:
+    # Issue 331: `np.append(1 - y, y)` with `y` a union pairs the members
+    # index-wise; the cartesian (N, 3*K) member was impossible.
+    result = run_mypy(FIXTURES / "union_append_ok.py", flags=("--allow-redefinition",))
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        14: f'"{_ND}[tuple[N, 2*K], {_F64}] | {_ND}[tuple[N, 4*K], {_F64}]"',
+    }, result.stdout
+
+
+# Issue 324: a string-spec word and the declared TypeVar of the same name
+# are one size: a bare or string body annotation, a union local, a local
+# variable named like the word, and overloads (formula specs included).
+def test_strspec_declared_word_ok() -> None:
+    result = run_mypy(FIXTURES / "strspec_declared_word_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        77: f'"tuple[{_ND}[tuple[K, G], {_F64}], {_ND}[tuple[K], {_F64}]]"',
+        81: f'"{_ND}[tuple[Literal[3], Literal[3]], {_F64}]"',
+        82: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}]"',
+        83: f'"tuple[{_ND}[tuple[Literal[2], Literal[3]], {_F64}], {_ND}[tuple[Literal[2]], {_F64}]]"',
+        84: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}]"',
+    }, result.stdout
+    assert _run_fixture("strspec_declared_word_ok.py") == [
+        "(3, 3)",
+        "(5, 3)",
+        "[(2, 3), (2,)]",
+        "(5, 3)",
+        "[(2, 4), (2,)]",
+    ]
+
+
+# Issue 324: the bad twin. Sharing the word's size must not merge it
+# with others: a size the body binds alone stays its own (it once took
+# an id of a signature word), and real mismatches are still reported.
+def test_bad_strspec_declared_word() -> None:
+    result = run_mypy(FIXTURES / "bad_strspec_declared_word.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 18, 19, 24, 35], result.stdout
+    got_t = 'type "ndarray[tuple[T], dtype[float64]]", variable has type "ndarray[tuple[N]'
+    got_r = 'type "ndarray[tuple[R], dtype[float64]]", variable has type "ndarray[tuple[N]'
+    assert got_t in errors[14][0], result.stdout
+    assert got_r in errors[19][0], result.stdout
+    assert "tuple[n_samples, n_features]" in errors[24][0], result.stdout
+    assert "tuple[n_features, n_samples]" in errors[24][0], result.stdout
+    assert "tuple[Literal[3], Literal[3]]" in errors[35][0], result.stdout
+    assert all(text.endswith("[assignment]") for line in errors.values() for text in line), result.stdout
+    assert _run_fixture("bad_strspec_declared_word.py") == ["(3, 3)"]
+
+
+def _run_mypy_env(
+    path: Path, cache: Path, *, strict: bool
+) -> "subprocess.CompletedProcess[str]":
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    env.pop("NUMTY_STRICT", None)
+    if strict:
+        env["NUMTY_STRICT"] = "1"
+    return subprocess.run(
+        [sys.executable, "-m", "mypy", "--cache-dir", str(cache), str(path)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+def test_strict_mode_keeps_every_type(tmp_path: Path) -> None:
+    # Issue 334: NUMTY_STRICT=1 changed what was inferred. Its report was
+    # raised inside mypy's overload, union and operator checks, which
+    # take any error as "this does not match": correct calls got
+    # [call-overload] / [operator] / [arg-type] and other types. The
+    # same file now gives identical output apart from [numty-unsolved].
+    fixture = FIXTURES / "strict_mode.py"
+    plain = _run_mypy_env(fixture, tmp_path / "plain", strict=False)
+    strict = _run_mypy_env(fixture, tmp_path / "strict", strict=True)
+    assert plain.returncode == 1 and strict.returncode == 1, strict.stdout
+    assert reveals_by_line(plain) == reveals_by_line(strict), (plain.stdout, strict.stdout)
+    lines = strict.stdout.splitlines()
+    unsolved = [line for line in lines if line.endswith("[numty-unsolved]")]
+    others = [line for line in lines if not line.endswith("[numty-unsolved]") and not line.startswith("Found ")]
+    assert others == [line for line in plain.stdout.splitlines() if not line.startswith("Found ")], (
+        plain.stdout,
+        strict.stdout,
+    )
+    # Only calls numty does not solve: not `.dtype`, `finfo(...).eps` or
+    # a `for` over range() (lines 35-38), and not the in-place ops, whose
+    # shapes are checked (39-42; 42 is the broadcast error).
+    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16, 22, 27, 29, 31], strict.stdout
+    errors = _errors_by_line(plain)
+    assert sorted(errors) == [42], plain.stdout
+    assert "H vs H-1" in errors[42][0] and errors[42][0].endswith("[numty-broadcast]"), plain.stdout
+
+
+def test_strict_mode_fixture_keeps_eps_shape() -> None:
+    # Issue 334: the eps sum keeps its shape (strict made it Any, with an
+    # [operator] error). A union argsort stays the stubs' answer in both
+    # modes: solving it per member made free-name returns of rebound
+    # locals fail on correct code (sklearn's _binary_clf_curve).
+    notes = reveals_by_line(run_mypy(FIXTURES / "strict_mode.py"))
+    assert notes[21] == f'"{_ND}[tuple[c], {_F64}]"', notes
+
+
+def test_strict_mode_is_in_the_cache_key(tmp_path: Path) -> None:
+    # Issue 334: a NUMTY_STRICT=1 run on a cache written without it
+    # reported the cached success. The setting is plugin config data now.
+    fixture = FIXTURES / "strict_mode.py"
+    cache = tmp_path / "cache"
+    first = _run_mypy_env(fixture, cache, strict=False)
+    assert "[numty-unsolved]" not in first.stdout, first.stdout
+    second = _run_mypy_env(fixture, cache, strict=True)
+    assert "[numty-unsolved]" in second.stdout, second.stdout
+    third = _run_mypy_env(fixture, cache, strict=False)
+    assert "[numty-unsolved]" not in third.stdout, third.stdout
+
+
+
+def test_size_int_is_a_scalar_in_arithmetic(tmp_path: Path) -> None:
+    # Issue 325: an `int` typed by a size TypeVar (`X.shape[0]`, `len(X)`)
+    # is a Python int in array arithmetic, like `float(X.shape[0])` is a
+    # Python float: `X / len(X)` kept no rank, and under NUMTY_STRICT=1
+    # `n_samples * p` was Any. The transposed covariance and the mean over
+    # the wrong axis are now reported at the return.
+    bad = run_mypy(FIXTURES / "bad_size_scalar_cov.py")
+    assert bad.returncode == 1, bad.stdout
+    errors = _errors_by_line(bad)
+    assert sorted(errors) == [12, 16], bad.stdout
+    assert 'got "ndarray[tuple[N, N]' in errors[12][0] and errors[12][0].endswith("[return-value]"), bad.stdout
+    assert 'got "ndarray[tuple[D]' in errors[16][0] and errors[16][0].endswith("[return-value]"), bad.stdout
+    assert _run_fixture("bad_size_scalar_cov.py") == ["(5, 5) (3,)"]
+    fixture = FIXTURES / "size_scalar_arith_ok.py"
+    ok = run_mypy(fixture)
+    assert ok.returncode == 0, ok.stdout
+    assert reveals_by_line(ok) == {
+        14: f'"{_ND}[tuple[N, D], {_F64}]"',
+        15: f'"{_ND}[tuple[N, D], {_F64}]"',
+        16: f'"{_ND}[tuple[C], {_F64}]"',
+        17: f'"{_ND}[tuple[N, D], {_F64}]"',
+        18: f'"{_ND}[tuple[N], {_F64}]"',
+        19: f'"{_ND}[tuple[N], {_I64}]"',
+        20: f'"{_ND}[tuple[D], {_F32}]"',
+        21: f'"{_ND}[tuple[N, D], {_F64}]"',
+    }, ok.stdout
+    assert _run_fixture("size_scalar_arith_ok.py") == ["(5, 3) (5, 3) (3, 3)", "float64 int64 float32"]
+    # Under NUMTY_STRICT=1 the function body proves every step.
+    strict = subprocess.run(
+        [sys.executable, "-m", "mypy", "--cache-dir", str(tmp_path / "cache"), str(fixture)],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT), "NUMTY_STRICT": "1"},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    in_body = [
+        line for line in strict.stdout.splitlines() if ": error:" in line and int(line.split(":")[1]) < 23
+    ]
+    assert in_body == [], strict.stdout
+    assert reveals_by_line(strict) == reveals_by_line(ok), strict.stdout
+
+
+def test_own_size_a_constant_apart() -> None:
+    # Issue 328: a size a call chose (`?K@17`) and one mask's count are
+    # one size, like a name, so `?K-1` against `?K-2` is a default error
+    # worded like `N-2` against `N-1`, not two names, and the `np.where`
+    # around one no longer gets a `tuple[Never, ...]` [arg-type].
+    fixture = FIXTURES / "bad_own_size_offset.py"
+    for result in (run_mypy(fixture), run_mypy(fixture, flags=("--enable-error-code", "numty-names"))):
+        assert result.returncode == 1, result.stdout
+        errors = _errors_by_line(result)
+        assert sorted(errors) == [16, 18, 19, 21, 24], result.stdout
+        assert all(len(errors[line]) == 1 for line in errors), result.stdout
+        assert all(errors[line][0].endswith("[numty-broadcast]") for line in errors), result.stdout
+        assert "?K@17-1 vs ?K@17-2 (shapes (?K@17-1,) vs (?K@17-2,))" in errors[18][0], result.stdout
+        assert "?K@17-1 vs ?K@17 " in errors[19][0], result.stdout
+        assert "?K@17-2 vs ?K@17-1 " in errors[21][0], result.stdout
+        assert "?U@23-1 vs ?U@23 " in errors[24][0], result.stdout
+        assert "Never" not in result.stdout and "different names" not in result.stdout, result.stdout
+    assert _run_fixture("bad_own_size_offset.py") == [
+        "operands could not be broadcast together with shapes (3,) (2,) ",
+        "operands could not be broadcast together with shapes (3,) (4,)",
+    ]
+    # A call or a mask variable in a loop or a comprehension gives a size
+    # per run: two runs may differ by one, so only the opt-in reports it,
+    # as `1 apart` and with no [operator] follow-on.
+    fixture = FIXTURES / "own_size_offset_loop_ok.py"
+    assert run_mypy(fixture).returncode == 0
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [17, 22, 24], on.stdout
+    for line in (17, 22, 24):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("are 1 apart  [numty-names]"), on.stdout
+    assert "?K@16-1 and ?K@16 are 1 apart" in errors[17][0], on.stdout
+    assert _run_fixture("own_size_offset_loop_ok.py") == ["(3,) (2,) (2,)"]
+
+
+def test_free_name_rebound_union_ok() -> None:
+    # Regression guard for the issue 331/332/334 bundle: solving a union
+    # argument per member made `y = y[order]` after an if-joined filter a
+    # different unknown per array, so correct free-name returns failed.
+    result = run_mypy(FIXTURES / "free_name_rebound_union_ok.py", flags=("--allow-redefinition",))
+    assert result.returncode == 0, result.stdout

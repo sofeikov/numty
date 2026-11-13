@@ -18,9 +18,9 @@ from mypy.types import (
     UnionType, get_proper_type,
 )
 
-from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, NUMTY_UNSOLVED, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, _report_unsolved, _swallowed, _trial_failed
 from ._state import STATE
-from ._trace import _numty_strict, _numty_trace_path, _trace_event
+from ._trace import _numty_trace_path, _trace_event
 from ._dtypes import (
     _DATETIME_FULLNAMES, _DTYPE_INFO, _WEAK_DEFAULT, _datetime_string_kind,
 )
@@ -29,6 +29,7 @@ from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
+    _distribute_pairings, _in_loop_body, _union_members, _union_results,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
@@ -298,7 +299,29 @@ def _undegraded_args(
     return ctx._replace(arg_types=new_types)
 
 
-def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..., Type] | None:
+def _may_lose_shape(
+    ctx: FunctionContext | MethodContext | AttributeContext,
+    fullname: str,
+    default: Type,
+    operands: list[Type],
+) -> bool:
+    """Whether a hook's give-up may have dropped a shape (strict gate).
+
+    Every numpy call counts, even a scalar-only one like np.sqrt(8):
+    its Any poisons the next known-shape op. An attribute read counts
+    only when its type holds an array, a builtin only with an array
+    operand.
+    """
+    if isinstance(ctx, AttributeContext):
+        return any(True for _ in _ndarrays_in(default))
+    if fullname.startswith(("numpy.", "numty.")):
+        return True
+    return any(True for t in operands for _ in _ndarrays_in(t))
+
+
+def _guard_mixed(
+    fullname: str, hook: Callable[..., Type] | None, *, strict_reports: bool = True
+) -> Callable[..., Type] | None:
     """Wrap a numpy hook so a mixed-shape operand cannot leak misplaced dims.
 
     Mixed shapes (tuple[int, Literal[3]]) come from builders over (n, 3)
@@ -315,6 +338,10 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
     well: the stubs answer int there for ops that keep or rebuild the
     shape (np.resize), and int would not fit back where the literal is
     expected. A result the plugin built itself is never touched.
+
+    strict_reports=False keeps a hook out of NUMTY_STRICT=1 (it is still
+    traced): the generic attribute hook only rewrites expression dims,
+    so its reads (`.dtype`, a dataclass field) have nothing to prove.
     """
     if hook is None and not fullname.startswith("numpy."):
         return None
@@ -357,6 +384,9 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                 _trace_event(ctx, fullname, "unhooked", "no hook for this op")
             result = default
         else:
+            # Issue 334: whether the check around this call had already
+            # failed before the hook ran (strict reports nothing then).
+            failed_before = _trial_failed(ctx)
             try:
                 if not isinstance(ctx, AttributeContext):
                     ctx = _undegraded_args(ctx)
@@ -381,16 +411,17 @@ def _guard_mixed(fullname: str, hook: Callable[..., Type] | None) -> Callable[..
                 # no known-shape input itself, but its Any poisons the
                 # known-shape truediv whose hook mypy then skips, so
                 # gating on known inputs would leave the repro silent.
+                # Issue 334: strict reports only a give-up that could have
+                # had a shape to prove. Not a generic attribute read
+                # (`.dtype`, `finfo(...).eps`, the `__next__` of a `for`
+                # over range()), not an attribute whose type holds no
+                # array, and not a builtin (len, min, ...) with no array
+                # operand: those stay in the trace only.
                 _trace_event(
                     ctx, fullname, "bail", "unsolved (default stub type kept)"
                 )
-                if _numty_strict():
-                    ctx.api.fail(
-                        f"numty could not prove {short}: "
-                        "unsolved (result is unchecked)",
-                        ctx.context,
-                        code=NUMTY_UNSOLVED,
-                    )
+                if strict_reports and _may_lose_shape(ctx, fullname, default, operands):
+                    _report_unsolved(ctx, short, "unsolved", failed_before)
             elif _numty_trace_path() is not None:
                 # Issue 234: explicit [numty-bail] errors return Any (to
                 # hide downstream assignment noise, keeping a single error)
@@ -1182,6 +1213,62 @@ def _sequence_parts(
     return None
 
 
+def _sequence_variants(
+    ctx: FunctionContext | MethodContext, tp: Type, expr: Expression | None
+) -> list[list[tuple[list[int | Type], Type]]] | None:
+    """Per-member item lists of a display that holds a union of arrays, else None.
+
+    Issue 331: `np.concatenate([np.array([0.0]), x])` with `x` an
+    if-joined union (`(N,) | (?U,)`) distributes per member like other
+    union inputs. Union items pair index-wise (see _distribute_pairings:
+    exact for the same union variable twice, `[x, x]`); a display
+    without a union item is `_sequence_parts`. Not in a loop body, where
+    the accumulator idiom would grow the union on every pass (see
+    _in_loop_body).
+    """
+    if _in_loop_body(ctx):
+        return None
+    proper = get_proper_type(tp)
+    item_types: list[Type] = []
+    item_exprs: list[Expression | None] = []
+    if isinstance(proper, TupleType):
+        item_types = list(proper.items)
+        if isinstance(expr, TupleExpr) and len(expr.items) == len(proper.items):
+            item_exprs = list(expr.items)
+        else:
+            item_exprs = [None] * len(item_types)
+    elif isinstance(expr, ListExpr):
+        for item_expr in expr.items:
+            item_tp = ctx.api.get_expression_type(item_expr)
+            if item_tp is None:
+                return None
+            item_types.append(item_tp)
+            item_exprs.append(item_expr)
+    if not any(_union_members(t) is not None for t in item_types):
+        return None
+    pairings = _distribute_pairings(item_types)
+    if pairings is None:
+        return None
+    width = max(len(members) for members in pairings)
+    variants: list[list[tuple[list[int | Type], Type]]] = []
+    for k in range(width):
+        items: list[tuple[list[int | Type], Type]] = []
+        for members, item_expr in zip(pairings, item_exprs):
+            item = members[k] if len(members) == width else members[0]
+            parts = _ndarray_parts(item) or _known_rank_parts(item)
+            if parts is None:
+                if isinstance(item_expr, ListExpr) and item_expr.items:
+                    dtype = _display_list_dtype(ctx, item_expr.items)
+                    if dtype is None:
+                        return None
+                    items.append(([len(item_expr.items)], dtype))
+                    continue
+                return None
+            items.append((list(parts[0]), parts[1]))
+        variants.append(items)
+    return variants
+
+
 def _display_list_dtype(
     ctx: FunctionContext | MethodContext, items: list[Expression]
 ) -> Type | None:
@@ -1327,6 +1414,9 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
+    variants = _sequence_variants(ctx, pairs[0][0], pairs[0][1])
+    if variants is not None:
+        return _union_results([_concatenate_items(ctx, pairs, items) for items in variants])
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_empty_sequence(pairs[0][0], pairs[0][1]):
@@ -1348,6 +1438,15 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
             )
             return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
+    return _concatenate_items(ctx, pairs, items)
+
+
+def _concatenate_items(
+    ctx: FunctionContext,
+    pairs: list[tuple[Type, Expression | None]],
+    items: list[tuple[list[int | Type], Type]],
+) -> Type:
+    """np.concatenate of known (dims, dtype) items."""
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
         if dtype is None:
@@ -1481,6 +1580,10 @@ def _stack_solve(
 ) -> Type:
     """Shared vstack/hstack/dstack/column_stack solver after promotion."""
     from numty_plugin import _fresh_unknown
+    variants = _sequence_variants(ctx, pairs[0][0], pairs[0][1])
+    if variants is not None:
+        # A union item distributes per member (issue 331).
+        return _union_results([_stack_items(ctx, items, kind, axis) for items in variants])
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_empty_sequence(pairs[0][0], pairs[0][1]):
@@ -1514,6 +1617,16 @@ def _stack_solve(
             out[norm] = _fresh_unknown(ctx, kind, norm)
             return _ndarray_type(ctx, out, dtype)
         return ctx.default_return_type
+    return _stack_items(ctx, items, kind, axis)
+
+
+def _stack_items(
+    ctx: FunctionContext,
+    items: list[tuple[list[int | Type], Type]],
+    kind: str,
+    axis: int,
+) -> Type:
+    """vstack/hstack/dstack/column_stack of known (dims, dtype) items."""
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
         if dtype is None:
@@ -1650,6 +1763,10 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
+    variants = _sequence_variants(ctx, pairs[0][0], pairs[0][1])
+    if variants is not None:
+        # A union item distributes per member (issue 331).
+        return _union_results([_stack_new_axis(ctx, pairs, items) for items in variants])
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
         if _is_empty_sequence(pairs[0][0], pairs[0][1]):
@@ -1671,6 +1788,15 @@ def stack_function_hook(ctx: FunctionContext) -> Type:
             )
             return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
+    return _stack_new_axis(ctx, pairs, items)
+
+
+def _stack_new_axis(
+    ctx: FunctionContext,
+    pairs: list[tuple[Type, Expression | None]],
+    items: list[tuple[list[int | Type], Type]],
+) -> Type:
+    """np.stack of known (dims, dtype) items."""
     if _explicit_dtype(ctx):
         dtype = _named_dtype(ctx)
         if dtype is None:

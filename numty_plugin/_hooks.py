@@ -17,7 +17,7 @@ from mypy.argmap import map_actuals_to_formals
 from mypy.expandtype import expand_type
 from mypy.plugin import (
     AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
-    MethodSigContext, Plugin,
+    MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
     AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from mypy.types import RawExpressionType, UnboundType
 
 from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
 from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
@@ -41,7 +42,7 @@ from ._types import (
     TUPLE_FULLNAME, _OPERATOR_DUNDERS,
 )
 from ._callbind import (
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return,
+    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _union_actual_variants,
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
@@ -422,8 +423,10 @@ class NumtyPlugin(Plugin):
         )
         try:
             if isinstance(sig, CallableType) and not overloaded:
-                _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
-                _report_call_site_names(sig, ctx)
+                # A union actual is checked per member (issue 331).
+                for overrides in _union_actual_variants(sig, ctx):
+                    _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx, overrides))
+                    _report_call_site_names(sig, ctx, overrides)
         except Exception:
             _swallowed(ctx, "method_signature_hook")
             pass
@@ -484,8 +487,12 @@ class NumtyPlugin(Plugin):
             OverloadedFuncDef,
         ):
             # The hook runs per overload candidate; a non-matching
-            # item would false-positive, so overloaded callees stay out.
-            return sig
+            # item would false-positive, so overloaded callees stay out
+            # of the reports. A formula in an item's return is still put
+            # in the caller's terms (issue 324: `coef: F64["C F+1"]` ->
+            # `F64[C, F]` given (K, G+1) is (K, G), not (K, Never)); it
+            # rewrites that item's return only, never its formals' match.
+            return _callsite_formula_return(sig, ctx)
         # String-spec words bound late (see _fam_bind_words) are missing
         # from the function's variables, so core checking would reject
         # concrete actuals against the free typevars. Add exactly those
@@ -522,8 +529,10 @@ class NumtyPlugin(Plugin):
         # so it is guarded separately (the outer hook would otherwise
         # fall back to the default, unrepaired signature).
         try:
-            _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
-            _report_call_site_names(sig, ctx)
+            # A union actual is checked per member (issue 331).
+            for overrides in _union_actual_variants(sig, ctx):
+                _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx, overrides))
+                _report_call_site_names(sig, ctx, overrides)
             _report_index_call_site(sig, ctx)
         except Exception:
             _swallowed(ctx, "_callsite_check")
@@ -696,6 +705,15 @@ class NumtyPlugin(Plugin):
     ) -> int | Type | list[int | Type]:
         return _fam_applied(ctx, head, arg, self._fam_late_bound)
 
+    def report_config_data(self, ctx: ReportConfigContext) -> dict[str, bool]:
+        """Settings that change the plugin's output, for mypy's cache key.
+
+        NUMTY_STRICT=1 adds [numty-unsolved] reports, so a module checked
+        without it must be checked again with it (issue 334); a cached
+        run would otherwise report success.
+        """
+        return {"numty_strict": _numty_strict()}
+
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         self._ensure_startup_check(fullname)
         return _guard_mixed(fullname, self._function_hook(fullname))
@@ -704,7 +722,10 @@ class NumtyPlugin(Plugin):
         self, fullname: str
     ) -> Callable[[AttributeContext], Type] | None:
         self._ensure_startup_check(fullname)
-        return _guard_mixed(fullname, self._attribute_hook(fullname))
+        hook = self._attribute_hook(fullname)
+        return _guard_mixed(
+            fullname, hook, strict_reports=hook is not substituted_attribute_hook
+        )
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
         self._ensure_startup_check(fullname)
@@ -1534,18 +1555,33 @@ def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
             return default
         base = get_proper_type(ctx.type)
         name = getattr(ctx.context, "name", None)
-        if not isinstance(base, Instance) or not isinstance(name, str):
+        if not isinstance(name, str):
             return default
-        member = base.type.get(name)
-        node = member.node if member is not None else None
-        if isinstance(node, OverloadedFuncDef) and node.items:
-            node = node.items[0]
-        if not isinstance(node, Decorator) or not node.var.is_property:
+        # A union receiver (`k: A | B`) calls this once per member with
+        # the whole union as the type (issue 332): the size is the
+        # object's, whichever class it is of, so it is keyed by them all.
+        members = [get_proper_type(item) for item in base.relevant_items()] if isinstance(base, UnionType) else [base]
+        own: dict[str, int] = {}
+        classes: set[str] = set()
+        for inst in members:
+            if not isinstance(inst, Instance):
+                continue
+            member = inst.type.get(name)
+            node = member.node if member is not None else None
+            if isinstance(node, OverloadedFuncDef) and node.items:
+                node = node.items[0]
+            if not isinstance(node, Decorator) or not node.var.is_property:
+                continue
+            getter = get_proper_type(node.func.type)
+            if not isinstance(getter, CallableType):
+                continue
+            classes.add(inst.type.fullname)
+            for index, v in enumerate(getter.variables):
+                if isinstance(v, TypeVarType):
+                    own.setdefault(v.fullname, index)
+        if not own:
             return default
-        getter = get_proper_type(node.func.type)
-        if not isinstance(getter, CallableType):
-            return default
-        own = {v.fullname: index for index, v in enumerate(getter.variables) if isinstance(v, TypeVarType)}
+        owner = "|".join(sorted(classes))
         # Read through a variable, the size belongs to the object in it:
         # `c.xs` and `c.ys`, both declared with `E`, have one size, and
         # so have two reads of `c.xs` (issue 306). Any other receiver
@@ -1566,7 +1602,7 @@ def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
                 if holder is None:
                     env[tv.id] = _fresh_unknown(ctx, "property", own[tv.fullname])
                 else:
-                    env[tv.id] = _fresh_own_size(ctx, tv.name, f"{base.type.fullname}::{tv.fullname}", holder)
+                    env[tv.id] = _fresh_own_size(ctx, tv.name, f"{owner}::{tv.fullname}", holder)
         if not env:
             return default
         return expand_type(default, env)
@@ -1645,23 +1681,29 @@ def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
 
 
 def t_attribute_hook(ctx: AttributeContext) -> Type:
-    dist = _distribute_solve([ctx.type], lambda t: _t_type(ctx, t))
+    # On a union mypy asks once per member, with that member's stub type
+    # as the default but the whole union as `ctx.type`. A member that
+    # does not solve keeps its own stub type (`Self`), not the default of
+    # the member being asked about (issue 331: `(M, N) | (Any, ...)` got
+    # the untransposed (M, N) as a third member).
+    dist = _distribute_solve([ctx.type], lambda t: _t_type(ctx, t, t))
     if dist is not None:
         return dist
-    return _t_type(ctx, ctx.type)
+    return _t_type(ctx, ctx.type, ctx.default_attr_type)
 
 
-def _t_type(ctx: AttributeContext, tp: Type) -> Type:
+def _t_type(ctx: AttributeContext, tp: Type, default: Type) -> Type:
     """The .T view: full reversal, concrete or mixed shapes only.
 
     Unpack shapes bail: reversing would also reverse *Ts itself, which
-    no annotation can spell (issue #48). Anything else stays on the stubs.
+    no annotation can spell (issue #48). Anything else stays on the
+    stubs (`default`, the stub's `Self`).
     """
     parts = _movable_parts(tp)
     if parts is not None:
         dims, dtype = parts
         return _ndarray_type(ctx, list(reversed(dims)), dtype)
-    return ctx.default_attr_type
+    return default
 
 
 def len_function_hook(ctx: FunctionContext) -> Type:

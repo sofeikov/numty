@@ -48,6 +48,39 @@ def _form_has_unknown(form: object) -> bool:
     return False
 
 
+# A selection count (`x[keep]`, one per mask variable, issue 288) and the
+# size a call chose for a name only its return declares (`?K@line`,
+# issue 307): unknowns that are sizes of their own.
+_OWN_SIZE_MARKS = (".maskcount_", ".ownsize_")
+# On one minted where it can stand for several sizes: a call in a loop or
+# a comprehension, a mask variable bound in a loop (issue 328).
+_REPEATS_MARK = ".repeats"
+
+
+def _is_own_size_fullname(name: str) -> bool:
+    """An own size that is one size on every use, like a name."""
+    return (
+        _is_unknown_fullname(name)
+        and any(mark in name for mark in _OWN_SIZE_MARKS)
+        and not name.endswith(_REPEATS_MARK)
+    )
+
+
+def _form_has_site_unknown(form: object) -> bool:
+    """Whether a form mentions an unknown that is not one size on every use.
+
+    A site unknown (`?U@14`) is named after the line that minted it, and
+    one site can stand for several sizes (the items of a comprehension),
+    so nothing is proved from it; so is an own size minted in a loop or
+    a comprehension. Any other own size is one size, like a name.
+    """
+    if isinstance(form, _LinForm):
+        return any(_is_unknown_fullname(name) and not _is_own_size_fullname(name) for name, _ in form.coeffs)
+    if isinstance(form, _MonoForm):
+        return any(_is_unknown_fullname(v) and not _is_own_size_fullname(v) for v in form.vars)
+    return False
+
+
 def _eval_form(node: ast.AST) -> _LinForm | _DivForm | _MonoForm:
     """Rebuild a canonical form from its repr AST (issue #42).
 
@@ -204,7 +237,9 @@ def _forms_provably_ne(fa: object, fb: object, nonzero: bool = False) -> bool:
 
     `N+1` vs `N` and `N+2` vs `N` can never be equal, and neither can
     same-division plus diffs (`N//2+1` vs `N//2`). Different vars,
-    divs vs linears or unknowns stay unprovable (issue #56).
+    divs vs linears or site unknowns stay unprovable (issue #56). A
+    selection count or a size a call chose is one size, so `?K-1` vs
+    `?K-2` is provably unequal like `N-1` vs `N-2` (issue 328).
 
     Coefficient diffs are different: `2*N` vs `N` and `2*M*N` vs `M*N`
     are equal exactly when a variable is 0, and an empty axis is a
@@ -218,9 +253,9 @@ def _forms_provably_ne(fa: object, fb: object, nonzero: bool = False) -> bool:
         return False
     if fa == fb:
         return False
-    # _form_has_unknown is pure (isinstance/startswith) and cannot raise,
-    # so the old _swallowed-guarded try is gone (Phase 2).
-    if _form_has_unknown(fa) or _form_has_unknown(fb):
+    # _form_has_site_unknown is pure (isinstance/startswith) and cannot
+    # raise, so the old _swallowed-guarded try is gone (Phase 2).
+    if _form_has_site_unknown(fa) or _form_has_site_unknown(fb):
         return False
     if isinstance(fa, _LinForm) and isinstance(fb, _LinForm):
         if fa.coeffs == fb.coeffs and fa.const != fb.const:

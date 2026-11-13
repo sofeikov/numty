@@ -84,6 +84,21 @@ quiet, where it is approximate, and what to write instead.
     broadcasts) or 2 (a length-1 axis broadcasts). The same holds for
     `N+1` against `N`. The oracle counts an error as false only when
     numpy accepts the expression at every set of sizes it tries.
+- The same holds for a size with no name that is still one size: the
+    count of one mask variable and a size a function chose for a name
+    of its return (`?K@12`). `np.diff(tps, n=1)` against
+    `np.diff(tps, n=2)` is reported as `?K@12-1` vs `?K@12-2`. Minted
+    in a loop or a comprehension (a call there, a mask variable bound
+    there, a variable holding an object bound there) such a size is a
+    size per run and nothing is proved from it; the same goes for any
+    other unknown (`?U@14` from an inline mask): one site can stand for
+    the items of a comprehension. A value kept across calls of a
+    function (an attribute holding last call's selection) is not
+    seen as another size.
+- An in-place op that grows a `1` axis to a size over names is
+    reported: `G *= K[..., np.newaxis]` with `G` of shape `(N, 1, M)`
+    and `K` of `(N, N)` fits only when `N` is 1, as the literal `(4, 4,
+    1)` into `(4, 1, 3)` does not.
 - A symbolic subtraction assumes the axis is long enough. `a[1:]` is
     `(N-1,)` and `np.diff(a)` is `(N-1,)`, but numpy stops at zero: on an
     empty axis both are `(0,)`, not `(-1,)`. The oracle counts a dim
@@ -188,7 +203,22 @@ quiet, where it is approximate, and what to write instead.
     union. Members pair index-wise (exact for co-derived unions);
     unrelated unions of different member counts, and dunder ops with
     unions on both sides (mypy matches those cartesianly), bail out
-    instead of guessing.
+    instead of guessing. A union with a Python or NumPy scalar
+    (`F64[M] | float`, `float | int`) distributes too when it is the
+    only union among the operands; `F64[N] | None` distributes in
+    `np.average(weights=...)` and at calls of user functions
+    ([#331](https://github.com/sofeikov/numty/issues/331)). Other
+    optional arguments of NumPy calls still keep the stubs' answer.
+- A union actual at a call of a user function is checked per member
+    for the call-site conflict and the `numty-names` binding report;
+    the return is mypy's own solve of the whole union, not a union of
+    per-member returns.
+- In a loop body, the joins that grow a size (`concatenate`, the
+    stacks, `append`) do not distribute over a union: mypy stops
+    re-checking the body after a few passes, so a growing accumulator
+    would be cut off at the last pass. Ops that distribute elsewhere
+    (indexing, `x[1:]` in a loop) have the same cut-off and are not
+    widened either.
 - Heterogeneous unpacking (`a, b = (f(p) for p in (p1, p2))` with
     different shapes) assigns the whole union to every name — genexp,
     list comprehension, `tuple(...)`, starred targets, and `map` (which
@@ -261,4 +291,6 @@ quiet, where it is approximate, and what to write instead.
     `n //= 2` is an error). Concrete dims widen to `int` (keeping the
     value for direct uses like `reshape(x.shape[0], 3)`), and unknown
     (`?U`) dims are plain `int`. For a loop counter over a symbolic
-    axis, write `int(...)` explicitly (`n = int(x.shape[0])`).
+    axis, write `int(...)` explicitly (`n = int(x.shape[0])`). In array
+    arithmetic such a size is a Python `int` scalar: `X @ X.T / X.shape[0]`
+    keeps `(N, N)` like `/ float(X.shape[0])` does.

@@ -21,7 +21,7 @@ from ._types import (
     _report_mask_names, _report_names,
 )
 from ._callbind import (
-    _shape_tvar_formals, _strip_optional,
+    ActualOverrides, _actual_type, _shape_tvar_formals, _strip_optional,
 )
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
 from ._linalg import _is_numpy_scalar
@@ -155,7 +155,11 @@ def _relax_dynamic_formals(sig: CallableType, ctx: FunctionSigContext | MethodSi
         return sig
 
 
-def _report_call_site_names(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> None:
+def _report_call_site_names(
+    sig: CallableType,
+    ctx: FunctionSigContext | MethodSigContext,
+    overrides: ActualOverrides | None = None,
+) -> None:
     """The opt-in `[numty-names]` report at a call (issue 280, reused by 288).
 
     `score(ids: I64[K], d: F64[P, K])` called with an `I64[N]` and an
@@ -172,7 +176,7 @@ def _report_call_site_names(sig: CallableType, ctx: FunctionSigContext | MethodS
         for i, positions in _shape_tvar_formals(sig):
             if len(ctx.args[i]) != 1:
                 continue
-            actual = _parts_or_unpack(ctx.api.get_expression_type(ctx.args[i][0]))
+            actual = _parts_or_unpack(_actual_type(ctx, ctx.args[i][0], overrides))
             if actual is None:
                 continue
             name = sig.arg_names[i] or "?"
