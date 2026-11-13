@@ -862,6 +862,13 @@ def _weak_name(tp: Type) -> str | None:
         return None
     if isinstance(proper, Instance) and proper.type.fullname in _WEAK_SCALARS:
         return proper.type.fullname
+    if isinstance(proper, TypeVarType):
+        # Issue 325: a size TypeVar as a value (`X.shape[0]`, `len(X)`)
+        # is an `int`; in arithmetic it is a Python int like `float(n)`
+        # is a Python float, so the array keeps its shape.
+        bound = get_proper_type(proper.upper_bound)
+        if isinstance(bound, Instance) and bound.type.fullname == "builtins.int":
+            return "builtins.int"
     return None
 
 

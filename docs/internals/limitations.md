@@ -261,4 +261,6 @@ quiet, where it is approximate, and what to write instead.
     `n //= 2` is an error). Concrete dims widen to `int` (keeping the
     value for direct uses like `reshape(x.shape[0], 3)`), and unknown
     (`?U`) dims are plain `int`. For a loop counter over a symbolic
-    axis, write `int(...)` explicitly (`n = int(x.shape[0])`).
+    axis, write `int(...)` explicitly (`n = int(x.shape[0])`). In array
+    arithmetic such a size is a Python `int` scalar: `X @ X.T / X.shape[0]`
+    keeps `(N, N)` like `/ float(X.shape[0])` does.

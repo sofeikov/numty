@@ -5673,3 +5673,46 @@ def test_polars_to_numpy_cast_chain() -> None:
         "(2,) float64",
         "float64 (3,)",
     ]
+
+
+def test_size_int_is_a_scalar_in_arithmetic(tmp_path: Path) -> None:
+    # Issue 325: an `int` typed by a size TypeVar (`X.shape[0]`, `len(X)`)
+    # is a Python int in array arithmetic, like `float(X.shape[0])` is a
+    # Python float: `X / len(X)` kept no rank, and under NUMTY_STRICT=1
+    # `n_samples * p` was Any. The transposed covariance and the mean over
+    # the wrong axis are now reported at the return.
+    bad = run_mypy(FIXTURES / "bad_size_scalar_cov.py")
+    assert bad.returncode == 1, bad.stdout
+    errors = _errors_by_line(bad)
+    assert sorted(errors) == [12, 16], bad.stdout
+    assert 'got "ndarray[tuple[N, N]' in errors[12][0] and errors[12][0].endswith("[return-value]"), bad.stdout
+    assert 'got "ndarray[tuple[D]' in errors[16][0] and errors[16][0].endswith("[return-value]"), bad.stdout
+    assert _run_fixture("bad_size_scalar_cov.py") == ["(5, 5) (3,)"]
+    fixture = FIXTURES / "size_scalar_arith_ok.py"
+    ok = run_mypy(fixture)
+    assert ok.returncode == 0, ok.stdout
+    assert reveals_by_line(ok) == {
+        14: f'"{_ND}[tuple[N, D], {_F64}]"',
+        15: f'"{_ND}[tuple[N, D], {_F64}]"',
+        16: f'"{_ND}[tuple[C], {_F64}]"',
+        17: f'"{_ND}[tuple[N, D], {_F64}]"',
+        18: f'"{_ND}[tuple[N], {_F64}]"',
+        19: f'"{_ND}[tuple[N], {_I64}]"',
+        20: f'"{_ND}[tuple[D], {_F32}]"',
+        21: f'"{_ND}[tuple[N, D], {_F64}]"',
+    }, ok.stdout
+    assert _run_fixture("size_scalar_arith_ok.py") == ["(5, 3) (5, 3) (3, 3)", "float64 int64 float32"]
+    # Under NUMTY_STRICT=1 the function body proves every step.
+    strict = subprocess.run(
+        [sys.executable, "-m", "mypy", "--cache-dir", str(tmp_path / "cache"), str(fixture)],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT), "NUMTY_STRICT": "1"},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    in_body = [
+        line for line in strict.stdout.splitlines() if ": error:" in line and int(line.split(":")[1]) < 23
+    ]
+    assert in_body == [], strict.stdout
+    assert reveals_by_line(strict) == reveals_by_line(ok), strict.stdout

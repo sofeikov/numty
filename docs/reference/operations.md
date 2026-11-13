@@ -156,7 +156,8 @@ ufuncs alike — broadcast shapes and promote dtypes. In-place ops
 (`+=`, `-=`, …) reuse the broadcast check and additionally require the
 result to fit the target (`(3,) += (2, 3)` errors). Promotion matches
 NumPy (`np.result_type` over the full dtype matrix, plus weak Python
-and numpy scalars): float ufuncs pick the smallest float (`sqrt(uint8)`
+and numpy scalars; a size taken from a shape, `X.shape[0]` or
+`len(X)`, is a Python `int`, so `X / len(X)` keeps `X`'s shape): float ufuncs pick the smallest float (`sqrt(uint8)`
 is `float16`), true division of ints is `float64` (`f32 / u8` stays
 `float32`), `rng(..., dtype=np.float32)` is honored, `clip` promotes
 across all operands, `linalg.solve` maps ints to `float64` and rejects
