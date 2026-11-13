@@ -29,7 +29,7 @@ from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
-    _distribute_pairings, _in_loop_body, _union_members, _union_results,
+    _distribute_pairings, _in_loop_body, _solve_union_arg, _union_members, _union_results,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
@@ -297,43 +297,6 @@ def _undegraded_args(
     if new_types is None:
         return ctx
     return ctx._replace(arg_types=new_types)
-
-
-def _solve_union_arg(
-    ctx: FunctionContext, hook: Callable[[FunctionContext], Type]
-) -> Type | None:
-    """Solve a call on a union of arrays one member at a time (issue 334).
-
-    `np.argsort(x)` with `x: F64[N] | F64[?U]` (an if-joined selection)
-    is not a union mypy splits itself: the stubs accept the union as a
-    whole, so a function hook that only reads one array bails and the
-    call is `ndarray[Any, Any]`. When exactly one argument is a pure
-    union of arrays, the hook runs once per member and the results are
-    joined, as mypy does when it has to split a union for an overload.
-    Any member the hook cannot solve keeps the stubs' answer for all.
-    """
-    slots = [
-        (i, j)
-        for i, types in enumerate(ctx.arg_types)
-        for j, tp in enumerate(types)
-        if _union_members(tp) is not None
-    ]
-    if len(slots) != 1:
-        return None
-    i, j = slots[0]
-    members = _union_members(ctx.arg_types[i][j])
-    if members is None:
-        return None
-    results: list[Type] = []
-    for member in members:
-        arg_types = [list(types) for types in ctx.arg_types]
-        arg_types[i][j] = member
-        sub = ctx._replace(arg_types=arg_types)
-        result = hook(sub)
-        if result is sub.default_return_type:
-            return None
-        results.append(result)
-    return _union_results(results)
 
 
 def _may_lose_shape(
