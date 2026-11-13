@@ -5716,3 +5716,38 @@ def test_size_int_is_a_scalar_in_arithmetic(tmp_path: Path) -> None:
     ]
     assert in_body == [], strict.stdout
     assert reveals_by_line(strict) == reveals_by_line(ok), strict.stdout
+
+
+def test_own_size_a_constant_apart() -> None:
+    # Issue 328: a size a call chose (`?K@17`) and one mask's count are
+    # one size, like a name, so `?K-1` against `?K-2` is a default error
+    # worded like `N-2` against `N-1`, not two names, and the `np.where`
+    # around one no longer gets a `tuple[Never, ...]` [arg-type].
+    fixture = FIXTURES / "bad_own_size_offset.py"
+    for result in (run_mypy(fixture), run_mypy(fixture, flags=("--enable-error-code", "numty-names"))):
+        assert result.returncode == 1, result.stdout
+        errors = _errors_by_line(result)
+        assert sorted(errors) == [16, 18, 19, 21, 24], result.stdout
+        assert all(len(errors[line]) == 1 for line in errors), result.stdout
+        assert all(errors[line][0].endswith("[numty-broadcast]") for line in errors), result.stdout
+        assert "?K@17-1 vs ?K@17-2 (shapes (?K@17-1,) vs (?K@17-2,))" in errors[18][0], result.stdout
+        assert "?K@17-1 vs ?K@17 " in errors[19][0], result.stdout
+        assert "?K@17-2 vs ?K@17-1 " in errors[21][0], result.stdout
+        assert "?U@23-1 vs ?U@23 " in errors[24][0], result.stdout
+        assert "Never" not in result.stdout and "different names" not in result.stdout, result.stdout
+    assert _run_fixture("bad_own_size_offset.py") == [
+        "operands could not be broadcast together with shapes (3,) (2,) ",
+        "operands could not be broadcast together with shapes (3,) (4,)",
+    ]
+    # A call or a mask variable in a loop or a comprehension gives a size
+    # per run: two runs may differ by one, so only the opt-in reports it,
+    # as `1 apart` and with no [operator] follow-on.
+    fixture = FIXTURES / "own_size_offset_loop_ok.py"
+    assert run_mypy(fixture).returncode == 0
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [17, 22, 24], on.stdout
+    for line in (17, 22, 24):
+        assert len(errors[line]) == 1 and errors[line][0].endswith("are 1 apart  [numty-names]"), on.stdout
+    assert "?K@16-1 and ?K@16 are 1 apart" in errors[17][0], on.stdout
+    assert _run_fixture("own_size_offset_loop_ok.py") == ["(3,) (2,) (2,)"]

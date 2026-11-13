@@ -282,6 +282,16 @@ def test_provably_ne_fires_where_it_should() -> None:
     assert not p._forms_provably_ne(n, _LinForm((("t.M", 1),), 0), nonzero=True)
     unknown = _LinForm(((p._UNKNOWN_PREFIX + "x", 1),), 0)
     assert not p._forms_provably_ne(unknown, unknown._replace(const=1))
+    # Issue 328: a size a call chose, or one mask's count, is one size
+    # like a name; minted in a loop or a comprehension it is not.
+    from numty_plugin._forms import _REPEATS_MARK
+
+    for key in ("ownsize_m_1_2_t.K", "maskcount_m::f::keep"):
+        own = _LinForm(((p._UNKNOWN_PREFIX + key, 1),), -1)
+        assert p._forms_provably_ne(own, own._replace(const=-2))
+        assert not p._forms_provably_ne(own, own._replace(coeffs=((own.coeffs[0][0], 2),)))
+        repeated = _LinForm(((own.coeffs[0][0] + _REPEATS_MARK, 1),), -1)
+        assert not p._forms_provably_ne(repeated, repeated._replace(const=-2))
 
 
 @given(forms)

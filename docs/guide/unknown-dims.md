@@ -47,7 +47,13 @@ different scope, and an inline mask (`x[x > 0]`, `flatnonzero`, chained
 selections) mint fresh each time — best-effort flow-insensitive
 tracking (same `Name` in the same function, bail on reassignment).
 Two arrays with the count of one mask variable broadcast to that count
-(`ids[keep] + d[0, keep]` keeps it).
+(`ids[keep] + d[0, keep]` keeps it), and the count against itself plus
+a constant is an error by default, as `N-1` against `N` is:
+`np.diff(sel) * sel` with `sel = x[keep]` is `?U@12-1 vs ?U@12`
+(`tests/fixtures/bad_own_size_offset.py`). A mask variable bound in a
+loop holds a mask per run, so there the count proves nothing and the
+pair is left to the opt-in code (`1 apart`,
+`tests/fixtures/own_size_offset_loop_ok.py`).
 Under the opt-in `numty-names` code a selection count is a size of its
 own: against a named size or another mask's count it is reported where
 the sizes must be equal
@@ -107,7 +113,11 @@ that the sizes given it are one size, as an annotation always is.
 unknown, printed with the name and the line of the call: `starts, ends
 = bounds(seg)` gives two arrays of `(?K@12,)`, and `ends - starts` is
 `(?K@12,)` too. Another free name of the same return is another
-unknown, and so is another call.
+unknown, and so is another call. Being one size, it is checked against
+itself like a name: `np.diff(starts, n=1)` against `np.diff(starts,
+n=2)` is `?K@12-1 vs ?K@12-2`, a default `[numty-broadcast]` error. A
+call in a loop or a comprehension chooses a size per run, so what it
+gives proves nothing of the kind (`[bounds(s)[0] for s in segs]`).
 
 **A property** that names a size its class does not bind
 (`def rows(self) -> I64[E]` in a class not generic in `E`) gives the
