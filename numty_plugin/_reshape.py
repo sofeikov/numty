@@ -31,7 +31,7 @@ from ._dtypes import (
     _DTYPE_BASE, _NBIT_MODULES, _NBIT_TAG_BY_BYTES,
 )
 from ._types import (
-    _fold_dim_expr, _has_unknown_shape,
+    _fold_dim_expr, _has_unknown_shape, _distribute_solve, _in_loop_body,
 )
 from collections.abc import (
     Iterator,
@@ -1391,11 +1391,41 @@ def permute_dims_function_hook(ctx: FunctionContext) -> Type:
 
 def append_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
-    from numty_plugin import _fresh_unknown
     if len(pairs) < 2:
         return ctx.default_return_type
-    parts_a = _ndarray_parts(pairs[0][0])
-    parts_b = _ndarray_parts(pairs[1][0])
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 2:
+        axis_pair = pairs[2]
+    # Union arguments reach the hook one member pair at a time, every
+    # member of `arr` with every member of `values`. `np.append(1 - y, y)`
+    # with `y` a union has co-derived arguments, so each call gives the
+    # members paired index-wise (issue 331), as other union inputs do.
+    # Not in a loop body (see _in_loop_body): `out = np.append(out, row)`.
+    if not _in_loop_body(ctx):
+        whole = [_whole_arg_type(ctx, tp, expr) for tp, expr in pairs[:2]]
+        dist = _distribute_solve(whole, lambda a, b: _append_types(ctx, a, b, axis_pair))
+        if dist is not None:
+            return dist
+    return _append_types(ctx, pairs[0][0], pairs[1][0], axis_pair)
+
+
+def _whole_arg_type(ctx: FunctionContext, tp: Type, expr: Expression | None) -> Type:
+    """The type of an argument expression before mypy split its union."""
+    if expr is None:
+        return tp
+    try:
+        return ctx.api.get_expression_type(expr)
+    except Exception:
+        _swallowed(ctx, "_whole_arg_type")
+        return tp
+
+
+def _append_types(
+    ctx: FunctionContext, a: Type, b: Type, axis_pair: tuple[Type, Expression | None] | None
+) -> Type:
+    from numty_plugin import _fresh_unknown
+    parts_a = _ndarray_parts(a)
+    parts_b = _ndarray_parts(b)
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     dims_a, dtype_a = parts_a
@@ -1403,9 +1433,6 @@ def append_function_hook(ctx: FunctionContext) -> Type:
     dtype = _promote_all(ctx, [dtype_a, dtype_b])
     if dtype is None:
         return ctx.default_return_type
-    axis_pair = _formal_pair(ctx, "axis")
-    if axis_pair is None and len(pairs) > 2:
-        axis_pair = pairs[2]
     axis_val = _int_or_none(axis_pair)
     if axis_val is None:
         # axis=None: flatten and concat -> 1-D

@@ -22,7 +22,10 @@ from ._exprs import (
     _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _iter_tvarlikes,
     _lookup_ns, _ns_of_ctx, _seen_vars, _short_var,
 )
-from ._types import INT_FULLNAME, NDARRAY_FULLNAME, _dim_value, _has_unknown_shape, _parts_or_unpack
+from ._types import (
+    INT_FULLNAME, NDARRAY_FULLNAME, _dim_value, _has_unknown_shape, _optional_members, _parts_or_unpack,
+    _union_members,
+)
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
@@ -124,8 +127,74 @@ def _align_pair(
     return out
 
 
+# One member type for each union-typed actual expression of a call (see
+# `_union_actual_variants`).
+ActualOverrides = dict[Expression, Type]
+
+
+def _actual_type(
+    ctx: FunctionSigContext | MethodSigContext, expr: Expression, overrides: ActualOverrides | None
+) -> Type:
+    """The type of an actual argument, or the member `overrides` gives it."""
+    if overrides and expr in overrides:
+        return overrides[expr]
+    return ctx.api.get_expression_type(expr)
+
+
+def _actual_members(tp: Type) -> list[Type] | None:
+    """The array members of a union actual (`None` dropped), else None."""
+    members = _union_members(tp)
+    if members is not None:
+        return members
+    optional = _optional_members(tp)
+    if optional is None:
+        return None
+    arrays = [m for m in optional if not isinstance(get_proper_type(m), NoneType)]
+    return arrays or None
+
+
+def _union_actual_variants(
+    sig: CallableType, ctx: FunctionSigContext | MethodSigContext
+) -> list[ActualOverrides]:
+    """Per-member views of the union-typed array actuals of a call (issue 331).
+
+    `xl(t, p)` with `p: F64[3, 2] | F64[6, 2]` is checked once for each
+    member of `p`, as operators are: a member that conflicts is a call
+    that can fail. An optional actual (`F64[N] | None`) is checked with
+    its array member. Several union actuals pair index-wise (exact for
+    co-derived unions, see `_distribute_pairings`); actuals of different
+    member counts are not split. One empty view when nothing splits.
+    """
+    found: list[tuple[Expression, list[Type]]] = []
+    if len(ctx.args) != len(sig.arg_types):
+        return [{}]
+    for i, kind in enumerate(sig.arg_kinds):
+        if kind not in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT) or len(ctx.args[i]) != 1:
+            continue
+        expr = ctx.args[i][0]
+        try:
+            members = _actual_members(ctx.api.get_expression_type(expr))
+        except Exception:
+            _swallowed(ctx, "_union_actual_variants")
+            continue
+        if members is not None:
+            found.append((expr, members))
+    widths = {len(members) for _, members in found if len(members) > 1}
+    if not found or len(widths) > 1:
+        return [{}]
+    width = widths.pop() if widths else 1
+    return [
+        {expr: members[k] if len(members) == width else members[0] for expr, members in found}
+        for k in range(width)
+    ]
+
+
 def _pairs_for_actual(
-    fname: str, formal_tp: Type, actual_expr: Expression, ctx: FunctionSigContext | MethodSigContext
+    fname: str,
+    formal_tp: Type,
+    actual_expr: Expression,
+    ctx: FunctionSigContext | MethodSigContext,
+    overrides: ActualOverrides | None = None,
 ) -> list[tuple[str, int, TypeVarLikeType, int, int | None]]:
     """Pair one formal type with one actual expression (issue #53).
 
@@ -136,7 +205,7 @@ def _pairs_for_actual(
     fparts = _parts_or_unpack(_strip_optional(formal_tp))
     if fparts is not None:
         try:
-            actual_tp = ctx.api.get_expression_type(actual_expr)
+            actual_tp = _actual_type(ctx, actual_expr, overrides)
         except Exception:
             _swallowed(ctx, "_pairs_for_actual")
             return []
@@ -188,7 +257,9 @@ def _pairs_for_actual(
 
 
 def _conflict_pairs(
-    sig: CallableType, ctx: FunctionSigContext | MethodSigContext
+    sig: CallableType,
+    ctx: FunctionSigContext | MethodSigContext,
+    overrides: ActualOverrides | None = None,
 ) -> list[tuple[str, int, TypeVarLikeType, int, int | None]]:
     """(formal name, axis, tvar, actual size) for the call-site check.
 
@@ -206,7 +277,7 @@ def _conflict_pairs(
         if kind in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT):
             if len(actuals) != 1:
                 continue
-            out.extend(_pairs_for_actual(fname, tp, actuals[0], ctx))
+            out.extend(_pairs_for_actual(fname, tp, actuals[0], ctx, overrides))
         elif kind == ARG_STAR:
             # *args: the formal type is the element type; every actual
             # binds to it, so each one is checked.

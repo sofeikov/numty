@@ -5048,7 +5048,9 @@ def test_family_dtype_heads() -> None:
         38: f'"{_ND}[tuple[int, N], numpy.dtype[numpy.floating[Any]]]"',
         39: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
         40: '"numpy.floating[Any] | float"',
-        41: f'"{_ND}[tuple[N], numpy.dtype[Any]]"',
+        # Issue 331: the `floating | float` divisor distributes per member;
+        # both members keep the floating family (was dtype[Any]).
+        41: f'"{_ND}[tuple[N], numpy.dtype[numpy.floating[Any]]]"',
         42: f'"{_ND}[tuple[N], numpy.dtype[numpy.integer[Any]]]"',
         43: f'"{_ND}[tuple[N], numpy.dtype[Any]]"',
         44: f'"{_ND}[tuple[N], numpy.dtype[numpy.unsignedinteger[{_NB}_32Bit]]]"',
@@ -5783,3 +5785,103 @@ def test_bad_own_size_bindings() -> None:
     assert sorted(redef) == [18, 28, 33, 42, 46, 50], redef
     assert all(text.endswith("[return-value]") for texts in redef.values() for text in texts), redef
     assert _run_fixture("bad_own_size_bindings.py") == ["(2,) (1,)"]
+
+
+# Issue 331: unions with `None` or a scalar, `.T`, call-site binding and
+# co-derived pairing on unions.
+
+
+def test_optional_average_weights() -> None:
+    # Issue 331: `weights: F64[7] | None` is checked and solved per member
+    # (it was `ndarray[Any, Any]` and silent); named sizes are numty-names.
+    fixture = FIXTURES / "bad_optional_weights.py"
+    result = run_mypy(fixture)
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [15, 16], result.stdout
+    for line in (15, 16):
+        assert "average weights length 7 does not match axis 1 size 2" in errors[line][0], result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[Literal[2]], {_F64}]"',
+        13: f'"{_ND}[tuple[Literal[2]], {_F64}]"',
+        14: f'"{_ND}[tuple[K], {_F64}]"',
+    }, result.stdout
+    on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    assert sorted(on) == [15, 16, 17], on
+    assert "N and K are different names  [numty-names]" in on[17][0], on
+
+
+def test_union_scalar_ok() -> None:
+    # Issue 331: `F64[M] | float` and a `float | int` threshold keep the
+    # shape (they were `ndarray[Any, Any]` and `(Any, ...)`).
+    result = run_mypy(FIXTURES / "union_scalar_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[N, M], {_F64}]"',
+        13: f'"{_ND}[tuple[N, M], {_F64}]"',
+        14: f'"{_ND}[tuple[N, M], {_F64}]"',
+        20: f'"{_ND}[tuple[N], {_BOOL}]"',
+        21: f'"{_ND}[tuple[N], {_BOOL}]"',
+    }, result.stdout
+
+
+def test_bad_union_scalar() -> None:
+    # Issue 331: the array member of `F64[3] | float` is checked.
+    result = run_mypy(FIXTURES / "bad_union_scalar.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [6, 7], result.stdout
+    assert all(len(errors[line]) == 1 for line in (6, 7)), result.stdout
+    assert "(shapes (2, 2) vs (3,))  [numty-broadcast]" in errors[6][0], result.stdout
+    assert "(shapes (3,) vs (2, 2))  [numty-broadcast]" in errors[7][0], result.stdout
+
+
+def test_union_concat_ok() -> None:
+    # Issue 331: concatenate / hstack over an if-joined union distribute
+    # per member (they were `(Any, ...)`); a loop accumulator still ends
+    # on the stubs, not on the members of the last pass.
+    result = run_mypy(FIXTURES / "union_concat_ok.py", flags=("--allow-redefinition",))
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        13: f'"{_ND}[tuple[N+1], {_F64}] | {_ND}[tuple[?U@12+1], {_F64}]"',
+        14: f'"{_ND}[tuple[2*N], {_F64}] | {_ND}[tuple[2*?U@12], {_F64}]"',
+        15: f'"{_ND}[tuple[N+1], {_F64}] | {_ND}[tuple[?U@12+1], {_F64}]"',
+        23: (
+            f'"{_ND}[tuple[Literal[0], Literal[3]], {_F64}] | {_ND}[tuple[Literal[1], Literal[3]], {_F64}]'
+            f' | {_ND}[tuple[Any, ...], numpy.dtype[Any]]"'
+        ),
+    }, result.stdout
+
+
+def test_union_transpose_ok() -> None:
+    # Issue 331: `.T` of `(M, N) | (Any, ...)` had the untransposed (M, N)
+    # as a third member, which failed the return.
+    result = run_mypy(FIXTURES / "union_transpose_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[N, M], {_F64}] | {_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+    }, result.stdout
+
+
+def test_bad_union_callsite() -> None:
+    # Issue 331: a union (or optional) actual is checked per member at a
+    # call of a user function; co-derived actuals pair index-wise.
+    fixture = FIXTURES / "bad_union_callsite.py"
+    result = run_mypy(fixture)
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [23, 24], result.stdout
+    for line in (23, 24):
+        assert len(errors[line]) == 1, result.stdout
+        assert "call-site shape conflict for 'N': 3" in errors[line][0], result.stdout
+        assert errors[line][0].endswith("[numty-callsite]"), result.stdout
+    on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    assert sorted(on) == [23, 24, 29], on
+    assert "call-site binding of 'T'" in on[29][0] and "T and N are different names" in on[29][0], on
+
+
+def test_union_append_ok() -> None:
+    # Issue 331: `np.append(1 - y, y)` with `y` a union pairs the members
+    # index-wise; the cartesian (N, 3*K) member was impossible.
+    result = run_mypy(FIXTURES / "union_append_ok.py", flags=("--allow-redefinition",))
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        14: f'"{_ND}[tuple[N, 2*K], {_F64}] | {_ND}[tuple[N, 4*K], {_F64}]"',
+    }, result.stdout

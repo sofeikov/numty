@@ -41,7 +41,7 @@ from ._types import (
     TUPLE_FULLNAME, _OPERATOR_DUNDERS,
 )
 from ._callbind import (
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return,
+    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _union_actual_variants,
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
@@ -422,8 +422,10 @@ class NumtyPlugin(Plugin):
         )
         try:
             if isinstance(sig, CallableType) and not overloaded:
-                _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
-                _report_call_site_names(sig, ctx)
+                # A union actual is checked per member (issue 331).
+                for overrides in _union_actual_variants(sig, ctx):
+                    _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx, overrides))
+                    _report_call_site_names(sig, ctx, overrides)
         except Exception:
             _swallowed(ctx, "method_signature_hook")
             pass
@@ -522,8 +524,10 @@ class NumtyPlugin(Plugin):
         # so it is guarded separately (the outer hook would otherwise
         # fall back to the default, unrepaired signature).
         try:
-            _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx))
-            _report_call_site_names(sig, ctx)
+            # A union actual is checked per member (issue 331).
+            for overrides in _union_actual_variants(sig, ctx):
+                _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx, overrides))
+                _report_call_site_names(sig, ctx, overrides)
             _report_index_call_site(sig, ctx)
         except Exception:
             _swallowed(ctx, "_callsite_check")
@@ -1660,23 +1664,29 @@ def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
 
 
 def t_attribute_hook(ctx: AttributeContext) -> Type:
-    dist = _distribute_solve([ctx.type], lambda t: _t_type(ctx, t))
+    # On a union mypy asks once per member, with that member's stub type
+    # as the default but the whole union as `ctx.type`. A member that
+    # does not solve keeps its own stub type (`Self`), not the default of
+    # the member being asked about (issue 331: `(M, N) | (Any, ...)` got
+    # the untransposed (M, N) as a third member).
+    dist = _distribute_solve([ctx.type], lambda t: _t_type(ctx, t, t))
     if dist is not None:
         return dist
-    return _t_type(ctx, ctx.type)
+    return _t_type(ctx, ctx.type, ctx.default_attr_type)
 
 
-def _t_type(ctx: AttributeContext, tp: Type) -> Type:
+def _t_type(ctx: AttributeContext, tp: Type, default: Type) -> Type:
     """The .T view: full reversal, concrete or mixed shapes only.
 
     Unpack shapes bail: reversing would also reverse *Ts itself, which
-    no annotation can spell (issue #48). Anything else stays on the stubs.
+    no annotation can spell (issue #48). Anything else stays on the
+    stubs (`default`, the stub's `Self`).
     """
     parts = _movable_parts(tp)
     if parts is not None:
         dims, dtype = parts
         return _ndarray_type(ctx, list(reversed(dims)), dtype)
-    return ctx.default_attr_type
+    return default
 
 
 def len_function_hook(ctx: FunctionContext) -> Type:

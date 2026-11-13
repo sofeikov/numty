@@ -699,6 +699,74 @@ def _union_members(tp: Type) -> list[Type] | None:
     return members
 
 
+_PY_SCALARS = frozenset({"builtins.int", "builtins.float", "builtins.complex", "builtins.bool"})
+
+
+def _is_scalar_member(tp: Type) -> bool:
+    """A Python number (`int`, `float`, a literal of one) or a NumPy scalar."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType):
+        proper = proper.fallback
+    if not isinstance(proper, Instance):
+        return False
+    return proper.type.fullname in _PY_SCALARS or proper.type.has_base("numpy.generic")
+
+
+def _scalar_union_members(tp: Type) -> list[Type] | None:
+    """Members of a union of numbers, or of arrays and numbers, else None.
+
+    Issue 331. `F64[M] | float` and `float | int`: a union with at least
+    one Python or NumPy scalar member and nothing but arrays and scalars
+    otherwise. A pure union of arrays is `_union_members`.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, UnionType):
+        return None
+    members: list[Type] = []
+    scalar = False
+    for item in proper.items:
+        item_proper = get_proper_type(item)
+        if _is_scalar_member(item_proper):
+            scalar = True
+        elif not (
+            isinstance(item_proper, Instance)
+            and item_proper.type.fullname == NDARRAY_FULLNAME
+            and len(item_proper.args) == 2
+        ):
+            return None
+        members.append(item)
+    return members if scalar and len(members) >= 2 else None
+
+
+def _optional_members(tp: Type) -> list[Type] | None:
+    """Members of a union of arrays and `None` (`F64[N] | None`), else None.
+
+    Issue 331: an optional array argument (`weights`, sklearn's
+    `sample_weight=None`) distributes per member like a union of arrays.
+    Only the call sites that know what `None` means there use it; the
+    `None` member stays in the list for them.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, UnionType):
+        return None
+    members: list[Type] = []
+    seen_none = False
+    for item in proper.items:
+        item_proper = get_proper_type(item)
+        if isinstance(item_proper, NoneType):
+            if seen_none:
+                continue
+            seen_none = True
+        elif not (
+            isinstance(item_proper, Instance)
+            and item_proper.type.fullname == NDARRAY_FULLNAME
+            and len(item_proper.args) == 2
+        ):
+            return None
+        members.append(item)
+    return members if len(members) >= 2 else None
+
+
 def _distribute_pairings(types: list[Type]) -> list[list[Type]] | None:
     """Per-operand member lists when union distribution applies.
 
@@ -711,6 +779,15 @@ def _distribute_pairings(types: list[Type]) -> list[list[Type]] | None:
     """
     member_lists: list[list[Type]] = []
     count = 0
+    mixed = [m for m in (_scalar_union_members(tp) for tp in types) if m is not None]
+    if mixed:
+        # Issue 331: a union of arrays and scalars (`F64[M] | float`, a
+        # `float | int` threshold) distributes per member too, when it is
+        # the only union among the operands: nothing says how its members
+        # pair with another union's.
+        if len(mixed) != 1 or any(_union_members(tp) is not None for tp in types):
+            return None
+        return [_scalar_union_members(tp) or [tp] for tp in types]
     for tp in types:
         members = _union_members(tp)
         if members is None:
@@ -724,6 +801,19 @@ def _distribute_pairings(types: list[Type]) -> list[list[Type]] | None:
     if count == 0:
         return None
     return member_lists
+
+
+def _in_loop_body(ctx: FunctionContext | MethodContext) -> bool:
+    """Whether the call is checked inside the body of a `for` or `while` loop.
+
+    mypy checks a loop body again while the types it binds change, and
+    stops after a few passes. A union that a call grows by a member on
+    every pass (`out = np.concatenate([out, row])`) is then cut off at
+    the last pass, not widened: the joins that grow a size do not
+    distribute there (issue 331).
+    """
+    binder = getattr(ctx.api, "binder", None)
+    return bool(getattr(binder, "break_frames", None))
 
 
 def _union_results(results: list[Type]) -> Type:

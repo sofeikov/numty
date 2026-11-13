@@ -41,7 +41,8 @@ permutations, repeated axes and non-1 squeeze axes error.
 
 `sum(axis=1)` (plus `median` and every `nan*` twin:
 `nansum`, `nanmean`, `nanargmin`, …), `average` (1-D weights must match
-the averaged axis), `diff` (concrete lengths subtract, bad axes and
+the averaged axis; `weights: F64[N] | None` is checked on its array
+member, and named sizes that differ are `numty-names`), `diff` (concrete lengths subtract, bad axes and
 negative orders error), `cumsum`/`cumprod` (shape-preserving).
 
 ## Matmul family
