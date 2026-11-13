@@ -19,8 +19,11 @@ from ._types import (
     _report_names, _union_members,
 )
 from ._heads import (
-    _index_record_exact, _index_recorded_exceeds, _recorded_at_site, _recorded_index_on,
+    _index_dims_match, _index_on, _index_record_exact, _index_recorded_exceeds, _recorded_at_site, _recorded_index_on,
 )
+import ast
+
+from ._returns import _module_ast
 from ._unknowns import _fresh_mask_count
 from ._ops import flatnonzero_function_hook
 from ._reshape import (
@@ -230,6 +233,40 @@ def _single_rvalue(func_node: object | None, varname: str) -> Expression | None:
                 _walk(inner)
 
     _walk(getattr(getattr(func_node, "body", None), "body", None))
+    return found[0] if len(found) == 1 else None
+
+
+def _assignment_lines(func_node: object | None, varname: str) -> list[int]:
+    """The lines of the plain assignments `varname = ...` in the function, at any depth."""
+    from mypy.nodes import AssignmentStmt as _AssignmentStmt
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import FuncDef as _FuncDef
+
+    lines: list[int] = []
+
+    def _walk(stmts: object) -> None:
+        for stmt in stmts if isinstance(stmts, list) else []:
+            if isinstance(stmt, (_FuncDef, _ClassDef)):
+                continue
+            if isinstance(stmt, _AssignmentStmt) and any(
+                isinstance(lv, NameExpr) and lv.name == varname for lv in stmt.lvalues
+            ):
+                lines.append(stmt.line)
+            for inner in _nested_bodies(stmt):
+                _walk(inner)
+
+    _walk(getattr(getattr(func_node, "body", None), "body", None))
+    return lines
+
+
+def _recorded_on_lines(module: str, lines: list[int], idims: list[int | Type]) -> int | Type | None:
+    """The one record, among those lines, of an array with exactly this shape."""
+    found = [
+        second
+        for line in lines
+        for first, second in _index_on.get(f"{module}@{line}", [])
+        if first is not None and _index_dims_match(first, idims)
+    ]
     return found[0] if len(found) == 1 else None
 
 
@@ -528,7 +565,19 @@ def _recorded_for_operand(
             # A non-Index annotation carries no record (plain I64 stays
             # silent even where a producer record shares the line).
             return None
-        return _recorded_index_on(ctx, idims, expr)
+        # The record is the assigned call's own, not that of a call
+        # nested in it: `idx = np.clip(np.searchsorted(a, v), 0, n - 1)`
+        # and `np.minimum(np.searchsorted(a, v), n - 1)` changed the
+        # values, as a rebinding would (issue 315).
+        rvalue = _single_rvalue(func_node, varname)
+        if isinstance(rvalue, (CallExpr, OpExpr)):
+            return _recorded_at_site(ctx, module, getattr(rvalue, "line", 0) or 0, getattr(rvalue, "column", 0) or 0)
+        found = _recorded_index_on(ctx, idims, expr)
+        if found is None:
+            # A name assigned in several branches: the record of the
+            # assignment that gave this shape, whichever line it is on.
+            found = _recorded_on_lines(module, _assignment_lines(func_node, varname), idims)
+        return found
     except Exception:
         _swallowed(ctx, "_recorded_for_operand")
         try:
@@ -789,6 +838,27 @@ def _parse_index_item(
         return ("newaxis",)
     if isinstance(expr, EllipsisExpr):
         return ("ellipsis",)
+    members = _union_members(tp)
+    if members is not None:
+        # An index assigned in both branches of an `if` (issue 319):
+        # every member an integer array, or every member a mask, of one
+        # rank. An axis the members do not agree on is unknown.
+        from numty_plugin import _fresh_unknown
+
+        parsed = [_parse_index_item(ctx, member, expr) for member in members]
+        first = parsed[0]
+        if (
+            first is None
+            or first[0] not in ("fancy", "mask")
+            or any(p is None or p[0] != first[0] or len(p[1]) != len(first[1]) for p in parsed)
+        ):
+            return None
+        dims: list[int | Type] = []
+        for axis in range(len(first[1])):
+            sizes = [p[1][axis] for p in parsed if p is not None]
+            same = all(s is sizes[0] or _dim_eq(s, sizes[0]) for s in sizes)
+            dims.append(sizes[0] if same else _fresh_unknown(ctx, "union-index", axis))
+        return (first[0], dims)
     part = _ndarray_parts(tp)
     if part is None:
         # Issue #226: Bool[int] (and other plain-int shapes) bails in
@@ -1170,6 +1240,14 @@ def _check_index_positions(
     expressions.
     """
     tp, expr = pair
+    members = _union_members(tp)
+    if members is not None:
+        # An index assigned in both branches of an `if`: each member has
+        # its own record (issue 319). The first report is enough.
+        for member in members:
+            if _check_index_positions(ctx, (member, expr), size, axis, dims):
+                return True
+        return False
     parts = _ndarray_parts(tp)
     if parts is None:
         return False
@@ -1526,6 +1604,60 @@ def getitem_method_hook(ctx: MethodContext) -> Type:
     if dist is not None:
         return dist
     return _getitem_types(ctx, ctx.type, pairs[0])
+
+
+def iter_method_hook(ctx: MethodContext) -> Type:
+    """Iterating or unpacking an array of known rank (issue 318).
+
+    `for row in m` and `xs, ys = points.T` go through `ndarray.__iter__`,
+    which the stubs type as an iterator of rank-less arrays. The items
+    of an array of rank 2 or more are arrays with the first axis
+    removed. A rank-1 array gives scalars, which stay with the stubs.
+    With a literal first axis, an unpacking into another number of
+    names raises, and is reported.
+    """
+    default = ctx.default_return_type
+    try:
+        parts = _ndarray_parts(ctx.type) or _known_rank_parts(ctx.type)
+        if parts is None or not parts[0]:
+            return default
+        dims, dtype = parts
+        first = dims[0]
+        if isinstance(first, int):
+            names = _unpack_target_count(ctx)
+            if names is not None and names != first:
+                ctx.api.fail(
+                    f"cannot unpack an array of shape {_dims_str(dims)} into {names} names: axis 0 has size {first}",
+                    ctx.context,
+                    code=NUMTY_SHAPE,
+                )
+                return default
+        proper = get_proper_type(default)
+        if len(dims) < 2 or not isinstance(proper, Instance) or len(proper.args) != 1:
+            return default
+        return proper.copy_modified(args=[_ndarray_type(ctx, list(dims[1:]), dtype)])
+    except Exception:
+        _swallowed(ctx, "iter_method_hook")
+        return default
+
+
+def _unpack_target_count(ctx: MethodContext) -> int | None:
+    """The number of names `a, b, c = <this value>` unpacks into, else None (no star, plain tuple target)."""
+    tree = getattr(ctx.api, "tree", None)
+    mod = _module_ast(getattr(tree, "path", None) or "")
+    if mod is None:
+        return None
+    where = (ctx.context.line, ctx.context.column)
+    for node in ast.walk(mod):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        if (node.value.lineno, node.value.col_offset) != where:
+            continue
+        target = node.targets[0]
+        if isinstance(target, (ast.Tuple, ast.List)) and not any(isinstance(e, ast.Starred) for e in target.elts):
+            return len(target.elts)
+        return None
+    return None
 
 
 def setitem_method_hook(ctx: MethodContext) -> Type:

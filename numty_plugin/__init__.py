@@ -65,7 +65,7 @@ from ._linalg import (  # noqa: F401
     _scalar_family, _scalar_of_dtype, _string_value,
 )
 from ._indexing import (  # noqa: F401
-    flatnonzero_mask_hook,
+    flatnonzero_mask_hook, iter_method_hook,
     _consume_one, _consume_prefix, _consume_suffix, _getitem_types, _index_pairs, _is_scalar_target,
     _parse_index_item, _parse_index_items, _solve_getitem, _solve_getitem_unpack, _take_in_bounds,
     _take_index_values, _take_indices, _take_solve, getitem_method_hook, setitem_method_hook,
@@ -144,6 +144,7 @@ from ._ops import (  # noqa: F401
     repeat_method_hook, _pad_side, _pad_widths, _pad_side_fallback, _pad_side_fallback_single,
     pad_function_hook, split_function_hook, array_split_function_hook, _select_index_elem,
     _nonzero_like, nonzero_function_hook, count_nonzero_function_hook, flatnonzero_function_hook,
+    bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook, _search_values_dims,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook,
     sliding_window_view_function_hook, atleast_function_hook,

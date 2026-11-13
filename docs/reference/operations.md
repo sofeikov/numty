@@ -93,7 +93,9 @@ counts: `bins=16` gives `(16,)` and `(17,)`, an array of `B` edges gives
 `(B-1,)` and `(B,)`. The counts are int64, and the edges have the dtype
 of the edges array, or of the data for a count of bins (float64 for
 integer data). `split` and `array_split` at a 1-D array of positions
-return a list of pieces with a `?U` size on the axis.
+return a list of pieces with a `?U` size on the axis. `bincount(x,
+weights=w)` needs one weight per entry of `x`: provably different
+lengths are an error, two different names an opt-in report.
 
 ## Arrays from lists built at runtime
 

@@ -5318,6 +5318,70 @@ def test_symbolic_slice() -> None:
     assert _run_fixture("symbolic_slice.py") == ["(4,)"]
 
 
+def test_join_int_items() -> None:
+    # Issue 316: items with an `int` size have a shape; they bailed
+    # with "the items have no known shape".
+    result = run_mypy(FIXTURES / "join_int_items.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[11] == f'"numpy.ndarray[tuple[N, ?U@11], {_F64}]"', result.stdout
+    assert notes[12] == f'"numpy.ndarray[tuple[int, ?U@12], {_F64}]"', result.stdout
+    assert notes[13] == f'"numpy.ndarray[tuple[int, ?U@13], {_F64}]"', result.stdout
+    assert notes[14] == f'"numpy.ndarray[tuple[?U@14], {_F64}]"', result.stdout
+
+
+def test_bad_bincount_weights() -> None:
+    # Issue 317: numpy raises "The weights and list don't have the same length".
+    result = run_mypy(FIXTURES / "bad_bincount_weights.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [13, 19], result.stdout
+    assert "bincount weights must have the length of x: (N,) vs (N-1,)" in errors[13][0], result.stdout
+    assert "(4,) vs (3,)" in errors[19][0] and errors[19][0].endswith("[numty-shape]"), result.stdout
+    assert _run_fixture("bad_bincount_weights.py") == ["The weights and list don't have the same length."]
+
+
+def test_array_unpack() -> None:
+    # Issue 318: the items of an iterated or unpacked array keep their
+    # shape, and a literal first axis is checked against the names.
+    result = run_mypy(FIXTURES / "array_unpack.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [6, 16], result.stdout
+    assert "cannot unpack an array of shape (3, 2) into 2 names: axis 0 has size 3" in errors[6][0], result.stdout
+    notes = reveals_by_line(result)
+    assert notes[9] == '"numpy.ndarray[tuple[?U@7], numpy.dtype[Any]]"', result.stdout
+    assert notes[11] == f'"numpy.ndarray[tuple[Literal[2]], {_F64}]"', result.stdout
+    assert _run_fixture("array_unpack.py") == ["too many values to unpack (expected 2)"]
+
+
+def test_union_index_optin() -> None:
+    # Issue 319: an index assigned in both branches of an `if` is a
+    # union under allow_redefinition. It is solved member by member,
+    # and the positions check runs for each.
+    fixture = FIXTURES / "union_index_optin.py"
+    off = run_mypy(fixture, flags=("--allow-redefinition",))
+    assert off.returncode == 0, off.stdout
+    notes = reveals_by_line(off)
+    assert notes[20] == f'"numpy.ndarray[tuple[?U@20, A, Literal[3]], {_F64}]"', off.stdout
+    assert notes[21] == f'"numpy.ndarray[tuple[?U@21, A], {_F64}]"', off.stdout
+    on = run_mypy(fixture, flags=("--allow-redefinition", "--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [14, 20, 21], on.stdout
+    for line in (14, 20, 21):
+        assert "F and S are different names" in errors[line][0], on.stdout
+
+
+def test_index_clip_ok() -> None:
+    # Issue 315: `np.clip(np.searchsorted(a, v), 0, len(a) - 1)` and
+    # `np.minimum(...)` changed the values, so the name assigned from
+    # them holds no record; the plain call and the method still do.
+    fixture = FIXTURES / "index_clip_ok.py"
+    assert run_mypy(fixture).returncode == 0
+    errors = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
+    assert sorted(errors) == [23, 28], errors
+    for line in (23, 28):
+        assert "they may run past the axis" in errors[line][0], errors
+
+
 def test_numba_dispatcher_call() -> None:
     # Issue 281: a call of a jitted function is checked as a call of the
     # function: sizes are solved (they were `Never`), a formula return is

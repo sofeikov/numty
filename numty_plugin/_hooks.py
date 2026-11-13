@@ -63,7 +63,7 @@ from ._ops import (
     corrcoef_function_hook, cov_function_hook, roll_function_hook, gradient_function_hook,
     rot90_function_hook, convolve_function_hook, correlate_function_hook, tile_function_hook,
     repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook,
-    array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook,
+    array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
     atleast_function_hook,
@@ -92,7 +92,8 @@ from ._linalg import (
     linalg_cross_function_hook, linalg_function_hook,
 )
 from ._indexing import (
-    flatnonzero_mask_hook, getitem_method_hook, setitem_method_hook, take_along_axis_function_hook, take_function_hook,
+    flatnonzero_mask_hook, getitem_method_hook, iter_method_hook,
+    setitem_method_hook, take_along_axis_function_hook, take_function_hook,
     take_method_hook,
 )
 from ._broadcast import (
@@ -870,6 +871,8 @@ class NumtyPlugin(Plugin):
             return transpose_method_hook
         if fullname == "numpy.ndarray.squeeze":
             return squeeze_method_hook
+        if fullname == "numpy.ndarray.__iter__":
+            return iter_method_hook
         if fullname == "numpy.ndarray.__getitem__":
             return getitem_method_hook
         if fullname == "numpy.ndarray.__setitem__":
@@ -1756,6 +1759,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             },
         },
         "numpy._core.multiarray": {
+            "bincount": bincount_function_hook,
             "arange": arange_function_hook,
             "array": asarray_function_hook,
             "asanyarray": asarray_function_hook,

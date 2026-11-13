@@ -1,5 +1,5 @@
 """Issue #274: a NamedTuple taken with an untyped index fits a callee that shares the size."""
-from typing import Generic, NamedTuple, TypeVar
+from typing import Any, Generic, NamedTuple, TypeVar
 
 import numpy as np
 from numty import F32, I64
@@ -21,8 +21,8 @@ def per_row(rows: I64[E], block: Block[P, E]) -> None:
     pass
 
 
-def use(block: Block[P, F], pairs: list[tuple[int, int]], rows: I64[E], idx: I64[R]) -> None:
-    ei, fi = np.array(pairs).T  # both Any
+def use(block: Block[P, F], pairs: Any, rows: I64[E], idx: I64[R]) -> None:
+    ei, fi = np.array(pairs).T  # both Any: `pairs` has no known shape
     sel = block.take(fi)
     reveal_type(sel)
     per_row(rows[ei], sel)
