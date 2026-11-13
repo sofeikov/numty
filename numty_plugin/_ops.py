@@ -1246,7 +1246,7 @@ def bincount_function_hook(ctx: FunctionContext) -> Type:
     numpy raises "The weights and list don't have the same length", with
     no broadcasting. Provably different sizes are an error; two
     different names, or a selection count against a name, are reported
-    under the opt-in code. The result keeps the stubs' type.
+    under the numty-names code. The result keeps the stubs' type.
     """
     try:
         pairs = _all_positionals(ctx)

@@ -1456,7 +1456,7 @@ def _concat_merge(
                 # bailing to Any so the shape stays solved.
                 # Issue 333: a name against an unknown is the name, as
                 # the items must agree there; two unknowns, or two names
-                # (reported under the opt-in code), are an unknown.
+                # (reported under the numty-names code), are an unknown.
                 kept = _kept_name(out[i], d)
                 if kept is None:
                     _report_names(

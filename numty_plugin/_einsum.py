@@ -170,7 +170,7 @@ def _einsum_solve(
                     )
                 else:
                     # Symbolic vs anything unprovable: bail out. Two
-                    # different names on one label are the opt-in
+                    # different names on one label are the
                     # report (issue 326), as a matmul's inner pair is.
                     if ctx is not None:
                         first_dims = label_first_dims.get(label, [])
@@ -229,7 +229,7 @@ def _widen_operands(sig: CallableType) -> CallableType:
 
 
 def _einsum_names_clash(ctx: FunctionSigContext, operand_exprs: list[Expression], terms: list[str]) -> bool:
-    """Whether the function hook makes the opt-in names report (issue 326).
+    """Whether the function hook makes the names report (issue 326).
 
     One label over two different names (`ij,jk` on (M, K) and (M, K)),
     with `numty-names` on. Ellipsis terms and anything unreadable: no.
@@ -292,7 +292,7 @@ def _einsum_signature_hook(ctx: FunctionSigContext) -> FunctionLike:
         if problem is not None:
             return _widen_operands(sig)
         # The dry run bails on two different names; the function hook makes
-        # the opt-in names report there (issue 326), so widen for it too.
+        # the names report there (issue 326), so widen for it too.
         terms = "".join(eq_expr.value.split()).split("->")[0].split(",")
         if _einsum_names_clash(ctx, operand_exprs, terms):
             return _widen_operands(sig)

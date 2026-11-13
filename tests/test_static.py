@@ -6710,7 +6710,7 @@ def test_index_kept_names_ok() -> None:
 
 
 def test_index_kept_names_catch_later_bugs() -> None:
-    result = run_mypy(FIXTURES / "bad_index_kept_names.py")
+    result = run_mypy(FIXTURES / "bad_index_kept_names.py", flags=NAMES_OFF)
     assert _messages_by_line(result) == {
         15: ["broadcast shapes disagree at trailing axis 0: M vs M+1 (shapes (M,) vs (M+1,))  [numty-broadcast]"],
         20: ["broadcast shapes disagree at trailing axis 0: f vs f-1 (shapes (c, f) vs (c, f-1))  [numty-broadcast]"],

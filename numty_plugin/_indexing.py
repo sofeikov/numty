@@ -680,7 +680,7 @@ def flatnonzero_mask_hook(ctx: FunctionContext) -> Type:
 
     `x[keep]` and `np.flatnonzero(keep)` hold one entry per True of
     `keep`, so they share the unknown of the variable (issue #288), and
-    under the opt-in code the positions are a size of their own against
+    under the numty-names code the positions are a size of their own against
     a name. Any other argument (an expression, a non-boolean array, a
     variable bound twice) gives a fresh unknown, as before.
     """
@@ -1291,7 +1291,7 @@ def _check_index_positions(
     """A recorded positions-on size must fit the axis it indexes (issues #285, #287).
 
     A recorded bound provably above the axis (N+1 positions on an N
-    axis) is an error; a different *named* size is an opt-in
+    axis) is an error; a different *named* size is a
     [numty-names] error; equal, fitting, unknown, or unrecorded
     operands stay silent. Returns True when an error was reported, so
     the caller can keep the stubs' type: like every older index error,
@@ -1330,7 +1330,7 @@ def _check_index_positions(
     if isinstance(recorded, str):
         # The annotation spelled a bare size name the analyzed record
         # missed (warm cache, odd spelling): match by name. Same name
-        # as the axis is fitting; a different named axis is the opt-in
+        # as the axis is fitting; a different named axis is the
         # report. Linear forms fall back to silent here; the analyzed
         # record covers them when present.
         if isinstance(size, int):
@@ -1357,7 +1357,7 @@ def _check_index_positions(
         # `Index[...]` annotation give an upper bound on the values, so
         # `a[np.searchsorted(a, v)]` is wrong only when a value is above
         # `a[-1]`, and code that clips, guards or fixes the positions in
-        # place is right. That report is under the opt-in code.
+        # place is right. That report is under the numty-names code.
         certain = span is not None or _index_record_exact(ctx, expr, recorded)
         if not certain and not _names_enabled(ctx):
             return False

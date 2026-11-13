@@ -1180,7 +1180,7 @@ def _fam_applied(
 # (argmin/argmax, argsort, arange, flatnonzero, nonzero, searchsorted)
 # record the same fact. The getitem fancy-index path reads the record:
 # a recorded size used on a provably different axis is an error, a
-# different *named* size is an opt-in [numty-names] error, and anything
+# different *named* size is a [numty-names] error, and anything
 # unrecorded or ambiguous stays silent.
 _index_on = STATE.index_on
 _index_exact = STATE.index_exact

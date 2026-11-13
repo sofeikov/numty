@@ -160,7 +160,7 @@ def _report_call_site_names(
     ctx: FunctionSigContext | MethodSigContext,
     overrides: ActualOverrides | None = None,
 ) -> None:
-    """The opt-in `[numty-names]` report at a call (issue 280, reused by 288).
+    """The `[numty-names]` report at a call (issue 280, reused by 288).
 
     `score(ids: I64[K], d: F64[P, K])` called with an `I64[N]` and an
     `F64[N, P]` binds `K` to the caller's `N` and to its `P`. The
@@ -260,7 +260,7 @@ def _report_index_call_site(sig: CallableType, ctx: FunctionSigContext) -> None:
     formal declares `Index` on another is reportable: `read(m,
     m.argmin(axis=0))` is silent where `read` expects positions on P,
     while `read(m, np.argsort(t))` (positions on N) is an error with
-    the opt-in code. Same-module plain functions only (the formal's
+    the numty-names code. Same-module plain functions only (the formal's
     annotation is read off the callee's own node); methods,
     cross-module calls, overloads and keyword arguments stay silent.
     Ints on either side stay silent. Never raises.

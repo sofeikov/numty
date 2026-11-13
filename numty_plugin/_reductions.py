@@ -1248,7 +1248,7 @@ def _check_average_weights(
     if not isinstance(size, int) or not isinstance(wdims[0], int):
         # Symbolic sizes: an error only when no sizes make them equal
         # (`N+1` against `N`); different names (`N` against `K`) are the
-        # opt-in `[numty-names]` report (issue 331).
+        # `[numty-names]` report (issue 331).
         if _dim_eq(size, wdims[0]):
             return None
         if not _dims_provably_ne(size, wdims[0]):

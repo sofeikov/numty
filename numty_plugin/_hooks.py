@@ -1226,7 +1226,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
                     _, msg = _broadcast_result(list(da), list(db), None)
                     if msg is not None:
                         return True
-                    # The opt-in reports for two different names (issue
+                    # The reports for two different names (issue
                     # #280) and for selection counts (issue #288) are
                     # errors of the method hook as well.
                     if names_on and (_named_pair_in(da, db) or _mask_pair_in(da, db)):
