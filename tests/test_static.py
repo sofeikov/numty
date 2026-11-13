@@ -5409,7 +5409,8 @@ def test_callsite_symbolic_conflict() -> None:
     assert sorted(errors) == [21, 22, 23, 24], result.stdout
     for line in errors:
         assert len(errors[line]) == 1, result.stdout
-        assert "call-site shape conflict for 'N': R (argument 'values', axis 0) vs R-1" in errors[line][0], result.stdout
+        want = "call-site shape conflict for 'N': R (argument 'values', axis 0) vs R-1"
+        assert want in errors[line][0], result.stdout
         assert errors[line][0].endswith("[numty-callsite]"), result.stdout
 
 
