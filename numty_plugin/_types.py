@@ -226,7 +226,14 @@ def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
     ma = _is_mask_count_dim(a)
     mb = _is_mask_count_dim(b)
     if ma is not None and mb is not None:
-        return ma != mb
+        if ma == mb:
+            return False
+        # One size against itself plus a constant (`?K-1` and `?K-2`) is
+        # not two names (issue 328): a mismatch, or `_unknown_offset`'s.
+        fa, fb = _resolve_dim(a), _resolve_dim(b)
+        if isinstance(fa, _LinForm) and isinstance(fb, _LinForm) and fa.coeffs == fb.coeffs:
+            return False
+        return True
     other: int | Type | None = None
     if ma is not None:
         other = b
@@ -251,8 +258,14 @@ def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
 
 
 def _mask_pair_in(a: Sequence[int | Type], b: Sequence[int | Type]) -> bool:
-    """Whether the broadcast of two shapes pairs a reportable mask count (issue 288)."""
-    return any(_mask_counts_differ(x, y) for x, y in zip(reversed(a), reversed(b)))
+    """Whether the broadcast of two shapes pairs a reportable mask count (issue 288).
+
+    Or one unknown against itself plus a constant (`_unknown_offset`):
+    `_report_mask_names` reports both (issue 328).
+    """
+    return any(
+        _mask_counts_differ(x, y) or _unknown_offset(x, y) != 0 for x, y in zip(reversed(a), reversed(b))
+    )
 
 
 def _report_mask_names(

@@ -70,7 +70,12 @@ transposed matrix, a per-row array against a per-group one. Turn the
 check on to have them reported (issue #280), including selection counts
 (issue #288) and the sizes a function or an object chose (`?K@12`,
 `?ctx.E`, see [A size the function chooses](../guide/unknown-dims.md#a-size-the-function-chooses)), and one unknown
-against itself plus a constant (`?U@12 and ?U@12-1 are 1 apart`):
+against itself plus a constant (`?U@12 and ?U@12-1 are 1 apart`). One
+selection count or one size a function chose against itself plus a
+constant (`?K@12-1` against `?K@12-2`) is wrong for every size, like
+`N-1` against `N-2`, and is a default `[numty-broadcast]` error; only
+where it is minted in a loop or a comprehension, and so stands for a
+size per run, is it left to this code (issue 328):
 
 ```ini
 [mypy]

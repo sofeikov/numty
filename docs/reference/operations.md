@@ -162,7 +162,8 @@ to two values (`(d, d) += (2, 3)`) are errors, while a literal against
 one name (`(d, d) += (3, 3)`), two different names and an `int` or
 unknown axis stay silent. Promotion matches
 NumPy (`np.result_type` over the full dtype matrix, plus weak Python
-and numpy scalars): float ufuncs pick the smallest float (`sqrt(uint8)`
+and numpy scalars; a size taken from a shape, `X.shape[0]` or
+`len(X)`, is a Python `int`, so `X / len(X)` keeps `X`'s shape): float ufuncs pick the smallest float (`sqrt(uint8)`
 is `float16`), true division of ints is `float64` (`f32 / u8` stays
 `float32`), `rng(..., dtype=np.float32)` is honored, `clip` promotes
 across all operands, `linalg.solve` maps ints to `float64` and rejects

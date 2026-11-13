@@ -34,6 +34,7 @@ from ._errors import _swallowed
 from ._exprs import _EXPR_PREFIX, _iter_tvarlikes, _resolve_dim
 from ._forms import _form_has_unknown, _is_unknown_fullname
 from ._types import _OWN_NAME_OF, INT_FULLNAME, NDARRAY_FULLNAME
+from ._unknowns import _AST_REPEATED, _module_ast
 
 
 def _is_dynamic_return_dim(d: int | Type) -> bool:
@@ -105,23 +106,6 @@ def _return_sites_of(path: str) -> tuple[list, list] | None:
     return returns, assigns
 
 
-_MODULE_AST_CACHE: dict[str, tuple[float, ast.Module]] = {}
-
-
-def _module_ast(path: str) -> ast.Module | None:
-    try:
-        mtime = os.path.getmtime(path)
-        hit = _MODULE_AST_CACHE.get(path)
-        if hit is not None and hit[0] == mtime:
-            return hit[1]
-        with open(path, "r", encoding="utf-8") as fh:
-            mod = ast.parse(fh.read())
-    except (OSError, SyntaxError, ValueError):
-        return None
-    _MODULE_AST_CACHE[path] = (mtime, mod)
-    return mod
-
-
 def _holder_key(path: str | None, use_line: int, name: str) -> str | None:
     """A key for the object the variable `name` holds at `use_line`, else None.
 
@@ -129,7 +113,9 @@ def _holder_key(path: str | None, use_line: int, name: str) -> str | None:
     the last binding of the name before it (0 for a parameter or a name
     from outside), so `ctx = ctx or Ctx(...)` starts a new object and
     the reads after it share one. Not flow-sensitive: with a binding
-    inside a loop and another one anywhere, there is no key.
+    inside a loop and another one anywhere, there is no key. A binding
+    in a loop or a comprehension holds an object per run: the key then
+    ends with `::loop` (issue 328).
     """
     mod = _module_ast(path) if path else None
     if mod is None or use_line <= 0:
@@ -155,7 +141,7 @@ def _holder_key(path: str | None, use_line: int, name: str) -> str | None:
                 continue
             if isinstance(child, ast.Name) and child.id == name and isinstance(child.ctx, (ast.Store, ast.Del)):
                 stores.append((child.lineno, in_loop))
-            walk(child, in_loop or isinstance(child, (ast.For, ast.AsyncFor, ast.While)))
+            walk(child, in_loop or isinstance(child, _AST_REPEATED))
 
     walk(func, False)
     args = getattr(func, "args", None)
@@ -166,7 +152,8 @@ def _holder_key(path: str | None, use_line: int, name: str) -> str | None:
     if len(stores) + (1 if is_param else 0) > 1 and any(loop for _, loop in stores):
         return None
     last = max((line for line, _ in stores if line < use_line), default=0)
-    return f"{getattr(func, 'name', '')}@{getattr(func, 'lineno', 0)}::{name}::{last}"
+    loop = "::loop" if any(in_loop for _, in_loop in stores) else ""
+    return f"{getattr(func, 'name', '')}@{getattr(func, 'lineno', 0)}::{name}::{last}{loop}"
 
 
 def _ast_directly_returns(node: ast.AST, line: int, col: int) -> bool:

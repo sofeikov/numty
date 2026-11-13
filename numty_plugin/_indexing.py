@@ -210,6 +210,62 @@ def _count_var_assignments(func_node: object | None, varname: str, deep: bool = 
     return count, is_param
 
 
+def _bound_in_loop(func_node: object | None, varname: str) -> bool:
+    """Whether `varname` may hold a value per run of a loop (issue 328).
+
+    A binding inside a `for` / `while` body, or as a `for` target, does;
+    so does a name with no binding of its own in the function that is
+    not a parameter (a comprehension variable, a walrus, a global).
+    """
+    from mypy.nodes import AssignmentStmt as _AssignmentStmt
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import ForStmt as _ForStmt
+    from mypy.nodes import FuncDef as _FuncDef
+    from mypy.nodes import WhileStmt as _WhileStmt
+
+    count, is_param = _count_var_assignments(func_node, varname, deep=True)
+    if count == 0:
+        return not is_param
+
+    def _names(lvalue: object) -> list[str]:
+        if isinstance(lvalue, NameExpr):
+            return [lvalue.name]
+        if isinstance(lvalue, (TupleExpr, ListExpr)):
+            return [n for item in getattr(lvalue, "items", []) or [] for n in _names(item)]
+        if isinstance(lvalue, StarExpr):
+            return _names(getattr(lvalue, "expr", None))
+        return []
+
+    def _walk(stmts: object, in_loop: bool) -> bool:
+        for stmt in stmts if isinstance(stmts, list) else []:
+            if isinstance(stmt, (_FuncDef, _ClassDef)):
+                continue
+            loop = in_loop or isinstance(stmt, (_ForStmt, _WhileStmt))
+            if loop:
+                if isinstance(stmt, _ForStmt) and varname in _names(stmt.index):
+                    return True
+                if isinstance(stmt, _AssignmentStmt) and any(varname in _names(lv) for lv in stmt.lvalues):
+                    return True
+            for inner in _nested_bodies(stmt):
+                if _walk(inner, loop):
+                    return True
+        return False
+
+    return _walk(getattr(getattr(func_node, "body", None), "body", None), False)
+
+
+def _mask_repeats(ctx: MethodContext | FunctionContext, mask_expr: Expression | None) -> bool:
+    """Whether the mask variable may hold a mask per run of a loop, so its count is several sizes."""
+    if not isinstance(mask_expr, NameExpr):
+        return True
+    try:
+        use_line = getattr(mask_expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+        return _bound_in_loop(_enclosing_func(ctx, use_line)[1], mask_expr.name)
+    except Exception:
+        _swallowed(ctx, "_mask_repeats")
+        return True
+
+
 def _single_rvalue(func_node: object | None, varname: str) -> Expression | None:
     """The value of `varname = <expr>` when that is the only binding of the name in the function."""
     from mypy.nodes import AssignmentStmt as _AssignmentStmt
@@ -629,7 +685,7 @@ def _mask_count_for(ctx: MethodContext, mask_expr: Expression | None, dim: int) 
     if key is None:
         return _fresh_unknown(ctx, "mask", dim)
     try:
-        return _fresh_mask_count(ctx, key)
+        return _fresh_mask_count(ctx, key, _mask_repeats(ctx, mask_expr))
     except Exception:
         _swallowed(ctx, "_mask_count_for")
         return _fresh_unknown(ctx, "mask", dim)
@@ -652,7 +708,7 @@ def flatnonzero_mask_hook(ctx: FunctionContext) -> Type:
             if isinstance(expr, NameExpr) and parts is not None and _dtype_base(parts[1]) == "b":
                 key = _mask_var_key(ctx, expr)
                 if key is not None:
-                    count = _fresh_mask_count(ctx, key)
+                    count = _fresh_mask_count(ctx, key, _mask_repeats(ctx, expr))
     except Exception:
         _swallowed(ctx, "flatnonzero_mask_hook")
         count = None
