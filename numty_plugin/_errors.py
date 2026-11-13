@@ -205,19 +205,76 @@ def _bail(
     NUMTY_STRICT=1, reports [numty-unsolved]. Strict fails for every
     bail, even scalar-only ones like np.sqrt(8): the Any born there
     poisons the known-shape truediv whose hook mypy then skips, so a
-    known-shape gate would leave that loss silent. New hooks should
+    known-shape gate would leave that loss silent (see _report_unsolved
+    for why the report cannot change any type). New hooks should
     call this instead of returning the default directly so the reason
     stays specific; _guard_mixed already applies the same policy
     generically to every hook that returns the default.
     """
     _trace_event(ctx, op, "bail", reason)
-    if _numty_strict():
-        ctx.api.fail(
-            f"numty could not prove {op}: {reason} (result is unchecked)",
-            ctx.context,
-            code=NUMTY_UNSOLVED,
-        )
+    _report_unsolved(ctx, op, reason)
     return ctx.default_return_type
+
+
+def _trial_failed(ctx: object) -> bool:
+    """Whether mypy's innermost speculative check has already failed.
+
+    mypy checks an overload (or a union member, or an operator) with its
+    errors filtered and drops it when any error was raised; a hook that
+    runs after its arguments failed to fit is in a call mypy discards.
+    """
+    api: object = getattr(ctx, "api", None)
+    errors: object = getattr(getattr(api, "msg", None), "errors", None)
+    watchers = getattr(errors, "_watchers", None)
+    if not isinstance(watchers, list) or not watchers:
+        return False
+    return bool(watchers[-1].has_new_errors())
+
+
+def _report_unsolved(
+    ctx: object, op: str, reason: str, failed_before: bool | None = None
+) -> None:
+    """Under NUMTY_STRICT=1, report one give-up as [numty-unsolved].
+
+    The report must not change what mypy infers (issue 334). mypy
+    matches overloads, splits unions and retries operators by checking
+    a call with its errors filtered and then asking whether any error
+    was raised: a plain `ctx.api.fail` from a hook makes that check
+    fail, so a correct call gets `[call-overload]` / `[operator]` and
+    another overload's (or member's) type. The report is therefore
+    recorded past mypy's error watchers, which never see it. A check
+    that already failed before the hook ran (an overload whose
+    arguments do not fit) is a trial mypy throws away, so it reports
+    nothing (see _trial_failed). `failed_before` is that state taken
+    before the hook ran: an error the hook itself reported (a broadcast
+    mismatch) does not make the call one mypy drops. mypy deduplicates
+    the same message on one line when a call is checked more than once.
+    """
+    if not _numty_strict():
+        return
+    api: object = getattr(ctx, "api", None)
+    msg: object = getattr(api, "msg", None)
+    errors: object = getattr(msg, "errors", None)
+    fail = getattr(api, "fail", None)
+    if errors is None or fail is None:
+        return
+    watchers = getattr(errors, "_watchers", None)
+    if not isinstance(watchers, list):
+        return
+    if failed_before is None:
+        failed_before = _trial_failed(ctx)
+    if failed_before:
+        return
+    message = f"numty could not prove {op}: {reason} (result is unchecked)"
+    context = getattr(ctx, "context", None)
+    if not watchers:
+        fail(message, context, code=NUMTY_UNSOLVED)
+        return
+    try:
+        setattr(errors, "_watchers", [])
+        fail(message, context, code=NUMTY_UNSOLVED)
+    finally:
+        setattr(errors, "_watchers", watchers)
 
 
 def _warn_startup(message: str) -> None:

@@ -17,7 +17,7 @@ from mypy.argmap import map_actuals_to_formals
 from mypy.expandtype import expand_type
 from mypy.plugin import (
     AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
-    MethodSigContext, Plugin,
+    MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
     AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from mypy.types import RawExpressionType, UnboundType
 
 from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
 from ._exprs import _EXPR_PREFIX, _LATE_PREFIXES, _expr_var, _form_of
@@ -696,6 +697,15 @@ class NumtyPlugin(Plugin):
     ) -> int | Type | list[int | Type]:
         return _fam_applied(ctx, head, arg, self._fam_late_bound)
 
+    def report_config_data(self, ctx: ReportConfigContext) -> dict[str, bool]:
+        """Settings that change the plugin's output, for mypy's cache key.
+
+        NUMTY_STRICT=1 adds [numty-unsolved] reports, so a module checked
+        without it must be checked again with it (issue 334); a cached
+        run would otherwise report success.
+        """
+        return {"numty_strict": _numty_strict()}
+
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         self._ensure_startup_check(fullname)
         return _guard_mixed(fullname, self._function_hook(fullname))
@@ -704,7 +714,10 @@ class NumtyPlugin(Plugin):
         self, fullname: str
     ) -> Callable[[AttributeContext], Type] | None:
         self._ensure_startup_check(fullname)
-        return _guard_mixed(fullname, self._attribute_hook(fullname))
+        hook = self._attribute_hook(fullname)
+        return _guard_mixed(
+            fullname, hook, strict_reports=hook is not substituted_attribute_hook
+        )
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
         self._ensure_startup_check(fullname)

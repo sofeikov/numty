@@ -29,11 +29,30 @@ additionally reports every hooked bail as
 [numty-unsolved]`. For example, `np.sqrt(8)` bails (its operand is not
 an array), its `Any` then poisons `... / np.sqrt(8)` whose hook mypy
 skips, so strict flags the `sqrt` birth site itself. Silence one line
-with `# type: ignore[numty-unsolved]`. Unhooked overloaded functions
-(e.g. `kron`, which has seven overloads) are trace-only: any
-diagnostic inside the hook aborts mypy's overload search and turns a
-correct call into `arg-type` noise, so strict leaves those to the
-trace.
+with `# type: ignore[numty-unsolved]`.
+
+Strict mode only adds these reports: every inferred type and every
+other error is the same as without it. mypy matches overloads, splits
+unions and retries operators by checking a call quietly and dropping
+the attempt when it raised any error, so the report is recorded where
+those checks do not see it (an attempt mypy has already dropped, such
+as an overload whose arguments do not fit, reports nothing). A call
+checked more than once is reported once.
+
+Not reported, because nothing there has a shape to prove (they still
+appear in the trace):
+
+- a plain attribute read (`X.dtype`, `np.finfo(X.dtype).eps`, a
+  dataclass field) and the `__next__` of a `for` loop over `range()`;
+- a builtin (`len`, `min`, `max`, `divmod`) with no array operand;
+- an in-place op (`a += b`, `a /= s`) whose shapes were compared, a
+  reported `[numty-broadcast]` mismatch included.
+
+Unhooked numpy functions (e.g. `np.linalg.eigvals`) are trace-only.
+
+`NUMTY_STRICT` is part of mypy's cache key (the plugin reports it as
+config data), so switching it on or off re-checks the modules instead
+of replaying a cached result.
 
 `python -m numty_report` measures the give-ups instead of erroring on
 them: it runs mypy with tracing on a fresh cache and prints per-file
