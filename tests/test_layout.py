@@ -526,6 +526,8 @@ _LAYERS = (
     "_broadcast_core",
     "_matmul",
     "_ops",
+    "_matrix",
+    "_aliases",
     "_broadcast",
     "_fft",
     "_indexing",

@@ -13,7 +13,10 @@ builder's size: `np.arange(m + 1)` is `(M+1,)` and `np.arange(1, m + 1)`
 is `(M,)`, as `x[1:]` is `(N-1,)`. A builder keeps its shape when the
 `dtype=` it is given is `Any` (`np.full((n, k), np.nan,
 dtype=other.dtype)` with a bare `np.ndarray` is `(int, int)` with dtype
-`Any`).
+`Any`). `np.eye(n)` and `np.identity(n)` read their size like a
+builder: with `n = X.shape[1]` both are `(D, D)`, `np.eye(k + 1)` is
+`(D+1, D+1)`, and `np.eye(n, m, k=1)` is `(n, m)` (the offset never
+resizes).
 
 ## Joining
 
@@ -51,10 +54,25 @@ negative orders error), `cumsum`/`cumprod` (shape-preserving).
 through shared `*Ts` (a lone concrete 1-D/2-D operand contributes an
 empty batch). The rest solves through the same inner-dim machinery:
 `dot` (no batch broadcast past rank 2), `tensordot` (int or pair-of-lists
-axes), `inner`/`outer`/`vdot` (scalars included), and `take` (the axis is
+axes), `inner`/`outer`/`vdot` (scalars included; `outer` ravels each
+operand, so `(N,)` by `(T,)` is `(N, T)` and an `(N, D)` operand counts
+`D*N`), and `take` (the axis is
 swapped for the index shape; literal indices past the axis error unless
 `mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, and
 `linalg.norm` with an explicit `ord` needs one or two reduced axes.
+
+## Diagonals and covariance
+
+`np.diag` of a vector `(N,)` is the square `(N, N)` (`(N+2, N+2)` with
+`k=2`); of a matrix it is the diagonal: `(N,)` for a square `(N, N)`,
+the exact count for literal sizes, and a `?U` for two different names
+(numpy's `min(N, M)`) or an offset on a symbolic size. `np.diagonal`
+and `.diagonal()` drop `axis1`/`axis2` and append the diagonal, so
+`np.diagonal(P, axis1=1, axis2=2)` of `(C, D, D)` is `(C, D)`; an axis
+out of range or the same axis twice is an error. `np.cov(m)` reads rows
+as variables: `(D, N)` gives `(D, D)`, `rowvar=False` reads columns
+(`(N, D)` gives `(D, D)`), a vector is one variable (`()`), and the
+dtype is `result_type(m, float64)` (`float32` input gives `float64`).
 
 ## Indexing
 
@@ -86,7 +104,12 @@ uneven index splits); negative counts and uneven divisions error.
 ## Selection
 
 `unique` keeps the dtype with a `?U` length (rank kept for
-`axis=`), `nonzero`/`where` with one argument return per-dim `?U` tuples
+`axis=`). With literal `return_index`/`return_inverse`/`return_counts`
+it is numpy's tuple: the index and counts arrays are int64 and share
+the values' `?U`, and the inverse has the input's shape (its axis length
+with `axis=`). `count_nonzero(a, axis=...)` drops the axes like
+`a.sum(axis=...)` (keeps them as 1 with `keepdims=True`) in int64; a
+full count stays numpy's scalar. `nonzero`/`where` with one argument return per-dim `?U` tuples
 (`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the input shape
 with a bool dtype, `searchsorted` follows the values shape; 0-d nonzero
 errors. `histogram` returns `(counts, edges)` with one edge more than
@@ -130,6 +153,23 @@ array with an integer (`ball["x"][row]`) is one value whatever the
 array's dtype. A display of `Any` items alone keeps numpy's own answer,
 with the dtype the call names (`dtype=float` as well as
 `dtype=np.float64`), `tests/fixtures/array_any_items.py`.
+
+## Functions held in a variable
+
+A numpy function bound to a name is solved by its own rule: `op =
+np.nansum if flag else np.sum`, then `op(a, axis=0)` is `(N,)` for an
+`(M, N)` array, as is a module-level alias (`total = np.sum`). Ufuncs
+in a variable (`f = np.exp`) were already followed.
+
+## Masked arrays
+
+`np.ma.masked_array(data, mask=...)` (and `np.ma.array`) has its data's
+shape and dtype. A `MaskedArray` goes through the ndarray rules and
+stays masked: `sm.min(axis=1)` of an `(N, M)` masked array is a
+`MaskedArray` of `(N,)`, `.reshape((-1, 1))` is `(N, 1)`, `.T` swaps,
+`np.sum(sm, axis=0)` and a comparison with a plain array broadcast and
+check like ndarray's. `.filled()` keeps numpy's own answer, a plain
+array of the same shape.
 
 ## Ufunc methods
 

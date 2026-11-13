@@ -5964,8 +5964,9 @@ def test_strict_mode_keeps_every_type(tmp_path: Path) -> None:
     )
     # Only calls numty does not solve: not `.dtype`, `finfo(...).eps` or
     # a `for` over range() (lines 35-38), and not the in-place ops, whose
-    # shapes are checked (39-42; 42 is the broadcast error).
-    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16, 22, 27, 29, 31], strict.stdout
+    # shapes are checked (39-42; 42 is the broadcast error). np.diagonal
+    # (22) and np.unique's tuple (31) are solved since issue 330.
+    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16, 27, 29], strict.stdout
     errors = _errors_by_line(plain)
     assert sorted(errors) == [42], plain.stdout
     assert "H vs H-1" in errors[42][0] and errors[42][0].endswith("[numty-broadcast]"), plain.stdout
@@ -6078,3 +6079,129 @@ def test_free_name_rebound_union_ok() -> None:
     # different unknown per array, so correct free-name returns failed.
     result = run_mypy(FIXTURES / "free_name_rebound_union_ok.py", flags=("--allow-redefinition",))
     assert result.returncode == 0, result.stdout
+
+
+def test_matrix_ops_symbolic() -> None:
+    # Issue 330: np.eye / np.identity of a size read from a shape (or a
+    # formula over one), np.diag / np.diagonal / .diagonal(), np.outer,
+    # np.cov, np.count_nonzero(axis=) and np.unique(return_*) keep
+    # symbolic shapes; they were ndarray[Any, Any] or (int, int) before.
+    result = run_mypy(FIXTURES / "matrix_symbolic_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        15: f'"{_ND}[tuple[D, D], {_F64}]"',
+        16: f'"{_ND}[tuple[D, D], {_F64}]"',
+        17: f'"{_ND}[tuple[D+1, D+1], {_F64}]"',
+        18: f'"{_ND}[tuple[D, N], {_I64}]"',
+        19: f'"{_ND}[tuple[D, D], {_F64}]"',
+        20: f'"{_ND}[tuple[D, D], {_F64}]"',
+        24: f'"{_ND}[tuple[D], {_F64}]"',
+        25: f'"{_ND}[tuple[D, D], {_F64}]"',
+        26: f'"{_ND}[tuple[D+2, D+2], {_F64}]"',
+        27: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        28: f'"{_ND}[tuple[?U@28], {_F64}]"',
+        29: f'"{_ND}[tuple[D], {_F64}]"',
+        30: f'"{_ND}[tuple[D], {_F64}]"',
+        31: f'"{_ND}[tuple[C, D], {_F64}]"',
+        32: '"numpy.float64"',
+        36: f'"{_ND}[tuple[N, D], {_F64}]"',
+        37: f'"{_ND}[tuple[D*N, D], {_F64}]"',
+        38: f'"{_ND}[tuple[N, D], {_F64}]"',
+        42: f'"{_ND}[tuple[D, D], {_F64}]"',
+        43: f'"{_ND}[tuple[D, D], {_F64}]"',
+        44: f'"{_ND}[tuple[N, N], {_F64}]"',
+        45: f'"{_ND}[tuple[()], {_F64}]"',
+        50: f'"{_ND}[tuple[N], {_I64}]"',
+        51: f'"{_ND}[tuple[Literal[1], D], {_I64}]"',
+        # The values and their counts share one unknown size.
+        53: f'"{_ND}[tuple[?U@52], {_INTP}]"',
+        54: f'"{_ND}[tuple[?U@52], {_I64}]"',
+        55: f'"{_ND}[tuple[?U@52], {_F64}]"',
+        # The inverse maps every input element back: the input's shape.
+        57: f'"{_ND}[tuple[N], {_I64}]"',
+        58: f'"tuple[{_ND}[tuple[?U@58], numpy.dtype[numpy.bool[Any]]], {_ND}[tuple[N, D], {_I64}]]"',
+    }, result.stdout
+    assert _run_fixture("matrix_symbolic_ok.py") == [
+        "(3, 3) (4, 4) (3, 5) (3, 3)",
+        "(3,) (3, 3) (5, 5) (3,) (3,) (4, 3)",
+        "(5, 3) (15, 3)",
+        "(3, 3) (3, 3) (5, 5) ()",
+        "(5,) (1, 3) (3,) (5,)",
+        "(5, 3)",
+    ]
+
+
+def test_matrix_ops_symbolic_errors() -> None:
+    # Issue 330: an off-by-one identity, cov over the wrong axis, swapped
+    # outer operands, a diagonal over the batch axis and a per-label
+    # count where a per-sample one is declared, all from sklearn.
+    result = run_mypy(FIXTURES / "bad_matrix_symbolic.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 19, 23, 27, 31, 35], result.stdout
+    assert all(len(errors[line]) == 1 for line in errors), result.stdout
+    assert errors[14][0].endswith(
+        "broadcast shapes disagree at trailing axis 0: D vs D+1 (shapes (D, D) vs (D+1, D+1))  [numty-broadcast]"
+    ), result.stdout
+    assert 'got "ndarray[tuple[N, N], dtype[float64]]", expected "ndarray[tuple[D, D]' in errors[19][0]
+    assert 'got "ndarray[tuple[C, N], dtype[float64]]", expected "ndarray[tuple[N, C]' in errors[23][0]
+    assert 'got "ndarray[tuple[D, ?U@27], dtype[float64]]", expected "ndarray[tuple[C, D]' in errors[27][0]
+    assert 'got "ndarray[tuple[D], dtype[signedinteger[_64Bit]]]"' in errors[31][0], result.stdout
+    assert all(errors[line][0].endswith("[return-value]") for line in (19, 23, 27, 31)), result.stdout
+    assert errors[35][0].endswith("eye dimensions must be non-negative, got (-1, -1)  [numty-shape]")
+    assert _run_fixture("bad_matrix_symbolic.py") == [
+        "operands could not be broadcast together with shapes (3,3) (4,4) (3,3) ",
+        "negative dimensions are not allowed",
+        "(5, 5) (5, 2)",
+        "(3, 3) (3,)",
+    ]
+
+
+def test_held_function_and_masked_array() -> None:
+    # Issue 330: a numpy function held in a variable (a conditional pick,
+    # a local alias, a module-level alias) is solved by its own hook, and
+    # np.ma.masked_array keeps its data's shape through the ndarray
+    # solvers (.min(axis=), .reshape, .T, comparisons, np.sum).
+    result = run_mypy(FIXTURES / "aliases_ok.py")
+    assert result.returncode == 0, result.stdout
+    ma = "numpy.ma.core.MaskedArray"
+    assert reveals_by_line(result) == {
+        16: f'"{_ND}[tuple[N], {_F64}]"',
+        18: f'"{_ND}[tuple[M], {_F64}]"',
+        19: f'"{_ND}[tuple[Literal[1], N], {_F64}]"',
+        20: f'"{_ND}[tuple[N], {_F64}]"',
+        25: f'"{ma}[tuple[N, M], {_F64}]"',
+        27: f'"{ma}[tuple[N, Literal[1]], {_F64}]"',
+        28: f'"{ma}[tuple[M, N], {_F64}]"',
+        29: f'"{ma}[tuple[M], {_F64}]"',
+        30: f'"{ma}[tuple[N], {_F64}]"',
+        31: f'"{ma}[tuple[N, M], {_F64}]"',
+        33: f'"{ma}[tuple[N], {_I64}]"',
+        # .filled() is the stubs' own: a plain array of the same shape.
+        34: f'"{_ND}[tuple[N], {_I64}]"',
+    }, result.stdout
+    assert _run_fixture("aliases_ok.py") == [
+        "(3,) (2,) (1, 3)",
+        "MaskedArray (2, 1) (3, 2) (3,) (2,)",
+        "MaskedArray (2,) (2,)",
+    ]
+    bad = FIXTURES / "bad_aliases.py"
+    for flags in ((), ("--enable-error-code", "numty-names")):
+        result = run_mypy(bad, flags=flags)
+        assert result.returncode == 1, result.stdout
+        errors = _errors_by_line(result)
+        assert sorted(errors) == ([13, 18, 23, 28, 30] if flags else [13, 18, 23]), result.stdout
+        assert 'got "ndarray[tuple[M], dtype[float64]]", expected "ndarray[tuple[N]' in errors[13][0]
+        assert 'got "MaskedArray[tuple[Literal[3]], dtype[float64]]"' in errors[18][0], result.stdout
+        # The MaskedArray operator also gets mypy's [operator] follow-on:
+        # the duplicate suppression (issue 148) covers ndarray's only.
+        assert errors[23][0].endswith("N-1 vs N (shapes (N-1, M) vs (N, M))  [numty-broadcast]"), result.stdout
+        assert len(errors[23]) == 2 and errors[23][1].endswith("[operator]"), result.stdout
+        if flags:
+            assert "(shapes (M,) vs (N,)): M and N are different names  [numty-names]" in errors[28][0]
+            assert "(shapes (N,) vs (N, M)): N and M are different names  [numty-names]" in errors[30][0]
+    assert _run_fixture("bad_aliases.py") == [
+        "(2,) (3,)",
+        "operands could not be broadcast together with shapes (3,3) (4,3) ",
+        "operands could not be broadcast together with shapes (2,) (3,)",
+    ]
