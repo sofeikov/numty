@@ -5673,3 +5673,45 @@ def test_polars_to_numpy_cast_chain() -> None:
         "(2,) float64",
         "float64 (3,)",
     ]
+
+
+# Issue 329: in-place results must equal a symbolic target, and indexed
+# assignment into a buffer with an `int` axis checks the known axes.
+def test_bad_inplace_symbolic_fit() -> None:
+    # A size over names that grows a literal-1 axis fits only at size 1,
+    # as `4` into `1` does not; literal value sizes that set one target
+    # size to two values fit no size. An `int` target axis keeps the
+    # other axes checked.
+    result = run_mypy(FIXTURES / "bad_inplace_symbolic_fit.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [15, 19, 23, 28], result.stdout
+    assert "in-place result (N, N, M) does not fit target (N, 1, M)" in errors[15][0], result.stdout
+    assert "in-place result (2, 3) does not fit target (d, d)" in errors[19][0], result.stdout
+    assert "in-place result (3, 3) does not fit target (N, N+1)" in errors[23][0], result.stdout
+    assert "N vs N+1" in errors[28][0], result.stdout
+    for line in errors:
+        assert errors[line][0].endswith("[numty-broadcast]"), result.stdout
+    assert _run_fixture("bad_inplace_symbolic_fit.py") == [
+        "non-broadcastable output operand",
+        "operands could not be broadcast together",
+    ]
+
+
+def test_bad_setitem_int_axis() -> None:
+    result = run_mypy(FIXTURES / "bad_setitem_int_axis.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 19], result.stdout
+    assert "cannot assign value of shape (N+1,) into target of shape (N,)" in errors[14][0], result.stdout
+    assert "cannot assign value of shape (N, 4) into target of shape (N, 3)" in errors[19][0], result.stdout
+    assert _run_fixture("bad_setitem_int_axis.py") == ["could not broadcast input array from shape (5,)"]
+
+
+def test_inplace_setitem_int_ok() -> None:
+    # A literal against one symbolic size, two different names, and an
+    # `int` axis on either side are never errors by themselves.
+    result = run_mypy(FIXTURES / "inplace_setitem_int_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[24] == f'"numpy.ndarray[tuple[N, N, M], {_F64}]"', result.stdout
+    assert notes[43] == f'"numpy.ndarray[tuple[N, int], {_F64}]"', result.stdout
+    assert _run_fixture("inplace_setitem_int_ok.py") == ["ok"]

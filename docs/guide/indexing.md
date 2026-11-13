@@ -132,4 +132,8 @@ fit). Symbolic sizes are compared by the rule of a broadcast: `out[i] =
 v[:-1]` with `out: F64[S, C]` and `v: F64[C]` is `cannot assign value of
 shape (C-1,) into target of shape (C,)`. Two different names (`S` into
 `C`), an unknown and an `int` size are not provable and stay silent
-(`tests/fixtures/bad_setitem_symbolic.py`).
+(`tests/fixtures/bad_setitem_symbolic.py`). An `int` axis is skipped on
+its own, not the whole write: in a buffer `a = np.empty((x.shape[0], n))`
+of shape `(N, int)`, `a[:, -1] = np.ones(x.shape[0] + 1)` is `cannot
+assign value of shape (N+1,) into target of shape (N,)`
+(`tests/fixtures/bad_setitem_int_axis.py`).

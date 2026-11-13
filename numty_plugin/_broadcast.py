@@ -69,8 +69,8 @@ from ._linalg import (
     _dtype_base, _dtype_family, _is_numpy_scalar, _kind_of,
 )
 from ._broadcast_core import (
-    _fallback_dtype, _loose_dtype_name, _merge_unpack_dims, _solve_broadcast, _whole_shape_operands,
-    _whole_shape_type, _whole_shape_var,
+    _fallback_dtype, _inplace_never_fits, _inplace_shown_dim, _loose_dtype_name, _merge_unpack_dims,
+    _solve_broadcast, _whole_shape_operands, _whole_shape_type, _whole_shape_var,
 )
 
 def _broadcast_result(
@@ -301,7 +301,8 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
     args = _positional_actuals(ctx, 1)
     if args is None:
         return ctx.default_return_type
-    lhs = _ndarray_parts(ctx.type)
+    # Issue 329: a target with an `int` axis keeps its known axes checked.
+    lhs = _ndarray_parts(ctx.type) or _known_rank_parts(ctx.type)
     if lhs is None:
         return ctx.default_return_type
     lhs_dims, _ = lhs
@@ -313,7 +314,7 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
         # member fits the target; a dry run, so no unknown is made.
         first: str | None = None
         for member in members:
-            part = _ndarray_parts(member)
+            part = _ndarray_parts(member) or _known_rank_parts(member)
             if part is None:
                 return ctx.default_return_type
             message = _inplace_message(lhs_dims, part[0], None)
@@ -324,7 +325,7 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
         if first is not None:
             ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
         return ctx.default_return_type
-    rhs = _ndarray_parts(args[0])
+    rhs = _ndarray_parts(args[0]) or _known_rank_parts(args[0])
     if rhs is None:
         return ctx.default_return_type
     message = _inplace_message(lhs_dims, rhs[0], ctx)
@@ -341,6 +342,12 @@ def _inplace_message(
     dims, message = _broadcast_result(lhs_dims, rhs_dims, ctx)
     if message is not None:
         return message
+    if len(rhs_dims) <= len(lhs_dims) and _inplace_never_fits(lhs_dims, rhs_dims):
+        shown = [
+            *lhs_dims[: len(lhs_dims) - len(rhs_dims)],
+            *(_inplace_shown_dim(l, r) for l, r in zip(lhs_dims[len(lhs_dims) - len(rhs_dims):], rhs_dims)),
+        ]
+        return f"in-place result {_dims_str(shown)} does not fit target {_dims_str(lhs_dims)}"
     if dims is None:
         return None
     if len(dims) != len(lhs_dims) or any(

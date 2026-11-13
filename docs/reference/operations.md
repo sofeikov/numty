@@ -154,7 +154,12 @@ See [polars and numba](../guide/integrations.md).
 Operators and bare `np.*`
 ufuncs alike — broadcast shapes and promote dtypes. In-place ops
 (`+=`, `-=`, …) reuse the broadcast check and additionally require the
-result to fit the target (`(3,) += (2, 3)` errors). Promotion matches
+result to fit the target (`(3,) += (2, 3)` errors). With symbolic sizes
+the result must be the target too: a size over names that grows a
+`1` axis (`(N, 1, M) *= (N, N, 1)`) and literal sizes that set one name
+to two values (`(d, d) += (2, 3)`) are errors, while a literal against
+one name (`(d, d) += (3, 3)`), two different names and an `int` or
+unknown axis stay silent. Promotion matches
 NumPy (`np.result_type` over the full dtype matrix, plus weak Python
 and numpy scalars): float ufuncs pick the smallest float (`sqrt(uint8)`
 is `float16`), true division of ints is `float64` (`f32 / u8` stays

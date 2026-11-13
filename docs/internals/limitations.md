@@ -84,6 +84,10 @@ quiet, where it is approximate, and what to write instead.
     broadcasts) or 2 (a length-1 axis broadcasts). The same holds for
     `N+1` against `N`. The oracle counts an error as false only when
     numpy accepts the expression at every set of sizes it tries.
+- An in-place op that grows a `1` axis to a size over names is
+    reported: `G *= K[..., np.newaxis]` with `G` of shape `(N, 1, M)`
+    and `K` of `(N, N)` fits only when `N` is 1, as the literal `(4, 4,
+    1)` into `(4, 1, 3)` does not.
 - A symbolic subtraction assumes the axis is long enough. `a[1:]` is
     `(N-1,)` and `np.diff(a)` is `(N-1,)`, but numpy stops at zero: on an
     empty axis both are `(0,)`, not `(-1,)`. The oracle counts a dim
