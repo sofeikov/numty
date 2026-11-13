@@ -29,7 +29,7 @@ from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
-    _distribute_pairings, _in_loop_body, _solve_union_arg, _union_members, _union_results,
+    _distribute_pairings, _in_loop_body, _union_members, _union_results,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
@@ -394,10 +394,6 @@ def _guard_mixed(
                     if isinstance(ctx, MethodContext):
                         operands.append(ctx.type)
                 result = hook(ctx)
-                if result is default and isinstance(ctx, FunctionContext):
-                    split = _solve_union_arg(ctx, hook)
-                    if split is not None:
-                        result = split
             except Exception:
                 _swallowed(ctx, fullname)
                 # Crash barrier (issue #41): no shape hook may abort the

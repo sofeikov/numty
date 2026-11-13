@@ -5965,21 +5965,18 @@ def test_strict_mode_keeps_every_type(tmp_path: Path) -> None:
     # Only calls numty does not solve: not `.dtype`, `finfo(...).eps` or
     # a `for` over range() (lines 35-38), and not the in-place ops, whose
     # shapes are checked (39-42; 42 is the broadcast error).
-    assert sorted(int(line.split(":")[1]) for line in unsolved) == [22, 27, 29, 31], strict.stdout
+    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16, 22, 27, 29, 31], strict.stdout
     errors = _errors_by_line(plain)
     assert sorted(errors) == [42], plain.stdout
     assert "H vs H-1" in errors[42][0] and errors[42][0].endswith("[numty-broadcast]"), plain.stdout
 
 
-def test_function_on_array_union_is_solved_per_member() -> None:
-    # Issue 334: argsort / diff / flip of an if-joined `(N,) | (?U,)`
-    # array were `ndarray[Any, Any]` (strict mode, by accident, was
-    # precise). The hook now runs once per union member.
+def test_strict_mode_fixture_keeps_eps_shape() -> None:
+    # Issue 334: the eps sum keeps its shape (strict made it Any, with an
+    # [operator] error). A union argsort stays the stubs' answer in both
+    # modes: solving it per member made free-name returns of rebound
+    # locals fail on correct code (sklearn's _binary_clf_curve).
     notes = reveals_by_line(run_mypy(FIXTURES / "strict_mode.py"))
-    assert notes[14] == f'"{_ND}[tuple[?U@13], {_INTP}] | {_ND}[tuple[N], {_INTP}]"', notes
-    assert notes[15] == f'"{_ND}[tuple[?U@13-1], {_F64}] | {_ND}[tuple[N-1], {_F64}]"', notes
-    assert notes[16] == f'"{_ND}[tuple[?U@13], {_F64}] | {_ND}[tuple[N], {_F64}]"', notes
-    # The eps sum keeps its shape (strict made it Any, with an [operator]).
     assert notes[21] == f'"{_ND}[tuple[c], {_F64}]"', notes
 
 
@@ -6073,3 +6070,11 @@ def test_own_size_a_constant_apart() -> None:
         assert len(errors[line]) == 1 and errors[line][0].endswith("are 1 apart  [numty-names]"), on.stdout
     assert "?K@16-1 and ?K@16 are 1 apart" in errors[17][0], on.stdout
     assert _run_fixture("own_size_offset_loop_ok.py") == ["(3,) (2,) (2,)"]
+
+
+def test_free_name_rebound_union_ok() -> None:
+    # Regression guard for the issue 331/332/334 bundle: solving a union
+    # argument per member made `y = y[order]` after an if-joined filter a
+    # different unknown per array, so correct free-name returns failed.
+    result = run_mypy(FIXTURES / "free_name_rebound_union_ok.py", flags=("--allow-redefinition",))
+    assert result.returncode == 0, result.stdout
