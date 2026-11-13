@@ -164,6 +164,19 @@ same-named variables, modules, and builtins (`F64["time freq"]` after
 their own namespace, like jaxtyping, except `Final` ints (which stay
 real dims) and the bare name `int` (which stays the dynamic dim).
 
+A word that names a declared TypeVar *is* that TypeVar, wherever the
+function names it: in the signature, in a body annotation, bare or
+quoted. With `T = TypeVar("T", bound=int)`, `def f(y: F64["N T"])` and
+`d: F64[T] = y.sum(axis=0)` in its body are one size, and so are a
+`F64["N T"]` local, a member of a union local (`F64["T T"] | F64["N T"]`)
+and an `@overload` item spelled with string words (`F64["C F+1"]`
+included). A local variable that hides the TypeVar's name hides it from
+expressions only: after `n_samples, n_features = X.shape`, the word
+`n_features` in `F64["n_samples n_features"]` is still the module's
+`n_features` TypeVar, not a new dim of that name. A word with no
+TypeVar of its name at module level (`n` with `n = 10` above) is minted
+as before.
+
 Two rules, both honest. First, every bare name must resolve: mypy binds
 function type variables by looking names up *before* any plugin runs,
 so an undeclared bare dim is an error, not a silent hole — `"hid"` and
