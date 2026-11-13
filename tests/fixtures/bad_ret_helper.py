@@ -45,7 +45,7 @@ def not_returned(n: int, a: F64[N]) -> None:
 
 
 def nested_arg(n: int, a: F64[N]) -> F64[N]:
-    return a + helper(n)  # an operand, not the returned value
+    return a + helper(n)  # (N,) + (int,) keeps N (issue 333)
 
 
 def passthrough(x: F64[int]) -> F64[N]:

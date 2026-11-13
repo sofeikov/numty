@@ -29,7 +29,7 @@ from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
-    _distribute_pairings, _in_loop_body, _union_members, _union_results,
+    _distribute_pairings, _in_loop_body, _kept_name, _union_members, _union_results,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
@@ -40,6 +40,7 @@ from ._reshape import (
 from ._types import (
     _enum_member_count,
 )
+from ._sequences import _comprehension_length, _union_item_parts
 from ._reshape import (
     _construct_dtype, _is_mixed_shape, _is_plain_int, _literal_positions, _ndarrays_in,
     _widen_literal_dims,
@@ -1338,9 +1339,12 @@ def _dynamic_sequence_element(
     """
     # An `int` size in the items is a shape too (issue 316): the rank is
     # known, and that axis stays `int` in the result.
+    # Items typed as a union of arrays of one rank (issue 333) join too.
     if isinstance(expr, ListComprehension):
         item = _element_expr_type(ctx, expr.generator.left_expr)
-        return (_ndarray_parts(item) or _known_rank_parts(item)) if item is not None else None
+        if item is None:
+            return None
+        return _ndarray_parts(item) or _known_rank_parts(item) or _union_item_parts(ctx, item)
     proper = get_proper_type(tp)
     if not (
         isinstance(proper, Instance)
@@ -1348,7 +1352,8 @@ def _dynamic_sequence_element(
         and proper.args
     ):
         return None
-    return _ndarray_parts(proper.args[0]) or _known_rank_parts(proper.args[0])
+    item = proper.args[0]
+    return _ndarray_parts(item) or _known_rank_parts(item) or _union_item_parts(ctx, item)
 
 
 def concatenate_function_hook(ctx: FunctionContext) -> Type:
@@ -1495,13 +1500,15 @@ def _concat_merge(
                 # Issue #227: a plain-int (dynamic) axis never proves
                 # equal, but the rank is known. Mint ?U instead of
                 # bailing to Any so the shape stays solved.
-                if _is_plain_int(out[i]) or _is_plain_int(d):
-                    out[i] = _fresh_unknown(ctx, op, i)
-                    continue
-                _report_names(
-                    ctx, out[i], d, f"{op} dimension {i} (shapes {_dims_str(out)} vs {_dims_str(dims)})"
-                )
-                return ctx.default_return_type
+                # Issue 333: a name against an unknown is the name, as
+                # the items must agree there; two unknowns, or two names
+                # (reported under the opt-in code), are an unknown.
+                kept = _kept_name(out[i], d)
+                if kept is None:
+                    _report_names(
+                        ctx, out[i], d, f"{op} dimension {i} (shapes {_dims_str(out)} vs {_dims_str(dims)})"
+                    )
+                out[i] = _fresh_unknown(ctx, op, i) if kept is None else kept
         acc, extra = out[norm], dims[norm]
         if isinstance(acc, int) and isinstance(extra, int):
             out[norm] = acc + extra
@@ -1696,7 +1703,9 @@ def _stack_dynamic(
         )
         return ctx.default_return_type
     out = list(dims_e)
-    out.insert(norm, _fresh_unknown(ctx, "stack", norm))
+    # An unfiltered comprehension over a known size has that many items (issue 333).
+    length = _comprehension_length(ctx, pairs[0][1])
+    out.insert(norm, _fresh_unknown(ctx, "stack", norm) if length is None else length)
     return _ndarray_type(ctx, out, dtype)
 
 

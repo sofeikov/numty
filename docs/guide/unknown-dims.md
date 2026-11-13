@@ -253,14 +253,38 @@ one array (or `None`), not an array inside a returned tuple.
 Stacking a list built at runtime works the same way when every item has
 one declared shape: a name typed `list[...]`, or a list comprehension
 (filters, nested loops, and element transforms such as `a * 2` or
-`t.field` all count). `stack` inserts an unknown at the stacked axis.
+`t.field` all count). `stack` inserts an unknown at the stacked axis,
+or the length of an unfiltered comprehension with one `for` over a
+known size (`range(3)`, the rows of an `(N, M)` array, `zip` of such
+arrays: `np.stack([X[k] for k in range(3)])` is `(3, d)`).
 `concatenate`, `vstack`, `hstack`, `dstack` and `column_stack` make the
 joined axis unknown. Every other dim and the item dtype carry over, and
 an out-of-range axis is still an error. An `int` size in the items is a
 shape too and stays `int` (`np.column_stack(columns)` with `columns:
-list[F64[int]]` is `(int, ?U)`, `tests/fixtures/join_int_items.py`). Items with no declared shape (a
-bare `np.ndarray`) or with different shapes still bail with
-`[numty-bail]` (see [Error codes](../reference/error-codes.md)).
+list[F64[int]]` is `(int, ?U)`, `tests/fixtures/join_int_items.py`).
+Items typed as a union of arrays of one rank join as well (issue 333):
+`np.hstack([l.ravel() for l in (W, b)])` with `W: F64[N, H]` and `b:
+F64[H]` is `(?U,)`. Items with no declared shape (a bare `np.ndarray`)
+or of different ranks still bail with `[numty-bail]` (see
+[Error codes](../reference/error-codes.md)).
+
+## A name next to an unknown size
+
+Where two sizes meet and must agree, a name against a size numty does
+not know (a plain `int`, an `Any`, a `?U`) is the name, not a fresh
+unknown (issue 333, `tests/fixtures/kept_names_ok.py`). In a broadcast
+the other side is the name or 1 whenever the call is valid, so `(N, N) *
+(int, int)` is `(N, N)` and `(n, c) + (?U,)` is `(n, c)`: both fit
+where `F64[N, N]` or `F64[n, c]` is declared, as the `int` operand alone
+does. The same goes for the axes a join does not grow: `np.hstack` of
+two `(N, N, ?U)` arrays is `(N, 2*N, ?U)`. A literal against an unknown,
+`int` against `int`, two unknowns, and two different names still give a
+fresh unknown (the names are an opt-in `[numty-names]` report). A name
+that is 1 at run time is the one case this misses: `(1,) * (5,)` is
+`(5,)`, so `(N,) * (int,)` is `(N,)` only when `N` is not 1. The kept
+name checks what follows: `np.diff(x * w) + x` with `w: F64[int]` is
+`N-1` against `N`, a `[numty-broadcast]` error
+(`tests/fixtures/bad_kept_names.py`).
 
 `assemble.py`:
 
