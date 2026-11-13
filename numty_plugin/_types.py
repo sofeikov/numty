@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 from ._errors import NUMTY_NAMES, NUMTY_SHAPE, _code_enabled, _swallowed
 from ._forms import (
-    _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_unknown, _form_mul,
+    _DivForm, _LinForm, _MonoForm, _coeff_vars_to_form, _form_has_clash, _form_has_unknown, _form_mul,
     _forms_provably_ne, _is_unknown_fullname, _lin_add, _lin_scale, _mono_normalize,
 )
 from ._exprs import (
@@ -166,9 +166,20 @@ def _kept_name(x: int | Type, y: int | Type) -> int | Type | None:
             return named
         if isinstance(other, TypeVarType):
             form = _resolve_dim(other)
-            if form is None or _form_has_unknown(form):
+            # Not an unknown from two different names: that one stays
+            # unknown, so the pairing's doubt reaches the result.
+            if form is None or (_form_has_unknown(form) and not _form_has_clash(form)):
                 return named
     return None
+
+
+def _clash_dim(dim: int | Type) -> bool:
+    """Whether a size mentions an unknown minted where two different names met."""
+    from numty_plugin import _resolve_dim
+    if isinstance(dim, int) or not isinstance(dim, TypeVarType):
+        return False
+    form = _resolve_dim(dim)
+    return form is not None and _form_has_clash(form)
 
 
 def _names_enabled(ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext) -> bool:

@@ -19,9 +19,9 @@ from ._dtypes import (
     _promote_strong, _promote_weak,
 )
 from ._types import (
-    DTYPE_FULLNAME, INT_FULLNAME, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
-    _fold_int, _has_unpack, _int_value, _kept_name, _ndarray_parts, _ndarray_type, _parts_or_unpack,
-    _report_mask_names, _report_names, _same_own_size, _shape_from_arg, _split_flat, _union_members,
+    DTYPE_FULLNAME, INT_FULLNAME, _clash_dim, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
+    _fold_int, _has_unpack, _int_value, _kept_name, _named_sizes_differ, _ndarray_parts, _ndarray_type,
+    _parts_or_unpack, _report_mask_names, _report_names, _same_own_size, _shape_from_arg, _split_flat, _union_members,
 )
 from ._sequences import _comprehension_length
 from ._reshape import (
@@ -119,7 +119,12 @@ def _broadcast_result(
                 ctx, x, y, f"broadcast at trailing axis {k} (shapes {_dims_str(a)} vs {_dims_str(b)})"
             )
             kept = _kept_name(x, y)
-            out.append(_fresh_unknown(ctx, "bcast", k) if kept is None else kept)
+            if kept is None:
+                clash = _named_sizes_differ(x, y) or _clash_dim(x) or _clash_dim(y)
+                role = "clash" if clash else "bcast"
+                out.append(_fresh_unknown(ctx, role, k))
+            else:
+                out.append(kept)
     shared = min(len(a), len(b))
     prefix = a[: len(a) - shared] + b[: len(b) - shared]
     return [*prefix, *reversed(out)], None

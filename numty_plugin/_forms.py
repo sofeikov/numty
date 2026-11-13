@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from typing import NamedTuple, cast
 
 class _LinForm(NamedTuple):
@@ -46,6 +47,24 @@ def _form_has_unknown(form: object) -> bool:
     if isinstance(form, _MonoForm):
         return any(_is_unknown_fullname(v) for v in form.vars)
     return False
+
+
+# An unknown minted where a broadcast paired two different names (role
+# "clash" in `_broadcast_result`). It marks a pairing that is right only
+# when the names are equal, so a later name does not absorb it (issue 333
+# keeps a name against other unknowns).
+_CLASH_RE = re.compile(r"_\d+_\d+_clash_\d+$")
+
+
+def _form_has_clash(form: object) -> bool:
+    """Whether a canonical form mentions an unknown from a two-names broadcast."""
+    if isinstance(form, _LinForm):
+        names = [name for name, _ in form.coeffs]
+    elif isinstance(form, _MonoForm):
+        names = list(form.vars)
+    else:
+        return False
+    return any(_is_unknown_fullname(n) and _CLASH_RE.search(n) is not None for n in names)
 
 
 # A selection count (`x[keep]`, one per mask variable, issue 288) and the

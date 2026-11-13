@@ -286,6 +286,13 @@ name checks what follows: `np.diff(x * w) + x` with `w: F64[int]` is
 `N-1` against `N`, a `[numty-broadcast]` error
 (`tests/fixtures/bad_kept_names.py`).
 
+The unknown from two different names is the exception: a later name
+does not absorb it. `(N, D) / (N,)` (a missing `[:, None]`) is `(N, ?U)`
+with `numty-names` off, and `+ b` with `b: F64[D]` stays `(N, ?U)`, so
+the forgotten axis still reaches a declared `F64[N, D]` return
+(`tests/fixtures/bad_clash_unknown.py`). With `numty-names` on, the
+pairing itself is reported where it happens.
+
 `assemble.py`:
 
 ```python
