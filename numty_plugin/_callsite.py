@@ -12,11 +12,12 @@ from mypy.types import (
     AnyType, CallableType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnionType, get_proper_type,
 )
 
-from ._errors import NUMTY_NAMES, _swallowed
+from ._errors import NUMTY_CALLSITE, NUMTY_NAMES, _swallowed
 from ._exprs import _iter_tvarlikes
 from ._indexing import _recorded_for_operand
 from ._types import (
-    INT_FULLNAME, NDARRAY_FULLNAME, _info_mentions_array, _names_enabled, _ndarray_parts, _parts_or_unpack,
+    INT_FULLNAME, NDARRAY_FULLNAME, _dim_str, _dims_provably_ne,
+    _info_mentions_array, _names_enabled, _ndarray_parts, _parts_or_unpack,
     _report_mask_names, _report_names,
 )
 from ._callbind import (
@@ -182,6 +183,18 @@ def _report_call_site_names(sig: CallableType, ctx: FunctionSigContext | MethodS
                 if isinstance(adim, int):
                     continue
                 seen = first.setdefault(tvar.fullname, (name, dim, adim))
+                if seen[2] is not adim and _dims_provably_ne(seen[2], adim):
+                    # One name of the callee bound to two sizes that no
+                    # values make equal (`N` and `N-1`): an error by
+                    # default, like the literal case of issue #53.
+                    ctx.api.fail(
+                        f"call-site shape conflict for '{tvar.name}': "
+                        f"{_dim_str(seen[2])} (argument '{seen[0]}', axis {seen[1]}) vs "
+                        f"{_dim_str(adim)} (argument '{name}', axis {dim})",
+                        ctx.context,
+                        code=NUMTY_CALLSITE,
+                    )
+                    continue
                 if seen[2] is not adim:
                     _report_names(
                         ctx,
