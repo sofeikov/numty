@@ -101,11 +101,28 @@ error: concatenate dimension 0 (shapes (A, B) vs (B, A)): A and B are different 
 ```
 
 It covers a broadcast (operators, comparisons, ufuncs, `where`), a
-boolean mask, an indexed assignment, `concatenate` and `stack`, and a
-call that binds one name of the callee to two names of the caller
+boolean mask, an indexed assignment, `concatenate` and `stack`, a
+contraction (`@`, `matmul`, `dot` and `ndarray.dot`, `inner`,
+`tensordot`, an `einsum` label), where two different names on the
+contracted axes are the forgotten `.T`, and a call that binds one name
+of the callee to two names of the caller
 (`score(ids: I64[K], d: F64[P, K])` given an `I64[B]` and an
-`F64[B, A]`). It does not cover `matmul` inner sizes or shapes with
-`*Ts`. A literal, an `int` and an `Any` against a name stay silent, and
+`F64[B, A]`):
+
+```python
+def f(a: F64[N, H], w: F64[K, H]) -> None:
+    a @ w            # should be a @ w.T
+```
+
+```text
+error: matmul inner dimensions (shapes (N, H) vs (K, H)): H and K are different names  [numty-names]
+```
+
+Without the code a contraction over two names is silent and keeps the
+outer dims, `(N, H)` here, which are the result's whenever the call
+runs (`tests/fixtures/bad_matmul_names_optin.py`). It does not cover
+shapes with `*Ts`, nor a contraction with an operand that is a union
+of arrays (mypy checks its members with errors held back). A literal, an `int` and an `Any` against a name stay silent, and
 so do two names of a callee that a call binds to one size. An unknown
 (`?U`) stays silent too, with one exception: the count of a boolean
 mask is a size of its own under this code, so it is reported against a

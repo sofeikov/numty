@@ -950,7 +950,8 @@ def test_issue141_linalg_guards_ok() -> None:
     assert notes[8] == (
         '"tuple[numpy.ndarray[tuple[Literal[3], Literal[3]], '
         'numpy.dtype[numpy.float64]], numpy.ndarray[tuple[Literal[3], '
-        'Literal[4]], numpy.dtype[numpy.float64]]]"'
+        'Literal[4]], numpy.dtype[numpy.float64]], '
+        'fallback=numpy.linalg._linalg.QRResult[Any]]"'
     ), result.stdout
     assert notes[9] == (
         '"numpy.ndarray[tuple[Literal[2], Literal[2]], '
@@ -5964,8 +5965,9 @@ def test_strict_mode_keeps_every_type(tmp_path: Path) -> None:
     )
     # Only calls numty does not solve: not `.dtype`, `finfo(...).eps` or
     # a `for` over range() (lines 35-38), and not the in-place ops, whose
-    # shapes are checked (39-42; 42 is the broadcast error).
-    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16, 22, 27, 29, 31], strict.stdout
+    # shapes are checked (39-42; 42 is the broadcast error). `Q.T @ X`
+    # with an `int` dim and the svd of it solve (issues 333, 330).
+    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16, 22, 31], strict.stdout
     errors = _errors_by_line(plain)
     assert sorted(errors) == [42], plain.stdout
     assert "H vs H-1" in errors[42][0] and errors[42][0].endswith("[numty-broadcast]"), plain.stdout
@@ -6078,3 +6080,128 @@ def test_free_name_rebound_union_ok() -> None:
     # different unknown per array, so correct free-name returns failed.
     result = run_mypy(FIXTURES / "free_name_rebound_union_ok.py", flags=("--allow-redefinition",))
     assert result.returncode == 0, result.stdout
+
+
+def test_matmul_names_optin() -> None:
+    # Issue 326: a contraction over two different names (the forgotten
+    # `.T`) was silent even under numty-names. By default it stays silent
+    # and keeps the outer dims, which are the result's own whenever the
+    # call runs; under the opt-in code each spelling is reported once,
+    # with no [operator] or [arg-type] follow-on.
+    fixture = FIXTURES / "bad_matmul_names_optin.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    notes = reveals_by_line(off)
+    for line in (19, 20, 21, 22):
+        assert notes[line] == f'"{_ND}[tuple[N, H], {_F64}]"', off.stdout
+    assert notes[23] == f'"{_ND}[tuple[N, K], {_F64}]"', off.stdout
+    assert notes[27] == notes[28] == f'"{_ND}[tuple[N], {_F64}]"', off.stdout
+    assert notes[29] == f'"{_ND}[tuple[M], {_F64}]"', off.stdout
+    assert notes[36] == f'"{_ND}[tuple[M, M], {_F64}]"', off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [19, 20, 21, 22, 27, 28, 33, 34, 35, 37], on.stdout
+    assert all(len(errors[line]) == 1 for line in errors), on.stdout
+    assert all(errors[line][0].endswith("[numty-names]") for line in errors), on.stdout
+    for line in (19, 20, 21, 22):
+        assert errors[line][0].endswith(
+            "error: matmul inner dimensions (shapes (N, H) vs (K, H)): H and K are different names  [numty-names]"
+        ), on.stdout
+    for line in (27, 28):
+        assert "matmul inner dimensions (shapes (N,) vs (M, N)): N and M are different names" in errors[line][0]
+    assert "dot contracted dimensions (shapes (2, N, K) vs (M, K)): K and M are different names" in errors[33][0]
+    assert "tensordot contracted dimensions (shapes (2, N, K) vs (M, K)): K and M" in errors[34][0]
+    assert "einsum label 'j' (shapes (M, K) vs (M, K)): K and M are different names" in errors[35][0]
+    assert "inner contracted dimensions (shapes (M, K) vs (K, M)): K and M are different names" in errors[37][0]
+    # np.matmul and np.dot keep the outer dims after the report; `@`
+    # is Any after it, as a reported `a + w` is.
+    on_notes = reveals_by_line(on)
+    assert on_notes[20] == on_notes[21] == f'"{_ND}[tuple[N, H], {_F64}]"', on.stdout
+    assert on_notes[23] == f'"{_ND}[tuple[N, K], {_F64}]"', on.stdout
+    assert _run_fixture("bad_matmul_names_optin.py") == [
+        "shapes (4,3) and (5,3)",
+        "shapes (3,) and (5,3)",
+        "(4, 5) (5,)",
+    ]
+
+
+def test_matmul_names_optin_union_operand() -> None:
+    # Issue 326: with a union operand mypy checks each pair of members
+    # with errors held back, so a report there made the result Any with
+    # no error. The opt-in report is not made there and the result stays.
+    result = run_mypy(
+        FIXTURES / "matmul_names_union_ok.py",
+        flags=("--allow-redefinition", "--enable-error-code", "numty-names"),
+    )
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[20] == f'"{_ND}[tuple[D-1], {_F64}] | {_ND}[tuple[D], {_F64}]"', result.stdout
+    assert notes[21] == notes[22] == f'"{_ND}[tuple[N], {_F64}]"', result.stdout
+    assert _run_fixture("matmul_names_union_ok.py") == ["(4,) (4,)"]
+
+
+def test_matmul_int_dim_keeps_rank() -> None:
+    # Issue 333: an `int` dim next to a named one lost the rank (`@`:
+    # tuple[Any, ...], np.matmul: Any, np.dot: (int, int)). An `int` dim
+    # is taken as matching and the outer dims are kept.
+    result = run_mypy(FIXTURES / "matmul_int_dim_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[17] == f'"{_ND}[tuple[N, H], {_F64}]"', result.stdout
+    for line in (18, 19, 20):
+        assert notes[line] == f'"{_ND}[tuple[N, int], {_F64}]"', result.stdout
+    assert notes[21] == f'"{_ND}[tuple[int, int], {_F64}]"', result.stdout
+    assert notes[26] == notes[27] == f'"{_ND}[tuple[int, M], {_F64}]"', result.stdout
+    assert notes[28] == f'"{_ND}[tuple[N, M], {_F64}]"', result.stdout
+    assert _run_fixture("matmul_int_dim_ok.py") == ["(4, 3) (2, 3)"]
+
+
+def test_svd_qr_symbolic() -> None:
+    # Issue 330: svd/qr of a symbolic matrix were SVDResult[Any, Any] /
+    # QRResult[Any]. K = min(M, N) is one unknown per call, shared by the
+    # factors; full_matrices=True and a square input are exact; the
+    # NamedTuple fields stay readable.
+    result = run_mypy(FIXTURES / "svd_qr_symbolic_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    svd = "numpy.linalg._linalg.SVDResult[Any, Any]"
+    assert notes[21] == f'"{_ND}[tuple[M, ?U@20], {_F64}]"', result.stdout
+    assert notes[22] == f'"{_ND}[tuple[?U@20, N], {_F64}]"', result.stdout
+    assert notes[24] == f'"{_ND}[tuple[M, ?U@23], {_F64}]"', result.stdout
+    assert notes[25] == f'"{_ND}[tuple[?U@23], {_F64}]"', result.stdout
+    assert notes[26] == f'"{_ND}[tuple[?U@23, N], {_F64}]"', result.stdout
+    assert notes[27] == (
+        f'"tuple[{_ND}[tuple[M, M], {_F64}], {_ND}[tuple[?U@27], {_F64}], '
+        f'{_ND}[tuple[N, N], {_F64}], fallback={svd}]"'
+    ), result.stdout
+    assert notes[28] == f'"{_ND}[tuple[?U@28], {_F64}]"', result.stdout
+    assert notes[29] == (
+        f'"tuple[{_ND}[tuple[D, D], {_F64}], {_ND}[tuple[D], {_F64}], '
+        f'{_ND}[tuple[D, D], {_F64}], fallback={svd}]"'
+    ), result.stdout
+    assert notes[30] == (
+        f'"tuple[{_ND}[tuple[Literal[3], M, ?U@30], {_F64}], {_ND}[tuple[Literal[3], ?U@30], {_F64}], '
+        f'{_ND}[tuple[Literal[3], ?U@30, N], {_F64}], fallback={svd}]"'
+    ), result.stdout
+    assert notes[31] == f'"{_ND}[tuple[?U@20, N], {_F64}]"', result.stdout
+    assert notes[32] == f'"{_ND}[tuple[M, N], {_F64}]"', result.stdout
+    assert notes[40] == f'"{_ND}[tuple[M, N], {_F64}]"', result.stdout
+    names = run_mypy(FIXTURES / "svd_qr_symbolic_ok.py", flags=("--enable-error-code", "numty-names"))
+    assert names.returncode == 0, names.stdout
+    assert _run_fixture("svd_qr_symbolic_ok.py") == [
+        "(5, 3) (3, 3) (5, 3) (3,) (3, 3)",
+        "(5, 5) (3, 3) (3,)",
+        "(5, 3) (3, 3)",
+    ]
+
+
+def test_svd_qr_symbolic_reduced_is_not_square() -> None:
+    # Issue 330: returning the reduced Vt (or R) of an (n, d) matrix
+    # where (d, d) is declared was silent; with full_matrices it fits.
+    result = run_mypy(FIXTURES / "bad_svd_symbolic.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [13, 17], result.stdout
+    assert '(got "ndarray[tuple[?U@12, d], dtype[float64]]", expected "ndarray[tuple[d, d]' in errors[13][0]
+    assert '(got "ndarray[tuple[?U@17, d], dtype[float64]]", expected "ndarray[tuple[d, d]' in errors[17][0]
+    assert all(errors[line][0].endswith("[return-value]") for line in errors), result.stdout
+    assert _run_fixture("bad_svd_symbolic.py") == ["(2, 3) (2, 3) (3, 3)"]

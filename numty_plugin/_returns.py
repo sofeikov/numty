@@ -27,11 +27,13 @@ from mypy.types import (
     get_proper_type,
 )
 
-from mypy.nodes import LambdaExpr
+from mypy.nodes import (
+    AssignmentStmt, Block, ClassDef, FuncDef, IndexExpr, LambdaExpr, ListExpr, NameExpr, TupleExpr, Var,
+)
 from mypy.types import LiteralType
 
 from ._errors import _swallowed
-from ._exprs import _EXPR_PREFIX, _iter_tvarlikes, _resolve_dim
+from ._exprs import _EXPR_PREFIX, _implicit_scope_vars, _iter_tvarlikes, _ns_of_ctx, _resolve_dim
 from ._forms import _form_has_unknown, _is_unknown_fullname
 from ._types import _OWN_NAME_OF, INT_FULLNAME, NDARRAY_FULLNAME
 from ._unknowns import _AST_REPEATED, _module_ast
@@ -315,6 +317,56 @@ def _misplaced_name_axes(ctx: object, items: list[Type], shapes: list[list[Type]
 _FREE_NAMES_CACHE: dict[int, tuple[object, dict[str, TypeVarType]]] = {}
 
 
+def _signature_names(scope: object, func: object) -> set[str]:
+    """Fullnames of the names a parameter (of `func` or an enclosing function) or a class binds."""
+    bound: set[str] = set()
+    for item in getattr(scope, "stack", []):
+        item_tp = get_proper_type(getattr(item, "type", None))
+        if isinstance(item_tp, CallableType):
+            for arg in item_tp.arg_types:
+                bound.update(tv.fullname for tv in _iter_tvarlikes(arg))
+        defn = getattr(item, "defn", None)  # a class on the stack
+        for tv in getattr(defn, "type_vars", None) or []:
+            bound.add(tv.fullname)
+    info = getattr(func, "info", None)
+    for tv in getattr(getattr(info, "defn", None), "type_vars", None) or []:
+        bound.add(tv.fullname)
+    return bound
+
+
+_BODY_NAMES_CACHE: dict[int, tuple[object, set[str]]] = {}
+
+
+def _is_body_name(ctx: object, want: TypeVarType) -> bool:
+    """Whether `want` is a size the function being checked names in its body only (issues 321, 330).
+
+    `Uhat: F64[n_basis, n_rank]` in a function whose signature binds
+    neither: the plugin binds such a name for the body (`_heads`), once
+    per function, and keeps the object by (function, name). Like a name
+    of the return alone it is the function's to choose, so a size born
+    in the body (an unknown, an `int`) takes it where it is declared. A
+    name a parameter binds is the caller's and never does.
+    """
+    scope = getattr(getattr(ctx, "api", None), "scope", None)
+    func = scope.current_function() if scope is not None else None
+    if func is None or isinstance(func, LambdaExpr) or not isinstance(want, TypeVarType):
+        return False
+    if _is_unknown_fullname(want.fullname) or want.fullname.startswith(_EXPR_PREFIX) or want.values:
+        return False
+    upper = get_proper_type(want.upper_bound)
+    if not (isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME):
+        return False
+    ns = _ns_of_ctx(ctx)
+    cached = _implicit_scope_vars.get((ns, want.fullname)) or _implicit_scope_vars.get((ns, want.name))
+    if cached is None or cached.fullname != want.fullname or cached.id != want.id:
+        return False
+    hit = _BODY_NAMES_CACHE.get(id(func))
+    if hit is None or hit[0] is not func:
+        hit = (func, _signature_names(scope, func))
+        _BODY_NAMES_CACHE[id(func)] = hit
+    return want.fullname not in hit[1]
+
+
 def _free_return_names(ctx: object) -> dict[str, TypeVarType]:
     """Sizes the function being checked names in its return alone, by fullname (issue 307).
 
@@ -335,18 +387,7 @@ def _free_return_names(ctx: object) -> dict[str, TypeVarType]:
     try:
         tp = get_proper_type(func.type)
         if isinstance(tp, CallableType):
-            bound: set[str] = set()
-            for item in getattr(scope, "stack", []):
-                item_tp = get_proper_type(getattr(item, "type", None))
-                if isinstance(item_tp, CallableType):
-                    for arg in item_tp.arg_types:
-                        bound.update(tv.fullname for tv in _iter_tvarlikes(arg))
-                defn = getattr(item, "defn", None)  # a class on the stack
-                for tv in getattr(defn, "type_vars", None) or []:
-                    bound.add(tv.fullname)
-            info = getattr(func, "info", None)
-            for tv in getattr(getattr(info, "defn", None), "type_vars", None) or []:
-                bound.add(tv.fullname)
+            bound = _signature_names(scope, func)
             for tv in _iter_tvarlikes(tp.ret_type):
                 if (
                     isinstance(tv, TypeVarType)
@@ -530,8 +571,58 @@ def _fits_first(key: tuple[str, int, int, str], where: tuple[int, ...], dim: Typ
 
 
 def _plain_tuple(proper: TupleType) -> bool:
+    """A tuple of arrays: a plain one, or a NamedTuple result (`SVDResult`, issue 330)."""
     fallback = get_proper_type(proper.partial_fallback)
-    return isinstance(fallback, Instance) and fallback.type.fullname == "builtins.tuple"
+    return isinstance(fallback, Instance) and (
+        fallback.type.fullname == "builtins.tuple" or fallback.type.is_named_tuple
+    )
+
+
+def _assign_of(block: Block, value: object) -> AssignmentStmt | None:
+    """The assignment in `block` (nested blocks too, not nested functions) whose value is
+    `value` or a subscript of it."""
+    todo: list[object] = [block]
+    while todo:
+        node = todo.pop()
+        if isinstance(node, Block):
+            todo.extend(node.body)
+        elif isinstance(node, list):
+            todo.extend(node)
+        elif isinstance(node, AssignmentStmt):
+            rvalue = node.rvalue
+            if rvalue is value or (isinstance(rvalue, IndexExpr) and rvalue.base is value):
+                return node
+        elif not isinstance(node, (FuncDef, ClassDef)):
+            for attr in ("body", "else_body", "finally_body", "handlers", "bodies"):
+                sub = getattr(node, attr, None)
+                if isinstance(sub, (Block, list)):
+                    todo.append(sub)
+    return None
+
+
+def _target_declared(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext, item: int
+) -> Type | None:
+    """The declared type of the local bound to item `item` of the hooked value, else None.
+
+    By a tuple target (`u, s, vt = svd(a)`) or a constant subscript
+    (`s = svd(a)[1]`): mypy checks either with no type context.
+    """
+    scope = getattr(ctx.api, "scope", None)
+    func = scope.current_function() if scope is not None else None
+    if not isinstance(func, FuncDef):
+        return None
+    stmt = _assign_of(func.body, ctx.context)
+    if stmt is None or len(stmt.lvalues) != 1:
+        return None
+    elt = stmt.lvalues[0]
+    if isinstance(elt, (TupleExpr, ListExpr)):
+        if stmt.rvalue is not ctx.context or item >= len(elt.items):
+            return None
+        elt = elt.items[item]
+    if not isinstance(elt, NameExpr) or not isinstance(elt.node, Var) or elt.node.is_inferred:
+        return None
+    return elt.node.type
 
 
 def _name_born_sizes(
@@ -565,10 +656,14 @@ def _name_born_sizes(
     name must hold the size the first one checked holds; a position that
     does not keeps its own size, and mypy reports the return. A size with a
     name of the signature in it (`N`, `N+1`) is never renamed.
+
+    A name the body alone declares (`_is_body_name`) is taken the same
+    way by a local annotated with it, also through a tuple target
+    (`Uhat, s, Vt = np.linalg.svd(B)`, issue 330).
     """
     proper = get_proper_type(tp)
     if isinstance(proper, TupleType):
-        if not proper.items or not _plain_tuple(proper) or not _free_return_names(ctx):
+        if not proper.items or not _plain_tuple(proper):
             return tp
         try:
             items = [
@@ -597,10 +692,10 @@ def _name_born_array(
     if not isinstance(shape, TupleType) or not shape.items:
         return tp
     free = _free_return_names(ctx)
-    if not free:
-        return tp
     items = [get_proper_type(i) for i in shape.items]
-    if not any(_is_born_dim(i) or _is_literal_dim(i) for i in items):
+    if not any(_is_born_dim(i) or (free and _is_literal_dim(i)) for i in items):
+        # Without a name of the return alone, only a size born here can
+        # take a name: one the body declares (issue 330).
         return tp
     try:
         tree = getattr(ctx.api, "tree", None)
@@ -615,7 +710,16 @@ def _name_born_array(
         returns, assigns = sites
 
         def here(node: ast.AST) -> bool:
-            return (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col)
+            if (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col):
+                return True
+            # mypy places an operator at its left operand inside the
+            # parentheses: `(S**2) / n` is where `S**2` is, one column
+            # past the `(` (issue 330).
+            while isinstance(node, ast.BinOp):
+                node = node.left
+                if (node.lineno, node.col_offset) == (line, col):
+                    return True
+            return False
 
         def whole(node: ast.AST) -> bool:
             # A tuple display starts where its first item does.
@@ -664,6 +768,13 @@ def _name_born_array(
             if not plain:
                 if len(shapes) == 1:
                     declared = shapes[0]
+                elif item is not None and bound:
+                    # `Uhat, s, Vt = np.linalg.svd(B)` into annotated
+                    # locals: mypy checks a tuple target with no context,
+                    # so the declared type is read off the target.
+                    found = _array_shapes(_target_declared(ctx, item), len(items))
+                    if len(found) == 1:
+                        declared = found[0]
             elif want_ret is not None:
                 site = (line, col, -1 if item is None else item)
                 for name, fstack in plain:
@@ -681,7 +792,12 @@ def _name_born_array(
         for axis, (have, want) in enumerate(zip(items, declared)):
             # By id: a callee's variable of the same name (the formal an
             # argument is checked under) is not this function's name.
-            if not isinstance(want, TypeVarType) or want.fullname not in free or want.id != free[want.fullname].id:
+            if not isinstance(want, TypeVarType):
+                continue
+            if want.fullname in free:
+                if want.id != free[want.fullname].id:
+                    continue
+            elif not _is_body_name(ctx, want):
                 continue
             if not (_is_born_dim(have) or (uses and _is_literal_dim(have))):
                 continue

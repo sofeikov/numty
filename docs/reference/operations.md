@@ -172,7 +172,13 @@ across all operands, `linalg.solve` maps ints to `float64` and rejects
 `einsum` parses the subscript string (explicit, implicit,
 ellipsis, diagonals) and `linalg` checks squareness and inner dims while
 tracking dtypes (`eigh` stays real, `svd` shrinks with
-`full_matrices=False`). `linalg.cross` takes batches of vectors of any
+`full_matrices=False`). `svd` and `qr` of a symbolic `(M, N)` matrix
+(stacked ones too) give `K = min(M, N)` as one fresh unknown per call,
+shared by the factors: `qr` (reduced) is `(M, ?K)` and `(?K, N)`, `svd`
+is `(M, ?K)`, `(?K,)`, `(?K, N)` with `full_matrices=False` and `(M, M)`,
+`(?K,)`, `(N, N)` with the default; a square `(D, D)` input is exact.
+The result keeps its NamedTuple fields (`.U`, `.S`, `.Q`), typed by the
+stubs (`tests/fixtures/svd_qr_symbolic_ok.py`). `linalg.cross` takes batches of vectors of any
 rank, where NumPy's stubs stop at 2-D. `np.round` and `np.around` keep
 the shape and dtype; a bool array comes back `float16`, and rounding
 one to `decimals` other than 0, which NumPy refuses, is typed `Any`
