@@ -188,7 +188,22 @@ quiet, where it is approximate, and what to write instead.
     union. Members pair index-wise (exact for co-derived unions);
     unrelated unions of different member counts, and dunder ops with
     unions on both sides (mypy matches those cartesianly), bail out
-    instead of guessing.
+    instead of guessing. A union with a Python or NumPy scalar
+    (`F64[M] | float`, `float | int`) distributes too when it is the
+    only union among the operands; `F64[N] | None` distributes in
+    `np.average(weights=...)` and at calls of user functions
+    ([#331](https://github.com/sofeikov/numty/issues/331)). Other
+    optional arguments of NumPy calls still keep the stubs' answer.
+- A union actual at a call of a user function is checked per member
+    for the call-site conflict and the `numty-names` binding report;
+    the return is mypy's own solve of the whole union, not a union of
+    per-member returns.
+- In a loop body, the joins that grow a size (`concatenate`, the
+    stacks, `append`) do not distribute over a union: mypy stops
+    re-checking the body after a few passes, so a growing accumulator
+    would be cut off at the last pass. Ops that distribute elsewhere
+    (indexing, `x[1:]` in a loop) have the same cut-off and are not
+    widened either.
 - Heterogeneous unpacking (`a, b = (f(p) for p in (p1, p2))` with
     different shapes) assigns the whole union to every name — genexp,
     list comprehension, `tuple(...)`, starred targets, and `map` (which

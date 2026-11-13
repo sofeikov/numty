@@ -19,7 +19,7 @@ from ._forms import _DivForm, _form_has_unknown, _is_unknown_fullname
 from ._types import (
     _int_value, _dim_eq, _dim_add_const, _mul_dims, _fold_int, _ndarray_parts, _parts_or_unpack,
     _has_unpack, _distribute_solve, _split_flat, _ndarray_type, _int_shape_from_arg,
-    NDARRAY_FULLNAME,
+    _dims_provably_ne, _optional_members, _report_names, _union_results, NDARRAY_FULLNAME,
 )
 from ._reshape import (
     REDUCTION_DTYPES, _all_positionals, _all_positionals_expanded, _construct_datetime_dtype,
@@ -1331,10 +1331,18 @@ def _check_average_weights(
         return None
     size = adims[norm]
     if not isinstance(size, int) or not isinstance(wdims[0], int):
-        # Symbolic sizes cannot be compared: unknown dims (#14) will make
-        # this exact instead of silent.
-        return None
-    if size == wdims[0]:
+        # Symbolic sizes: an error only when no sizes make them equal
+        # (`N+1` against `N`); different names (`N` against `K`) are the
+        # opt-in `[numty-names]` report (issue 331).
+        if _dim_eq(size, wdims[0]):
+            return None
+        if not _dims_provably_ne(size, wdims[0]):
+            _report_names(
+                ctx, wdims[0], size,
+                f"average weights against axis {axis[0]} (shape {_dims_str(adims)})",
+            )
+            return None
+    elif size == wdims[0]:
         return None
     return (
         f"average weights length {wdims[0]} does not match "
@@ -1379,8 +1387,17 @@ def average_function_hook(ctx: FunctionContext) -> Type:
     if not pairs:
         return ctx.default_return_type
     weights = _formal_pair(ctx, "weights")
-    if weights is not None and not _is_none_type(weights[0]):
-        message = _check_average_weights(ctx, pairs[0][0], weights[0])
+    # `weights: F64[N] | None` (sklearn's `sample_weight=None`) distributes
+    # per member, as union array inputs do (issue 331): each array member
+    # is checked as a plain one, and the results union.
+    options: list[Type | None] = [None]
+    if weights is not None:
+        members = _optional_members(weights[0])
+        options = [None if _is_none_type(m) else m for m in members] if members else [weights[0]]
+    for option in options:
+        if option is None:
+            continue
+        message = _check_average_weights(ctx, pairs[0][0], option)
         if message is not None:
             ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
@@ -1388,13 +1405,14 @@ def average_function_hook(ctx: FunctionContext) -> Type:
     returned = False if returned_pair is None else _fold_flag(returned_pair)
     if returned is None:
         return ctx.default_return_type
-    avg = _reduction_inputs(ctx, pairs[0][0])
-    if weights is not None and not _is_none_type(weights[0]):
-        avg = _average_weighted_dtype(ctx, avg, pairs[0][0], weights[0])
-    if not returned:
-        return avg
-    # returned=True: (average, sum_of_weights), same shape for both.
-    return _linalg_tuple(ctx, [avg, avg])
+    results: list[Type] = []
+    for option in options:
+        avg = _reduction_inputs(ctx, pairs[0][0])
+        if option is not None:
+            avg = _average_weighted_dtype(ctx, avg, pairs[0][0], option)
+        # returned=True: (average, sum_of_weights), same shape for both.
+        results.append(_linalg_tuple(ctx, [avg, avg]) if returned else avg)
+    return _union_results(results)
 
 
 def _flatten_total_dim(
