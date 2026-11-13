@@ -749,10 +749,10 @@ def test_einsum_label_conflict() -> None:
 
 
 def test_einsum_rank_mismatch() -> None:
-    assert_rank_mismatch(
+    # Issue 335: one error, with no [arg-type] follow-on per operand.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_einsum_rank.py"),
-        "einsum subscript 'ijk' has 3 labels but operand has rank 2",
-        '"einsum"',
+        "einsum subscript 'ijk' has 3 labels but operand has rank 2 (shape (2, 3))  [numty-shape]",
     )
 
 
@@ -950,7 +950,8 @@ def test_issue141_linalg_guards_ok() -> None:
     assert notes[8] == (
         '"tuple[numpy.ndarray[tuple[Literal[3], Literal[3]], '
         'numpy.dtype[numpy.float64]], numpy.ndarray[tuple[Literal[3], '
-        'Literal[4]], numpy.dtype[numpy.float64]]]"'
+        'Literal[4]], numpy.dtype[numpy.float64]], '
+        'fallback=numpy.linalg._linalg.QRResult[Any]]"'
     ), result.stdout
     assert notes[9] == (
         '"numpy.ndarray[tuple[Literal[2], Literal[2]], '
@@ -2245,9 +2246,11 @@ def test_f64_tuple_spelling_rejected() -> None:
 
 
 def test_f64_empty_rejected() -> None:
+    # Issue 335: `F64[()]` is a 0-d array now; the bare head still names
+    # no dims, and the message says how to spell either.
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_empty.py"),
-        "F64 takes at least one dim",
+        "F64 needs its dims, e.g. F64[N, M], or F64[()] for a 0-d array  [numty-annotation]",
     )
 
 
@@ -2905,10 +2908,9 @@ def test_comprehension_unknown_bails_not_false_proof() -> None:
 
 def test_einsum_symbolic_conflict() -> None:
     # Issue #63: einsum label N vs N+2 from off-by-pad is provable.
-    assert_rank_mismatch(
+    assert_single_error(
         run_mypy(FIXTURES / "bad_einsum_symbolic.py"),
-        "einsum label 'n' has conflicting sizes: N vs N+2",
-        '"einsum"',
+        "einsum label 'n' has conflicting sizes: N vs N+2 (shapes (H, N) vs (N+2,))  [numty-shape]",
     )
 
 
@@ -4811,7 +4813,9 @@ def test_arr_head_misuse() -> None:
     errors = _errors_by_line(result)
     assert sorted(errors) == [12, 15, 18], result.stdout
     assert len(errors[12]) == 1 and len(errors[15]) == 1 and len(errors[18]) == 1, result.stdout
-    assert "Arr takes a dtype and at least one dim" in errors[12][0], result.stdout
+    assert "Arr takes a dtype and its dims, e.g. Arr[T, N, M], or Arr[T, ()] for a 0-d array" in errors[12][0], (
+        result.stdout
+    )
     assert "[numty-annotation]" in errors[12][0], result.stdout
     assert 'Arr takes a dtype as its first argument, but "N" is bound to int' in errors[15][0], (
         result.stdout
@@ -5964,8 +5968,10 @@ def test_strict_mode_keeps_every_type(tmp_path: Path) -> None:
     )
     # Only calls numty does not solve: not `.dtype`, `finfo(...).eps` or
     # a `for` over range() (lines 35-38), and not the in-place ops, whose
-    # shapes are checked (39-42; 42 is the broadcast error).
-    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16, 22, 27, 29, 31], strict.stdout
+    # shapes are checked (39-42; 42 is the broadcast error). np.diagonal
+    # (22) and np.unique's tuple (31) are solved since issue 330; `Q.T @ X`
+    # with an `int` dim and the svd of it (27, 29) since issues 333 and 330.
+    assert sorted(int(line.split(":")[1]) for line in unsolved) == [14, 15, 16], strict.stdout
     errors = _errors_by_line(plain)
     assert sorted(errors) == [42], plain.stdout
     assert "H vs H-1" in errors[42][0] and errors[42][0].endswith("[numty-broadcast]"), plain.stdout
@@ -6078,3 +6084,374 @@ def test_free_name_rebound_union_ok() -> None:
     # different unknown per array, so correct free-name returns failed.
     result = run_mypy(FIXTURES / "free_name_rebound_union_ok.py", flags=("--allow-redefinition",))
     assert result.returncode == 0, result.stdout
+
+
+def _messages_by_line(result: "subprocess.CompletedProcess[str]") -> dict[int, list[str]]:
+    """Error messages per line, without the `path:line: error: ` prefix."""
+    return {
+        line: [text.split(": error: ", 1)[1] for text in texts]
+        for line, texts in _errors_by_line(result).items()
+    }
+
+# Issue 335: `F64[()]` is a 0-d array for every head, and `Arr[T, ()]`
+# for the generic one; it was refused ("takes at least one dim") and
+# the parameter became Any.
+def test_zero_d_head_ok() -> None:
+    result = run_mypy(FIXTURES / "zero_d_head_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        27: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"',
+        28: f'"{_ND}[tuple[()], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"',
+        29: f'"{_ND}[tuple[()], numpy.dtype[numpy.bool[Any]]]"',
+        30: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[Any]]]"',
+        31: f'"{_ND}[tuple[()], {_F64}]"',
+        39: f'"{_ND}[tuple[()], {_F64}]"',
+        40: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        41: f'"{_ND}[tuple[()], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit]]]"',
+    }, result.stdout
+    assert _run_fixture("zero_d_head_ok.py") == [
+        "() float64",
+        "(3,) float64",
+        "() int32",
+        "() float32",
+        "() int64",
+        "() bool",
+        "() float64",
+        "() float64",
+    ]
+
+
+def test_bad_zero_d_head() -> None:
+    result = run_mypy(FIXTURES / "bad_zero_d_head.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [11, 14, 17], result.stdout
+    assert all(len(errors[line]) == 1 for line in errors), result.stdout
+    assert errors[11][0].endswith(
+        'Incompatible return value type (got "ndarray[tuple[N], dtype[float64]]",'
+        ' expected "ndarray[tuple[()], dtype[float64]]")  [return-value]'
+    ), result.stdout
+    assert errors[14][0].endswith(
+        "F64 takes () only on its own, for a 0-d array; other dims go flat,"
+        " e.g. F64[N, M]  [numty-annotation]"
+    ), result.stdout
+    assert errors[17][0].endswith(
+        'F64 string dims must name at least one dim, e.g. "batch features";'
+        " a 0-d array is F64[()]  [numty-annotation]"
+    ), result.stdout
+    assert _run_fixture("bad_zero_d_head.py") == ["(3,)"]
+
+
+# Issue 335: a head inside a generic container alias (`list[F64[N, int]]`)
+# said 'F64 dim "N" must be a TypeVar', although N is one: mypy analyzes
+# the right-hand side once with TypeVars left unbound, before it knows
+# the line is an alias.
+def test_head_generic_alias_ok() -> None:
+    result = run_mypy(FIXTURES / "head_generic_alias_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        28: f'"tuple[{_ND}[tuple[N, H], {_F64}], {_ND}[tuple[H], {_F64}]]"',
+        29: f'"dict[str, {_ND}[tuple[N, Literal[3]], {_F64}]]"',
+        30: f'"list[{_ND}[tuple[N], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]]"',
+        35: f'"tuple[{_ND}[tuple[Literal[2], Literal[4]], {_F64}], {_ND}[tuple[Literal[4]], {_F64}]]"',
+    }, result.stdout
+    assert _run_fixture("head_generic_alias_ok.py") == ["[(2, 4), (4,)]", "[(2, 4), (4,)]", "[(2, 3)]", "[(2,)]"]
+
+
+def test_bad_head_generic_alias() -> None:
+    result = run_mypy(FIXTURES / "bad_head_generic_alias.py")
+    errors = _messages_by_line(result)
+    assert sorted(errors) == [14, 18], result.stdout
+    assert errors[14] == [
+        'Incompatible return value type (got "tuple[ndarray[tuple[N, H], dtype[float64]],'
+        ' ndarray[tuple[H], dtype[float64]]]", expected "tuple[ndarray[tuple[H, N], dtype[float64]],'
+        ' ndarray[tuple[N], dtype[float64]]]")  [return-value]'
+    ], result.stdout
+    assert errors[18] == [
+        'Incompatible return value type (got "ndarray[tuple[H], dtype[float64]]",'
+        ' expected "ndarray[tuple[N], dtype[float64]]")  [return-value]'
+    ], result.stdout
+    assert _run_fixture("bad_head_generic_alias.py") == ["(2, 4) (4,)"]
+
+
+# Issue 335: an einsum error came with one [arg-type] per operand quoting
+# the bool overload, a correct operand included. Every einsum error is
+# now the one numty error.
+def test_bad_einsum_followon() -> None:
+    result = run_mypy(FIXTURES / "bad_einsum_followon.py")
+    errors = _messages_by_line(result)
+    assert errors == {
+        13: ["einsum subscript 'ijl' has 3 labels but operand has rank 2 (shape (N, N))  [numty-shape]"],
+        14: ["einsum subscript 'jk' has 2 labels but operand has rank 3 (shape (N, N, T))  [numty-shape]"],
+        15: ["einsum subscripts describe 2 operand(s) but 1 array(s) given  [numty-shape]"],
+        16: ["einsum output subscript 'q' never appeared in an input  [numty-axis]"],
+    }, result.stdout
+    assert _run_fixture("bad_einsum_followon.py") == ["(2, 2)"]
+
+
+# Issue 335: a call through a callback Protocol with positional-only
+# parameters named them `argument '?'` in the call-site reports.
+def test_bad_callsite_posonly() -> None:
+    fixture = FIXTURES / "bad_callsite_posonly.py"
+    conflict = (
+        "call-site shape conflict for 'U': 3 (argument 'Z', axis 1)"
+        " vs 4 (argument 'delta', axis 1)  [numty-callsite]"
+    )
+    assert _messages_by_line(run_mypy(fixture)) == {27: [conflict]}
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    names = (
+        "call-site binding of 'U' (argument 'Z', axis 1, and argument 'delta', axis 1):"
+        " H and K are different names  [numty-names]"
+    )
+    assert _messages_by_line(on) == {22: [names], 23: [names], 27: [conflict]}, on.stdout
+    assert _run_fixture("bad_callsite_posonly.py") == ["(2, 3) (2, 3)", "(2, 3) (2, 3)"]
+
+
+def test_matrix_ops_symbolic() -> None:
+    # Issue 330: np.eye / np.identity of a size read from a shape (or a
+    # formula over one), np.diag / np.diagonal / .diagonal(), np.outer,
+    # np.cov, np.count_nonzero(axis=) and np.unique(return_*) keep
+    # symbolic shapes; they were ndarray[Any, Any] or (int, int) before.
+    result = run_mypy(FIXTURES / "matrix_symbolic_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        15: f'"{_ND}[tuple[D, D], {_F64}]"',
+        16: f'"{_ND}[tuple[D, D], {_F64}]"',
+        17: f'"{_ND}[tuple[D+1, D+1], {_F64}]"',
+        18: f'"{_ND}[tuple[D, N], {_I64}]"',
+        19: f'"{_ND}[tuple[D, D], {_F64}]"',
+        20: f'"{_ND}[tuple[D, D], {_F64}]"',
+        24: f'"{_ND}[tuple[D], {_F64}]"',
+        25: f'"{_ND}[tuple[D, D], {_F64}]"',
+        26: f'"{_ND}[tuple[D+2, D+2], {_F64}]"',
+        27: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        28: f'"{_ND}[tuple[?U@28], {_F64}]"',
+        29: f'"{_ND}[tuple[D], {_F64}]"',
+        30: f'"{_ND}[tuple[D], {_F64}]"',
+        31: f'"{_ND}[tuple[C, D], {_F64}]"',
+        32: '"numpy.float64"',
+        36: f'"{_ND}[tuple[N, D], {_F64}]"',
+        37: f'"{_ND}[tuple[D*N, D], {_F64}]"',
+        38: f'"{_ND}[tuple[N, D], {_F64}]"',
+        42: f'"{_ND}[tuple[D, D], {_F64}]"',
+        43: f'"{_ND}[tuple[D, D], {_F64}]"',
+        44: f'"{_ND}[tuple[N, N], {_F64}]"',
+        45: f'"{_ND}[tuple[()], {_F64}]"',
+        50: f'"{_ND}[tuple[N], {_I64}]"',
+        51: f'"{_ND}[tuple[Literal[1], D], {_I64}]"',
+        # The values and their counts share one unknown size.
+        53: f'"{_ND}[tuple[?U@52], {_INTP}]"',
+        54: f'"{_ND}[tuple[?U@52], {_I64}]"',
+        55: f'"{_ND}[tuple[?U@52], {_F64}]"',
+        # The inverse maps every input element back: the input's shape.
+        57: f'"{_ND}[tuple[N], {_I64}]"',
+        58: f'"tuple[{_ND}[tuple[?U@58], numpy.dtype[numpy.bool[Any]]], {_ND}[tuple[N, D], {_I64}]]"',
+    }, result.stdout
+    assert _run_fixture("matrix_symbolic_ok.py") == [
+        "(3, 3) (4, 4) (3, 5) (3, 3)",
+        "(3,) (3, 3) (5, 5) (3,) (3,) (4, 3)",
+        "(5, 3) (15, 3)",
+        "(3, 3) (3, 3) (5, 5) ()",
+        "(5,) (1, 3) (3,) (5,)",
+        "(5, 3)",
+    ]
+
+
+def test_matrix_ops_symbolic_errors() -> None:
+    # Issue 330: an off-by-one identity, cov over the wrong axis, swapped
+    # outer operands, a diagonal over the batch axis and a per-label
+    # count where a per-sample one is declared, all from sklearn.
+    result = run_mypy(FIXTURES / "bad_matrix_symbolic.py")
+    assert result.returncode == 1, result.stdout
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 19, 23, 27, 31, 35], result.stdout
+    assert all(len(errors[line]) == 1 for line in errors), result.stdout
+    assert errors[14][0].endswith(
+        "broadcast shapes disagree at trailing axis 0: D vs D+1 (shapes (D, D) vs (D+1, D+1))  [numty-broadcast]"
+    ), result.stdout
+    assert 'got "ndarray[tuple[N, N], dtype[float64]]", expected "ndarray[tuple[D, D]' in errors[19][0]
+    assert 'got "ndarray[tuple[C, N], dtype[float64]]", expected "ndarray[tuple[N, C]' in errors[23][0]
+    assert 'got "ndarray[tuple[D, ?U@27], dtype[float64]]", expected "ndarray[tuple[C, D]' in errors[27][0]
+    assert 'got "ndarray[tuple[D], dtype[signedinteger[_64Bit]]]"' in errors[31][0], result.stdout
+    assert all(errors[line][0].endswith("[return-value]") for line in (19, 23, 27, 31)), result.stdout
+    assert errors[35][0].endswith("eye dimensions must be non-negative, got (-1, -1)  [numty-shape]")
+    assert _run_fixture("bad_matrix_symbolic.py") == [
+        "operands could not be broadcast together with shapes (3,3) (4,4) (3,3) ",
+        "negative dimensions are not allowed",
+        "(5, 5) (5, 2)",
+        "(3, 3) (3,)",
+    ]
+
+
+def test_held_function_and_masked_array() -> None:
+    # Issue 330: a numpy function held in a variable (a conditional pick,
+    # a local alias, a module-level alias) is solved by its own hook, and
+    # np.ma.masked_array keeps its data's shape through the ndarray
+    # solvers (.min(axis=), .reshape, .T, comparisons, np.sum).
+    result = run_mypy(FIXTURES / "aliases_ok.py")
+    assert result.returncode == 0, result.stdout
+    ma = "numpy.ma.core.MaskedArray"
+    assert reveals_by_line(result) == {
+        16: f'"{_ND}[tuple[N], {_F64}]"',
+        18: f'"{_ND}[tuple[M], {_F64}]"',
+        19: f'"{_ND}[tuple[Literal[1], N], {_F64}]"',
+        20: f'"{_ND}[tuple[N], {_F64}]"',
+        25: f'"{ma}[tuple[N, M], {_F64}]"',
+        27: f'"{ma}[tuple[N, Literal[1]], {_F64}]"',
+        28: f'"{ma}[tuple[M, N], {_F64}]"',
+        29: f'"{ma}[tuple[M], {_F64}]"',
+        30: f'"{ma}[tuple[N], {_F64}]"',
+        31: f'"{ma}[tuple[N, M], {_F64}]"',
+        33: f'"{ma}[tuple[N], {_I64}]"',
+        # .filled() is the stubs' own: a plain array of the same shape.
+        34: f'"{_ND}[tuple[N], {_I64}]"',
+    }, result.stdout
+    assert _run_fixture("aliases_ok.py") == [
+        "(3,) (2,) (1, 3)",
+        "MaskedArray (2, 1) (3, 2) (3,) (2,)",
+        "MaskedArray (2,) (2,)",
+    ]
+    bad = FIXTURES / "bad_aliases.py"
+    for flags in ((), ("--enable-error-code", "numty-names")):
+        result = run_mypy(bad, flags=flags)
+        assert result.returncode == 1, result.stdout
+        errors = _errors_by_line(result)
+        assert sorted(errors) == ([13, 18, 23, 28, 30] if flags else [13, 18, 23]), result.stdout
+        assert 'got "ndarray[tuple[M], dtype[float64]]", expected "ndarray[tuple[N]' in errors[13][0]
+        assert 'got "MaskedArray[tuple[Literal[3]], dtype[float64]]"' in errors[18][0], result.stdout
+        # The MaskedArray operator also gets mypy's [operator] follow-on:
+        # the duplicate suppression (issue 148) covers ndarray's only.
+        assert errors[23][0].endswith("N-1 vs N (shapes (N-1, M) vs (N, M))  [numty-broadcast]"), result.stdout
+        assert len(errors[23]) == 2 and errors[23][1].endswith("[operator]"), result.stdout
+        if flags:
+            assert "(shapes (M,) vs (N,)): M and N are different names  [numty-names]" in errors[28][0]
+            assert "(shapes (N,) vs (N, M)): N and M are different names  [numty-names]" in errors[30][0]
+    assert _run_fixture("bad_aliases.py") == [
+        "(2,) (3,)",
+        "operands could not be broadcast together with shapes (3,3) (4,3) ",
+        "operands could not be broadcast together with shapes (2,) (3,)",
+    ]
+
+
+def test_matmul_names_optin() -> None:
+    # Issue 326: a contraction over two different names (the forgotten
+    # `.T`) was silent even under numty-names. By default it stays silent
+    # and keeps the outer dims, which are the result's own whenever the
+    # call runs; under the opt-in code each spelling is reported once,
+    # with no [operator] or [arg-type] follow-on.
+    fixture = FIXTURES / "bad_matmul_names_optin.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    notes = reveals_by_line(off)
+    for line in (19, 20, 21, 22):
+        assert notes[line] == f'"{_ND}[tuple[N, H], {_F64}]"', off.stdout
+    assert notes[23] == f'"{_ND}[tuple[N, K], {_F64}]"', off.stdout
+    assert notes[27] == notes[28] == f'"{_ND}[tuple[N], {_F64}]"', off.stdout
+    assert notes[29] == f'"{_ND}[tuple[M], {_F64}]"', off.stdout
+    assert notes[36] == f'"{_ND}[tuple[M, M], {_F64}]"', off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    errors = _errors_by_line(on)
+    assert sorted(errors) == [19, 20, 21, 22, 27, 28, 33, 34, 35, 37], on.stdout
+    assert all(len(errors[line]) == 1 for line in errors), on.stdout
+    assert all(errors[line][0].endswith("[numty-names]") for line in errors), on.stdout
+    for line in (19, 20, 21, 22):
+        assert errors[line][0].endswith(
+            "error: matmul inner dimensions (shapes (N, H) vs (K, H)): H and K are different names  [numty-names]"
+        ), on.stdout
+    for line in (27, 28):
+        assert "matmul inner dimensions (shapes (N,) vs (M, N)): N and M are different names" in errors[line][0]
+    assert "dot contracted dimensions (shapes (2, N, K) vs (M, K)): K and M are different names" in errors[33][0]
+    assert "tensordot contracted dimensions (shapes (2, N, K) vs (M, K)): K and M" in errors[34][0]
+    assert "einsum label 'j' (shapes (M, K) vs (M, K)): K and M are different names" in errors[35][0]
+    assert "inner contracted dimensions (shapes (M, K) vs (K, M)): K and M are different names" in errors[37][0]
+    # np.matmul and np.dot keep the outer dims after the report; `@`
+    # is Any after it, as a reported `a + w` is.
+    on_notes = reveals_by_line(on)
+    assert on_notes[20] == on_notes[21] == f'"{_ND}[tuple[N, H], {_F64}]"', on.stdout
+    assert on_notes[23] == f'"{_ND}[tuple[N, K], {_F64}]"', on.stdout
+    assert _run_fixture("bad_matmul_names_optin.py") == [
+        "shapes (4,3) and (5,3)",
+        "shapes (3,) and (5,3)",
+        "(4, 5) (5,)",
+    ]
+
+
+def test_matmul_names_optin_union_operand() -> None:
+    # Issue 326: with a union operand mypy checks each pair of members
+    # with errors held back, so a report there made the result Any with
+    # no error. The opt-in report is not made there and the result stays.
+    result = run_mypy(
+        FIXTURES / "matmul_names_union_ok.py",
+        flags=("--allow-redefinition", "--enable-error-code", "numty-names"),
+    )
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[20] == f'"{_ND}[tuple[D-1], {_F64}] | {_ND}[tuple[D], {_F64}]"', result.stdout
+    assert notes[21] == notes[22] == f'"{_ND}[tuple[N], {_F64}]"', result.stdout
+    assert _run_fixture("matmul_names_union_ok.py") == ["(4,) (4,)"]
+
+
+def test_matmul_int_dim_keeps_rank() -> None:
+    # Issue 333: an `int` dim next to a named one lost the rank (`@`:
+    # tuple[Any, ...], np.matmul: Any, np.dot: (int, int)). An `int` dim
+    # is taken as matching and the outer dims are kept.
+    result = run_mypy(FIXTURES / "matmul_int_dim_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[17] == f'"{_ND}[tuple[N, H], {_F64}]"', result.stdout
+    for line in (18, 19, 20):
+        assert notes[line] == f'"{_ND}[tuple[N, int], {_F64}]"', result.stdout
+    assert notes[21] == f'"{_ND}[tuple[int, int], {_F64}]"', result.stdout
+    assert notes[26] == notes[27] == f'"{_ND}[tuple[int, M], {_F64}]"', result.stdout
+    assert notes[28] == f'"{_ND}[tuple[N, M], {_F64}]"', result.stdout
+    assert _run_fixture("matmul_int_dim_ok.py") == ["(4, 3) (2, 3)"]
+
+
+def test_svd_qr_symbolic() -> None:
+    # Issue 330: svd/qr of a symbolic matrix were SVDResult[Any, Any] /
+    # QRResult[Any]. K = min(M, N) is one unknown per call, shared by the
+    # factors; full_matrices=True and a square input are exact; the
+    # NamedTuple fields stay readable.
+    result = run_mypy(FIXTURES / "svd_qr_symbolic_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    svd = "numpy.linalg._linalg.SVDResult[Any, Any]"
+    assert notes[21] == f'"{_ND}[tuple[M, ?U@20], {_F64}]"', result.stdout
+    assert notes[22] == f'"{_ND}[tuple[?U@20, N], {_F64}]"', result.stdout
+    assert notes[24] == f'"{_ND}[tuple[M, ?U@23], {_F64}]"', result.stdout
+    assert notes[25] == f'"{_ND}[tuple[?U@23], {_F64}]"', result.stdout
+    assert notes[26] == f'"{_ND}[tuple[?U@23, N], {_F64}]"', result.stdout
+    assert notes[27] == (
+        f'"tuple[{_ND}[tuple[M, M], {_F64}], {_ND}[tuple[?U@27], {_F64}], '
+        f'{_ND}[tuple[N, N], {_F64}], fallback={svd}]"'
+    ), result.stdout
+    assert notes[28] == f'"{_ND}[tuple[?U@28], {_F64}]"', result.stdout
+    assert notes[29] == (
+        f'"tuple[{_ND}[tuple[D, D], {_F64}], {_ND}[tuple[D], {_F64}], '
+        f'{_ND}[tuple[D, D], {_F64}], fallback={svd}]"'
+    ), result.stdout
+    assert notes[30] == (
+        f'"tuple[{_ND}[tuple[Literal[3], M, ?U@30], {_F64}], {_ND}[tuple[Literal[3], ?U@30], {_F64}], '
+        f'{_ND}[tuple[Literal[3], ?U@30, N], {_F64}], fallback={svd}]"'
+    ), result.stdout
+    assert notes[31] == f'"{_ND}[tuple[?U@20, N], {_F64}]"', result.stdout
+    assert notes[32] == f'"{_ND}[tuple[M, N], {_F64}]"', result.stdout
+    assert notes[40] == f'"{_ND}[tuple[M, N], {_F64}]"', result.stdout
+    names = run_mypy(FIXTURES / "svd_qr_symbolic_ok.py", flags=("--enable-error-code", "numty-names"))
+    assert names.returncode == 0, names.stdout
+    assert _run_fixture("svd_qr_symbolic_ok.py") == [
+        "(5, 3) (3, 3) (5, 3) (3,) (3, 3)",
+        "(5, 5) (3, 3) (3,)",
+        "(5, 3) (3, 3)",
+    ]
+
+
+def test_svd_qr_symbolic_reduced_is_not_square() -> None:
+    # Issue 330: returning the reduced Vt (or R) of an (n, d) matrix
+    # where (d, d) is declared was silent; with full_matrices it fits.
+    result = run_mypy(FIXTURES / "bad_svd_symbolic.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [13, 17], result.stdout
+    assert '(got "ndarray[tuple[?U@12, d], dtype[float64]]", expected "ndarray[tuple[d, d]' in errors[13][0]
+    assert '(got "ndarray[tuple[?U@17, d], dtype[float64]]", expected "ndarray[tuple[d, d]' in errors[17][0]
+    assert all(errors[line][0].endswith("[return-value]") for line in errors), result.stdout
+    assert _run_fixture("bad_svd_symbolic.py") == ["(2, 3) (2, 3) (3, 3)"]

@@ -28,6 +28,29 @@ from ._types import (
 )
 
 
+def _formal_name(sig: CallableType, i: int) -> str:
+    """The name of formal `i` for a message, or "?" when it has none.
+
+    Issue 335: a positional-only parameter (`def __call__(self, Z, /)`,
+    the usual spelling of a callback Protocol) has no name in the
+    callable type, so the call-site reports said `argument '?'`. The
+    definition still has it: read it there, past a bound `self`.
+    """
+    name = sig.arg_names[i] if i < len(sig.arg_names) else None
+    if name:
+        return name
+    try:
+        arguments = list(getattr(sig.definition, "arguments", None) or [])
+        offset = len(arguments) - len(sig.arg_names)
+        if offset >= 0 and 0 <= i + offset < len(arguments):
+            found = arguments[i + offset].variable.name
+            if found:
+                return found
+    except Exception:
+        _swallowed(None, "_formal_name")
+    return "?"
+
+
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
     """Formals with shape TypeVars: (formal index, [(dim index, tvar)]).
 
@@ -271,8 +294,8 @@ def _conflict_pairs(
     out: list[tuple[str, int, TypeVarLikeType, int, int | None]] = []
     if len(ctx.args) != len(sig.arg_types):
         return out
-    for i, (tp, kind, name) in enumerate(zip(sig.arg_types, sig.arg_kinds, sig.arg_names)):
-        fname = name or "?"
+    for i, (tp, kind) in enumerate(zip(sig.arg_types, sig.arg_kinds)):
+        fname = _formal_name(sig, i)
         actuals = ctx.args[i]
         if kind in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT):
             if len(actuals) != 1:
@@ -454,7 +477,7 @@ def _callsite_expr_bindings(
                         ctx.api.fail(
                             f"call-site shape conflict: no size '{_short_var(m_full)}' "
                             f"makes {_expr_str(form_f)} equal {fa.const} "
-                            f"(argument '{sig.arg_names[i]}', axis {dim})",
+                            f"(argument '{_formal_name(sig, i)}', axis {dim})",
                             ctx.context,
                             code=NUMTY_CALLSITE,
                         )

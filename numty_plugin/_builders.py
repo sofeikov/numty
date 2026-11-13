@@ -959,39 +959,6 @@ def full_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, dims, dtype)
 
 
-def eye_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if not pairs:
-        return ctx.default_return_type
-    n = _fold_single(pairs[0])
-    if n is None:
-        return ctx.default_return_type
-    m_pair = _formal_pair(ctx, "M")
-    if m_pair is None or _is_none_type(m_pair[0]):
-        m = n
-    else:
-        folded_m = _fold_single(m_pair)
-        if folded_m is None:
-            return ctx.default_return_type
-        m = folded_m
-    if n < 0 or m < 0:
-        ctx.api.fail(
-            f"eye dimensions must be non-negative, got ({n}, {m})",
-            ctx.context,
-            code=NUMTY_SHAPE,
-        )
-        return ctx.default_return_type
-    if _explicit_dtype(ctx):
-        named = _named_dtype(ctx)
-        if named is None:
-            return ctx.default_return_type
-        return _ndarray_type(ctx, [n, m], named)
-    dtype = _construct_dtype(ctx, "numpy.float64")
-    if dtype is None:
-        return ctx.default_return_type
-    return _ndarray_type(ctx, [n, m], dtype)
-
-
 def _builder_single_dim(
     pair: tuple[Type, Expression | None] | None,
 ) -> int | TypeVarType | None:
@@ -1052,32 +1019,6 @@ def linspace_function_hook(ctx: FunctionContext) -> Type:
     if dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, [num], dtype)
-
-
-def identity_function_hook(ctx: FunctionContext) -> Type:
-    """np.identity: (n, n) with explicit dtype or float64 (issue #58)."""
-    pairs = _all_positionals(ctx)
-    if not pairs:
-        return ctx.default_return_type
-    n = _builder_single_dim(pairs[0])
-    if n is None:
-        return ctx.default_return_type
-    if isinstance(n, int) and n < 0:
-        ctx.api.fail(
-            f"identity dimensions must be non-negative, got ({n}, {n})",
-            ctx.context,
-            code=NUMTY_SHAPE,
-        )
-        return ctx.default_return_type
-    if _explicit_dtype(ctx):
-        named = _named_dtype(ctx)
-        if named is None:
-            return ctx.default_return_type
-        return _ndarray_type(ctx, [n, n], named)
-    dtype = _construct_dtype(ctx, "numpy.float64")
-    if dtype is None:
-        return ctx.default_return_type
-    return _ndarray_type(ctx, [n, n], dtype)
 
 
 def tri_function_hook(ctx: FunctionContext) -> Type:

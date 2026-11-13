@@ -21,7 +21,7 @@ from ._types import (
     _report_mask_names, _report_names,
 )
 from ._callbind import (
-    ActualOverrides, _actual_type, _shape_tvar_formals, _strip_optional,
+    ActualOverrides, _actual_type, _formal_name, _shape_tvar_formals, _strip_optional,
 )
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
 from ._linalg import _is_numpy_scalar
@@ -179,7 +179,7 @@ def _report_call_site_names(
             actual = _parts_or_unpack(_actual_type(ctx, ctx.args[i][0], overrides))
             if actual is None:
                 continue
-            name = sig.arg_names[i] or "?"
+            name = _formal_name(sig, i)
             for dim, tvar in positions:
                 if dim >= len(actual[0]):
                     continue

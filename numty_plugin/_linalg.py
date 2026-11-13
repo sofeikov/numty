@@ -13,7 +13,7 @@ from ._dtypes import (
     _NAME_OF_KIND_SIZE,
 )
 from ._types import (
-    TUPLE_FULLNAME, _check_dim_eq, _dim_str, _has_unpack, _int_value, _ndarray_parts, _ndarray_type,
+    TUPLE_FULLNAME, _check_dim_eq, _dim_eq, _dim_str, _has_unpack, _int_value, _ndarray_parts, _ndarray_type,
 )
 from ._reshape import (
     _all_positionals, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.types import AnyType, CallableType, TupleType, Type, TypeOfAny
 from ._reshape import (
-    _construct_dtype,
+    _construct_dtype, _mixed_parts,
 )
 from ._dtypes import (
     _DTYPE_INFO,
@@ -47,6 +47,38 @@ def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Ty
         TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
     )
     return TupleType(items, fallback)
+
+def _linalg_named(ctx: FunctionContext, items: list[Type]) -> Type:
+    """items as the stubs' NamedTuple result (SVDResult, QRResult), else a plain tuple.
+
+    The fields stay readable (`.U`, `.S`, `.Q`), each typed by the stubs;
+    unpacking and indexing get the solved shapes.
+    """
+    default = get_proper_type(ctx.default_return_type)
+    fallback = default.partial_fallback if isinstance(default, TupleType) else default
+    if (
+        isinstance(fallback, Instance)
+        and fallback.type.is_named_tuple
+        and fallback.type.tuple_type is not None
+        and len(fallback.type.tuple_type.items) == len(items)
+    ):
+        # One fallback whichever overload mypy tries: answers that differ
+        # between candidates would join to the stubs' Any fields.
+        any_args = [AnyType(TypeOfAny.special_form) for _ in fallback.args]
+        return TupleType(items, fallback.copy_modified(args=any_args))
+    return _linalg_tuple(ctx, items)
+
+
+def _linalg_min_dim(ctx: FunctionContext, rows: int | Type, cols: int | Type, op: str) -> int | Type:
+    """min(M, N) of a matrix: an int, the one size of a square matrix,
+    else one fresh unknown for the call, shared by every factor (issue 330)."""
+    from numty_plugin import _fresh_unknown
+    if isinstance(rows, int) and isinstance(cols, int):
+        return min(rows, cols)
+    if _dim_eq(rows, cols):
+        return rows
+    return _fresh_unknown(ctx, op, 0)
+
 
 def _linalg_real_name(kind: str, size: int) -> str | None:
     """Float dtype for real-valued results: int inputs, norm, svd values."""
@@ -330,7 +362,9 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    part = _ndarray_parts(pairs[0][0])
+    # A plain `int` dim is a size like any other here: (int, M) from
+    # Q.T @ X in randomized_svd (issue 330).
+    part = _ndarray_parts(pairs[0][0]) or _mixed_parts(pairs[0][0], partner=True)
     if part is None:
         return ctx.default_return_type
     dims, dtype = part
@@ -341,10 +375,9 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
-    rows, cols = dims[-2], dims[-1]
-    if not isinstance(rows, int) or not isinstance(cols, int):
-        # K = min(M, N) is unknowable with symbolic dims.
+    if _has_unpack(dims):
         return ctx.default_return_type
+    rows, cols = dims[-2], dims[-1]
     full = _linalg_flag(ctx, "full_matrices", True)
     compute_uv = _linalg_flag(ctx, "compute_uv", True)
     if full is None or compute_uv is None:
@@ -370,7 +403,8 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
     if uv_dtype is None or s_dtype is None:
         return ctx.default_return_type
     batch = dims[:-2]
-    inner = min(rows, cols)
+    # K = min(M, N): a fresh unknown with symbolic dims (issue 330).
+    inner = _linalg_min_dim(ctx, rows, cols, "svd")
     s_type = _ndarray_type(ctx, [*batch, inner], s_dtype)
     if not compute_uv:
         return s_type
@@ -378,7 +412,7 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
         u_dims, vh_dims = [*batch, rows, rows], [*batch, cols, cols]
     else:
         u_dims, vh_dims = [*batch, rows, inner], [*batch, inner, cols]
-    return _linalg_tuple(
+    return _linalg_named(
         ctx,
         [
             _ndarray_type(ctx, u_dims, uv_dtype),
@@ -805,7 +839,9 @@ def _linalg_qr(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    part = _ndarray_parts(pairs[0][0])
+    # A plain `int` dim is a size like any other here: (int, M) from
+    # Q.T @ X in randomized_svd (issue 330).
+    part = _ndarray_parts(pairs[0][0]) or _mixed_parts(pairs[0][0], partner=True)
     if part is None:
         return ctx.default_return_type
     dims, dtype = part
@@ -848,18 +884,17 @@ def _linalg_qr(ctx: FunctionContext) -> Type:
     batch = dims[:-2]
     rows, cols = dims[-2], dims[-1]
     if mode == "complete":
-        return _linalg_tuple(
+        return _linalg_named(
             ctx,
             [
                 _ndarray_type(ctx, [*batch, rows, rows], out_dtype),
                 _ndarray_type(ctx, [*batch, rows, cols], out_dtype),
             ],
         )
-    if not isinstance(rows, int) or not isinstance(cols, int):
-        return ctx.default_return_type
-    inner = min(rows, cols)
+    # K = min(M, N): a fresh unknown with symbolic dims (issue 330).
+    inner = _linalg_min_dim(ctx, rows, cols, "qr")
     if mode == "reduced":
-        return _linalg_tuple(
+        return _linalg_named(
             ctx,
             [
                 _ndarray_type(ctx, [*batch, rows, inner], out_dtype),

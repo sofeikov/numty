@@ -27,7 +27,10 @@ error: call-site shape conflict for 'hid': 8 (argument 'w', axis 1) vs 2 (argume
 
 ## Dtype heads
 
-Fixed sizes spell as integers (`F64[3, 4]`), runtime sizes nothing can
+Fixed sizes spell as integers (`F64[3, 4]`), a 0-d array as `F64[()]`
+(`ndarray[tuple[()], dtype[float64]]`, what `np.array(1.0)` and
+`np.squeeze` of a scalar give; `Arr[T, ()]` for the generic head),
+runtime sizes nothing can
 name as `int` (`F32[int, int, Unpack[Ts]]` for a gather over runtime
 counts, see `tests/fixtures/pad_time_ok.py`), rank polymorphism as
 `Unpack[Ts]` or `*Ts` with a declared TypeVarTuple, mixed freely with
@@ -115,6 +118,28 @@ def build(n: int) -> Positions[int]:
 error: Argument 1 to "Positions" has incompatible type "ndarray[tuple[int, Literal[3]], dtype[floating[_16Bit]]]"; expected "ndarray[tuple[int, Literal[2]], dtype[floating[_16Bit]]]"  [arg-type]
 ```
 
+## Heads inside generic aliases
+
+A head can sit inside a container alias, and the alias is generic in
+its TypeVars like `Mat = F64[N, M]` is
+(`tests/fixtures/head_generic_alias_ok.py`):
+
+```python
+Layers = list[F64[N, int]]
+Pair = tuple[F64[N, H], F64[H]]
+
+
+def forward(x: F64[N, H], layers: Layers[H]) -> Pair[N, H]:
+    return x, x[0]
+```
+
+A list holds one item type, so its items share their sizes:
+`list[F64[N, int]]` says every item has `N` rows. Per-layer sizes
+(layer `i` maps `H_i` to `H_{i+1}`) have no spelling; a fixed depth
+can be a tuple of heads instead (`tuple[F64[I, H], F64[H, O]]`), and a
+variable depth stays `list[F64[int, int]]`
+([#28](https://github.com/sofeikov/numty/issues/28)).
+
 ## String specs, jaxtyping style
 
 Prefer jaxtyping's string look? Write that instead — one spec per
@@ -184,6 +209,6 @@ so an undeclared bare dim is an error, not a silent hole — `"hid"` and
 (Quoted multi-word specs are the exception: their words mint implicit
 dims, per the boundary note above.)
 Second, misuse fails loudly with a redirect, never a silent `Any`:
-`F64[tuple[N, M]]` tells you to write `F64[N, M]`, `F64[()]` and `_`
-tell you what's wrong. Quoted or bare is a style choice, not a semantic
-one.
+`F64[tuple[N, M]]` tells you to write `F64[N, M]`, a bare `F64`, `_`
+and `F64[(), N]` tell you what's wrong. Quoted or bare is a style
+choice, not a semantic one.

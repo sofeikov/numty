@@ -4,12 +4,14 @@ local facade import is used only for a monkeypatch seam (_LAZY_SEAMS).
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 
-from mypy.nodes import ARG_POS, Expression, ListExpr, TupleExpr
-from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import Type, TypeVarType
+from mypy.nodes import ARG_POS, CallExpr, Expression, ListExpr, MemberExpr, NameExpr, OpExpr, TupleExpr, Var
+from mypy.plugin import FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
+from mypy.types import AnyType, CallableType, FunctionLike, Type, TypeOfAny, TypeVarType
 
-from ._errors import NUMTY_AXIS, NUMTY_SHAPE
+from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
 from ._forms import _form_has_unknown, _forms_provably_ne, _is_unknown_fullname
 from ._unknowns import _is_same_unknown
 from ._exprs import _expr_str
@@ -34,7 +36,8 @@ from ._linalg import (
     _scalar_of_dtype,
 )
 from ._types import (
-    _unpack_shape,
+    _mask_counts_differ, _named_sizes_differ, _names_enabled, _report_mask_names, _report_names,
+    _union_members, _unknown_offset, _unpack_shape,
 )
 from ._broadcast_core import (
     _merge_unpack_dims, _same_unpack, _solve_broadcast,
@@ -58,6 +61,87 @@ def _matmul_inner(x: int | Type, y: int | Type) -> tuple[bool, str | None]:
     return False, None
 
 
+def _contracted_pair(
+    a: list[int | Type], b: list[int | Type]
+) -> tuple[int | Type, int | Type] | None:
+    """The (left, right) dims a matmul contracts, None for a 0-d operand."""
+    if not a or not b:
+        return None
+    return a[-1], (b[0] if len(b) == 1 else b[-2])
+
+
+def _names_contracted(x: int | Type, y: int | Type) -> bool:
+    """Whether a contracted pair is an opt-in `[numty-names]` report (issue 326).
+
+    Two different names (`H` against `K`, a forgotten `.T`), a selection
+    count against a name, or one unknown against itself plus a constant:
+    the pairs a broadcast reports under the same code.
+    """
+    return _named_sizes_differ(x, y) or _mask_counts_differ(x, y) or _unknown_offset(x, y) != 0
+
+
+def _report_contracted(
+    ctx: FunctionContext | MethodContext | None, x: int | Type, y: int | Type, where: str
+) -> None:
+    """The opt-in report for an unprovable contracted pair (issue 326).
+
+    Like the broadcast's: nothing with `numty-names` off, where the
+    pair stays unprovable and the result keeps the outer dims.
+    """
+    if ctx is None or _union_operand(ctx):
+        return
+    _report_names(ctx, x, y, where)
+    _report_mask_names(ctx, x, y, where)
+
+
+def _union_operand(ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext) -> bool:
+    """Whether an operand of the contraction being checked is a union of arrays.
+
+    mypy then checks each pair of members with errors held back, and an
+    error in one makes the whole result Any, silently: the opt-in report
+    is not made there (issue 326), and the result is kept.
+    """
+    call = ctx.context
+    if isinstance(call, OpExpr):
+        exprs: list[Expression] = [call.left, call.right]
+    elif isinstance(call, CallExpr):
+        exprs = list(call.args)
+        if isinstance(call.callee, MemberExpr):
+            exprs.append(call.callee.expr)  # `a.dot(b)`: the receiver too
+    else:
+        return False
+    try:
+        for e in exprs:
+            if _union_members(ctx.api.get_expression_type(e)) is not None:
+                return True
+            # In mypy's per-member check of a call the argument reads as
+            # the member; the variable still holds the union.
+            node = e.node if isinstance(e, NameExpr) else None
+            if isinstance(node, Var) and node.type is not None and _union_members(node.type) is not None:
+                return True
+        return False
+    except Exception:
+        _swallowed(ctx, "_union_operand")
+        return True
+
+
+def _matmul_names_report(
+    ctx: FunctionContext | MethodContext | MethodSigContext,
+    a: list[int | Type],
+    b: list[int | Type],
+) -> bool:
+    """Whether `_matmul_result` makes the opt-in report for these shapes.
+
+    For the `@` signature hook: the method hook's error must not also
+    fail mypy's overload check (an `[operator]` duplicate).
+    """
+    pair = _contracted_pair(a, b)
+    if pair is None or not _names_enabled(ctx) or _is_same_unknown(*pair) or _union_operand(ctx):
+        return False
+    matched, message = _matmul_inner(*pair)
+    return not matched and message is None and _names_contracted(*pair)
+
+
 def _matmul_result(
     a: list[int | Type],
     b: list[int | Type],
@@ -67,40 +151,34 @@ def _matmul_result(
 
     An unprovable inner pair (N vs M, ?U vs ?U') is not a clash and the
     output dims do not depend on it (issue #56), so the outer dims are
-    still returned instead of bailing the whole result to Any. The one
-    exception is the same ?U on both sides (issue #63): one mask site
-    serves every comprehension element, so equality would falsely prove
-    (3, 3) — bail instead.
+    still returned instead of bailing the whole result to Any. Two
+    different names there are the opt-in `[numty-names]` report (issue
+    326), as in a broadcast; the outer dims are the result's own either
+    way, the contracted size never reaches it. The one exception is the
+    same ?U on both sides (issue #63): one mask site serves every
+    comprehension element, so equality would falsely prove (3, 3) —
+    bail instead.
     """
     from numty_plugin import _broadcast_result
-    if not a or not b:
+    pair = _contracted_pair(a, b)
+    if pair is None:
         return None, None
-    if len(a) == 1 and len(b) == 1:
-        if _is_same_unknown(a[0], b[0]):
-            return None, None
-        _, message = _matmul_inner(a[0], b[0])
-        if message is not None:
-            return None, message
-        return [], None
-    if len(a) == 1:
-        if _is_same_unknown(a[0], b[-2]):
-            return None, None
-        _, message = _matmul_inner(a[0], b[-2])
-        if message is not None:
-            return None, message
-        return [*b[:-2], b[-1]], None
-    if len(b) == 1:
-        if _is_same_unknown(a[-1], b[0]):
-            return None, None
-        _, message = _matmul_inner(a[-1], b[0])
-        if message is not None:
-            return None, message
-        return a[:-1], None
-    if _is_same_unknown(a[-1], b[-2]):
+    x, y = pair
+    if _is_same_unknown(x, y):
         return None, None
-    _, message = _matmul_inner(a[-1], b[-2])
+    matched, message = _matmul_inner(x, y)
     if message is not None:
         return None, message
+    if not matched:
+        _report_contracted(
+            ctx, x, y, f"matmul inner dimensions (shapes {_dims_str(a)} vs {_dims_str(b)})"
+        )
+    if len(a) == 1 and len(b) == 1:
+        return [], None
+    if len(a) == 1:
+        return [*b[:-2], b[-1]], None
+    if len(b) == 1:
+        return a[:-1], None
     batch_a, batch_b = a[:-2], b[:-2]
     batch, cause = _broadcast_result(batch_a, batch_b, ctx)
     if cause is not None:
@@ -221,8 +299,15 @@ def _operand_parts(
     """
     parts_a = _ndarray_parts(left)
     parts_b = _ndarray_parts(right)
-    if (parts_a is None or parts_b is None) and _has_mixed_operand(left, right):
-        return _mixed_parts(left, partner=True), _mixed_parts(right, partner=True)
+    if parts_a is None or parts_b is None:
+        if _has_mixed_operand(left, right):
+            return _mixed_parts(left, partner=True), _mixed_parts(right, partner=True)
+        # A plain `int` dim next to named ones, (N, int) @ (int, H)
+        # (issue 333): the int dims match anything, the outer dims stay.
+        mixed_a = parts_a or _mixed_parts(left, partner=True)
+        mixed_b = parts_b or _mixed_parts(right, partner=True)
+        if mixed_a is not None and mixed_b is not None:
+            return mixed_a, mixed_b
     return parts_a, parts_b
 
 
@@ -315,14 +400,19 @@ def _two_arrays(ctx: FunctionContext) -> tuple[Type, Type] | None:
 
 
 def _contract_pair(
-    op: str, x: int | Type, y: int | Type
+    op: str,
+    x: int | Type,
+    y: int | Type,
+    ctx: FunctionContext | MethodContext | None = None,
+    shapes: tuple[list[int | Type], list[int | Type]] | None = None,
 ) -> tuple[bool, str | None]:
     """(match, error) for one contracted dim pair.
 
     Match on equality, error when both ints differ or linear forms are
     provably unequal (N+1 vs N, issue #139), and (False, None) to bail
     on anything unprovable (N vs M, ?U vs ?U'). Mirrors _matmul_inner
-    with an op-specific message.
+    with an op-specific message. With ctx and the operand shapes, two
+    different names there are the opt-in report (issue 326).
     """
     if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
@@ -330,6 +420,9 @@ def _contract_pair(
         return False, f"{op} contracted dimensions disagree: {x} vs {y}"
     if _dims_provably_ne(x, y):
         return False, f"{op} contracted dimensions disagree: {_dim_str(x)} vs {_dim_str(y)}"
+    if shapes is not None and not _is_same_unknown(x, y):
+        where = f"{op} contracted dimensions (shapes {_dims_str(shapes[0])} vs {_dims_str(shapes[1])})"
+        _report_contracted(ctx, x, y, where)
     return False, None
 
 
@@ -359,7 +452,7 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
         return _solve_broadcast(ctx, pair[0], pair[1])
     if len(dims_a) == 1 and len(dims_b) == 1:
         # Vector inner product is a scalar (the stubs agree).
-        matched, message = _contract_pair("dot", dims_a[0], dims_b[0])
+        matched, message = _contract_pair("dot", dims_a[0], dims_b[0], ctx, (dims_a, dims_b))
         if message is not None:
             ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
@@ -374,13 +467,60 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
     else:
         contracted = (dims_a[-1], dims_b[-2])
         out = dims_a[:-1] + dims_b[:-2] + dims_b[-1:]
-    matched, message = _contract_pair("dot", *contracted)
+    matched, message = _contract_pair("dot", *contracted, ctx, (dims_a, dims_b))
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     if not matched:
         return ctx.default_return_type
     return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), pair[0], pair[1])
+
+
+def _contraction_names_report(op: str, left: Type, right: Type) -> bool:
+    """Whether np.dot / np.inner contract two different names (issue 326).
+
+    The pair the function hook reads: for dot a's last axis against b's
+    only axis (1-D) or second to last, for inner both last axes. Proofs
+    and plain `int` dims are not reports.
+    """
+    parts_a, parts_b = _operand_parts(left, right) if op == "dot" else (_ndarray_parts(left), _ndarray_parts(right))
+    if parts_a is None or parts_b is None or not parts_a[0] or not parts_b[0]:
+        return False
+    pair = _contracted_pair(parts_a[0], parts_b[0]) if op == "dot" else (parts_a[0][-1], parts_b[0][-1])
+    if pair is None or _is_same_unknown(*pair):
+        return False
+    matched, message = _matmul_inner(*pair)
+    return not matched and message is None and _names_contracted(*pair)
+
+
+def _contraction_signature(ctx: FunctionSigContext, op: str) -> FunctionLike:
+    """np.dot / np.inner: Any formals where the function hook makes the opt-in names report.
+
+    The report fails each overload mypy tries, and its fallback then adds
+    an `[arg-type]` error against the last one (issue 326). Calls the
+    code is off for, and every other call, keep the stubs' signature.
+    """
+    sig = ctx.default_signature
+    try:
+        call = ctx.context
+        if not isinstance(sig, CallableType) or not _names_enabled(ctx) or _union_operand(ctx):
+            return sig
+        if not isinstance(call, CallExpr) or call.arg_kinds[:2] != [ARG_POS, ARG_POS]:
+            return sig
+        left = ctx.api.get_expression_type(call.args[0])
+        right = ctx.api.get_expression_type(call.args[1])
+        if not _contraction_names_report(op, left, right):
+            return sig
+        return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
+    except Exception:
+        _swallowed(ctx, "_contraction_signature")
+        return sig
+
+
+def contraction_signature_hook(fullname: str) -> Callable[[FunctionSigContext], FunctionLike] | None:
+    """The signature hook of np.dot and np.inner (issue 326), None for any other name."""
+    op = {"numpy._core.multiarray.dot": "dot", "numpy._core.multiarray.inner": "inner"}.get(fullname)
+    return None if op is None else partial(_contraction_signature, op=op)
 
 
 def dot_method_hook(ctx: MethodContext) -> Type:
@@ -397,7 +537,7 @@ def dot_method_hook(ctx: MethodContext) -> Type:
         # 0-d operand: dot is broadcast multiplication (issue #41).
         return _solve_broadcast(ctx, left, right)
     if len(dims_a) == 1 and len(dims_b) == 1:
-        matched, message = _contract_pair("dot", dims_a[0], dims_b[0])
+        matched, message = _contract_pair("dot", dims_a[0], dims_b[0], ctx, (dims_a, dims_b))
         if message is not None:
             ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type
@@ -411,7 +551,7 @@ def dot_method_hook(ctx: MethodContext) -> Type:
     else:
         contracted = (dims_a[-1], dims_b[-2])
         out = dims_a[:-1] + dims_b[:-2] + dims_b[-1:]
-    matched, message = _contract_pair("dot", *contracted)
+    matched, message = _contract_pair("dot", *contracted, ctx, (dims_a, dims_b))
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
@@ -475,7 +615,7 @@ def inner_function_hook(ctx: FunctionContext) -> Type:
     if not dims_a or not dims_b:
         # 0-d operand: inner is broadcast multiplication (issue #41).
         return _solve_broadcast(ctx, pair[0], pair[1])
-    matched, message = _contract_pair("inner", dims_a[-1], dims_b[-1])
+    matched, message = _contract_pair("inner", dims_a[-1], dims_b[-1], ctx, (dims_a, dims_b))
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
@@ -703,7 +843,7 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
     drop_a = {i for i, _ in contract}
     drop_b = {j for _, j in contract}
     for i, j in contract:
-        matched, message = _contract_pair("tensordot", dims_a[i], dims_b[j])
+        matched, message = _contract_pair("tensordot", dims_a[i], dims_b[j], ctx, (dims_a, dims_b))
         if message is not None:
             ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
             return ctx.default_return_type

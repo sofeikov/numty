@@ -182,6 +182,20 @@ generic alias (`MyVec[Rows]` for `np.ndarray[tuple[Rows], ...]`) is
 mypy's to analyze, so it still needs the name in the signature
 (`tests/fixtures/local_only_name.py`).
 
+Such a local takes an unknown as well as an `int`, also through a tuple
+target, so the factors of a decomposition can be named
+(`tests/fixtures/svd_qr_symbolic_ok.py`):
+
+```python
+def project(a: F64[M, N], n: int) -> F64[M, N]:
+    Q = np.zeros((a.shape[0], n))
+    Uhat: F64[B, R]
+    s: F64[R]
+    Vt: F64[R, N]
+    Uhat, s, Vt = np.linalg.svd(Q.T @ a, full_matrices=False)   # (int, ?K), (?K,), (?K, N)
+    return (Q @ Uhat) * s @ Vt
+```
+
 What stays out: a bare parameter returned under a free name, and a name
 a parameter binds, which is the caller's and still refuses an unknown.
 
