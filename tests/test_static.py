@@ -5382,6 +5382,24 @@ def test_index_clip_ok() -> None:
         assert "they may run past the axis" in errors[line][0], errors
 
 
+def test_local_only_name() -> None:
+    # A size TypeVar the signature does not mention can be named in the
+    # body (mypy alone: `Type variable "Rows" is unbound`). One name is
+    # one size per function; at module level it is still unbound.
+    fixture = FIXTURES / "local_only_name.py"
+    off = _errors_by_line(run_mypy(fixture))
+    assert sorted(off) == [26, 37], off
+    assert "Rows-1 vs Rows" in off[26][0] and off[26][0].endswith("[numty-broadcast]"), off
+    assert 'Rows" is unbound' in off[37][0], off
+    on_result = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    on = _errors_by_line(on_result)
+    assert sorted(on) == [25, 26, 33, 37], on
+    assert "Rows and Other are different names" in on[25][0], on
+    assert "N and Rows are different names" in on[33][0], on
+    assert reveals_by_line(on_result)[24] == '"numpy.ndarray[tuple[Rows], numpy.dtype[Any]]"', on_result.stdout
+    assert _run_fixture("local_only_name.py") == ["7.0"]
+
+
 def test_numba_dispatcher_call() -> None:
     # Issue 281: a call of a jitted function is checked as a call of the
     # function: sizes are solved (they were `Never`), a formula return is
