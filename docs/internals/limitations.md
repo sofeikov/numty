@@ -281,6 +281,23 @@ quiet, where it is approximate, and what to write instead.
 
 ## Annotations and integer bookkeeping
 
+- A test on a shape does not narrow it. In `if scores.shape[1] == 1:
+    return scores.reshape(-1)` the reshape is still `(k*n,)`, and
+    `assert out.shape[1] == means.shape[0]` does not make an unknown
+    `?U` the parameter's `c`: mypy has no plugin hook for narrowing on
+    a condition. Write what the branch knows (`scores[:, 0]` is `(n,)`),
+    or check at runtime with
+    [`narrow(out, witness)`](../guide/runtime.md) or `typing.cast`
+    ([#17](https://github.com/sofeikov/numty/issues/17),
+    [#306](https://github.com/sofeikov/numty/issues/306)).
+- A list holds one item type, so its items share their sizes:
+    `list[F64[N, int]]` says every item has `N` rows, and per-layer
+    sizes (an MLP's `coefs_`, layer `i` mapping `H_i` to `H_{i+1}`)
+    have no spelling. A fixed depth can be a tuple of heads
+    (`tuple[F64[I, H], F64[H, O]]`); a variable depth stays
+    `list[F64[int, int]]`, and the layer loop is checked for rank and
+    dtype only ([#28](https://github.com/sofeikov/numty/issues/28)).
+
 - Bare ints are rejected in alias definitions by mypy itself, before
     any plugin runs (`Mat34 = F64[3, 4]` errors exactly like
     `X = list[3]` does). Spell the sizes with `Literal`

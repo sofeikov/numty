@@ -749,10 +749,10 @@ def test_einsum_label_conflict() -> None:
 
 
 def test_einsum_rank_mismatch() -> None:
-    assert_rank_mismatch(
+    # Issue 335: one error, with no [arg-type] follow-on per operand.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_einsum_rank.py"),
-        "einsum subscript 'ijk' has 3 labels but operand has rank 2",
-        '"einsum"',
+        "einsum subscript 'ijk' has 3 labels but operand has rank 2 (shape (2, 3))  [numty-shape]",
     )
 
 
@@ -2245,9 +2245,11 @@ def test_f64_tuple_spelling_rejected() -> None:
 
 
 def test_f64_empty_rejected() -> None:
+    # Issue 335: `F64[()]` is a 0-d array now; the bare head still names
+    # no dims, and the message says how to spell either.
     assert_single_error(
         run_mypy(FIXTURES / "bad_f64_empty.py"),
-        "F64 takes at least one dim",
+        "F64 needs its dims, e.g. F64[N, M], or F64[()] for a 0-d array  [numty-annotation]",
     )
 
 
@@ -2905,10 +2907,9 @@ def test_comprehension_unknown_bails_not_false_proof() -> None:
 
 def test_einsum_symbolic_conflict() -> None:
     # Issue #63: einsum label N vs N+2 from off-by-pad is provable.
-    assert_rank_mismatch(
+    assert_single_error(
         run_mypy(FIXTURES / "bad_einsum_symbolic.py"),
-        "einsum label 'n' has conflicting sizes: N vs N+2",
-        '"einsum"',
+        "einsum label 'n' has conflicting sizes: N vs N+2 (shapes (H, N) vs (N+2,))  [numty-shape]",
     )
 
 
@@ -4811,7 +4812,9 @@ def test_arr_head_misuse() -> None:
     errors = _errors_by_line(result)
     assert sorted(errors) == [12, 15, 18], result.stdout
     assert len(errors[12]) == 1 and len(errors[15]) == 1 and len(errors[18]) == 1, result.stdout
-    assert "Arr takes a dtype and at least one dim" in errors[12][0], result.stdout
+    assert "Arr takes a dtype and its dims, e.g. Arr[T, N, M], or Arr[T, ()] for a 0-d array" in errors[12][0], (
+        result.stdout
+    )
     assert "[numty-annotation]" in errors[12][0], result.stdout
     assert 'Arr takes a dtype as its first argument, but "N" is bound to int' in errors[15][0], (
         result.stdout
@@ -6078,3 +6081,123 @@ def test_free_name_rebound_union_ok() -> None:
     # different unknown per array, so correct free-name returns failed.
     result = run_mypy(FIXTURES / "free_name_rebound_union_ok.py", flags=("--allow-redefinition",))
     assert result.returncode == 0, result.stdout
+
+
+def _messages_by_line(result: "subprocess.CompletedProcess[str]") -> dict[int, list[str]]:
+    """Error messages per line, without the `path:line: error: ` prefix."""
+    return {
+        line: [text.split(": error: ", 1)[1] for text in texts]
+        for line, texts in _errors_by_line(result).items()
+    }
+
+# Issue 335: `F64[()]` is a 0-d array for every head, and `Arr[T, ()]`
+# for the generic one; it was refused ("takes at least one dim") and
+# the parameter became Any.
+def test_zero_d_head_ok() -> None:
+    result = run_mypy(FIXTURES / "zero_d_head_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        27: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"',
+        28: f'"{_ND}[tuple[()], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"',
+        29: f'"{_ND}[tuple[()], numpy.dtype[numpy.bool[Any]]]"',
+        30: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[Any]]]"',
+        31: f'"{_ND}[tuple[()], {_F64}]"',
+        39: f'"{_ND}[tuple[()], {_F64}]"',
+        40: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        41: f'"{_ND}[tuple[()], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit]]]"',
+    }, result.stdout
+    assert _run_fixture("zero_d_head_ok.py") == [
+        "() float64",
+        "(3,) float64",
+        "() int32",
+        "() float32",
+        "() int64",
+        "() bool",
+        "() float64",
+        "() float64",
+    ]
+
+
+def test_bad_zero_d_head() -> None:
+    result = run_mypy(FIXTURES / "bad_zero_d_head.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [11, 14, 17], result.stdout
+    assert all(len(errors[line]) == 1 for line in errors), result.stdout
+    assert errors[11][0].endswith(
+        'Incompatible return value type (got "ndarray[tuple[N], dtype[float64]]",'
+        ' expected "ndarray[tuple[()], dtype[float64]]")  [return-value]'
+    ), result.stdout
+    assert errors[14][0].endswith(
+        "F64 takes () only on its own, for a 0-d array; other dims go flat,"
+        " e.g. F64[N, M]  [numty-annotation]"
+    ), result.stdout
+    assert errors[17][0].endswith(
+        'F64 string dims must name at least one dim, e.g. "batch features";'
+        " a 0-d array is F64[()]  [numty-annotation]"
+    ), result.stdout
+    assert _run_fixture("bad_zero_d_head.py") == ["(3,)"]
+
+
+# Issue 335: a head inside a generic container alias (`list[F64[N, int]]`)
+# said 'F64 dim "N" must be a TypeVar', although N is one: mypy analyzes
+# the right-hand side once with TypeVars left unbound, before it knows
+# the line is an alias.
+def test_head_generic_alias_ok() -> None:
+    result = run_mypy(FIXTURES / "head_generic_alias_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        28: f'"tuple[{_ND}[tuple[N, H], {_F64}], {_ND}[tuple[H], {_F64}]]"',
+        29: f'"dict[str, {_ND}[tuple[N, Literal[3]], {_F64}]]"',
+        30: f'"list[{_ND}[tuple[N], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]]"',
+        35: f'"tuple[{_ND}[tuple[Literal[2], Literal[4]], {_F64}], {_ND}[tuple[Literal[4]], {_F64}]]"',
+    }, result.stdout
+    assert _run_fixture("head_generic_alias_ok.py") == ["[(2, 4), (4,)]", "[(2, 4), (4,)]", "[(2, 3)]", "[(2,)]"]
+
+
+def test_bad_head_generic_alias() -> None:
+    result = run_mypy(FIXTURES / "bad_head_generic_alias.py")
+    errors = _messages_by_line(result)
+    assert sorted(errors) == [14, 18], result.stdout
+    assert errors[14] == [
+        'Incompatible return value type (got "tuple[ndarray[tuple[N, H], dtype[float64]],'
+        ' ndarray[tuple[H], dtype[float64]]]", expected "tuple[ndarray[tuple[H, N], dtype[float64]],'
+        ' ndarray[tuple[N], dtype[float64]]]")  [return-value]'
+    ], result.stdout
+    assert errors[18] == [
+        'Incompatible return value type (got "ndarray[tuple[H], dtype[float64]]",'
+        ' expected "ndarray[tuple[N], dtype[float64]]")  [return-value]'
+    ], result.stdout
+    assert _run_fixture("bad_head_generic_alias.py") == ["(2, 4) (4,)"]
+
+
+# Issue 335: an einsum error came with one [arg-type] per operand quoting
+# the bool overload, a correct operand included. Every einsum error is
+# now the one numty error.
+def test_bad_einsum_followon() -> None:
+    result = run_mypy(FIXTURES / "bad_einsum_followon.py")
+    errors = _messages_by_line(result)
+    assert errors == {
+        13: ["einsum subscript 'ijl' has 3 labels but operand has rank 2 (shape (N, N))  [numty-shape]"],
+        14: ["einsum subscript 'jk' has 2 labels but operand has rank 3 (shape (N, N, T))  [numty-shape]"],
+        15: ["einsum subscripts describe 2 operand(s) but 1 array(s) given  [numty-shape]"],
+        16: ["einsum output subscript 'q' never appeared in an input  [numty-axis]"],
+    }, result.stdout
+    assert _run_fixture("bad_einsum_followon.py") == ["(2, 2)"]
+
+
+# Issue 335: a call through a callback Protocol with positional-only
+# parameters named them `argument '?'` in the call-site reports.
+def test_bad_callsite_posonly() -> None:
+    fixture = FIXTURES / "bad_callsite_posonly.py"
+    conflict = (
+        "call-site shape conflict for 'U': 3 (argument 'Z', axis 1)"
+        " vs 4 (argument 'delta', axis 1)  [numty-callsite]"
+    )
+    assert _messages_by_line(run_mypy(fixture)) == {27: [conflict]}
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-names"))
+    names = (
+        "call-site binding of 'U' (argument 'Z', axis 1, and argument 'delta', axis 1):"
+        " H and K are different names  [numty-names]"
+    )
+    assert _messages_by_line(on) == {22: [names], 23: [names], 27: [conflict]}, on.stdout
+    assert _run_fixture("bad_callsite_posonly.py") == ["(2, 3) (2, 3)", "(2, 3) (2, 3)"]

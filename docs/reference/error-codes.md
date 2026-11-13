@@ -10,7 +10,7 @@ can be silenced or selected on its own:
 | `numty-callsite` | one shape variable bound to two sizes by the arguments of a call: two literals, or two symbolic sizes that no values make equal (`R` and `R-1`) | `call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)` |
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
-| `numty-annotation` | malformed `F64[...]`-style annotations | `F64 takes at least one dim` |
+| `numty-annotation` | malformed `F64[...]`-style annotations | `F64 needs its dims, e.g. F64[N, M], or F64[()] for a 0-d array` |
 | `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
@@ -25,7 +25,7 @@ from numty import F64, batch
 def pair(x: F64[batch], y: F64[batch]) -> None: ...
 
 
-def demo(blocks: list[np.ndarray], bad: F64[()]) -> None:
+def demo(blocks: list[np.ndarray], bad: F64) -> None:
     a, b = np.zeros((4, 3)), np.zeros((2, 5))
     np.matmul(a, b)                     # numty-shape
     pair(np.zeros(4), np.zeros(5))      # numty-callsite
@@ -35,7 +35,7 @@ def demo(blocks: list[np.ndarray], bad: F64[()]) -> None:
 ```
 
 ```text
-codes.py:8: error: F64 takes at least one dim  [numty-annotation]
+codes.py:8: error: F64 needs its dims, e.g. F64[N, M], or F64[()] for a 0-d array  [numty-annotation]
 codes.py:10: error: matmul inner dimensions disagree: 3 vs 2  [numty-shape]
 codes.py:11: error: call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)  [numty-callsite]
 codes.py:12: error: where shapes disagree: broadcast shapes disagree at trailing axis 0: 3 vs 4 (shapes (4, 3) vs (4,))  [numty-broadcast]

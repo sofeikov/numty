@@ -103,8 +103,16 @@ def _fam_head(ctx: AnalyzeTypeContext, dtype_fullname: str, late_bound: set[str]
     raw_args = list(ctx.type.args)
     try:
         if not raw_args:
-            raise _FamFail(f"{head} takes at least one dim")
-        dims = _fam_parse_dims(ctx, head, raw_args, late_bound)
+            if not ctx.type.empty_tuple_index:
+                raise _FamFail(
+                    f"{head} needs its dims, e.g. {head}[N, M], or {head}[()] for a 0-d array"
+                )
+            # Issue 335: `F64[()]` is a 0-d array, `ndarray[tuple[()], ...]`
+            # (np.array(1.0), np.squeeze of a scalar), as `tuple[()]` is
+            # the empty tuple.
+            dims: list[int | Type] = []
+        else:
+            dims = _fam_parse_dims(ctx, head, raw_args, late_bound)
     except _FamFail as bad:
         ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
         return AnyType(TypeOfAny.from_error)
@@ -150,9 +158,16 @@ def _arr_head(ctx: AnalyzeTypeContext, late_bound: set[str]) -> Type:
     raw_args = list(ctx.type.args)
     try:
         if len(raw_args) < 2:
-            raise _FamFail(f"{head} takes a dtype and at least one dim, e.g. {head}[T, N, M]")
+            raise _FamFail(
+                f"{head} takes a dtype and its dims, e.g. {head}[T, N, M],"
+                f" or {head}[T, ()] for a 0-d array"
+            )
         element = _arr_dtype(ctx, head, raw_args[0])
-        dims = _fam_parse_dims(ctx, head, raw_args[1:], late_bound)
+        if len(raw_args) == 2 and _is_empty_tuple_arg(raw_args[1]):
+            # Issue 335: `Arr[T, ()]` is a 0-d array, like `F64[()]`.
+            dims: list[int | Type] = []
+        else:
+            dims = _fam_parse_dims(ctx, head, raw_args[1:], late_bound)
     except _FamFail as bad:
         ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
         return AnyType(TypeOfAny.from_error)
@@ -202,6 +217,11 @@ def _arr_dtype(ctx: AnalyzeTypeContext, head: str, arg: Type) -> Type:
         # already said 'Type variable "X" is unbound', with hints.
         raise _FamBail
     raise _FamFail(_arr_dtype_msg(head))
+
+
+def _is_empty_tuple_arg(arg: Type) -> bool:
+    """Whether a raw head argument is the empty tuple `()`."""
+    return isinstance(arg, TupleType) and not arg.items
 
 
 def _is_numpy_scalar_class(inst: Instance) -> bool:
@@ -329,6 +349,11 @@ def _fam_arg(
             f"{head} '...' cannot be named for shape solving;"
             " use Unpack[Ts] with a declared TypeVarTuple"
         )
+    if _is_empty_tuple_arg(arg):
+        raise _FamFail(
+            f"{head} takes () only on its own, for a 0-d array; other dims go flat,"
+            f" e.g. {head}[N, M]"
+        )
     if isinstance(arg, RawExpressionType):
         value = arg.literal_value
         if isinstance(value, str):
@@ -416,7 +441,8 @@ def _fam_string(
     words = text.split()
     if not words:
         raise _FamFail(
-            f'{head} string dims must name at least one dim, e.g. "batch features"'
+            f'{head} string dims must name at least one dim, e.g. "batch features";'
+            f" a 0-d array is {head}[()]"
         )
     bare = [w for w in words if w.isidentifier() and not keyword.iskeyword(w)]
     minted = _fam_bind_words(ctx, bare, node, late_bound)
@@ -1066,11 +1092,14 @@ def _fam_bare(
     if isinstance(analyzed, UnboundType):
         analyzer = cast(TypeAnalyser, ctx.api)
         sym = analyzer.lookup_qualified(arg.name, arg, suppress_errors=True)
-        if (
-            sym is not None
-            and isinstance(sym.node, TypeVarLikeExpr)
-            and not analyzer.allow_unbound_tvars
-        ):
+        if sym is not None and isinstance(sym.node, TypeVarLikeExpr):
+            if analyzer.allow_unbound_tvars:
+                # Issue 335: a head inside a type application on the
+                # right of an assignment (`Layers = list[F64[N, int]]`)
+                # is analyzed before mypy knows the line is an alias,
+                # with type variables left unbound. Keep the name as
+                # mypy keeps it in `list[N]`; the alias pass binds it.
+                return analyzed
             # A TypeVar used outside any scope that binds it: mypy has
             # already said 'Type variable "X" is unbound', with hints.
             raise _FamBail
