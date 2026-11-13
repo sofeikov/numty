@@ -206,44 +206,11 @@ def trace_method_hook(ctx: MethodContext) -> Type:
     return ctx.default_return_type
 
 
-def diag_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if not pairs:
-        return ctx.default_return_type
-    if not _rank_check_hook(ctx, pairs[0][0], "diag", min_rank=1, max_rank=2):
-        return ctx.default_return_type
-    return ctx.default_return_type
-
-
-def diagonal_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if not pairs:
-        return ctx.default_return_type
-    if not _rank_check_hook(ctx, pairs[0][0], "diagonal", min_rank=2):
-        return ctx.default_return_type
-    return ctx.default_return_type
-
-
-def diagonal_method_hook(ctx: MethodContext) -> Type:
-    if not _rank_check_hook(ctx, ctx.type, "diagonal", min_rank=2):
-        return ctx.default_return_type
-    return ctx.default_return_type
-
-
 def corrcoef_function_hook(ctx: FunctionContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
     if not _rank_check_hook(ctx, pairs[0][0], "corrcoef", max_rank=2):
-        return ctx.default_return_type
-    return ctx.default_return_type
-
-
-def cov_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if not pairs:
-        return ctx.default_return_type
-    if not _rank_check_hook(ctx, pairs[0][0], "cov", max_rank=2):
         return ctx.default_return_type
     return ctx.default_return_type
 
@@ -1301,7 +1268,30 @@ def count_nonzero_function_hook(ctx: FunctionContext) -> Type:
                 code=NUMTY_AXIS,
             )
             return ctx.default_return_type
-    return ctx.default_return_type
+    return _count_nonzero_axis(ctx, dims, axis)
+
+
+def _count_nonzero_axis(ctx: FunctionContext, dims: list[int | Type], axis: list[int]) -> Type:
+    """count_nonzero(a, axis=...): the reduced shape in intp (issue #330).
+
+    Like a.sum(axis=...): the named axes go, or stay as 1 with
+    keepdims=True. Repeated axes raise. A full reduction (numpy answers
+    an intp scalar) and a 0-d input stay with the stubs.
+    """
+    if not dims or not _check_unique_axes(ctx, dims, axis, "count_nonzero"):
+        return ctx.default_return_type
+    keep_pair = _formal_pair(ctx, "keepdims")
+    keepdims = False if keep_pair is None else _fold_flag(keep_pair)
+    if keepdims is None:
+        return ctx.default_return_type
+    drop = {_normalize_axis(ax, len(dims)) for ax in axis}
+    out = [1 if i in drop else d for i, d in enumerate(dims)] if keepdims else [
+        d for i, d in enumerate(dims) if i not in drop
+    ]
+    dtype = _construct_dtype(ctx, "numpy.int64")
+    if not out or dtype is None:
+        return ctx.default_return_type
+    return _ndarray_type(ctx, out, dtype)
 
 
 def bincount_function_hook(ctx: FunctionContext) -> Type:
@@ -1369,6 +1359,14 @@ def argwhere_function_hook(ctx: FunctionContext) -> Type:
 
 
 def unique_function_hook(ctx: FunctionContext) -> Type:
+    """np.unique: (?U,) values of the flattened input, or ?U along axis.
+
+    With return_index/return_inverse/return_counts (literal flags) the
+    result is the tuple numpy returns, in that order (issue #330). The
+    index and counts arrays have one int64 entry per unique value, so
+    they share the values' ?U; the inverse maps every input element
+    back, so it has the input's shape (its axis length with axis=).
+    """
     pairs = _all_positionals(ctx)
     from numty_plugin import _fresh_unknown
     if not pairs:
@@ -1379,6 +1377,7 @@ def unique_function_hook(ctx: FunctionContext) -> Type:
     dims, dtype = parts
     if not _picture_complete(ctx, "ar"):
         return ctx.default_return_type
+    extras: list[str] = []
     for name, index in (
         ("return_index", 1),
         ("return_inverse", 2),
@@ -1390,19 +1389,22 @@ def unique_function_hook(ctx: FunctionContext) -> Type:
         assert not isinstance(found, str)
         if found is None:
             continue
-        if _fold_flag(found) is not False:
+        flag = _fold_flag(found)
+        if flag is None:
             return ctx.default_return_type
+        if flag:
+            extras.append(name)
     found_axis = _hook_pair(ctx, "ar", "axis", 4)
     if found_axis == "incomplete":
         return ctx.default_return_type
     assert not isinstance(found_axis, str)
-    if found_axis is None:
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "unique", 0)], dtype)
     folded = _int_or_none(found_axis)
     if folded == "bail":
         return ctx.default_return_type
     if folded is None:
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "unique", 0)], dtype)
+        count = _fresh_unknown(ctx, "unique", 0)
+        values = _ndarray_type(ctx, [count], dtype)
+        return _unique_tuple(ctx, values, count, dims, extras)
     assert isinstance(folded, int)
     target = _normalize_axis(folded, len(dims))
     if target is None:
@@ -1414,8 +1416,25 @@ def unique_function_hook(ctx: FunctionContext) -> Type:
         )
         return ctx.default_return_type
     out = list(dims)
-    out[target] = _fresh_unknown(ctx, "unique", target)
-    return _ndarray_type(ctx, out, dtype)
+    count = _fresh_unknown(ctx, "unique", target)
+    out[target] = count
+    values = _ndarray_type(ctx, out, dtype)
+    return _unique_tuple(ctx, values, count, [dims[target]], extras)
+
+
+def _unique_tuple(
+    ctx: FunctionContext, values: Type, count: Type, inverse: list[int | Type], extras: list[str]
+) -> Type:
+    """The values alone, or numpy's tuple with the requested int64 extras."""
+    if not extras:
+        return values
+    intp = _construct_dtype(ctx, "numpy.int64")
+    if intp is None:
+        return ctx.default_return_type
+    items = [values]
+    for name in extras:
+        items.append(_ndarray_type(ctx, inverse if name == "return_inverse" else [count], intp))
+    return _linalg_tuple(ctx, items)
 
 
 def isin_function_hook(ctx: FunctionContext) -> Type:

@@ -46,8 +46,8 @@ from ._callbind import (
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
-    ascontiguousarray_function_hook, full_function_hook, eye_function_hook, linspace_function_hook,
-    identity_function_hook, tri_function_hook, concatenate_function_hook,
+    ascontiguousarray_function_hook, full_function_hook, linspace_function_hook,
+    tri_function_hook, concatenate_function_hook,
     vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook,
     stack_function_hook, r_getitem_hook,
 )
@@ -55,19 +55,22 @@ from ._arange import arange_function_hook
 from ._matmul import (
     _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook, dot_function_hook,
     dot_method_hook, matmul_method_hook, rmatmul_method_hook, imatmul_method_hook,
-    inner_function_hook, outer_function_hook, kron_function_hook, vdot_function_hook,
+    inner_function_hook, kron_function_hook, vdot_function_hook,
     tensordot_function_hook,
 )
 from ._ops import (
     flip_function_hook, fliplr_function_hook, flipud_function_hook, trace_function_hook,
-    trace_method_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook,
-    corrcoef_function_hook, cov_function_hook, roll_function_hook, gradient_function_hook,
+    trace_method_hook, corrcoef_function_hook, roll_function_hook, gradient_function_hook,
     rot90_function_hook, convolve_function_hook, correlate_function_hook, tile_function_hook,
     repeat_function_hook, repeat_method_hook, pad_function_hook, split_function_hook,
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
     atleast_function_hook,
+)
+from ._matrix import (
+    cov_function_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, eye_function_hook,
+    identity_function_hook, outer_function_hook,
 )
 from ._reshape import (
     _reshape_new_dims, _all_positionals, _scalar_key, reshape_method_hook, reshape_function_hook,
@@ -108,15 +111,9 @@ from ._heads import (
     _FAM_HEAD_DTYPES, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string, _index_head,
 )
-from ._exprs import (
-    _iter_tvarlikes,
-)
-from ._reshape import (
-    _known_rank_parts, _movable_parts,
-)
-from ._linalg import (
-    _dtype_base,
-)
+from ._exprs import _iter_tvarlikes
+from ._reshape import _known_rank_parts, _movable_parts
+from ._linalg import _dtype_base
 from ._types import (
     _enum_member_count, _mask_pair_in, _named_pair_in, _names_enabled,
 )
@@ -128,6 +125,8 @@ from ._callsite import _relax_dynamic_formals, _report_call_site_names, _report_
 from ._returns import _holder_key, _return_sig_for_dynamic
 from ._unknowns import _fresh_own_size
 from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
+from ._aliases import held_call_hook, holds_numpy_function, masked_attribute_hook
+from ._aliases import masked_function_hook, masked_method_hook
 
 class NumtyPlugin(Plugin):
     def __init__(self, options) -> None:
@@ -480,7 +479,7 @@ class NumtyPlugin(Plugin):
 
     def _callsite_check(self, ctx: FunctionSigContext) -> FunctionLike:
         sig = ctx.default_signature
-        if not isinstance(sig, CallableType):
+        if not isinstance(sig, CallableType) or holds_numpy_function(ctx, _NUMPY_FUNCTION_HOOKS):
             return sig
         if isinstance(ctx.context, CallExpr) and isinstance(
             ctx.context.callee.node if hasattr(ctx.context.callee, "node") else None,
@@ -716,20 +715,21 @@ class NumtyPlugin(Plugin):
 
     def get_function_hook(self, fullname: str) -> Callable[[FunctionContext], Type] | None:
         self._ensure_startup_check(fullname)
-        return _guard_mixed(fullname, self._function_hook(fullname))
+        hook = masked_function_hook(fullname, self._function_hook(fullname))
+        return _guard_mixed(fullname, hook) or held_call_hook(fullname, _NUMPY_FUNCTION_HOOKS)
 
     def get_attribute_hook(
         self, fullname: str
     ) -> Callable[[AttributeContext], Type] | None:
         self._ensure_startup_check(fullname)
-        hook = self._attribute_hook(fullname)
+        hook = masked_attribute_hook(fullname, self._attribute_hook(fullname))
         return _guard_mixed(
             fullname, hook, strict_reports=hook is not substituted_attribute_hook
         )
 
     def get_method_hook(self, fullname: str) -> Callable[[MethodContext], Type] | None:
         self._ensure_startup_check(fullname)
-        hook = self._method_hook(fullname)
+        hook = masked_method_hook(fullname, self._method_hook(fullname), self._method_hook)
         short = fullname[len("numpy.ndarray."):] if fullname.startswith("numpy.ndarray.") else ""
         if hook is not None and short in _UNION_PAIR_METHODS:
             # Issue #265: one error for an operator on a union of arrays.

@@ -99,6 +99,18 @@ quiet, where it is approximate, and what to write instead.
     reported: `G *= K[..., np.newaxis]` with `G` of shape `(N, 1, M)`
     and `K` of `(N, N)` fits only when `N` is 1, as the literal `(4, 4,
     1)` into `(4, 1, 3)` does not.
+- `np.cov` squeezes its result, so a single variable gives `()`. numty
+    knows that for a literal 1 (`np.cov` of `(1, N)`) and a vector,
+    not for a named size that is 1 at run time: `(D, N)` is `(D, D)`.
+- The diagonal of a non-square matrix is `min(N, M)`, and an offset
+    diagonal is clamped at zero; neither is spelled over names, so
+    they are a `?U` unless the sizes are literals.
+- Each `np.unique` call has its own `?U`. `classes = np.unique(y)` and
+    `_, counts = np.unique(y, return_counts=True)` are two sizes, and so
+    is the length of a list appended to once per class. A return that
+    declares one free name for both (`F64["n_classes d"]` and
+    `F64["n_classes"]`) is reported; say they are one with a `cast` on
+    one of them.
 - A symbolic subtraction assumes the axis is long enough. `a[1:]` is
     `(N-1,)` and `np.diff(a)` is `(N-1,)`, but numpy stops at zero: on an
     empty axis both are `(0,)`, not `(-1,)`. The oracle counts a dim
@@ -173,6 +185,22 @@ quiet, where it is approximate, and what to write instead.
 - An explicit `dtype=` is honored when it resolves (`np.float32`,
     `"float64"`, bare `int`/`float`/`bool`, ...); exotic forms bail out.
     Same for unknown `keepdims`.
+
+## Aliases and masked arrays
+
+- A numpy function held in a local or module-level variable is
+    followed (`op = np.sum; op(a, axis=0)`). One held in a class or
+    instance attribute (`self.op(a)`), passed as a `Callable`
+    parameter, or wrapped (`functools.partial(np.sum, axis=0)`) keeps
+    the stubs' answer.
+- `numpy.ma` support is the `MaskedArray` type: its constructor, its
+    methods and numpy functions given one follow the ndarray rules. The
+    `np.ma.*` functions (`np.ma.sum`, `np.ma.where`, ...) keep the
+    stubs' answer, the mask is not checked against the data, and a
+    `dtype=` in the constructor leaves it to the stubs. A shape error in
+    a `MaskedArray` operator draws mypy's `Unsupported operand types`
+    next to ours (the suppression of that duplicate covers ndarray's
+    operators only).
 
 ## Rank polymorphism (`*Ts`)
 

@@ -118,7 +118,7 @@ from ._builders import (  # noqa: F401
     zeros_like_hook, _default_dtype, _fill_dtype_name, _fold_single, _explicit_dtype,
     _instance_fullname, _scalar_ret_name, _named_dtype, _apply_out_dtype, like_function_hook,
     _like_types, copy_function_hook, ascontiguousarray_function_hook, full_function_hook,
-    eye_function_hook, _builder_single_dim, linspace_function_hook, identity_function_hook,
+    _builder_single_dim, linspace_function_hook,
     tri_function_hook,
     _comprehension_parts, _sequence_parts, _is_dynamic_sequence, _is_empty_sequence, _concat_axis,
     _single_axis_value, _element_expr_type, _dynamic_sequence_element, concatenate_function_hook,
@@ -130,14 +130,14 @@ from ._matmul import (  # noqa: F401
     _matmul_inner, _matmul_result, _matmul_unpack_dims, _matmul_promoted, _operand_parts,
     _solve_matmul, _positional_actuals, _matmul_has_dims, matmul_hook, _two_arrays, _contract_pair,
     _promoted_scalar, dot_function_hook, dot_method_hook, matmul_method_hook, rmatmul_method_hook,
-    imatmul_method_hook, inner_function_hook, _total_size, outer_function_hook, kron_function_hook,
+    imatmul_method_hook, inner_function_hook, _total_size, kron_function_hook,
     vdot_function_hook, _tensordot_axes, tensordot_function_hook,
 )
 from ._ops import (  # noqa: F401
     _check_each_axis, _roll_shift_matches, _same_shape_hook, flip_function_hook,
     fliplr_function_hook, flipud_function_hook, _rank_check_hook, trace_function_hook,
-    trace_method_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook,
-    corrcoef_function_hook, cov_function_hook, roll_function_hook, gradient_function_hook,
+    trace_method_hook,
+    corrcoef_function_hook, roll_function_hook, gradient_function_hook,
     _gradient_result, _parse_int_pair, rot90_function_hook, _convolve_solve, _convolve_same_size,
     _convolve_valid_size, convolve_function_hook, correlate_function_hook, _hook_pair, _tile_reps,
     tile_function_hook, _repeat_count, _repeat_display, _repeat_display_size, repeat_function_hook,
@@ -149,6 +149,10 @@ from ._ops import (  # noqa: F401
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook,
     sliding_window_view_function_hook, atleast_function_hook,
     _fft_seq_arg, _fft_seq_entry,
+)
+from ._matrix import (  # noqa: F401
+    eye_function_hook, identity_function_hook, diag_function_hook, diagonal_function_hook,
+    diagonal_method_hook, outer_function_hook, cov_function_hook,
 )
 from ._reshape import (  # noqa: F401
     _dims_str, _reshape_new_dims, _solve_reshape_unpack, _reshape_fold_arithmetic,
