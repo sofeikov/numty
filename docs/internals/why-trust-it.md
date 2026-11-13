@@ -7,7 +7,9 @@
   mypy 2.4.1) had **no disagreements**. Each symbolic expression is
   run at four sets of sizes, empty axes included, which makes 105,000
   comparisons: 59,023 exact shapes matched NumPy's, and of the 27,853
-  NumPy rejects, 17,160 were reported before running. Three cases hit
+  NumPy rejects, 17,160 were reported before running (measured with
+  `numty-names` off; it is on by default since issue 327, so more are
+  reported now). Three cases hit
   documented gaps in NumPy's own stubs and 137 hit the empty-axis
   limit on symbolic subtraction (see
   [Checked against numpy](checked-against-numpy.md)). Rejections are now

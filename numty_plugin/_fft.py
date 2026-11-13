@@ -10,22 +10,20 @@ from ._types import (
     _dim_div, _ndarray_parts, _ndarray_type,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _normalize_axis,
+    _check_axis, _all_positionals, _bound_args, _dims_str, _dtype_fullname,
 )
 from ._builders import (
     _default_dtype,
 )
 
 if TYPE_CHECKING:
-    from mypy.nodes import Expression
     from mypy.plugin import FunctionContext
     from mypy.types import Type
 
 # Runtime-only imports for bodies that index node types at runtime.
-from mypy.nodes import Expression
 from mypy.types import Type
 from ._reshape import (
-    _construct_dtype, _int_or_none, _positionals_only,
+    _construct_dtype, _int_or_none,
 )
 from ._linalg import (
     _dtype_base,
@@ -33,18 +31,6 @@ from ._linalg import (
 from ._ops import (
     _fft_seq_arg,
 )
-
-def _fft_pair(
-    ctx: FunctionContext, names: tuple[str, str], indices: tuple[int, int]
-) -> list[tuple[Type, Expression | None] | None] | None:
-    """Two optional actuals: raw positionals when complete, formals when live."""
-    if _positionals_only(ctx):
-        pos = _all_positionals(ctx)
-        return [pos[i] if i < len(pos) else None for i in indices]
-    if _formal_pair(ctx, "a") is None:
-        return None
-    return [_formal_pair(ctx, name) for name in names]
-
 
 def _complex_dtype(ctx: FunctionContext, dtype: Type) -> Type:
     """complex64 for float16/float32, else complex128 (issue #61)."""
@@ -69,14 +55,8 @@ def fft_function_hook(ctx: FunctionContext) -> Type:
     if parsed is None:
         return ctx.default_return_type
     n, axis = parsed
-    target = _normalize_axis(axis, len(dims))
+    target = _check_axis(ctx, "fft axis", axis, dims)
     if target is None:
-        ctx.api.fail(
-            f"fft axis {axis} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     if isinstance(n, int):
@@ -103,14 +83,8 @@ def irfft_function_hook(ctx: FunctionContext) -> Type:
     if parsed is None:
         return ctx.default_return_type
     n, axis = parsed
-    target = _normalize_axis(axis, len(dims))
+    target = _check_axis(ctx, "irfft axis", axis, dims)
     if target is None:
-        ctx.api.fail(
-            f"irfft axis {axis} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     if isinstance(n, int):
@@ -168,14 +142,8 @@ def _rfft_solve(
     dims, dtype = parts
     if _dtype_base(dtype) == "c":
         return _rfft_complex_input(ctx, op)
-    target = _normalize_axis(axis, len(dims))
+    target = _check_axis(ctx, f"{op} axis", axis, dims)
     if target is None:
-        ctx.api.fail(
-            f"{op} axis {axis} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     if isinstance(n, int):
@@ -198,7 +166,7 @@ def rfft_function_hook(ctx: FunctionContext) -> Type:
 
 def _fft_axis_n(ctx: FunctionContext) -> tuple[int | None, int] | None:
     """(n, axis) for fft/rfft: None to bail, axis defaulting to -1."""
-    found = _fft_pair(ctx, ("n", "axis"), (1, 2))
+    found = _bound_args(ctx, "a", ("n", "axis"), (1, 2), slots_first=True)
     if found is None:
         return None
     n = _int_or_none(found[0])
@@ -220,7 +188,7 @@ def _fft_s_axes(
     ctx: FunctionContext,
 ) -> tuple[list[int | None] | None | str, list[int | None] | None | str] | None:
     """(s, axes) for fftn/rfftn: None to bail on an unreadable call."""
-    found = _fft_pair(ctx, ("s", "axes"), (1, 2))
+    found = _bound_args(ctx, "a", ("s", "axes"), (1, 2), slots_first=True)
     if found is None:
         return None
     s = _fft_seq_arg(found[0])
@@ -289,14 +257,8 @@ def _fftn_solve(
         assert len(raw) == len(axes)
         eff = []
         for ax in raw:
-            target = _normalize_axis(ax, ndim)
+            target = _check_axis(ctx, f"{op} axis", ax, dims, ndim)
             if target is None:
-                ctx.api.fail(
-                    f"{op} axis {ax} is out of range for {ndim} dimensions "
-                    f"(shape {_dims_str(dims)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
                 return ctx.default_return_type
             eff.append(target)
         if len(set(eff)) != len(eff):

@@ -27,6 +27,12 @@ plugins = numty_plugin
 allow_redefinition = True
 ```
 
+Every numty check is on once the plugin is, `numty-names` included: two
+different named sizes where one size is needed (`F64[N] + F64[M]` in a
+function generic in both) are reported. Add
+`disable_error_code = numty-names` to keep such pairs silent (see
+[Error codes](reference/error-codes.md#turning-it-off)).
+
 ## Check something
 
 Save this as `train.py`. It imports nothing from numty and has no

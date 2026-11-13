@@ -21,7 +21,7 @@ from ._types import (
     _ndarray_parts, _has_unpack, _ndarray_type,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
+    _fail_axis, _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
 )
 from ._builders import (
     _has_mixed_operand,
@@ -71,7 +71,7 @@ def _contracted_pair(
 
 
 def _names_contracted(x: int | Type, y: int | Type) -> bool:
-    """Whether a contracted pair is an opt-in `[numty-names]` report (issue 326).
+    """Whether a contracted pair is a `[numty-names]` report (issue 326).
 
     Two different names (`H` against `K`, a forgotten `.T`), a selection
     count against a name, or one unknown against itself plus a constant:
@@ -83,7 +83,7 @@ def _names_contracted(x: int | Type, y: int | Type) -> bool:
 def _report_contracted(
     ctx: FunctionContext | MethodContext | None, x: int | Type, y: int | Type, where: str
 ) -> None:
-    """The opt-in report for an unprovable contracted pair (issue 326).
+    """The report for an unprovable contracted pair (issue 326).
 
     Like the broadcast's: nothing with `numty-names` off, where the
     pair stays unprovable and the result keeps the outer dims.
@@ -98,7 +98,7 @@ def _union_operand(ctx: FunctionContext | MethodContext | FunctionSigContext | M
     """Whether an operand of the contraction being checked is a union of arrays.
 
     mypy then checks each pair of members with errors held back, and an
-    error in one makes the whole result Any, silently: the opt-in report
+    error in one makes the whole result Any, silently: the report
     is not made there (issue 326), and the result is kept.
     """
     call = ctx.context
@@ -130,7 +130,7 @@ def _matmul_names_report(
     a: list[int | Type],
     b: list[int | Type],
 ) -> bool:
-    """Whether `_matmul_result` makes the opt-in report for these shapes.
+    """Whether `_matmul_result` makes the report for these shapes.
 
     For the `@` signature hook: the method hook's error must not also
     fail mypy's overload check (an `[operator]` duplicate).
@@ -152,7 +152,7 @@ def _matmul_result(
     An unprovable inner pair (N vs M, ?U vs ?U') is not a clash and the
     output dims do not depend on it (issue #56), so the outer dims are
     still returned instead of bailing the whole result to Any. Two
-    different names there are the opt-in `[numty-names]` report (issue
+    different names there are the `[numty-names]` report (issue
     326), as in a broadcast; the outer dims are the result's own either
     way, the contracted size never reaches it. The one exception is the
     same ?U on both sides (issue #63): one mask site serves every
@@ -412,7 +412,7 @@ def _contract_pair(
     provably unequal (N+1 vs N, issue #139), and (False, None) to bail
     on anything unprovable (N vs M, ?U vs ?U'). Mirrors _matmul_inner
     with an op-specific message. With ctx and the operand shapes, two
-    different names there are the opt-in report (issue 326).
+    different names there are the report (issue 326).
     """
     if _dim_eq(x, y) or _is_plain_int(x) or _is_plain_int(y):
         return True, None
@@ -494,7 +494,7 @@ def _contraction_names_report(op: str, left: Type, right: Type) -> bool:
 
 
 def _contraction_signature(ctx: FunctionSigContext, op: str) -> FunctionLike:
-    """np.dot / np.inner: Any formals where the function hook makes the opt-in names report.
+    """np.dot / np.inner: Any formals where the function hook makes the names report.
 
     The report fails each overload mypy tries, and its fallback then adds
     an `[arg-type]` error against the last one (issue 326). Calls the
@@ -813,20 +813,10 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
             na = ia + len(dims_a) if ia < 0 else ia
             nb = ib + len(dims_b) if ib < 0 else ib
             if not 0 <= na < len(dims_a):
-                ctx.api.fail(
-                    f"tensordot axis {ia} is out of range for {len(dims_a)} "
-                    f"dimensions (shape {_dims_str(dims_a)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
+                _fail_axis(ctx, "tensordot axis", ia, dims_a)
                 return ctx.default_return_type
             if not 0 <= nb < len(dims_b):
-                ctx.api.fail(
-                    f"tensordot axis {ib} is out of range for {len(dims_b)} "
-                    f"dimensions (shape {_dims_str(dims_b)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
+                _fail_axis(ctx, "tensordot axis", ib, dims_b)
                 return ctx.default_return_type
             if na in seen_a or nb in seen_b:
                 bad = ia if na in seen_a else ib

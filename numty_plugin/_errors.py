@@ -16,6 +16,7 @@ from mypy.errorcodes import MISC, ErrorCode
 from ._trace import _numty_strict, _trace_event
 
 if TYPE_CHECKING:
+    from mypy.options import Options
     from mypy.plugin import FunctionContext, MethodContext
     from mypy.types import Type
 
@@ -53,15 +54,18 @@ NUMTY_UNSOLVED = ErrorCode(
     "numty",
     sub_code_of=MISC,
 )
-# Off by default (issue 280). `F64[N] + F64[M]` runs when N == M, so it
-# is not provably wrong and the default checks stay silent. A function
-# generic in N and M has to work when they differ, and with this code on
-# a body that pairs two different names is reported.
+# On by default since issue 327 (opt-in before, issue 280).
+# `F64[N] + F64[M]` runs when N == M, so it is not provably wrong, but a
+# function generic in N and M has to work when they differ, and a body
+# that pairs two different names is reported. On 3,600 lines of annotated
+# scikit-learn code it caught 41 more of 149 seeded bugs (66 -> 107) for
+# 3 false positives on the correct code, so it is worth having on.
+# `disable_error_code = numty-names` turns it off: two different names
+# then meet silently, and a broadcast of them is an unknown size (`?U`).
 NUMTY_NAMES = ErrorCode(
     "numty-names",
     "Two different named sizes are used where one size is needed",
     "numty",
-    default_enabled=False,
 )
 # Off by default (issue 308). `a[idx] = value` casts with
 # casting="unsafe", so floats written into an integer array are
@@ -79,6 +83,26 @@ NUMTY_INTERNAL = ErrorCode(
     "numty",
     sub_code_of=MISC,
 )
+
+
+def _code_enabled(options: Options | None, code: ErrorCode) -> bool:
+    """Whether mypy reports `code` under these (per-module) options.
+
+    The same rule as mypy's `Errors.is_error_code_enabled`: a disabled
+    code is off, then an enabled one is on, then a disabled parent code
+    turns it off, else the code's default. A check that emits a code only
+    when it is on must agree with mypy: a message of a disabled code still
+    fails the overload mypy is checking (see `_types._report_names`).
+    """
+    if options is None:
+        return False
+    if code in options.disabled_error_codes:
+        return False
+    if code in options.enabled_error_codes:
+        return True
+    if code.sub_code_of is not None and code.sub_code_of in options.disabled_error_codes:
+        return False
+    return code.default_enabled
 
 
 def _numty_debug() -> bool:

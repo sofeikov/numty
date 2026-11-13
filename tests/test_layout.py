@@ -338,6 +338,13 @@ def test_package_layout_and_manifest() -> None:
         )
 
 
+# Shared helpers that report a numty-axis error themselves (issue #323):
+# each call stands for a site that used to call ctx.api.fail directly.
+AXIS_REPORTERS = frozenset(
+    {"_fail_axis", "_check_axis", "_validate_axes", "_fail_duplicate_axis"}
+)
+
+
 def test_every_fail_site_has_code() -> None:
     plugin_dir = ROOT / "numty_plugin"
     files = _package_py_files()
@@ -358,6 +365,13 @@ def test_every_fail_site_has_code() -> None:
                 total += 1
                 if not any(k.arg == "code" for k in node.keywords):
                     missing.append(f"{py.relative_to(plugin_dir)}:{node.lineno}")
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in AXIS_REPORTERS
+            ):
+                # A shared axis check reports with its own code (#323).
+                total += 1
     assert total > 100, total
     # Floor 232 (was 233 on the monolith): issue #217 moved the broadcast
     # check before dtype promotion, so the datetime path no longer needs

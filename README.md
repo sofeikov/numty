@@ -127,6 +127,13 @@ allow_redefinition = True
 
 Run `mypy` as usual. Needs Python 3.13+, NumPy 2.5+ and mypy 2.4.
 
+Two different named sizes where one size is needed (`F64[N] + F64[M]`
+in a function generic in both) are reported by the `numty-names` code,
+which is on by default since
+[#327](https://github.com/sofeikov/numty/issues/327). Add
+`disable_error_code = numty-names` to turn it off; see
+[Error codes](https://sofeikov.github.io/numty/reference/error-codes/).
+
 ## Documentation
 
 | | |

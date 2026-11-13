@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING
 
 from ._errors import NUMTY_AXIS, NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
 from ._dtypes import (
-    _NAME_OF_KIND_SIZE,
+    _GENERIC_KIND, _NAME_OF_KIND_SIZE,
 )
 from ._types import (
     TUPLE_FULLNAME, _check_dim_eq, _dim_eq, _dim_str, _has_unpack, _int_value, _ndarray_parts, _ndarray_type,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
+    _check_axis, _all_positionals, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
     _is_none_type, _normalize_axis, _parse_axis_arg, _promote_all, _promote_dtypes, _weak_name,
 )
 from ._builders import (
@@ -670,14 +670,8 @@ def _linalg_norm(ctx: FunctionContext) -> Type:
         assert isinstance(axis, list)
         axes = []
         for ax in axis:
-            norm = _normalize_axis(ax, len(dims))
+            norm = _check_axis(ctx, "linalg.norm axis", ax, dims)
             if norm is None:
-                ctx.api.fail(
-                    f"linalg.norm axis {ax} is out of range for {len(dims)} "
-                    f"dimensions (shape {_dims_str(dims)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
                 return ctx.default_return_type
             axes.append(norm)
         if len(set(axes)) != len(axes):
@@ -1098,23 +1092,11 @@ def cross_function_hook(ctx: FunctionContext) -> Type:
         if axisa is None or axisb is None or axisc is None:
             return ctx.default_return_type
     assert isinstance(axisa, int) and isinstance(axisb, int) and isinstance(axisc, int)
-    norm_a = _normalize_axis(axisa, len(dims_a))
+    norm_a = _check_axis(ctx, "cross axisa", axisa, dims_a)
     if norm_a is None:
-        ctx.api.fail(
-            f"cross axisa {axisa} is out of range for {len(dims_a)} dimensions "
-            f"(shape {_dims_str(dims_a)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
-    norm_b = _normalize_axis(axisb, len(dims_b))
+    norm_b = _check_axis(ctx, "cross axisb", axisb, dims_b)
     if norm_b is None:
-        ctx.api.fail(
-            f"cross axisb {axisb} is out of range for {len(dims_b)} dimensions "
-            f"(shape {_dims_str(dims_b)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     vec_a, vec_b = dims_a[norm_a], dims_b[norm_b]
     # Issue #183: fail on a literal vector size that can never be 3,
@@ -1197,23 +1179,11 @@ def linalg_cross_function_hook(ctx: FunctionContext) -> Type:
     axis_value = _cross_int_value(ctx, "axis", -1)
     if axis_value is None:
         return ctx.default_return_type
-    norm_a = _normalize_axis(axis_value, len(dims_a))
+    norm_a = _check_axis(ctx, "linalg.cross axis", axis_value, dims_a)
     if norm_a is None:
-        ctx.api.fail(
-            f"linalg.cross axis {axis_value} is out of range for {len(dims_a)} "
-            f"dimensions (shape {_dims_str(dims_a)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
-    norm_b = _normalize_axis(axis_value, len(dims_b))
+    norm_b = _check_axis(ctx, "linalg.cross axis", axis_value, dims_b)
     if norm_b is None:
-        ctx.api.fail(
-            f"linalg.cross axis {axis_value} is out of range for {len(dims_b)} "
-            f"dimensions (shape {_dims_str(dims_b)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     vec_a, vec_b = dims_a[norm_a], dims_b[norm_b]
     # A symbolic vector axis is taken to be 3: the call fails otherwise,
@@ -1280,25 +1250,12 @@ def _dtype_base(dtype: Type) -> str | None:
     direct = _DTYPE_INFO.get(element.type.fullname)
     if direct is not None:
         return direct[0]
-    return {
-        "numpy.floating": "f",
-        "numpy.complexfloating": "c",
-        "numpy.signedinteger": "i",
-        "numpy.unsignedinteger": "u",
-        # Bare `numpy.integer` carries no width for _dtype_kind_size,
-        # but the kind alone classifies index/ufunc/logical operands.
-        "numpy.integer": "i",
-    }.get(element.type.fullname)
+    # Bare `numpy.integer` carries no width for _dtype_kind_size, but
+    # the kind alone classifies index/ufunc/logical operands.
+    return {**_GENERIC_KIND, "numpy.integer": "i"}.get(element.type.fullname)
 
 
-_FAMILY_OF_BASE = {
-    "numpy.bool": "b",
-    "numpy.floating": "f",
-    "numpy.complexfloating": "c",
-    "numpy.signedinteger": "i",
-    "numpy.unsignedinteger": "u",
-    "numpy.integer": "i",
-}
+_FAMILY_OF_BASE = {"numpy.bool": "b", **_GENERIC_KIND, "numpy.integer": "i"}
 
 
 def _dtype_family(dtype: Type) -> str | None:

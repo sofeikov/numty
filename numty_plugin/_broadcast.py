@@ -31,7 +31,7 @@ from ._reshape import (
 )
 from ._builders import (
     _apply_out_dtype, _default_dtype, _element_expr_type, _explicit_dtype, _fold_single, _is_dynamic_sequence,
-    _named_dtype, _scalar_ret_name, _stub_shape_named_dtype,
+    _named_dtype, _scalar_ret_name, _scalar_spec, _stub_shape_named_dtype,
 )
 from ._linalg import (
     _linalg_dtype, _linalg_real_name, _linalg_tuple,
@@ -585,13 +585,10 @@ def _operand_spec(tp: Type) -> tuple[list[int | Type] | None, str, str] | None:
         if name is None:
             return None
         return (list(part[0]), "strong", name)
-    key = _scalar_key(tp)
+    # Numpy scalars (np.int64(3), x.max()) are strong (NEP 50).
+    key = _scalar_spec(tp)
     if key is not None:
         return (None, key[0], key[1])
-    # Numpy scalars (np.int64(3), x.max()) are strong (NEP 50).
-    name = _scalar_ret_name(tp)
-    if name is not None:
-        return (None, "strong", name)
     return None
 
 
@@ -626,14 +623,14 @@ def _shapes_for_broadcast(types: list[Type]) -> list[list[int | Type]] | None:
         if part is not None:
             shapes.append(list(part[0]))
             continue
-        if _scalar_key(tp) is not None or _scalar_ret_name(tp) is not None:
+        if _scalar_spec(tp) is not None:
             continue
         if _is_numpy_scalar(tp):
             # A numpy scalar with no width (`floating[Any]`, issue 277).
             continue
         proper = get_proper_type(tp)
         if isinstance(proper, UnionType) and all(
-            _scalar_key(m) is not None or _scalar_ret_name(m) is not None or _is_numpy_scalar(m)
+            _scalar_spec(m) is not None or _is_numpy_scalar(m)
             for m in proper.items
         ):
             # One of several scalars (`max(t.max(), 1e-9)`): still a scalar.
@@ -799,13 +796,10 @@ def _where_types(ctx: FunctionContext | MethodContext, cond: Type, x: Type, y: T
                 branch_specs.append(("strong", wname))
                 branch_dtypes.append(wv[1])
                 continue
-            key = _scalar_key(tp)
+            key = _scalar_spec(tp)
             if key is None:
-                rname = _scalar_ret_name(tp)
-                if rname is None:
-                    branch_specs = []
-                    break
-                key = ("strong", rname)
+                branch_specs = []
+                break
             branch_specs.append(key)
             branch_dtypes.append(tp)
         dtype_w: Type | None = None
@@ -1066,14 +1060,6 @@ def _display_element_kind(tp: Type, expr: Expression | None) -> str | None:
     return None
 
 
-_EXACT_WEAK_DTYPE = {
-    "builtins.bool": "numpy.bool",
-    "builtins.int": "numpy.int64",
-    "builtins.float": "numpy.float64",
-    "builtins.complex": "numpy.complex128",
-}
-
-
 def _scalar_item(tp: Type, expr: Expression | None) -> tuple[str, str | None] | None:
     """What a display item that is certainly a scalar brings, else None.
 
@@ -1092,7 +1078,7 @@ def _scalar_item(tp: Type, expr: Expression | None) -> tuple[str, str | None] | 
     proper = get_proper_type(tp)
     if isinstance(proper, LiteralType):
         weak = _weak_name(proper)
-        return ("exact", _EXACT_WEAK_DTYPE[weak]) if weak is not None else None
+        return ("exact", _WEAK_DEFAULT[weak]) if weak is not None else None
     if isinstance(expr, FloatExpr):
         return ("exact", "numpy.float64")
     weak = _weak_name(tp)
@@ -1440,12 +1426,9 @@ def _ufunc_types(ctx: FunctionContext | MethodContext, group: str, tp: Type) -> 
             # Scalar input (np.sqrt(4.0)): map to the matching numpy scalar
             # instead of the stub's Any (issue #61).
             if group in ("float", "abs", "real"):
-                key = _scalar_key(tp)
+                key = _scalar_spec(tp)
                 if key is None:
-                    name = _scalar_ret_name(tp)
-                    if name is None:
-                        return ctx.default_return_type
-                    key = ("strong", name)
+                    return ctx.default_return_type
                 kind, sname = key
                 if kind == "weak":
                     # Python scalars: float -> float64, int/bool -> smallest float.
@@ -1683,13 +1666,10 @@ def _truediv_types(
                     break
                 specs_w.append(("strong", wn))
                 continue
-            key = _scalar_key(tp)
+            key = _scalar_spec(tp)
             if key is None:
-                rn = _scalar_ret_name(tp)
-                if rn is None:
-                    specs_w = []
-                    break
-                key = ("strong", rn)
+                specs_w = []
+                break
             specs_w.append(key)
         if len(specs_w) == 2:
             (kl, nl), (kr, nr) = specs_w

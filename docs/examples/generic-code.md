@@ -20,13 +20,16 @@ pack(np.zeros((5, 10, 2)), np.zeros((5, 10)) > 0)  # (5, 10, 2), precise
 Two arguments sharing one shape TypeVar are checked at the call site,
 where the actual shapes are still visible: `f(x_5, y_6)` against `(A[N],
 A[N])` errors with the two sizes named. Different TypeVars (`N` vs `M`)
-stay silent by default — their equality is unprovable, and unknown is not
-an error (the opt-in `numty-names` code reports them, see
+are not a provable error inside the body, since their equality is
+unprovable. A body that needs them equal is still reported, as a likely
+mistake, by the `numty-names` code, which is on by default (with
+`disable_error_code = numty-names` they stay silent, see
 [Error codes](../reference/error-codes.md)). The same holds for `matmul` inner dims between distinct free
 symbolics (`(S,F)@(S,T)` keeps `(S,T)` "if legal", issue #127): a generic
 function whose body needs `F == S` but declares them independent cannot
-be proven wrong inside the body, so the check stays at the call site,
-where concrete sizes are visible. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
+be proven wrong inside the body, so `numty-names` reports the pair and
+the provable check stays at the call site, where concrete sizes are
+visible. Apply the alias explicitly at each use (`A[N, K, C]`, never bare
 `A` — a bare generic alias silently means unknown sizes). The same holds
 for a dataclass holding shapes: `list[Box]` with `Box(Generic[N])`
 holding `F64[N, 3]` is an error (`Box used bare ... [numty-annotation]`,
@@ -49,5 +52,6 @@ S], box: Box[S])` called with `np.zeros((n, n))` and a `Box[S]` takes
 A size that only the return of a property or of a method names (`def
 rows(self) -> I64[E]` in a class that is not generic in `E`) is unknown
 at each read: `c.rows` is `tuple[?U@line]`, and adding it to a caller's
-`F64[E]` does not check as two arrays of one size
+`F64[E]` does not check as two arrays of one size (it is a
+`[numty-names]` report, `E and ?c.E are different names`)
 (`tests/fixtures/property_own_size.py`).

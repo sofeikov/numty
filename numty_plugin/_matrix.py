@@ -13,8 +13,9 @@ from mypy.types import AnyType, Instance, Type, TypeVarType, get_proper_type
 from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
 from ._types import _dim_add_const, _dim_eq, _ndarray_parts, _ndarray_type
 from ._reshape import (
+    _check_axis,
     _all_positionals, _construct_dtype, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _int_or_none,
-    _is_none_type, _normalize_axis, _picture_complete,
+    _is_none_type, _picture_complete,
 )
 from ._builders import _builder_shape, _explicit_dtype, _fold_single, _named_dtype, _unknown_dtype
 from ._matmul import _matmul_promoted, _two_arrays
@@ -207,14 +208,8 @@ def _diagonal_solve(ctx: FunctionContext | MethodContext, array: Type, first: in
             value = default
         if not isinstance(value, int):
             return ctx.default_return_type
-        norm = _normalize_axis(value, len(dims))
+        norm = _check_axis(ctx, f"diagonal {name}", value, dims)
         if norm is None:
-            ctx.api.fail(
-                f"diagonal {name} {value} is out of range for {len(dims)} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
             return ctx.default_return_type
         axes.append(norm)
     if axes[0] == axes[1]:

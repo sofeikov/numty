@@ -22,14 +22,15 @@ from ._types import (
     _dims_provably_ne, _optional_members, _report_names, _union_results, NDARRAY_FULLNAME,
 )
 from ._reshape import (
+    _check_axis, _fail_duplicate_axis, _validate_axes,
     REDUCTION_DTYPES, _all_positionals, _all_positionals_expanded, _construct_datetime_dtype,
     _datetime_kind, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
-    _is_none_type, _known_rank_parts, _normalize_axis, _normalize_axis_0d, _parse_axis_arg,
+    _is_none_type, _known_rank_parts, _normalize_axis, _parse_axis_arg,
     _promote_all, _promote_dtypes, _scalar_key, _weak_name,
 )
 from ._builders import (
     _apply_out_dtype, _builder_shape, _default_dtype, _dims_fit_intp, _explicit_dtype, _named_dtype,
-    _scalar_ret_name,
+    _scalar_spec,
 )
 from ._heads import _record_index_on
 from ._linalg import (
@@ -124,31 +125,13 @@ def _solve_reduction(
     if force_dtype is None and not _family_keeps_dtype(dtype):
         return ctx.default_return_type
     out_dtype = force_dtype if force_dtype is not None else dtype
-    ndim = len(dims)
-    normalized: list[int] = []
     # sum/prod/max/min/any/all take axis 0 or -1 on a 0-d array; the
     # mean family counts elements along the axis first and rejects it.
     # (The nan* twins go through nansum-style code and accept it.)
     strict_0d = op in ("mean", "var", "std")
-    for ax in axis:
-        norm = _normalize_axis(ax, ndim) if strict_0d else _normalize_axis_0d(ax, ndim)
-        if norm is None:
-            ctx.api.fail(
-                f"{op} axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        if norm in normalized:
-            ctx.api.fail(
-                f"{op} has duplicate axis {ax} in {tuple(axis)} "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        normalized.append(norm)
+    normalized = _validate_axes(ctx, op, axis, dims, zero_d=not strict_0d)
+    if normalized is None:
+        return ctx.default_return_type
     chosen = set(normalized)
     if keepdims:
         return _ndarray_type(ctx, [1 if i in chosen else d for i, d in enumerate(dims)], out_dtype)
@@ -259,12 +242,7 @@ def _solve_reduction_unpack(
                 return AnyType(TypeOfAny.from_omitted_generics)
             pos = ax
         if pos in chosen:
-            ctx.api.fail(
-                f"{op} has duplicate axis {ax} in {tuple(axis)} "
-                f"(shape {_dims_str(prefix + [unpack] + suffix)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
+            _fail_duplicate_axis(ctx, op, ax, axis, prefix + [unpack] + suffix)
             return ctx.default_return_type
         chosen.add(pos)
     if keepdims:
@@ -346,16 +324,8 @@ def _reduction_types(
     # (median before its dtype table, datetime mean, ...).
     if isinstance(axis, list):
         strict_0d = op in ("mean", "var", "std")
-        for ax in axis:
-            norm = _normalize_axis(ax, len(dims)) if strict_0d else _normalize_axis_0d(ax, len(dims))
-            if norm is None:
-                ctx.api.fail(
-                    f"{op} axis {ax} is out of range for {len(dims)} dimensions "
-                    f"(shape {_dims_str(dims)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
-                return ctx.default_return_type
+        if _validate_axes(ctx, op, axis, dims, zero_d=not strict_0d, unique=False) is None:
+            return ctx.default_return_type
     out_dtype = _reduction_out_dtype(ctx, op, dtype)
     if out_dtype is None:
         # mean(datetime) always raises (UFuncTypeError, issue #144):
@@ -467,14 +437,8 @@ def _ufunc_accumulate_inputs(
         axis = [0]
     if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
         return ctx.default_return_type
-    norm = _normalize_axis_0d(axis[0], len(dims))
+    norm = _check_axis(ctx, f"{op} axis", axis[0], dims, zero_d=True)
     if norm is None:
-        ctx.api.fail(
-            f"{op} axis {axis[0]} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     dist = _distribute_solve([array], lambda t: _ufunc_accumulate_types(ctx, t, op))
     if dist is not None:
@@ -490,7 +454,7 @@ def _ufunc_outer_shape(tp: Type) -> list[int | Type] | None:
         if _has_unpack(dims):
             return None
         return list(dims)
-    if _scalar_key(tp) is not None or _scalar_ret_name(tp) is not None:
+    if _scalar_spec(tp) is not None:
         return []
     return None
 
@@ -616,14 +580,8 @@ def _ufunc_reduceat_types(
         return ctx.default_return_type
     if not isinstance(axis, list) or len(axis) != 1 or not isinstance(axis[0], int):
         return ctx.default_return_type
-    norm = _normalize_axis_0d(axis[0], len(dims))
+    norm = _check_axis(ctx, f"{op} axis", axis[0], dims, zero_d=True)
     if norm is None:
-        ctx.api.fail(
-            f"{op} axis {axis[0]} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     out[norm] = length
@@ -827,27 +785,9 @@ def _solve_argdrop(
         return ctx.default_return_type
     if keepdims is None:
         return ctx.default_return_type
-    ndim = len(dims)
-    normalized: list[int] = []
-    for ax in axis:
-        norm = _normalize_axis_0d(ax, ndim)
-        if norm is None:
-            ctx.api.fail(
-                f"{op} axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        if norm in normalized:
-            ctx.api.fail(
-                f"{op} has duplicate axis {ax} in {tuple(axis)} "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        normalized.append(norm)
+    normalized = _validate_axes(ctx, op, axis, dims, zero_d=True)
+    if normalized is None:
+        return ctx.default_return_type
     chosen = set(normalized)
     single = normalized[0] if len(normalized) == 1 else None
     if keepdims:
@@ -882,19 +822,9 @@ def _solve_same_or_flat(
             _record_argsort_positions(ctx, dims, 0 if len(dims) == 1 else None, [total], int_out)
             return _ndarray_type(ctx, [total], _default_dtype(ctx) if int_out else dtype)
         return ctx.default_return_type
-    ndim = len(dims)
-    normed: list[int] = []
-    for ax in axis:
-        norm = _normalize_axis(ax, ndim)
-        if norm is None:
-            ctx.api.fail(
-                f"{op} axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        normed.append(norm)
+    normed = _validate_axes(ctx, op, axis, dims, unique=False)
+    if normed is None:
+        return ctx.default_return_type
     _record_argsort_positions(
         ctx, dims, normed[0] if len(normed) == 1 else None, dims, int_out
     )
@@ -1074,14 +1004,8 @@ def rng_method_hook(ctx: MethodContext, op: str) -> Type:
         else:
             if len(axis) != 1 or not isinstance(axis[0], int):
                 return ctx.default_return_type
-            norm = _normalize_axis(axis[0], len(dims))
+            norm = _check_axis(ctx, "choice axis", axis[0], dims)
             if norm is None:
-                ctx.api.fail(
-                    f"choice axis {axis[0]} is out of range for "
-                    f"{len(dims)} dimensions (shape {_dims_str(dims)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
                 return ctx.default_return_type
             k = norm
         return _ndarray_type(ctx, dims[:k] + size + dims[k + 1 :], dtype)
@@ -1205,18 +1129,9 @@ def percentile_function_hook(ctx: FunctionContext) -> Type:
         remaining: list[int | Type] = [1] * ndim if keepdims else []
     else:
         assert isinstance(axis, list)
-        normed: list[int] = []
-        for ax in axis:
-            norm = _normalize_axis(ax, ndim)
-            if norm is None:
-                ctx.api.fail(
-                    f"percentile axis {ax} is out of range for {ndim} dimensions "
-                    f"(shape {_dims_str(dims_a)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
-                return ctx.default_return_type
-            normed.append(norm)
+        normed = _validate_axes(ctx, "percentile", axis, dims_a, unique=False)
+        if normed is None:
+            return ctx.default_return_type
         if len(set(normed)) != len(normed):
             return ctx.default_return_type
         removed = set(normed)
@@ -1333,7 +1248,7 @@ def _check_average_weights(
     if not isinstance(size, int) or not isinstance(wdims[0], int):
         # Symbolic sizes: an error only when no sizes make them equal
         # (`N+1` against `N`); different names (`N` against `K`) are the
-        # opt-in `[numty-names]` report (issue 331).
+        # `[numty-names]` report (issue 331).
         if _dim_eq(size, wdims[0]):
             return None
         if not _dims_provably_ne(size, wdims[0]):
@@ -1500,14 +1415,8 @@ def _cumsum_solve(
             return _ndarray_type(ctx, [total], dtype)
         else:
             return ctx.default_return_type
-    norm = _normalize_axis_0d(axis[0], len(dims))
+    norm = _check_axis(ctx, f"{op} axis", axis[0], dims, zero_d=True)
     if norm is None:
-        ctx.api.fail(
-            f"{op} axis {axis[0]} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     # A 0-d input with axis 0/-1 accumulates to one element (issue #62).
     out_dims = [1] if not dims else list(dims)
@@ -1601,14 +1510,8 @@ def diff_function_hook(ctx: FunctionContext) -> Type:
     if axis == "absent":
         ax = ndim - 1
     elif isinstance(axis, list) and len(axis) == 1 and isinstance(axis[0], int):
-        norm = _normalize_axis(axis[0], ndim)
+        norm = _check_axis(ctx, "axis", axis[0], dims, ndim)
         if norm is None:
-            ctx.api.fail(
-                f"axis {axis[0]} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
             return ctx.default_return_type
         ax = norm
     else:

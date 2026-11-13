@@ -46,7 +46,7 @@ def _symbolic_slice(
     counted from the end. This holds when the bounds are inside the
     axis; numpy clips them otherwise. So the answer is given when an
     `int` variable is left in it (such a size is an unknown, nothing is
-    proved from it, and it is compared only under the opt-in code:
+    proved from it, and it is compared only under the numty-names code:
     `N-?k` against `N-?k+1` are 1 apart), or when the bounds are over
     names alone and inside the axis (issue 333): `s[:n]` with
     `n = X.shape[1]` on an `M+1` axis is `(M,)`, since `0 <= M <= M+1`.

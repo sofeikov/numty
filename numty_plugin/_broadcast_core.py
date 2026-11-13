@@ -23,7 +23,7 @@ from ._reshape import (
     _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _known_rank_parts, _promote_dtypes,
     _scalar_key,
 )
-from ._builders import _default_dtype, _scalar_ret_name
+from ._builders import _default_dtype, _scalar_ret_name, _scalar_spec
 from ._linalg import _is_numpy_scalar, _scalar_family
 
 
@@ -165,18 +165,15 @@ def _fallback_dtype(
             else:
                 strong.append((base, _loose_dtype_name(dtype), dtype))
             continue
-        key = _scalar_key(tp)
+        key = _scalar_spec(tp)
         if key is None:
-            ret_name = _scalar_ret_name(tp)
-            if ret_name is None:
-                # A numpy scalar with no width (`floating[Any]`, issue
-                # 277): its family is its kind, and it has no name.
-                family = _scalar_family(tp)
-                if family is None or family not in _KIND_RANK:
-                    return any_dtype
-                strong.append((family, None, None))
-                continue
-            key = ("strong", ret_name)
+            # A numpy scalar with no width (`floating[Any]`, issue
+            # 277): its family is its kind, and it has no name.
+            family = _scalar_family(tp)
+            if family is None or family not in _KIND_RANK:
+                return any_dtype
+            strong.append((family, None, None))
+            continue
         if key[0] == "weak":
             weak_kind = _WEAK_KIND.get(key[1])
             if weak_kind is None:
@@ -307,14 +304,14 @@ def _whole_shape_operands(
     """(shared shape var, array-operand dtypes) for whole-shape operands.
 
     Every ndarray operand must carry the same whole-shape TypeVar
-    (issue #229); scalars are skipped via _scalar_key/_scalar_ret_name.
+    (issue #229); scalars are skipped via _scalar_spec.
     Anything else (regular shapes, mixed vars, non-arrays) bails with
     None and the caller keeps today's behavior.
     """
     var: TypeVarType | None = None
     dtypes: list[Type] = []
     for tp in types:
-        if _scalar_key(tp) is not None or _scalar_ret_name(tp) is not None:
+        if _scalar_spec(tp) is not None:
             continue
         whole = _whole_shape_var(tp)
         if whole is None:
@@ -441,18 +438,15 @@ def _solve_broadcast_scalar(
     ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, other: Type
 ) -> Type:
     """Array/scalar promotion keeping the array dims, or default."""
-    key = _scalar_key(other)
+    # Numpy scalars (np.int64(3), x.max()) are strong (issue #61).
+    key = _scalar_spec(other)
     if key is None:
-        # Numpy scalars (np.int64(3), x.max()) are strong (issue #61).
-        name = _scalar_ret_name(other)
-        if name is None:
-            if _is_numpy_scalar(other):
-                # A numpy scalar with no width (`t.min()` of an array
-                # with a family dtype, issue 277): still a scalar, so the
-                # array dims are kept, and the dtype follows the kinds.
-                return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [dtype, other]))
-            return ctx.default_return_type
-        key = ("strong", name)
+        if _is_numpy_scalar(other):
+            # A numpy scalar with no width (`t.min()` of an array
+            # with a family dtype, issue 277): still a scalar, so the
+            # array dims are kept, and the dtype follows the kinds.
+            return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [dtype, other]))
+        return ctx.default_return_type
     strong = _dtype_fullname(dtype)
     if strong is None:
         # Issue #217: an abstract dtype (floating, Any, TypeVar, union)
@@ -578,12 +572,9 @@ def _broadcast_types(
             return ctx.default_return_type
         # Scalar is neutral for shape: keep _S (dtype via promotion when
         # resolvable, else the array dtype).
-        key = _scalar_key(other)
+        key = _scalar_spec(other)
         if key is None:
-            name = _scalar_ret_name(other)
-            if name is None:
-                return ctx.default_return_type
-            key = ("strong", name)
+            return ctx.default_return_type
         strong = _dtype_fullname(dtype)
         if strong is None:
             return _whole_shape_type(ctx, var, _fallback_dtype(ctx, [left, right]))
@@ -633,13 +624,9 @@ def _broadcast_types(
             if dtype is None:
                 return _ndarray_type(ctx, dims, _fallback_dtype(ctx, [left, right]))
             return _ndarray_type(ctx, dims, dtype)
-        if ma is not None and _scalar_key(right) is not None:
+        if ma is not None and _scalar_spec(right) is not None:
             return _solve_broadcast_scalar(ctx, list(ma[0]), ma[1], right)
-        if ma is not None and _scalar_ret_name(right) is not None:
-            return _solve_broadcast_scalar(ctx, list(ma[0]), ma[1], right)
-        if mb is not None and _scalar_key(left) is not None:
-            return _solve_broadcast_scalar(ctx, list(mb[0]), mb[1], left)
-        if mb is not None and _scalar_ret_name(left) is not None:
+        if mb is not None and _scalar_spec(left) is not None:
             return _solve_broadcast_scalar(ctx, list(mb[0]), mb[1], left)
         return _solve_broadcast_unpack(ctx, left, right, a, b)
     dims_a, dtype_a = a

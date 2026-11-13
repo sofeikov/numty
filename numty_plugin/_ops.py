@@ -21,8 +21,8 @@ from ._types import (
     _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _is_none_type,
-    _normalize_axis, _normalize_axis_0d, _parse_axis_arg,
+    _check_axis, _all_positionals, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _is_none_type,
+    _normalize_axis, _parse_axis_arg,
 )
 from ._linalg import (
     _linalg_tuple,
@@ -34,7 +34,7 @@ from ._reshape import (
     _construct_dtype, _known_rank_parts, _mixed_parts,
 )
 from ._reshape import (
-    _check_unique_axes, _int_or_none, _picture_complete, _positionals_only,
+    _bound_args, _check_unique_axes, _int_or_none, _picture_complete, _positionals_only,
 )
 from ._linalg import (
     _string_value,
@@ -49,13 +49,7 @@ def _check_each_axis(
 ) -> bool:
     """True when every axis is in range, else a loud error."""
     for ax in axes:
-        if _normalize_axis(ax, len(dims)) is None:
-            ctx.api.fail(
-                f"{op} axis {ax} is out of range for {len(dims)} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
+        if _check_axis(ctx, f"{op} axis", ax, dims) is None:
             return False
     return True
 
@@ -116,13 +110,10 @@ def _same_shape_hook(
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
-    if not _picture_complete(ctx, first):
+    found = _bound_args(ctx, first, ("axis",), (axis_index,))
+    if found is None:
         return ctx.default_return_type
-    pair = _formal_pair(ctx, "axis")
-    if pair is None and axis_index is not None and _positionals_only(ctx):
-        pos = _all_positionals(ctx)
-        pair = pos[axis_index] if axis_index < len(pos) else None
-    axis = _parse_axis_arg(pair)
+    axis = _parse_axis_arg(found[0])
     if isinstance(axis, list) and not _check_each_axis(ctx, dims, axis, op):
         return ctx.default_return_type
     if (
@@ -316,14 +307,10 @@ def rot90_function_hook(ctx: FunctionContext) -> Type:
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
-    if _positionals_only(ctx):
-        k_pair = pairs[1] if len(pairs) > 1 else None
-        axes_pair = pairs[2] if len(pairs) > 2 else None
-    elif _formal_pair(ctx, "m") is None:
+    found = _bound_args(ctx, "m", ("k", "axes"), (1, 2), slots_first=True)
+    if found is None:
         return ctx.default_return_type
-    else:
-        k_pair = _formal_pair(ctx, "k")
-        axes_pair = _formal_pair(ctx, "axes")
+    k_pair, axes_pair = found
     k = 1
     if k_pair is not None:
         folded = _int_value(k_pair[0])
@@ -339,13 +326,7 @@ def rot90_function_hook(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         ia, ib = parsed
     for ax in (ia, ib):
-        if _normalize_axis(ax, len(dims)) is None:
-            ctx.api.fail(
-                f"rot90 axis {ax} is out of range for {len(dims)} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
+        if _check_axis(ctx, "rot90 axis", ax, dims) is None:
             return ctx.default_return_type
     na = ia + len(dims) if ia < 0 else ia
     nb = ib + len(dims) if ib < 0 else ib
@@ -485,13 +466,8 @@ def _hook_pair(
 
     Returns "incomplete" when keywords may hide behind erased formals.
     """
-    if not _picture_complete(ctx, first):
-        return "incomplete"
-    pair = _formal_pair(ctx, name)
-    if pair is None and _positionals_only(ctx):
-        pos = _all_positionals(ctx)
-        pair = pos[index] if index < len(pos) else None
-    return pair
+    found = _bound_args(ctx, first, (name,), (index,))
+    return "incomplete" if found is None else found[0]
 
 
 def _tile_reps(pair: tuple[Type, Expression | None]) -> list[int | None] | None:
@@ -704,14 +680,8 @@ def repeat_function_hook(ctx: FunctionContext) -> Type:
                 ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
             )
         return _ndarray_type(ctx, [_repeat_unknown(ctx, found_repeats, 0)], dtype)
-    target = _normalize_axis_0d(axis, len(dims))
+    target = _check_axis(ctx, "repeat axis", axis, dims, zero_d=True)
     if target is None:
-        ctx.api.fail(
-            f"repeat axis {axis} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     if not dims:
         # A 0-d input with axis 0/-1 repeats the scalar (issue #62).
@@ -788,14 +758,8 @@ def repeat_method_hook(ctx: MethodContext) -> Type:
                 ctx, [_mul_dims(ctx, "repeat", 0, [*dims, count])], dtype
             )
         return _ndarray_type(ctx, [_repeat_unknown(ctx, repeats_pair, 0)], dtype)
-    target = _normalize_axis_0d(axis, len(dims))
+    target = _check_axis(ctx, "repeat axis", axis, dims, zero_d=True)
     if target is None:
-        ctx.api.fail(
-            f"repeat axis {axis} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     if not dims:
         # A 0-d input with axis 0/-1 repeats the scalar (issue #62).
@@ -1000,14 +964,8 @@ def split_function_hook(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         assert isinstance(folded, int)
         axis = folded
-    target = _normalize_axis(axis, len(dims))
+    target = _check_axis(ctx, "split axis", axis, dims)
     if target is None:
-        ctx.api.fail(
-            f"split axis {axis} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     if found_sections is None:
@@ -1086,14 +1044,8 @@ def array_split_function_hook(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         assert isinstance(folded, int)
         axis = folded
-    target = _normalize_axis(axis, len(dims))
+    target = _check_axis(ctx, "array_split axis", axis, dims)
     if target is None:
-        ctx.api.fail(
-            f"array_split axis {axis} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     if found_sections is None:
@@ -1260,13 +1212,7 @@ def count_nonzero_function_hook(ctx: FunctionContext) -> Type:
     if not isinstance(axis, list):
         return ctx.default_return_type
     for ax in axis:
-        if _normalize_axis_0d(ax, len(dims)) is None:
-            ctx.api.fail(
-                f"count_nonzero axis {ax} is out of range for {len(dims)} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
+        if _check_axis(ctx, "count_nonzero axis", ax, dims, zero_d=True) is None:
             return ctx.default_return_type
     return _count_nonzero_axis(ctx, dims, axis)
 
@@ -1300,7 +1246,7 @@ def bincount_function_hook(ctx: FunctionContext) -> Type:
     numpy raises "The weights and list don't have the same length", with
     no broadcasting. Provably different sizes are an error; two
     different names, or a selection count against a name, are reported
-    under the opt-in code. The result keeps the stubs' type.
+    under the numty-names code. The result keeps the stubs' type.
     """
     try:
         pairs = _all_positionals(ctx)
@@ -1406,14 +1352,8 @@ def unique_function_hook(ctx: FunctionContext) -> Type:
         values = _ndarray_type(ctx, [count], dtype)
         return _unique_tuple(ctx, values, count, dims, extras)
     assert isinstance(folded, int)
-    target = _normalize_axis(folded, len(dims))
+    target = _check_axis(ctx, "unique axis", folded, dims)
     if target is None:
-        ctx.api.fail(
-            f"unique axis {folded} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     count = _fresh_unknown(ctx, "unique", target)
@@ -1673,14 +1613,8 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
     else:
         eff = []
         for ax in axes:
-            target = _normalize_axis(ax, ndim)
+            target = _check_axis(ctx, "sliding_window_view axis", ax, dims, ndim)
             if target is None:
-                ctx.api.fail(
-                    f"sliding_window_view axis {ax} is out of range for "
-                    f"{ndim} dimensions (shape {_dims_str(dims)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
                 return ctx.default_return_type
             eff.append(target)
         if len(set(eff)) != len(eff):

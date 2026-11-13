@@ -60,7 +60,7 @@ import argparse
 import ast
 import sys
 
-from numty_convert import Edit, Source, run_cli, splice
+from numty_convert import Edit, Source, numpy_alias, run_cli, splice
 
 _SELF_OP_UFUNCS: dict[type[ast.operator], str] = {
     ast.Add: "add",
@@ -80,16 +80,6 @@ _SUBCLASS_OVERRIDES = {
     ast.Pow: "np.matrix makes `**` a matrix power",
     ast.Div: "np.ma.MaskedArray masks nan results of `/` that np.divide keeps",
 }
-
-
-def _numpy_alias(tree: ast.Module) -> str | None:
-    """The `np` in `import numpy as np` (or `numpy` for plain import)."""
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                if a.name == "numpy":
-                    return a.asname or "numpy"
-    return None
 
 
 # Array types numty exports, for annotations (`from numty import F64`).
@@ -830,7 +820,7 @@ def codemod_source(
     out = src
     if self_ops:
         tree = ast.parse(out)
-        alias = _numpy_alias(tree)
+        alias = numpy_alias(tree)
         if alias is None:
             warnings.append(
                 "self-ops skipped: no `import numpy [as ...]` found"

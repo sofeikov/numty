@@ -338,7 +338,8 @@ def _string_mentions_head(node: ast.AST) -> bool:
     return False
 
 
-def _numpy_alias(tree: ast.Module) -> str | None:
+def numpy_alias(tree: ast.Module) -> str | None:
+    """The `np` in `import numpy as np` (or `numpy` for plain import)."""
     for node in tree.body:
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -365,7 +366,7 @@ class _Converter:
         # versa), and a binding of a jaxtyping head means the annotation
         # never was jaxtyping at runtime -- both bail out verbatim.
         self.assigned = _module_shadows(tree)
-        self.numpy_alias = _numpy_alias(tree)
+        self.numpy_alias = numpy_alias(tree)
         self.single_ids: dict[str, str | None] = {}
         self.variadic_ids: dict[str, str | None] = {}
         self.converted: list[_Converted] = []

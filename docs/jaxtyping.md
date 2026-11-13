@@ -35,8 +35,17 @@ convert comes back unchanged. It catches real mistakes: mis-annotate the output
 bias as `"hid"` instead of `"out"` and the converted file fails with
 
 ```text
-error: call-site shape conflict for 'HID': 8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)
+error: broadcast at trailing axis 0 (shapes (BATCH, OUT) vs (HID,)): OUT and HID are different names  [numty-names]
+error: call-site shape conflict for 'HID': 8 (argument 'w1', axis 1) vs 2 (argument 'b2', axis 0)  [numty-callsite]
 ```
+
+Two different names are two sizes. jaxtyping accepts `"hid"` and
+`"out"` that happen to be equal at run time; numty's `numty-names`
+code, on by default, reports a body that needs them to be equal (the
+first error above, where the mistake is made). Where two names really
+are one size, give them one name, or turn the code off with
+`disable_error_code = numty-names` (see
+[Error codes](reference/error-codes.md#turning-it-off)).
 
 Anything the static solver cannot express is left verbatim with a
 warning, never silently changed: symbolic dims (`"n+1"`), broadcastable

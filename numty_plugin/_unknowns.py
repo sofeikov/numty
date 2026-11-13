@@ -175,7 +175,7 @@ def _fresh_mask_count(
     site; any reassignment in the same function bails to a fresh
     per-site unknown). The same variable reuses the same id, so
     `ids[keep]` and `d[0, keep]` share `?U`; different variables mint
-    different ids. The fullname carries `.maskcount_` so the opt-in
+    different ids. The fullname carries `.maskcount_` so the
     report can tell a selection count from a generic unknown, while the
     default checks treat it like any unknown (silent, unifying), except
     that one count against itself plus a constant is a shape error, as
@@ -228,7 +228,7 @@ def _fresh_own_size(
     for every position declared `K` (keyed by the call site and the
     name), and another name of the same return gives another. It prints
     as `?K@line`. The fullname carries `.ownsize_`: like a selection
-    count, it is a size of its own for the opt-in report, and an unknown
+    count, it is a size of its own for the names report, and an unknown
     for every default check, except that one such size against itself
     plus a constant is a shape error, as `N-1` against `N` is (issue
     328). A call, or a read, in a loop or a comprehension can choose a
@@ -283,7 +283,7 @@ def _fresh_int_symbol(
 
     `window[k - 1 :]` on an axis of size `N` is `N-?k+1`. It is an
     unknown like any other: nothing is proved from it, and a formula
-    over it is only compared under the opt-in code.
+    over it is only compared under the numty-names code.
     """
     tree = getattr(ctx.api, "tree", None)
     module = getattr(tree, "fullname", "") or ""
