@@ -190,7 +190,7 @@ and is pinned by the test suite, message for message.
 
 -   :material-format-list-checks: **[Reference](reference/operations.md)**
 
-    Every supported operation, the nine error codes, tracing and strict
+    Every supported operation, the ten error codes, tracing and strict
     mode.
 
 </div>

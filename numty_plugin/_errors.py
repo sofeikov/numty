@@ -63,6 +63,16 @@ NUMTY_NAMES = ErrorCode(
     "numty",
     default_enabled=False,
 )
+# Off by default (issue 308). `a[idx] = value` casts with
+# casting="unsafe", so floats written into an integer array are
+# truncated silently; that is right code when the truncation is meant,
+# and `.astype(...)` on the value says so.
+NUMTY_CAST = ErrorCode(
+    "numty-cast",
+    "An indexed assignment casts its value to a kind that loses information",
+    "numty",
+    default_enabled=False,
+)
 NUMTY_INTERNAL = ErrorCode(
     "numty-internal",
     "numty itself failed on this expression; the result is unchecked",

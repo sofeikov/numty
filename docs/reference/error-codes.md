@@ -1,6 +1,6 @@
 # Error codes
 
-Every numty diagnostic carries one of nine mypy error codes, so each kind
+Every numty diagnostic carries one of ten mypy error codes, so each kind
 can be silenced or selected on its own:
 
 | Code | Covers | Example message |
@@ -12,6 +12,7 @@ can be silenced or selected on its own:
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 needs its dims, e.g. F64[N, M], or F64[()] for a 0-d array` |
 | `numty-names` | opt-in (`enable_error_code = numty-names`): two different named sizes where one size is needed, inside a function generic in both (broadcast, mask, assignment, call) | `broadcast at trailing axis 0 (shapes (B,) vs (A,)): B and A are different names` |
+| `numty-cast` | opt-in (`enable_error_code = numty-cast`): an indexed assignment whose value has a kind the target cannot hold without loss (floats into an integer array) | `assignment casts float32 into int64 (values are truncated); use .astype(...) if this is meant` |
 | `numty-unsolved` | opt-in `NUMTY_STRICT=1` report: a hooked call numty could not prove, so the result is unchecked | `numty could not prove __call__: unsolved (result is unchecked)` |
 | `numty-internal` | numty itself failed on this expression (a plugin bug), so the result is unchecked | `numty internal error in numpy.ndarray.__add__: RuntimeError: ... (result is unchecked; please report this)` |
 
@@ -53,7 +54,7 @@ disable_error_code = numty-bail
 ```
 
 or per line, `np.stack([b for b in blocks])  # type: ignore[numty-bail]`, which still
-reports a shape error on that line. All but `numty-names` are sub-codes of
+reports a shape error on that line. All but `numty-names` and `numty-cast` are sub-codes of
 `misc`, so an existing `# type: ignore[misc]` or `disable_error_code = misc`
 keeps covering them. Under `--warn-unused-ignores` (part of `--strict`), mypy
 then asks for the narrower code (`Unused "type: ignore" comment, use
@@ -131,3 +132,56 @@ named size and against another mask's count (see
 also covers index positions: positions on one named size used on an
 axis of another, and positions that may run past the axis. Where two names are known to be one
 size, give them one name. The fixture is `tests/fixtures/names_opt_in.py`.
+
+## Lossy indexed assignment: the opt-in `numty-cast` code
+
+numpy's indexed assignment (`a[:] = v`, a mask or fancy index, a single
+position) casts with `casting="unsafe"`, so floats written into an
+integer array are truncated with no error at run time:
+`rows[:] = [0.5, 1.7, 2.2, 3.9]` leaves `[0, 1, 2, 3]`. Every shape is
+right, so the default checks say nothing. Turn the check on to have the
+dtype of the write compared too (issue 308):
+
+```ini
+[mypy]
+plugins = numty_plugin
+enable_error_code = numty-cast
+```
+
+```python
+def f(rows: I64[N], times: F32[N], keep: Bool[N]) -> None:
+    rows[:] = times                        # floats into an integer array
+    rows[keep] = times[keep]
+    rows[0] = 1.5
+    rows[:] = times.astype(np.int64)       # fine: the cast is meant
+```
+
+```text
+error: assignment casts float32 into int64 (values are truncated); use .astype(...) if this is meant  [numty-cast]
+error: assignment casts float32 into int64 (values are truncated); use .astype(...) if this is meant  [numty-cast]
+error: assignment casts float into int64 (values are truncated); use .astype(...) if this is meant  [numty-cast]
+```
+
+A write is reported when numpy's `np.can_cast(value, target,
+casting="same_kind")` is false, that is when the value's kind comes
+later than the target's in bool, unsigned, signed, float, complex:
+
+- float or complex into an integer or bool array (values are truncated,
+  or become `True`/`False`);
+- complex into float (the imaginary part is dropped);
+- integer into bool, and signed into unsigned (negative values wrap
+  around).
+
+Integer into float, unsigned into signed, bool into anything and a
+change of width within one kind (`float64` into `float32`, `int64` into
+`int32`) stay silent, as does a value whose dtype is unknown or `Any`.
+Python scalars count by their kind: a `float` into an integer array is
+reported, an `int` into a float or integer array is not, and an `int`
+into a bool array is reported unless it is the literal `0` or `1`. A
+list of Python scalars (`[0.5, 1.7]`) counts by its element. An
+intended truncation (`counts[:] = np.floor(x)`) says so with
+`.astype(...)` on the value. The in-place operators (`rows += times`)
+are refused by the numpy stubs already and are not reported again;
+`rows[0] += 1.5` is an assignment of `rows[0] + 1.5` and is reported.
+The fixtures are `tests/fixtures/bad_setitem_cast.py` and
+`tests/fixtures/setitem_cast_ok.py`.

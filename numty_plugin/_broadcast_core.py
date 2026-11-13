@@ -13,11 +13,11 @@ from mypy.types import (
 from mypy.subtypes import is_same_type
 
 from ._errors import NUMTY_BROADCAST, _swallowed
-from ._forms import _DivForm, _form_has_unknown, _forms_provably_ne, _LinForm
+from ._forms import _DivForm, _forms_provably_ne, _LinForm
 from ._dtypes import _promote_strong, _promote_weak
 from ._types import (
     DTYPE_FULLNAME, NDARRAY_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve,
-    _ndarray_parts, _ndarray_type, _same_own_size, _unpack_shape,
+    _named_size, _ndarray_parts, _ndarray_type, _same_own_size, _unpack_shape,
 )
 from ._reshape import (
     _construct_dtype, _datetime_kind, _dims_str, _dtype_fullname, _known_rank_parts, _promote_dtypes,
@@ -695,15 +695,6 @@ def _broadcast_types(
     if dtype is None:
         return _ndarray_type(ctx, dims, _default_dtype(ctx))
     return _ndarray_type(ctx, dims, dtype)
-
-
-def _named_size(d: int | Type) -> bool:
-    """A size spelled over names alone: no literal, `int`, `Any` or unknown."""
-    from numty_plugin import _resolve_dim
-    if not isinstance(d, TypeVarType):
-        return False
-    form = _resolve_dim(d)
-    return form is not None and not _form_has_unknown(form)
 
 
 def _inplace_never_fits(lhs_dims: list[int | Type], rhs_dims: list[int | Type]) -> bool:

@@ -28,6 +28,6 @@ if __name__ == "__main__":
     k = np.array([True, False, True, True, False])
     print(t[r[k], c[k]].shape)
     try:
-        t[c[k], r[k]]
+        t[c[k], r[k]]  # E (opt-in): positions on 5 on the axis of size 3
     except IndexError as exc:
         print(type(exc).__name__)

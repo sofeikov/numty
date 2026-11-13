@@ -42,9 +42,11 @@ quiet, where it is approximate, and what to write instead.
 
 - On lines the solver rejects, mypy may add its own follow-on error next
     to ours (an overload complaint for tuple `reshape`, `Unsupported
-    operand` for broadcast ops, `Invalid index type` for an out-of-range
-    tuple index, a `DTypeT` type-var complaint for `fft` with a bad `n`).
-    Ours is the readable one.
+    operand` for broadcast ops, a `DTypeT` type-var complaint for `fft`
+    with a bad `n`). Ours is the readable one. An index error no longer
+    gets mypy's `Invalid index type` on top (issue 333): it is reported
+    past the overload trial that mypy runs for a key that is not all
+    arrays, so the trial does not fail.
 - Test runs use a dedicated mypy cache dir cleared per suite run (see
     `test_static.py`): mypy does not reliably invalidate plugin results
     across plugin edits, so never trust the default cache while hacking
@@ -99,6 +101,10 @@ quiet, where it is approximate, and what to write instead.
     reported: `G *= K[..., np.newaxis]` with `G` of shape `(N, 1, M)`
     and `K` of `(N, N)` fits only when `N` is 1, as the literal `(4, 4,
     1)` into `(4, 1, 3)` does not.
+- A name against an `int`, `Any` or unknown size in a broadcast is
+    kept as the name (issue 333): the other side is the name or 1 when
+    the broadcast is valid. A name that is 1 at run time broadcasts to
+    the other size instead, which this misses, as `np.cov` below does.
 - `np.cov` squeezes its result, so a single variable gives `()`. numty
     knows that for a literal 1 (`np.cov` of `(1, N)`) and a vector,
     not for a named size that is 1 at run time: `(D, N)` is `(D, D)`.
@@ -143,7 +149,8 @@ quiet, where it is approximate, and what to write instead.
     (no overload takes the shape from the assignment), so a name first
     bound to `(n, 3, 4)` could not be rebound to `size=(n, d, 4)`. A
     `reshape` from an input with no literal axis (`x.ravel().reshape(n,
-    d)`) makes its `int` sizes unknown for the same reason. Most of the
+    d)`) makes its `int` sizes unknown for the same reason; named target
+    sizes stay (with `n: N`, `h: H` it is `(N, H)`, issue 333). Most of the
     solver does not read `int` dims. The exceptions: `reshape` keeps the literal sizes
     it is asked for whenever one of them is a plain `int` or the input's
     shape cannot be read (`x.reshape(-1, 3)`, `x.reshape(n, 3)` and

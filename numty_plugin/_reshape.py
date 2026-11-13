@@ -15,7 +15,7 @@ from mypy.types import (
 
 from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
 from ._dtypes import _DTYPE_INFO, _NAME_OF_KIND_SIZE, _WEAK_SCALARS, _promote_strong
-from ._forms import _DivForm, _MonoForm, _canon_div, _forms_provably_ne
+from ._forms import _DivForm, _MonoForm, _canon_div, _form_has_unknown, _forms_provably_ne
 from ._exprs import _expr_str
 
 from ._types import (
@@ -62,9 +62,8 @@ def _reshape_new_dims(
     if not pairs:
         return None
     first_tp, first_expr = pairs[0]
-    if isinstance(first_expr, (TupleExpr, ListExpr)) or (
-        first_expr is None and isinstance(get_proper_type(first_tp), TupleType)
-    ):
+    # A tuple-typed value (`W.shape`, issue 333) is a whole shape too.
+    if isinstance(first_expr, (TupleExpr, ListExpr)) or isinstance(get_proper_type(first_tp), TupleType):
         got = _shape_from_arg(first_tp, first_expr)
         if got is None or any(
             not isinstance(d, int) and not isinstance(d, TypeVarType) for d in got
@@ -268,7 +267,8 @@ def _solve_reshape_dynamic(
     plain = any(_is_plain_int(d) for d in dims)
     if plain:
         inferred = AnyType(TypeOfAny.explicit)
-    if not plain and not any(d >= 0 for d in ints):
+    if not plain and not any(d >= 0 for d in ints) and -1 in ints:
+        # reshape(-1), reshape(N, -1): the -1 is not readable here.
         return ctx.default_return_type
     out = [inferred if d == -1 else d for d in dims]
     if not _is_mixed_shape(proper):
@@ -280,6 +280,12 @@ def _solve_reshape_dynamic(
     # literal ((n, 3) -> (-1, d)) may well be that literal: unknown, as
     # for contractions, so x = x.reshape(-1, d) keeps fitting x.
     return _mixed_result(_ndarray_type(ctx, out, proper.args[1]), old)
+
+
+def _has_unknown_dim(dims: Sequence[int | Type]) -> bool:
+    """Whether a size of `dims` holds an unknown (`?U`, `?U+2`)."""
+    from numty_plugin import _resolve_dim
+    return any(isinstance(d, TypeVarType) and _form_has_unknown(_resolve_dim(d)) for d in dims)
 
 
 def _solve_reshape(
@@ -517,7 +523,9 @@ def _solve_reshape(
                 or isinstance(old_total, (_MonoForm, _DivForm))
                 or isinstance(new_total, (_MonoForm, _DivForm))
             )
-            if nonlin:
+            # An input with an unknown size (`p[k:k + 3]`, issue 333) can
+            # be any total, so nothing makes the request impossible.
+            if nonlin and not _has_unknown_dim(dims_old):
                 return ctx.default_return_type
         if old_vars != new_vars:
             # Same int total but different symbolic factors (N vs M): the

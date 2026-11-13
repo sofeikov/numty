@@ -140,6 +140,37 @@ def _named_sizes_differ(a: int | Type, b: int | Type) -> bool:
     return True
 
 
+def _named_size(d: int | Type) -> bool:
+    """A size spelled over names alone: no literal, `int`, `Any` or unknown."""
+    from numty_plugin import _resolve_dim
+    if not isinstance(d, TypeVarType):
+        return False
+    form = _resolve_dim(d)
+    return form is not None and not _form_has_unknown(form)
+
+
+def _kept_name(x: int | Type, y: int | Type) -> int | Type | None:
+    """The named side of a pair of sizes that must match, when the other is not known (issue 333).
+
+    Where two sizes meet and a valid call needs them equal (a join's
+    other axes) or equal up to a 1 (a broadcast), a size over names
+    against a plain `int`, an `Any` or an unknown (`?U`, `?U+2`) is the
+    name. None for anything else: a literal, two names, two unknowns.
+    """
+    from numty_plugin import _resolve_dim
+    for named, other in ((x, y), (y, x)):
+        if not _named_size(named) or isinstance(other, int):
+            continue
+        proper = get_proper_type(other)
+        if isinstance(proper, AnyType) or (isinstance(proper, Instance) and proper.type.fullname == INT_FULLNAME):
+            return named
+        if isinstance(other, TypeVarType):
+            form = _resolve_dim(other)
+            if form is None or _form_has_unknown(form):
+                return named
+    return None
+
+
 def _names_enabled(ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext) -> bool:
     """Whether `enable_error_code = numty-names` is set for the module being checked."""
     options = getattr(ctx.api, "options", None)
