@@ -484,8 +484,12 @@ class NumtyPlugin(Plugin):
             OverloadedFuncDef,
         ):
             # The hook runs per overload candidate; a non-matching
-            # item would false-positive, so overloaded callees stay out.
-            return sig
+            # item would false-positive, so overloaded callees stay out
+            # of the reports. A formula in an item's return is still put
+            # in the caller's terms (issue 324: `coef: F64["C F+1"]` ->
+            # `F64[C, F]` given (K, G+1) is (K, G), not (K, Never)); it
+            # rewrites that item's return only, never its formals' match.
+            return _callsite_formula_return(sig, ctx)
         # String-spec words bound late (see _fam_bind_words) are missing
         # from the function's variables, so core checking would reject
         # concrete actuals against the free typevars. Add exactly those

@@ -5673,3 +5673,43 @@ def test_polars_to_numpy_cast_chain() -> None:
         "(2,) float64",
         "float64 (3,)",
     ]
+
+
+# Issue 324: a string-spec word and the declared TypeVar of the same name
+# are one size: a bare or string body annotation, a union local, a local
+# variable named like the word, and overloads (formula specs included).
+def test_strspec_declared_word_ok() -> None:
+    result = run_mypy(FIXTURES / "strspec_declared_word_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        77: f'"tuple[{_ND}[tuple[K, G], {_F64}], {_ND}[tuple[K], {_F64}]]"',
+        81: f'"{_ND}[tuple[Literal[3], Literal[3]], {_F64}]"',
+        82: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}]"',
+        83: f'"tuple[{_ND}[tuple[Literal[2], Literal[3]], {_F64}], {_ND}[tuple[Literal[2]], {_F64}]]"',
+        84: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}]"',
+    }, result.stdout
+    assert _run_fixture("strspec_declared_word_ok.py") == [
+        "(3, 3)",
+        "(5, 3)",
+        "[(2, 3), (2,)]",
+        "(5, 3)",
+        "[(2, 4), (2,)]",
+    ]
+
+
+# Issue 324: the bad twin. Sharing the word's size must not merge it
+# with others: a size the body binds alone stays its own (it once took
+# an id of a signature word), and real mismatches are still reported.
+def test_bad_strspec_declared_word() -> None:
+    result = run_mypy(FIXTURES / "bad_strspec_declared_word.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [14, 18, 19, 24, 35], result.stdout
+    got_t = 'type "ndarray[tuple[T], dtype[float64]]", variable has type "ndarray[tuple[N]'
+    got_r = 'type "ndarray[tuple[R], dtype[float64]]", variable has type "ndarray[tuple[N]'
+    assert got_t in errors[14][0], result.stdout
+    assert got_r in errors[19][0], result.stdout
+    assert "tuple[n_samples, n_features]" in errors[24][0], result.stdout
+    assert "tuple[n_features, n_samples]" in errors[24][0], result.stdout
+    assert "tuple[Literal[3], Literal[3]]" in errors[35][0], result.stdout
+    assert all(text.endswith("[assignment]") for line in errors.values() for text in line), result.stdout
+    assert _run_fixture("bad_strspec_declared_word.py") == ["(3, 3)"]

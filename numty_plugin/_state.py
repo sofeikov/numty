@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from mypy.nodes import FuncDef
     from mypy.types import Type, TypeVarId, TypeVarLikeType, TypeVarType
 
     from ._forms import _DivForm, _LinForm, _MonoForm
@@ -36,6 +37,14 @@ class NumtyState:
     seen_vars: dict[tuple[str, str], TypeVarType] = field(default_factory=dict)
     expr_constituents: dict[str, dict[tuple[str, str], TypeVarType]] = field(default_factory=dict)
     implicit_scope_vars: dict[tuple[str, str], TypeVarLikeType] = field(default_factory=dict)
+    # Issue 324: per full tvar namespace, the lowest function-scope id a
+    # dim kept in implicit_scope_vars holds, so a fresh bind_new in a
+    # frame that reuses those dims never takes one of their ids.
+    reserved_func_ids: dict[str, int] = field(default_factory=dict)
+    # Issue 324: overload items/implementations whose signature binds a
+    # string-spec word late, with the fullnames to add to their type's
+    # variables once semantic analysis is done (drained by the patch).
+    overload_late: dict[FuncDef, set[str]] = field(default_factory=dict)
     # Region C - ephemeral display/debug (never cleared in Phase 0).
     unknown_ids: dict[str, TypeVarId] = field(default_factory=dict)
     unknown_names: dict[str, str] = field(default_factory=dict)

@@ -250,3 +250,91 @@ def test_implicit_two_func_same_file_parity() -> None:
         assert 'Need type annotation for "z"' not in cold.stdout, cold.stdout
         assert "tuple[Any, Any]" not in cold.stdout, cold.stdout
         assert cold.stdout.count("tuple[2*myhid, myrest]") == 2, cold.stdout
+
+
+LIB324 = '''\
+from typing import Literal, TypeVar, overload
+
+from numty import F64
+
+s = TypeVar("s", bound=int)
+f = TypeVar("f", bound=int)
+C = TypeVar("C", bound=int)
+F = TypeVar("F", bound=int)
+D = TypeVar("D", bound=int)
+
+
+@overload
+def p(X: F64["s f"], gram: Literal[True]) -> F64["f f"]: ...
+@overload
+def p(X: F64["s f"], gram: Literal[False]) -> F64["s f"]: ...
+def p(X: F64["s f"], gram: bool) -> F64["f f"] | F64["s f"]:
+    return X.T @ X if gram else X
+
+
+@overload
+def wi(coef: F64["C F+1"], fit_intercept: Literal[True]) -> tuple[F64[C, F], F64[C]]: ...
+@overload
+def wi(coef: F64["C F"], fit_intercept: Literal[False]) -> tuple[F64[C, F], float]: ...
+def wi(coef: F64["C D"], fit_intercept: bool) -> tuple[F64[C, int], F64[C] | float]:
+    if fit_intercept:
+        return coef[:, :-1], coef[:, -1]
+    return coef, 0.0
+
+
+def colsum(y: F64["s f"]) -> F64[f]:
+    d: F64[f] = y.sum(axis=0)
+    return d
+'''
+
+USE324 = '''\
+import numpy as np
+
+from lib324 import colsum, p, wi
+from numty import F64
+
+reveal_type(p(np.zeros((5, 3)), True))
+reveal_type(p(np.zeros((5, 3)), False))
+reveal_type(colsum(np.zeros((5, 3))))
+
+
+def use(c1: F64["K G+1"]) -> None:
+    reveal_type(wi(c1, True))
+'''
+
+
+def test_string_word_typevar_overload_parity() -> None:
+    """Issue 324: overloads spelled with string words of declared
+    TypeVars check clean and resolve alike cold and warm (a callee
+    served from the cache keeps the variables added to its items)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        (work / "lib324.py").write_text(LIB324)
+        (work / "use324.py").write_text(USE324)
+        cache = work / "cache"
+
+        cold = _run_mypy_files(work, cache, "use324.py", "lib324.py")
+        with open(work / "use324.py", "a") as fh:
+            fh.write("# edit\n")
+        warm = _run_mypy_files(work, cache, "use324.py", "lib324.py")
+        with open(work / "use324.py", "a") as fh:
+            fh.write("# edit\n")
+        warm_caller_only = _run_mypy_files(work, cache, "use324.py")
+
+        def notes(out: str) -> list[str]:
+            return [line for line in out.splitlines() if line.startswith("use324.py")]
+
+        assert cold.stdout == warm.stdout, (
+            f"--- cold ---\n{cold.stdout}\n--- warm ---\n{warm.stdout}"
+        )
+        assert notes(cold.stdout) == notes(warm_caller_only.stdout), (
+            f"--- cold ---\n{cold.stdout}\n--- warm ---\n{warm.stdout}"
+            f"\n--- warm (caller only) ---\n{warm_caller_only.stdout}"
+        )
+        assert "error" not in cold.stdout, cold.stdout
+        assert "tuple[Literal[3], Literal[3]]" in cold.stdout, cold.stdout
+        assert "tuple[Literal[5], Literal[3]]" in cold.stdout, cold.stdout
+        assert "ndarray[tuple[Literal[3]]," in cold.stdout, cold.stdout
+        assert "tuple[K, G]" in cold.stdout, cold.stdout

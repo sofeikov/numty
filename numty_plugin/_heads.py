@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 from ._errors import NUMTY_ANNOTATION, _swallowed
 from ._exprs import (
     _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _implicit_scope_vars,
-    _normalize_ns, _seen_vars,
+    _iter_tvarlikes, _normalize_ns, _seen_vars,
 )
 from ._forms import _LinForm, _form_never_size
 from ._state import STATE
@@ -20,6 +20,11 @@ from ._types import (
     INT_FULLNAME, _dim_eq, _dim_str, _dim_value,
 )
 from ._unknowns import _is_same_unknown
+
+_reserved_func_ids = STATE.reserved_func_ids
+_overload_late = STATE.overload_late
+# After mypy's own patches (forward refs 0, fallbacks 1, typevar values 2).
+_PRIORITY_OVERLOAD_VARS = 3
 
 
 def _is_fam_int_name(fullname: str) -> bool:
@@ -37,10 +42,13 @@ if TYPE_CHECKING:
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.types import Type, TypeVarLikeType
 
-from mypy.nodes import Expression, NameExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var
+from mypy.nodes import (
+    Context, Expression, FuncDef, NameExpr, TypeAlias, TypeInfo, TypeVarExpr, TypeVarLikeExpr, Var,
+)
+from mypy.semanal_shared import SemanticAnalyzerInterface
 from mypy.typeanal import TypeAnalyser
 from mypy.types import (
-    AnyType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny,
+    AnyType, CallableType, EllipsisType, Instance, LiteralType, RawExpressionType, TupleType, TypeOfAny,
     TypeVarId, TypeVarTupleType, TypeVarType, UnboundType, UnpackType, get_proper_type,
 )
 
@@ -579,6 +587,7 @@ def _fam_expr(
     scope = analyzer.tvar_scope
     existing = scope.get_binding(fullname)
     if existing is not None:
+        _note_overload_late(ctx, analyzer, existing)
         return existing
     vid = _expr_ids.get(fullname)
     if vid is None:
@@ -599,6 +608,7 @@ def _fam_expr(
     )
     scope.bind_existing(obj)
     late_bound.add(fullname)
+    _note_overload_late(ctx, analyzer, obj)
     # Remember constituent vars so later simplifications (e.g.
     # diff(N+1) -> N) return the scope's own object, not a stale one.
     # Last-wins (issue #43): each scope's binding refreshes this.
@@ -663,9 +673,13 @@ def _fam_bind_words(
                 continue
             if sym.fullname and not scope.allow_binding(sym.fullname):
                 continue
-            scope.bind_new(word, sym.node, analyzer.fail_func, node)
             if sym.fullname:
-                late_bound.add(sym.fullname)
+                # Issue 324: one object per function, like an implicit
+                # dim, so a local annotation (string or bare) in the
+                # body is the signature's size, not a lookalike.
+                _fam_bind_declared(ctx, analyzer, scope, word, sym.node, sym.fullname, node, late_bound)
+            else:
+                scope.bind_new(word, sym.node, analyzer.fail_func, node)
             continue
         if sym is not None and isinstance(sym.node, Var) and sym.node.is_final:
             # A Final int is a real dim; the normal path resolves it.
@@ -681,6 +695,14 @@ def _fam_bind_words(
             # style), so mint an implicit dim instead of erroring
             # (issue #62): `F64["time freq"]` after `import time`,
             # `F64["n d"]` with a module-level `n = 10`.
+            # Issue 324: but a local (or class attribute) named like a
+            # declared size TypeVar (`n_samples, n_features = X.shape`)
+            # hides the module's TypeVar from expressions only; the word
+            # is that TypeVar, as in the signature, not a lookalike.
+            shadowed = _shadowed_size_tvar(ctx, analyzer, word, node, late_bound)
+            if shadowed is not None:
+                minted[word] = shadowed
+                continue
             minted[word] = _fam_ensure_implicit(
                 ctx, analyzer, scope, word, node,
                 late_bound)
@@ -690,6 +712,197 @@ def _fam_bind_words(
                 ctx, analyzer, scope, word, node,
                 late_bound)
     return minted
+
+
+def _shadowed_size_tvar(
+    ctx: AnalyzeTypeContext,
+    analyzer: TypeAnalyser,
+    word: str,
+    node: RawExpressionType | UnboundType,
+    late_bound: set[str]) -> TypeVarLikeType | None:
+    """The module's size TypeVar `word` names under a shadowing symbol.
+
+    Issue 324: `n_samples, n_features = X.shape` in a function whose
+    signature says `F64["n_samples n_features"]` with a declared
+    `n_features`: inside the body the name finds the local, but the
+    dim is the declared TypeVar. A plain module variable (no TypeVar of
+    that name at module level) still mints an implicit dim (issue #62).
+    Only an int-bounded TypeVar counts, like `_fam_bind_local_name`.
+    """
+    try:
+        api = analyzer.api
+        module = getattr(api, "cur_mod_id", None)
+        if not module:
+            return None
+        gsym = api.lookup_fully_qualified_or_none(f"{module}.{word}")
+        if gsym is None or not isinstance(gsym.node, TypeVarExpr) or not gsym.fullname:
+            return None
+        upper = get_proper_type(gsym.node.upper_bound)
+        if not (isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME):
+            return None
+        scope = analyzer.tvar_scope
+        bound = scope.get_binding(gsym.fullname)
+        if bound is not None:
+            return bound
+        if not scope.allow_binding(gsym.fullname):
+            return None
+        return _fam_bind_declared(ctx, analyzer, scope, word, gsym.node, gsym.fullname, node, late_bound)
+    except Exception:
+        _swallowed(ctx, "_shadowed_size_tvar")
+        return None
+
+
+def _scope_bound_ids(scope: TypeVarLikeScope) -> dict[TypeVarId, str]:
+    """Every id bound in the scope chain, mapped to its variable's fullname."""
+    out: dict[TypeVarId, str] = {}
+    it: TypeVarLikeScope | None = scope
+    while it is not None:
+        for fullname, tv in it.scope.items():
+            out.setdefault(tv.id, fullname)
+        it = it.parent
+    return out
+
+
+def _scope_reserve(scope: TypeVarLikeScope, tv: TypeVarLikeType | None = None) -> None:
+    """Keep the next `bind_new` ids clear of dims reused by `bind_existing`.
+
+    A dim kept per function (an implicit word, a declared word bound
+    late) is reused in the body's scope with its signature id. mypy's
+    `bind_new` counts ids per frame and does not see it, so a size
+    TypeVar the body binds afresh could take the same id and be the
+    same type as an unrelated signature dim (issue 324). Every reused or
+    late id is remembered per namespace, and the frame's counter is
+    moved past them before a fresh binding.
+    """
+    try:
+        if scope.is_class_scope:
+            return
+        ns = scope.namespace
+        if tv is not None and tv.id.namespace == ns and tv.id.raw_id < 0:
+            low = min(_reserved_func_ids.get(ns, 0), tv.id.raw_id)
+            _reserved_func_ids[ns] = low
+        low = _reserved_func_ids.get(ns, 0)
+        if low < scope.func_id:
+            scope.func_id = low
+    except Exception:
+        _swallowed(None, "_scope_reserve")
+
+
+def _scope_reuse(scope: TypeVarLikeScope, cached: TypeVarLikeType | None, fullname: str) -> bool:
+    """Bind a dim kept for this function into the scope, when it is safe.
+
+    The cached object must be for this fullname, and no other variable
+    in the scope chain may already hold its id (a stale entry from a
+    changed signature in a daemon run, say): one id must never be two
+    sizes.
+    """
+    if cached is None or getattr(cached, "fullname", None) != fullname:
+        return False
+    other = _scope_bound_ids(scope).get(cached.id)
+    if other is not None and other != fullname:
+        return False
+    scope.bind_existing(cached)
+    _scope_reserve(scope, cached)
+    return True
+
+
+def _fam_bind_declared(
+    ctx: AnalyzeTypeContext,
+    analyzer: TypeAnalyser,
+    scope: TypeVarLikeScope,
+    word: str,
+    expr: TypeVarLikeExpr,
+    fullname: str,
+    node: Context,
+    late_bound: set[str]) -> TypeVarLikeType:
+    """Bind a declared TypeVar that mypy's pre-pass did not see, once per function.
+
+    A word of a string spec (`F64["N T"]` with `T = TypeVar(...)`) and a
+    size TypeVar named only in the body are bound by the plugin, after
+    mypy has bound the signature's written names. The signature and
+    the body are analyzed in different scope frames, so binding afresh
+    in each made two sizes that print alike (issue 324): `d: F64[T]` in
+    the body was not the `T` of the parameter. Keep the object per
+    (function, fullname), like an implicit dim (issue #145), and reuse
+    it wherever the function names the word again.
+    """
+    key = (_normalize_ns(scope.namespace), fullname)
+    cached = _implicit_scope_vars.get(key)
+    if _scope_reuse(scope, cached, fullname):
+        assert cached is not None
+        late_bound.add(fullname)
+        _note_overload_late(ctx, analyzer, cached)
+        return cached
+    _scope_reserve(scope)
+    bound = scope.bind_new(word, expr, analyzer.fail_func, node)
+    _scope_reserve(scope, bound)
+    _implicit_scope_vars[key] = bound
+    late_bound.add(fullname)
+    _note_overload_late(ctx, analyzer, bound)
+    return bound
+
+
+def _note_overload_late(ctx: AnalyzeTypeContext, analyzer: TypeAnalyser, tv: TypeVarLikeType) -> None:
+    """Make a size bound late in an overload signature one of its variables.
+
+    mypy fixes a function's type variables from the written signature,
+    before any hook runs, so a word only a string spec names is not one
+    of them. A call of a plain function gets them added back by the
+    call-site hook; the overload checks (the implementation accepts
+    every item, a call picks an item) run on the items' own types. So
+    for an overload item or implementation, the word's TypeVar is added
+    to the function's variables once semantic analysis is done, the
+    same as the bare-TypeVar spelling of the overload (issue 324).
+    """
+    try:
+        api = analyzer.api
+        # While a signature is analyzed, the statement is its FuncDef
+        # (in the body it is the body's statement), and the scope frame
+        # is the one mypy opens for that signature: `name#i` for item i,
+        # the plain name for the implementation (analyzed last, with no
+        # item index but flagged as part of the overload).
+        defn = getattr(api, "statement", None)
+        if not isinstance(defn, FuncDef):
+            return
+        item = getattr(api, "current_overload_item", None)
+        if item is not None:
+            expected = f"{defn.fullname}#{item}"
+        elif defn.is_overload:
+            expected = defn.fullname
+        else:
+            return
+        if analyzer.tvar_scope.namespace != expected:
+            return
+        pending = _overload_late.get(defn)
+        if pending is None:
+            pending = _overload_late[defn] = set()
+            cast(SemanticAnalyzerInterface, api).schedule_patch(
+                _PRIORITY_OVERLOAD_VARS, lambda: _add_overload_vars(defn)
+            )
+        pending.add(tv.fullname)
+    except Exception:
+        _swallowed(ctx, "_note_overload_late")
+
+
+def _add_overload_vars(defn: FuncDef) -> None:
+    """The scheduled half of `_note_overload_late`."""
+    try:
+        names = _overload_late.pop(defn, None)
+        typ = defn.type
+        if not names or not isinstance(typ, CallableType):
+            return
+        have = {v.fullname for v in typ.variables}
+        add: list[TypeVarLikeType] = []
+        for formal in [*typ.arg_types, typ.ret_type]:
+            for tv in _iter_tvarlikes(formal):
+                if tv.fullname in names and tv.fullname not in have:
+                    have.add(tv.fullname)
+                    add.append(tv)
+        if add:
+            # In place: the overload's own type holds this same object.
+            typ.variables = (*typ.variables, *add)
+    except Exception:
+        _swallowed(None, "_add_overload_vars")
 
 
 def _fam_ensure_implicit(
@@ -743,22 +956,17 @@ def _fam_ensure_implicit(
     # Same function, different scope tree (signature vs body): reuse
     # the signature's object instead of minting a lookalike.
     cached = _implicit_scope_vars.get(key)
-    if cached is not None:
-        # A stale entry from another process lifetime (or a pre-#146
-        # cache with an unnamespaced fullname) must not shadow the
-        # current scope's own dim: only reuse when the fullnames
-        # agree, else fall through and mint fresh.
-        try:
-            if getattr(cached, "fullname", None) == fullname:
-                try:
-                    scope.bind_existing(cached)
-                except Exception:
-                    _swallowed(ctx, "_fam_ensure_implicit")
-                    pass
-                return cached
-        except Exception:
-            _swallowed(ctx, "_fam_ensure_implicit")
-            pass
+    # A stale entry from another process lifetime (or a pre-#146 cache
+    # with an unnamespaced fullname) must not shadow the current
+    # scope's own dim: only reuse when the fullnames agree (and the id
+    # is free in this scope, issue 324), else mint fresh.
+    try:
+        if _scope_reuse(scope, cached, fullname):
+            assert cached is not None
+            _note_overload_late(ctx, analyzer, cached)
+            return cached
+    except Exception:
+        _swallowed(ctx, "_fam_ensure_implicit")
     upper = cast(TypeAnalyser, ctx.api).named_type("builtins.int", [], node.line, node.column)
     expr = TypeVarExpr(
         word,
@@ -768,9 +976,12 @@ def _fam_ensure_implicit(
         AnyType(TypeOfAny.from_omitted_generics),
         line=node.line,
     )
+    _scope_reserve(scope)
     bound = scope.bind_new(word, expr, analyzer.fail_func, node)
+    _scope_reserve(scope, bound)
     late_bound.add(fullname)
     _implicit_scope_vars[key] = bound
+    _note_overload_late(ctx, analyzer, bound)
     return bound
 
 
@@ -798,13 +1009,10 @@ def _fam_bind_local_name(ctx: AnalyzeTypeContext, arg: UnboundType, late_bound: 
         upper = get_proper_type(sym.node.upper_bound)
         if not (isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME):
             return
-        key = (_normalize_ns(scope.namespace), sym.fullname)
-        cached = _implicit_scope_vars.get(key)
-        if cached is not None and getattr(cached, "fullname", None) == sym.fullname:
-            scope.bind_existing(cached)
-            return
-        _implicit_scope_vars[key] = scope.bind_new(arg.name, sym.node, analyzer.fail_func, arg)
-        late_bound.add(sym.fullname)
+        # Kept per function and shared with a string-spec word of the
+        # same name (issue 324), so `F64[T]` in the body is the `T` of
+        # an `F64["N T"]` parameter.
+        _fam_bind_declared(ctx, analyzer, scope, arg.name, sym.node, sym.fullname, arg, late_bound)
     except Exception:
         _swallowed(ctx, "_fam_bind_local_name")
 
