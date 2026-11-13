@@ -21,7 +21,7 @@ from ._types import (
     _ndarray_parts, _has_unpack, _ndarray_type,
 )
 from ._reshape import (
-    _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
+    _fail_axis, _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
 )
 from ._builders import (
     _has_mixed_operand,
@@ -813,20 +813,10 @@ def tensordot_function_hook(ctx: FunctionContext) -> Type:
             na = ia + len(dims_a) if ia < 0 else ia
             nb = ib + len(dims_b) if ib < 0 else ib
             if not 0 <= na < len(dims_a):
-                ctx.api.fail(
-                    f"tensordot axis {ia} is out of range for {len(dims_a)} "
-                    f"dimensions (shape {_dims_str(dims_a)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
+                _fail_axis(ctx, "tensordot axis", ia, dims_a)
                 return ctx.default_return_type
             if not 0 <= nb < len(dims_b):
-                ctx.api.fail(
-                    f"tensordot axis {ib} is out of range for {len(dims_b)} "
-                    f"dimensions (shape {_dims_str(dims_b)})",
-                    ctx.context,
-                    code=NUMTY_AXIS,
-                )
+                _fail_axis(ctx, "tensordot axis", ib, dims_b)
                 return ctx.default_return_type
             if na in seen_a or nb in seen_b:
                 bad = ia if na in seen_a else ib

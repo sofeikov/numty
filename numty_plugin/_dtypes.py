@@ -22,6 +22,35 @@ _DTYPE_INFO: dict[str, tuple[str, int]] = {
 _NAME_OF_KIND_SIZE = {v: k for k, v in _DTYPE_INFO.items()}
 
 
+# Generic scalar classes whose width is a bit-width tag argument
+# (floating[_32Bit] is float32), by the kind they stand for.
+_GENERIC_KIND = {
+    "numpy.floating": "f",
+    "numpy.complexfloating": "c",
+    "numpy.signedinteger": "i",
+    "numpy.unsignedinteger": "u",
+}
+
+
+def _nbit_tag_bits(fullname: str) -> int | None:
+    """Bits of a bit-width tag class (numpy._typing._nbit_base._32Bit -> 32)."""
+    tail = fullname.rsplit(".", 1)[-1]
+    digits = tail[1:-3]
+    if not (tail.startswith("_") and tail.endswith("Bit") and digits.isdecimal()):
+        return None
+    return int(digits)
+
+
+def _kind_bits_name(kind: str, bits: int) -> str | None:
+    """Canonical dtype fullname for a kind and a width in bits, else None.
+
+    The width counts the whole item: ("c", 64) is complex64.
+    """
+    if bits % 8:
+        return None
+    return _NAME_OF_KIND_SIZE.get((kind, bits // 8))
+
+
 _DATETIME_FULLNAMES = frozenset({"numpy.datetime64", "numpy.timedelta64"})
 
 

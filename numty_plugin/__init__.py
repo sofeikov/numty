@@ -50,7 +50,7 @@ from ._casts import (  # noqa: F401
     _array_dtype, _report_cast, _value_kind,
 )
 from ._fft import (  # noqa: F401
-    _complex_dtype, _fft_axis_n, _fft_pair, _fft_s_axes, _fftn_solve, _rfft_complex_input,
+    _complex_dtype, _fft_axis_n, _fft_s_axes, _fftn_solve, _rfft_complex_input,
     _rfft_size, _rfft_solve, fft2_function_hook, fft_function_hook, fftn_function_hook,
     fftshift_function_hook, irfft_function_hook, rfft2_function_hook, rfft_function_hook,
     rfftn_function_hook,

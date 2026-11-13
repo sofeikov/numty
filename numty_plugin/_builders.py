@@ -15,14 +15,14 @@ from mypy.nodes import (
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
 from mypy.types import (
     AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarType,
-    UnionType, get_proper_type,
+    get_proper_type,
 )
 
-from ._errors import NUMTY_AXIS, NUMTY_BAIL, NUMTY_SHAPE, _report_unsolved, _swallowed, _trial_failed
+from ._errors import NUMTY_BAIL, NUMTY_SHAPE, _report_unsolved, _swallowed, _trial_failed
 from ._state import STATE
 from ._trace import _numty_trace_path, _trace_event
 from ._dtypes import (
-    _DATETIME_FULLNAMES, _DTYPE_INFO, _WEAK_DEFAULT, _datetime_string_kind,
+    _DATETIME_FULLNAMES, _DTYPE_INFO, _GENERIC_KIND, _WEAK_DEFAULT, _datetime_string_kind, _kind_bits_name,
 )
 
 from ._types import (
@@ -34,8 +34,9 @@ from ._types import (
 )
 from ._returns import _return_any_for_dynamic
 from ._reshape import (
+    _check_axis, _fail_axis,
     _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,
-    _known_rank_parts, _normalize_axis, _promote_all, _scalar_key,
+    _known_rank_parts, _nbit_bits, _promote_all, _scalar_key,
 )
 from ._types import (
     _enum_member_count,
@@ -640,12 +641,9 @@ def _explicit_dtype(ctx: FunctionContext | MethodContext) -> bool:
     return pair is not None and not _is_none_type(pair[0])
 
 
-_BUILTIN_DTYPE = {
-    "builtins.bool": "numpy.bool",
-    "builtins.int": "numpy.int64",
-    "builtins.float": "numpy.float64",
-    "builtins.complex": "numpy.complex128",
-}
+# Kept as names for the facade: the Python-scalar defaults and the
+# canonical dtype strings ("float32"), both read off the _dtypes tables.
+_BUILTIN_DTYPE = _WEAK_DEFAULT
 
 
 def _instance_fullname(tp: Type) -> str | None:
@@ -655,22 +653,7 @@ def _instance_fullname(tp: Type) -> str | None:
     return None
 
 
-_DTYPE_STRINGS = {
-    "bool": "numpy.bool",
-    "int8": "numpy.int8",
-    "int16": "numpy.int16",
-    "int32": "numpy.int32",
-    "int64": "numpy.int64",
-    "uint8": "numpy.uint8",
-    "uint16": "numpy.uint16",
-    "uint32": "numpy.uint32",
-    "uint64": "numpy.uint64",
-    "float16": "numpy.float16",
-    "float32": "numpy.float32",
-    "float64": "numpy.float64",
-    "complex64": "numpy.complex64",
-    "complex128": "numpy.complex128",
-}
+_DTYPE_STRINGS = {name.removeprefix("numpy."): name for name in _DTYPE_INFO}
 
 
 def _scalar_ret_name(ret: Type) -> str | None:
@@ -682,50 +665,27 @@ def _scalar_ret_name(ret: Type) -> str | None:
     base = proper.type.fullname
     if base == "numpy.bool":
         return "numpy.bool"
-    tables = {
-        "numpy.floating": {16: "numpy.float16", 32: "numpy.float32", 64: "numpy.float64"},
-        "numpy.complexfloating": {64: "numpy.complex64", 128: "numpy.complex128"},
-        "numpy.signedinteger": {
-            8: "numpy.int8",
-            16: "numpy.int16",
-            32: "numpy.int32",
-            64: "numpy.int64",
-        },
-        "numpy.unsignedinteger": {
-            8: "numpy.uint8",
-            16: "numpy.uint16",
-            32: "numpy.uint32",
-            64: "numpy.uint64",
-        },
-    }
-    table = tables.get(base)
-    if table is None or len(proper.args) != 1:
+    kind = _GENERIC_KIND.get(base)
+    if kind is None or len(proper.args) != 1:
         return None
-    bit = get_proper_type(proper.args[0])
     # Issue #223: np.intp is signedinteger[_32Bit | _64Bit] (and uintp
     # likewise). Map the platform union to the 64-bit entry (linux x64
     # CI; the 32-bit member would also be valid but less precise).
-    if isinstance(bit, UnionType):
-        bits: list[int] = []
-        for item in bit.relevant_items():
-            item_proper = get_proper_type(item)
-            if not isinstance(item_proper, Instance):
-                return None
-            try:
-                b = int(item_proper.type.fullname.rsplit("_", 1)[-1].removesuffix("Bit"))
-            except ValueError:
-                return None
-            bits.append(b)
-        if not bits:
-            return None
-        return table.get(max(bits))
-    if not isinstance(bit, Instance):
-        return None
-    try:
-        bits = int(bit.type.fullname.rsplit("_", 1)[-1].removesuffix("Bit"))
-    except ValueError:
-        return None
-    return table.get(bits)
+    bits = _nbit_bits(proper.args[0], union=True)
+    return None if bits is None else _kind_bits_name(kind, bits)
+
+
+def _scalar_spec(tp: Type) -> tuple[str, str] | None:
+    """("weak", name) for a Python scalar, ("strong", name) for a numpy one.
+
+    Like _scalar_key, and also reads a numpy scalar by its generic class
+    and width (np.int64(3), x.max(): strong under NEP 50).
+    """
+    key = _scalar_key(tp)
+    if key is not None:
+        return key
+    name = _scalar_ret_name(tp)
+    return None if name is None else ("strong", name)
 
 
 def _named_dtype(ctx: FunctionContext | MethodContext) -> Type | None:
@@ -1433,14 +1393,8 @@ def _concatenate_items(
         )
         return ctx.default_return_type
     ndim = len(items[0][0])
-    norm = _normalize_axis(axis, ndim)
+    norm = _check_axis(ctx, "concatenate axis", axis, items[0][0], ndim)
     if norm is None:
-        ctx.api.fail(
-            f"concatenate axis {axis} is out of range for {ndim} dimensions "
-            f"(shape {_dims_str(items[0][0])})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     return _concat_merge(ctx, "concatenate", items, dtype, norm)
 
@@ -1663,14 +1617,8 @@ def _concat_dynamic(
         if axis == "none":
             return _ndarray_type(ctx, [_fresh_unknown(ctx, "concat", 0)], dtype)
         return ctx.default_return_type
-    norm = _normalize_axis(axis, len(dims_e))
+    norm = _check_axis(ctx, "concatenate axis", axis, dims_e)
     if norm is None:
-        ctx.api.fail(
-            f"concatenate axis {axis} is out of range for {len(dims_e)} dimensions "
-            f"(shape {_dims_str(dims_e)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims_e)
     out[norm] = _fresh_unknown(ctx, "concat", norm)
@@ -1695,12 +1643,7 @@ def _stack_dynamic(
     ndim = len(dims_e)
     norm = axis + ndim + 1 if axis < 0 else axis
     if not 0 <= norm <= ndim:
-        ctx.api.fail(
-            f"stack axis {axis} is out of range for {ndim} dimensions "
-            f"(shape {_dims_str(dims_e)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
+        _fail_axis(ctx, "stack axis", axis, dims_e, ndim)
         return ctx.default_return_type
     out = list(dims_e)
     # An unfiltered comprehension over a known size has that many items (issue 333).
@@ -1841,12 +1784,7 @@ def _stack_new_axis(
     ndim = len(first)
     norm = axis + ndim + 1 if axis < 0 else axis
     if not 0 <= norm <= ndim:
-        ctx.api.fail(
-            f"stack axis {axis} is out of range for {ndim} dimensions "
-            f"(shape {_dims_str(first)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
+        _fail_axis(ctx, "stack axis", axis, first, ndim)
         return ctx.default_return_type
     out = list(first)
     out.insert(norm, len(items))

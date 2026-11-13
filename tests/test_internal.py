@@ -6,15 +6,29 @@ site and records a `crash` trace event, and NUMTY_DEBUG=1 (which
 conftest.py sets for the whole suite) lets the exception propagate.
 """
 
+import ast
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from mypy.nodes import ARG_NAMED, ARG_POS, Block, ClassDef, NameExpr, SymbolTable, TypeInfo
+from mypy.types import Instance, LiteralType, UnionType
 
+import numty_codmod
 import numty_plugin
+from numty_convert import numpy_alias
+from numty_plugin._builders import _scalar_ret_name, _scalar_spec
+from numty_plugin._dtypes import _kind_bits_name, _nbit_tag_bits
+from numty_plugin._errors import NUMTY_AXIS
+from numty_plugin._reshape import (
+    _bound_args, _check_axis, _dtype_kind_size, _fail_axis, _fail_duplicate_axis, _nbit_bits,
+    _nbit_bytes, _validate_axes,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -216,3 +230,153 @@ def test_return_substitution_survives_a_failed_tuple_copy(tmp_path: Path) -> Non
     assert "RuntimeError: seeded failure" in result.stdout, out
     assert "AttributeError" not in out, out
     assert 'Revealed type is "numpy.ndarray[tuple[K+1], ' in result.stdout, out
+
+
+# Shared kernel helpers (issue #323): argument plumbing, axis checks and
+# dtype resolution, exercised directly on hand-built contexts and types.
+
+
+def _call(formals: list[tuple[str | None, list[tuple[object, str]]]]) -> Any:
+    """A stand-in call context: per formal, its name and its (kind, value) actuals."""
+    return SimpleNamespace(
+        callee_arg_names=[name for name, _ in formals],
+        arg_kinds=[[kind for kind, _ in acts] for _, acts in formals],
+        arg_types=[[value for _, value in acts] for _, acts in formals],
+        args=[[NameExpr(value) for _, value in acts] for _, acts in formals],
+    )
+
+
+def _values(found: list | None) -> list | None:
+    return None if found is None else [None if p is None else p[0] for p in found]
+
+
+def test_bound_args_reads_formals_then_positional_slots() -> None:
+    positional = _call([("a", [(ARG_POS, "x")]), ("n", [(ARG_POS, "8")]), ("axis", [])])
+    assert _values(_bound_args(positional, "a", ("n", "axis"), (1, 2))) == ["8", None]
+    # Erased formals (overload fallback): only the slots are readable.
+    erased = _call([(None, [(ARG_POS, "x")]), (None, [(ARG_POS, "8")]), (None, [(ARG_POS, "-1")])])
+    assert _values(_bound_args(erased, "a", ("n", "axis"), (1, 2))) == ["8", "-1"]
+    assert _values(_bound_args(erased, "a", ("n", "axis"), (1, None))) == ["8", None]
+    assert _values(_bound_args(erased, "a", ("n", "axis"), (1, 2), slots_first=True)) == ["8", "-1"]
+
+
+def test_bound_args_keywords_need_the_first_formal() -> None:
+    keyword = _call([("a", [(ARG_POS, "x")]), ("n", []), ("axis", [(ARG_NAMED, "0")])])
+    assert _values(_bound_args(keyword, "a", ("n", "axis"), (1, 2))) == [None, "0"]
+    assert _values(_bound_args(keyword, "a", ("n", "axis"), (1, 2), slots_first=True)) == [None, "0"]
+    # A keyword behind erased formals hides where it binds: bail.
+    erased = _call([(None, [(ARG_POS, "x")]), (None, [(ARG_NAMED, "0")])])
+    assert _bound_args(erased, "a", ("axis",), (1,)) is None
+    # first=None skips that check (a method, whose self is not an actual).
+    assert _values(_bound_args(erased, None, ("axis",), (1,))) == [None]
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.errors: list[tuple[str, object]] = []
+
+    def fail(self, msg: str, context: object, code: object = None) -> None:
+        self.errors.append((msg, code))
+
+
+def _ctx() -> Any:
+    return SimpleNamespace(api=_Recorder(), context=None)
+
+
+def test_fail_axis_message_and_code() -> None:
+    ctx = _ctx()
+    _fail_axis(ctx, "swapaxes axis2", 5, [2, 3])
+    _fail_axis(ctx, "stack axis", -4, [2], 2)
+    assert ctx.api.errors == [
+        ("swapaxes axis2 5 is out of range for 2 dimensions (shape (2, 3))", NUMTY_AXIS),
+        ("stack axis -4 is out of range for 2 dimensions (shape (2,))", NUMTY_AXIS),
+    ]
+
+
+def test_check_axis_normalizes_or_reports() -> None:
+    ctx = _ctx()
+    assert _check_axis(ctx, "fft axis", -1, [4, 5]) == 1
+    assert _check_axis(ctx, "repeat axis", -1, [], zero_d=True) == 0
+    assert ctx.api.errors == []
+    assert _check_axis(ctx, "repeat axis", 1, [], zero_d=True) is None
+    assert _check_axis(ctx, "fft axis", 0, []) is None
+    assert ctx.api.errors == [
+        ("repeat axis 1 is out of range for 0 dimensions (shape ())", NUMTY_AXIS),
+        ("fft axis 0 is out of range for 0 dimensions (shape ())", NUMTY_AXIS),
+    ]
+
+
+def test_validate_axes_range_then_duplicates() -> None:
+    ctx = _ctx()
+    assert _validate_axes(ctx, "sum", [0, -1], [2, 3, 4]) == [0, 2]
+    assert _validate_axes(ctx, "transpose", [1, -1], [2, 3], unique=False) == [1, 1]
+    assert ctx.api.errors == []
+    assert _validate_axes(ctx, "sum", [0, -3], [2, 3, 4]) is None
+    assert _validate_axes(ctx, "sum", [3, 0, 0], [2, 3, 4]) is None
+    assert _validate_axes(ctx, "max", [0], [], zero_d=True) == [0]
+    assert ctx.api.errors == [
+        ("sum has duplicate axis -3 in (0, -3) (shape (2, 3, 4))", NUMTY_AXIS),
+        ("sum axis 3 is out of range for 3 dimensions (shape (2, 3, 4))", NUMTY_AXIS),
+    ]
+    _fail_duplicate_axis(ctx, "expand_dims", 1, [1, 1], [5])
+    assert ctx.api.errors[-1] == (
+        "expand_dims has duplicate axis 1 in (1, 1) (shape (5,))",
+        NUMTY_AXIS,
+    )
+
+
+def _inst(fullname: str, *args) -> Instance:
+    module, name = fullname.rsplit(".", 1)
+    defn = ClassDef(name, Block([]))
+    defn.fullname = fullname
+    return Instance(TypeInfo(SymbolTable(), defn, module), list(args))
+
+
+_NBIT = "numpy._typing._nbit_base."
+
+
+def test_nbit_tag_bits_and_kind_names() -> None:
+    assert _nbit_tag_bits(_NBIT + "_32Bit") == 32
+    assert _nbit_tag_bits(_NBIT + "_96Bit") == 96
+    assert _nbit_tag_bits(_NBIT + "NBitBase") is None
+    assert _nbit_tag_bits("numpy.float64") is None
+    assert _nbit_tag_bits("numpy.int_") is None
+    assert _kind_bits_name("f", 32) == "numpy.float32"
+    assert _kind_bits_name("c", 64) == "numpy.complex64"
+    assert _kind_bits_name("i", 128) is None
+    assert _kind_bits_name("f", 12) is None
+
+
+def test_nbit_bits_reads_tags_and_unions() -> None:
+    b32, b64, b96 = (_inst(_NBIT + f"_{n}Bit") for n in (32, 64, 96))
+    assert _nbit_bits(b64) == 64
+    assert _nbit_bits(UnionType([b32, b64])) is None
+    assert _nbit_bits(UnionType([b32, b64]), union=True) == 64
+    assert _nbit_bits(UnionType([b32, _inst("builtins.int")]), union=True) is None
+    # Bytes: a literal width counts, widths numpy has no dtype for do not.
+    assert _nbit_bytes(LiteralType(16, _inst("builtins.int"))) == 2
+    assert _nbit_bytes(b96) is None
+
+
+def test_scalar_dtype_resolution() -> None:
+    b32, b64 = _inst(_NBIT + "_32Bit"), _inst(_NBIT + "_64Bit")
+    intp = _inst("numpy.signedinteger", UnionType([b32, b64]))
+    assert _scalar_ret_name(_inst("numpy.floating", b32)) == "numpy.float32"
+    assert _scalar_ret_name(_inst("numpy.bool")) == "numpy.bool"
+    assert _scalar_ret_name(intp) == "numpy.int64"
+    assert _scalar_ret_name(_inst("numpy.complexfloating", b32, b32)) is None
+    assert _dtype_kind_size(_inst("numpy.dtype", _inst("numpy.complexfloating", b32, b32))) == ("c", 8)
+    assert _dtype_kind_size(_inst("numpy.dtype", _inst("numpy.unsignedinteger", b32))) == ("u", 4)
+    assert _dtype_kind_size(_inst("numpy.dtype", _inst("numpy.float64"))) == ("f", 8)
+    assert _dtype_kind_size(_inst("numpy.dtype", intp)) is None
+    assert _scalar_spec(_inst("builtins.float")) == ("weak", "builtins.float")
+    assert _scalar_spec(_inst("numpy.int16")) == ("strong", "numpy.int16")
+    assert _scalar_spec(intp) == ("strong", "numpy.int64")
+    assert _scalar_spec(_inst("builtins.str")) is None
+
+
+def test_numpy_alias_is_shared_by_convert_and_codmod() -> None:
+    assert numpy_alias(ast.parse("import numpy as np\n")) == "np"
+    assert numpy_alias(ast.parse("import os, numpy\n")) == "numpy"
+    assert numpy_alias(ast.parse("from numpy import zeros\n")) is None
+    assert numty_codmod.numpy_alias is numpy_alias

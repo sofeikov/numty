@@ -6,7 +6,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from mypy.nodes import ARG_POS, ARG_STAR, ARG_STAR2, Expression, ListExpr, NameExpr, OpExpr, StarExpr, TupleExpr
+from mypy.nodes import (
+    ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, Expression, ListExpr, NameExpr, OpExpr, StarExpr, TupleExpr,
+)
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
 from mypy.types import (
     AnyType, Instance, LiteralType, NoneType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType,
@@ -14,7 +16,9 @@ from mypy.types import (
 )
 
 from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
-from ._dtypes import _DTYPE_INFO, _NAME_OF_KIND_SIZE, _WEAK_SCALARS, _promote_strong
+from ._dtypes import (
+    _DTYPE_INFO, _GENERIC_KIND, _NAME_OF_KIND_SIZE, _WEAK_SCALARS, _nbit_tag_bits, _promote_strong,
+)
 from ._forms import _DivForm, _MonoForm, _canon_div, _form_has_unknown, _forms_provably_ne
 from ._exprs import _expr_str
 
@@ -537,14 +541,15 @@ def _solve_reshape(
     return _ndarray_type(ctx, dims_new, dtype)
 
 
+def _actuals(ctx: FunctionContext | MethodContext) -> Iterator[tuple[ArgKind, Type, Expression]]:
+    """Every actual as (kind, type, expression), in formal order."""
+    for kinds, types, exprs in zip(ctx.arg_kinds, ctx.arg_types, ctx.args):
+        yield from zip(kinds, types, exprs)
+
+
 def _all_positionals(ctx: FunctionContext | MethodContext) -> list[tuple[Type, Expression | None]]:
     """Every positional actual in call order, each with its expression."""
-    out: list[tuple[Type, Expression | None]] = []
-    for kinds, types, exprs in zip(ctx.arg_kinds, ctx.arg_types, ctx.args):
-        for kind, tp, expr in zip(kinds, types, exprs):
-            if kind == ARG_POS:
-                out.append((tp, expr))
-    return out
+    return [(tp, expr) for kind, tp, expr in _actuals(ctx) if kind == ARG_POS]
 
 
 def _all_positionals_expanded(
@@ -560,25 +565,24 @@ def _all_positionals_expanded(
     """
     out: list[tuple[Type, Expression | None]] = []
     seen_star: set[int] = set()
-    for kinds, types, exprs in zip(ctx.arg_kinds, ctx.arg_types, ctx.args):
-        for kind, tp, expr in zip(kinds, types, exprs):
-            if kind == ARG_POS:
-                out.append((tp, expr))
-            elif kind == ARG_STAR:
-                # One star actual can be bound to several formals when the
-                # callee is overloaded (same expression object twice):
-                # count it once.
-                if id(expr) in seen_star:
-                    continue
-                seen_star.add(id(expr))
-                proper = get_proper_type(tp)
-                if isinstance(proper, TupleType):
-                    for item in proper.items:
-                        out.append((item, None))
-                else:
-                    return None
-            elif kind == ARG_STAR2:
+    for kind, tp, expr in _actuals(ctx):
+        if kind == ARG_POS:
+            out.append((tp, expr))
+        elif kind == ARG_STAR:
+            # One star actual can be bound to several formals when the
+            # callee is overloaded (same expression object twice):
+            # count it once.
+            if id(expr) in seen_star:
+                continue
+            seen_star.add(id(expr))
+            proper = get_proper_type(tp)
+            if isinstance(proper, TupleType):
+                for item in proper.items:
+                    out.append((item, None))
+            else:
                 return None
+        elif kind == ARG_STAR2:
+            return None
     return out
 
 
@@ -594,6 +598,36 @@ def _formal_pair(
         return None
     exprs = ctx.args[index] if index < len(ctx.args) else []
     return ctx.arg_types[index][0], exprs[0] if exprs else None
+
+
+def _bound_args(
+    ctx: FunctionContext | MethodContext,
+    first: str | None,
+    names: Sequence[str],
+    indices: Sequence[int | None],
+    *,
+    slots_first: bool = False,
+) -> list[tuple[Type, Expression | None] | None] | None:
+    """Optional actuals by formal name, else by positional slot.
+
+    Entry i is the actual bound to formal names[i]; when every actual
+    is positional and indices[i] is not None, a miss falls back to
+    positional slot indices[i] (slots_first=True reads the slot only).
+    None when keywords may hide behind erased formals: the call is not
+    all-positional and formal `first` is unbound. first=None skips
+    that check.
+    """
+    positional = _positionals_only(ctx)
+    if not positional and first is not None and _formal_pair(ctx, first) is None:
+        return None
+    pos = _all_positionals(ctx) if positional else []
+    out: list[tuple[Type, Expression | None] | None] = []
+    for name, index in zip(names, indices, strict=True):
+        pair = None if positional and slots_first else _formal_pair(ctx, name)
+        if pair is None and positional and index is not None:
+            pair = pos[index] if index < len(pos) else None
+        out.append(pair)
+    return out
 
 
 def _fold_bool(expr: Expression) -> bool | None:
@@ -650,26 +684,115 @@ def _normalize_axis_0d(ax: int, ndim: int) -> int | None:
     return _normalize_axis(ax, ndim)
 
 
+def _fail_axis(
+    ctx: FunctionContext | MethodContext,
+    what: str,
+    ax: object,
+    dims: Sequence[int | Type],
+    ndim: int | None = None,
+) -> None:
+    """Report `{what} {ax}` out of range for the rank (numty-axis).
+
+    `what` names the argument ("fft axis", "swapaxes axis1"); ndim
+    defaults to len(dims), the shape the message shows.
+    """
+    ctx.api.fail(
+        f"{what} {ax} is out of range for {len(dims) if ndim is None else ndim} "
+        f"dimensions (shape {_dims_str(dims)})",
+        ctx.context,
+        code=NUMTY_AXIS,
+    )
+
+
+def _check_axis(
+    ctx: FunctionContext | MethodContext,
+    what: str,
+    ax: int,
+    dims: Sequence[int | Type],
+    ndim: int | None = None,
+    *,
+    zero_d: bool = False,
+) -> int | None:
+    """The normalized axis, or None after an out-of-range error.
+
+    zero_d also accepts axis 0/-1 on 0-d input (_normalize_axis_0d).
+    """
+    rank = len(dims) if ndim is None else ndim
+    norm = _normalize_axis_0d(ax, rank) if zero_d else _normalize_axis(ax, rank)
+    if norm is None:
+        _fail_axis(ctx, what, ax, dims, ndim)
+    return norm
+
+
+def _fail_duplicate_axis(
+    ctx: FunctionContext | MethodContext,
+    op: str,
+    ax: int,
+    axes: Sequence[int],
+    dims: Sequence[int | Type],
+) -> None:
+    """Report an axis named twice in `axes` (numty-axis)."""
+    ctx.api.fail(
+        f"{op} has duplicate axis {ax} in {tuple(axes)} (shape {_dims_str(dims)})",
+        ctx.context,
+        code=NUMTY_AXIS,
+    )
+
+
+def _validate_axes(
+    ctx: FunctionContext | MethodContext,
+    op: str,
+    axes: Sequence[int],
+    dims: Sequence[int | Type],
+    ndim: int | None = None,
+    *,
+    zero_d: bool = False,
+    unique: bool = True,
+) -> list[int] | None:
+    """Every axis normalized, or None after the first loud error.
+
+    Each axis must be in range ("{op} axis ..."); with unique, no two may
+    name the same dim. unique=False leaves repeats to the caller.
+    """
+    normalized: list[int] = []
+    for ax in axes:
+        norm = _check_axis(ctx, f"{op} axis", ax, dims, ndim, zero_d=zero_d)
+        if norm is None:
+            return None
+        if unique and norm in normalized:
+            _fail_duplicate_axis(ctx, op, ax, axes, dims)
+            return None
+        normalized.append(norm)
+    return normalized
+
+
+def _nbit_bits(tp: Type, *, union: bool = False) -> int | None:
+    """Bits of a bit-width tag type (_32Bit), else None.
+
+    union=True reads a union of tags as its widest member: np.intp is
+    signedinteger[_32Bit | _64Bit] (issue #223).
+    """
+    proper = get_proper_type(tp)
+    if union and isinstance(proper, UnionType):
+        widths = [_nbit_bits(item) for item in proper.relevant_items()]
+        if not widths or None in widths:
+            return None
+        return max(w for w in widths if w is not None)
+    if isinstance(proper, Instance):
+        return _nbit_tag_bits(proper.type.fullname)
+    return None
+
+
 def _nbit_bytes(tp: Type) -> int | None:
     """Byte size of a bit-width tag (_32Bit class, literal, ...)."""
     proper = get_proper_type(tp)
     if isinstance(proper, LiteralType) and isinstance(proper.value, int):
-        bits = proper.value
-    elif isinstance(proper, Instance):
-        tail = proper.type.fullname.rsplit(".", 1)[-1]
-        tagged = {
-            "_8Bit": 8,
-            "_16Bit": 16,
-            "_32Bit": 32,
-            "_64Bit": 64,
-            "_128Bit": 128,
-        }.get(tail)
-        if tagged is None:
-            return None
-        bits = tagged
+        bits: int | None = proper.value
     else:
+        bits = _nbit_bits(proper)
+    if bits is None or bits not in (8, 16, 32, 64, 128):
         return None
-    return bits // 8 if bits in (8, 16, 32, 64, 128) else None
+    return bits // 8
 
 
 def _dtype_kind_size(dtype: Type) -> tuple[str, int] | None:
@@ -687,12 +810,7 @@ def _dtype_kind_size(dtype: Type) -> tuple[str, int] | None:
     direct = _DTYPE_INFO.get(element.type.fullname)
     if direct is not None:
         return direct
-    base = {
-        "numpy.floating": "f",
-        "numpy.complexfloating": "c",
-        "numpy.signedinteger": "i",
-        "numpy.unsignedinteger": "u",
-    }.get(element.type.fullname)
+    base = _GENERIC_KIND.get(element.type.fullname)
     if base is None:
         return None
     if base == "c" and len(element.args) == 2:
@@ -781,18 +899,9 @@ def _apply_permutation(
     ctx: FunctionContext | MethodContext, dims: list[int | Type], dtype: Type, axes: list[int]
 ) -> Type:
     ndim = len(dims)
-    normalized: list[int] = []
-    for ax in axes:
-        norm = _normalize_axis(ax, ndim)
-        if norm is None:
-            ctx.api.fail(
-                f"transpose axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        normalized.append(norm)
+    normalized = _validate_axes(ctx, "transpose", axes, dims, unique=False)
+    if normalized is None:
+        return ctx.default_return_type
     if sorted(normalized) != list(range(ndim)):
         ctx.api.fail(
             f"transpose axes {tuple(axes)} are not a permutation of {ndim} "
@@ -942,14 +1051,8 @@ def _solve_squeeze(
         return ctx.default_return_type
     chosen: list[int] = []
     for ax in axis:
-        norm = _normalize_axis_0d(ax, ndim)
+        norm = _check_axis(ctx, "squeeze axis", ax, dims, ndim, zero_d=True)
         if norm is None:
-            ctx.api.fail(
-                f"squeeze axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
             return ctx.default_return_type
         if ndim == 0:
             # 0-d input with axis 0/-1: nothing to squeeze.
@@ -988,12 +1091,7 @@ def _solve_expand_dims(
             )
             return ctx.default_return_type
         if norm in normalized:
-            ctx.api.fail(
-                f"expand_dims has duplicate axis {ax} in {tuple(axis)} "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
+            _fail_duplicate_axis(ctx, "expand_dims", ax, axis, dims)
             return ctx.default_return_type
         normalized.append(norm)
     out = list(dims)
@@ -1108,23 +1206,11 @@ def _swapaxes_solve(
     axis2: int,
 ) -> Type:
     ndim = len(dims)
-    n1 = _normalize_axis(axis1, ndim)
-    n2 = _normalize_axis(axis2, ndim)
+    n1 = _check_axis(ctx, "swapaxes axis1", axis1, dims, ndim)
     if n1 is None:
-        ctx.api.fail(
-            f"swapaxes axis1 {axis1} is out of range for {ndim} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
+    n2 = _check_axis(ctx, "swapaxes axis2", axis2, dims, ndim)
     if n2 is None:
-        ctx.api.fail(
-            f"swapaxes axis2 {axis2} is out of range for {ndim} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     out[n1], out[n2] = out[n2], out[n1]
@@ -1245,30 +1331,12 @@ def moveaxis_function_hook(ctx: FunctionContext) -> Type:
     if src_list is None or dst_list is None:
         return ctx.default_return_type
     # Normalize
-    norm_src: list[int] = []
-    for ax in src_list:
-        n = _normalize_axis(ax, ndim)
-        if n is None:
-            ctx.api.fail(
-                f"moveaxis source axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        norm_src.append(n)
-    norm_dst: list[int] = []
-    for ax in dst_list:
-        n = _normalize_axis(ax, ndim)
-        if n is None:
-            ctx.api.fail(
-                f"moveaxis destination axis {ax} is out of range for {ndim} dimensions "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
-            return ctx.default_return_type
-        norm_dst.append(n)
+    norm_src = _validate_axes(ctx, "moveaxis source", src_list, dims, unique=False)
+    if norm_src is None:
+        return ctx.default_return_type
+    norm_dst = _validate_axes(ctx, "moveaxis destination", dst_list, dims, unique=False)
+    if norm_dst is None:
+        return ctx.default_return_type
     perm = _moveaxis_permutation(ndim, norm_src, norm_dst)
     if perm is None:
         ctx.api.fail(
@@ -1302,14 +1370,8 @@ def rollaxis_function_hook(ctx: FunctionContext) -> Type:
     if ax_val in (None, "bail"):
         return ctx.default_return_type
     assert isinstance(ax_val, int)
-    norm_ax = _normalize_axis(ax_val, ndim)
+    norm_ax = _check_axis(ctx, "rollaxis axis", ax_val, dims, ndim)
     if norm_ax is None:
-        ctx.api.fail(
-            f"rollaxis axis {ax_val} is out of range for {ndim} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     if start_pair is None:
         start = 0
@@ -1325,12 +1387,7 @@ def rollaxis_function_hook(ctx: FunctionContext) -> Type:
     else:
         norm_start = start
     if not 0 <= norm_start <= ndim:
-        ctx.api.fail(
-            f"rollaxis start {start} is out of range for {ndim} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
+        _fail_axis(ctx, "rollaxis start", start, dims, ndim)
         return ctx.default_return_type
     # Rollaxis algorithm per numpy docs
     # If start <= axis, move axis to start, else to start-1 after removal
@@ -1473,14 +1530,8 @@ def _append_types(
         # If ranks differ, numpy still allows? Actually append with axis requires same shape except axis.
         # We'll bail if ranks differ.
         return ctx.default_return_type
-    norm = _normalize_axis(axis_val, len(dims_a))
+    norm = _check_axis(ctx, "append axis", axis_val, dims_a)
     if norm is None:
-        ctx.api.fail(
-            f"append axis {axis_val} is out of range for {len(dims_a)} dimensions "
-            f"(shape {_dims_str(dims_a)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims_a)
     for i, (da, db) in enumerate(zip(dims_a, dims_b)):
@@ -1523,14 +1574,8 @@ def insert_function_hook(ctx: FunctionContext) -> Type:
     if axis_val is None:
         return _ndarray_type(ctx, [_fresh_unknown(ctx, "insert", 0)], dtype)
     assert isinstance(axis_val, int)
-    norm = _normalize_axis(axis_val, len(dims))
+    norm = _check_axis(ctx, "insert axis", axis_val, dims)
     if norm is None:
-        ctx.api.fail(
-            f"insert axis {axis_val} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     out[norm] = _fresh_unknown(ctx, "insert", norm)
@@ -1557,14 +1602,8 @@ def delete_function_hook(ctx: FunctionContext) -> Type:
     if axis_val is None:
         return _ndarray_type(ctx, [_fresh_unknown(ctx, "delete", 0)], dtype)
     assert isinstance(axis_val, int)
-    norm = _normalize_axis(axis_val, len(dims))
+    norm = _check_axis(ctx, "delete axis", axis_val, dims)
     if norm is None:
-        ctx.api.fail(
-            f"delete axis {axis_val} is out of range for {len(dims)} dimensions "
-            f"(shape {_dims_str(dims)})",
-            ctx.context,
-            code=NUMTY_AXIS,
-        )
         return ctx.default_return_type
     out = list(dims)
     out[norm] = _fresh_unknown(ctx, "delete", norm)
@@ -1656,12 +1695,7 @@ def _check_unique_axes(
         if norm is None:
             continue
         if norm in seen:
-            ctx.api.fail(
-                f"{op} has duplicate axis {ax} in {tuple(axes)} "
-                f"(shape {_dims_str(dims)})",
-                ctx.context,
-                code=NUMTY_AXIS,
-            )
+            _fail_duplicate_axis(ctx, op, ax, axes, dims)
             return False
         seen.append(norm)
     return True

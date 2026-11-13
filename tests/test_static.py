@@ -4305,8 +4305,20 @@ def test_every_plugin_fail_site_passes_an_error_code() -> None:
             and isinstance(node.func.value, ast.Attribute)
             and node.func.value.attr == "api"
         ]
-    assert len(sites) > 100, len(sites)
-    assert len(sites) >= 232, f"fail-site total dropped: {len(sites)} < 232"
+    # Calls to the shared axis checks (issue #323) report with their own
+    # code, so each counts as a site.
+    shared = sum(
+        1
+        for path in files
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id
+        in {"_fail_axis", "_check_axis", "_validate_axes", "_fail_duplicate_axis"}
+    )
+    total = len(sites) + shared
+    assert total > 100, total
+    assert total >= 232, f"fail-site total dropped: {total} < 232"
     missing = [
         f"{path.relative_to(plugin_dir)}:{n.lineno}"
         for path, n in sites
