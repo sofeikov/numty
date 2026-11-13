@@ -1534,18 +1534,33 @@ def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
             return default
         base = get_proper_type(ctx.type)
         name = getattr(ctx.context, "name", None)
-        if not isinstance(base, Instance) or not isinstance(name, str):
+        if not isinstance(name, str):
             return default
-        member = base.type.get(name)
-        node = member.node if member is not None else None
-        if isinstance(node, OverloadedFuncDef) and node.items:
-            node = node.items[0]
-        if not isinstance(node, Decorator) or not node.var.is_property:
+        # A union receiver (`k: A | B`) calls this once per member with
+        # the whole union as the type (issue 332): the size is the
+        # object's, whichever class it is of, so it is keyed by them all.
+        members = [get_proper_type(item) for item in base.relevant_items()] if isinstance(base, UnionType) else [base]
+        own: dict[str, int] = {}
+        classes: set[str] = set()
+        for inst in members:
+            if not isinstance(inst, Instance):
+                continue
+            member = inst.type.get(name)
+            node = member.node if member is not None else None
+            if isinstance(node, OverloadedFuncDef) and node.items:
+                node = node.items[0]
+            if not isinstance(node, Decorator) or not node.var.is_property:
+                continue
+            getter = get_proper_type(node.func.type)
+            if not isinstance(getter, CallableType):
+                continue
+            classes.add(inst.type.fullname)
+            for index, v in enumerate(getter.variables):
+                if isinstance(v, TypeVarType):
+                    own.setdefault(v.fullname, index)
+        if not own:
             return default
-        getter = get_proper_type(node.func.type)
-        if not isinstance(getter, CallableType):
-            return default
-        own = {v.fullname: index for index, v in enumerate(getter.variables) if isinstance(v, TypeVarType)}
+        owner = "|".join(sorted(classes))
         # Read through a variable, the size belongs to the object in it:
         # `c.xs` and `c.ys`, both declared with `E`, have one size, and
         # so have two reads of `c.xs` (issue 306). Any other receiver
@@ -1566,7 +1581,7 @@ def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
                 if holder is None:
                     env[tv.id] = _fresh_unknown(ctx, "property", own[tv.fullname])
                 else:
-                    env[tv.id] = _fresh_own_size(ctx, tv.name, f"{base.type.fullname}::{tv.fullname}", holder)
+                    env[tv.id] = _fresh_own_size(ctx, tv.name, f"{owner}::{tv.fullname}", holder)
         if not env:
             return default
         return expand_type(default, env)

@@ -428,56 +428,129 @@ def _return_positions(node: ast.AST, match: Callable[[ast.AST], bool]) -> list[i
     return []
 
 
-def _bound_once(func: ast.AST, name: str) -> bool:
-    """Whether `name` is bound exactly once in the body of `func` (its own scope) and is not a parameter."""
-    count = 0
-    args = getattr(func, "args", None)
-    if args is not None:
-        every = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
-        if any(a is not None and a.arg == name for a in every):
-            return False
+def _annotated_names(func: ast.AST) -> set[str]:
+    """Names given an annotation (`clock: F64[E] = ...`, `clock: F64[E]`) in the body of `func`, its own scope."""
+    out: set[str] = set()
     todo = list(ast.iter_child_nodes(func))
     while todo:
         node = todo.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
             continue
-        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del)):
-            count += 1
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.add(node.target.id)
         todo.extend(ast.iter_child_nodes(node))
-    return count == 1
+    return out
+
+
+def _value_matches(node: ast.AST, match: Callable[[ast.AST], bool]) -> bool:
+    """Whether the bound value `node` is what `match` accepts, or a branch of a conditional that is."""
+    if isinstance(node, ast.IfExp):
+        return _value_matches(node.body, match) or _value_matches(node.orelse, match)
+    if isinstance(node, ast.NamedExpr):
+        return _value_matches(node.value, match)
+    return match(node)
+
+
+def _const_index(node: ast.AST, length: int) -> int | None:
+    """The item a constant subscript `[i]` (or `[-i]`) picks from a tuple of `length` items, else None."""
+    sign = 1
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        sign, node = -1, node.operand
+    if not isinstance(node, ast.Constant) or not isinstance(node.value, int) or isinstance(node.value, bool):
+        return None
+    index = sign * node.value
+    if index < 0:
+        index += length
+    return index if 0 <= index < length else None
+
+
+def _bound_names(
+    assign: ast.Assign,
+    match: Callable[[ast.AST], bool],
+    whole: Callable[[ast.AST], bool],
+    item: int | None,
+    length: int,
+) -> list[str]:
+    """Plain names `assign` binds to the value `match` accepts (issue 332).
+
+    `v = <value>` and its conditional (`v = a if c else b`); `v, z =
+    <value>, 0`, item by item; and, for the item `item` of a hooked
+    tuple (`whole` accepts the hooked call itself), `t, _ = pick(x)`.
+    """
+    if len(assign.targets) != 1:
+        return []
+    target, value = assign.targets[0], assign.value
+    if isinstance(target, ast.Name):
+        return [target.id] if _value_matches(value, match) else []
+    if not isinstance(target, (ast.Tuple, ast.List)) or any(isinstance(e, ast.Starred) for e in target.elts):
+        return []
+    if isinstance(value, (ast.Tuple, ast.List)):
+        if len(value.elts) != len(target.elts) or any(isinstance(e, ast.Starred) for e in value.elts):
+            return []
+        return [
+            elt.id
+            for elt, sub in zip(target.elts, value.elts)
+            if isinstance(elt, ast.Name) and _value_matches(sub, match)
+        ]
+    if item is not None and len(target.elts) == length and whole(value):
+        elt = target.elts[item]
+        return [elt.id] if isinstance(elt, ast.Name) else []
+    return []
+
+
+def _shapes_at(declared: Type, p: int | None, rank: int) -> list[list[Type]]:
+    """Array shapes of the given rank declared at a position of a return.
+
+    The position is None for the value itself, else the tuple index.
+    """
+    if p is None:
+        return _array_shapes(declared, rank)
+    proper = get_proper_type(declared)
+    if isinstance(proper, TupleType) and p < len(proper.items):
+        return _array_shapes(proper.items[p], rank)
+    return []
 
 
 # Sizes already given to a free name in one `return`, by position:
-# (path, line and column of the return, name) -> {(tuple index, axis): size}.
-_OWN_RETURN_SIZES: dict[tuple[str, int, int, str], dict[tuple[int, int], Type]] = {}
+# (path, line and column of the return, name) -> {position: size}. A
+# position is (tuple index, axis) for an item of the `return` itself,
+# and (tuple index, axis, line, column, item) for a binding of a local
+# that is returned there: each binding holds a size of its own.
+_OWN_RETURN_SIZES: dict[tuple[str, int, int, str], dict[tuple[int, ...], Type]] = {}
 
 
-def _fits_first(key: tuple[str, int, int, str], where: tuple[int, int], dim: Type) -> bool:
+def _fits_first(key: tuple[str, int, int, str], where: tuple[int, ...], dim: Type) -> bool:
     """Record `dim` for this position, and say whether it is the size the first position has.
 
     Every position a `return` declares with one free name must hold one
-    size. The position checked first is the reference (a local that is
-    returned, then the items of the `return` from the left). `int` is
-    not followed, so it fits anything, as it fits a name a parameter
-    binds.
+    size, and so must every binding of a local returned there. The
+    position checked first is the reference (a local that is returned,
+    then the items of the `return` from the left). `int` is not
+    followed, so it fits anything, as it fits a name a parameter binds,
+    and it is not the reference: `int`, then two selection counts, is
+    still two sizes.
     """
     seen = _OWN_RETURN_SIZES.setdefault(key, {})
     seen[where] = dim
+    if _is_dynamic_return_dim(dim):
+        return True
     # The position recorded first, which keeps its place when it is
     # recorded again: the same reference in every pass.
-    first = next(iter(seen))
+    first = next((w for w, d in seen.items() if not _is_dynamic_return_dim(d)), where)
     if first == where:
         return True
-    ref = seen[first]
-    if _is_dynamic_return_dim(ref) or _is_dynamic_return_dim(dim):
-        return True
-    return bool(ref == dim)
+    return bool(seen[first] == dim)
+
+
+def _plain_tuple(proper: TupleType) -> bool:
+    fallback = get_proper_type(proper.partial_fallback)
+    return isinstance(fallback, Instance) and fallback.type.fullname == "builtins.tuple"
 
 
 def _name_born_sizes(
     ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext, tp: Type
 ) -> Type:
-    """`tp` with the sizes born here written as the free name declared for them (issues 306, 307).
+    """`tp` with the sizes born here written as the free name declared for them (issues 306, 307, 332).
 
     A free name is a size the function names in its return alone (see
     `_free_return_names`). Where a value meets a position declared with
@@ -486,11 +559,19 @@ def _name_born_sizes(
 
     - a value under a declared type: `ex: F64[E] = col.to_numpy()`, a
       directly returned call, an item of a returned tuple;
-    - a call assigned to a plain local that is bound once and returned,
-      `starts = np.flatnonzero(...)` then `return starts, ends`. The
-      local then has the name for its whole life, so what is computed
-      from it is in the name's terms: `np.r_[starts[1:], n]` is `(K,)`
-      and `np.r_[starts, n]` is `(K+1,)`, which mypy refuses for `K`.
+    - a value bound to a plain local that is returned, `starts =
+      np.flatnonzero(...)` then `return starts, ends`. The local then
+      has the name, so what is computed from it is in the name's terms:
+      `np.r_[starts[1:], n]` is `(K,)` and `np.r_[starts, n]` is
+      `(K+1,)`, which mypy refuses for `K`. The local may be bound more
+      than once (a rebound parameter, both branches of an `if`, a
+      conditional, a tuple target): every binding must hold the size
+      the first one holds, and one that does not keeps its own size, so
+      mypy reports it there (issue 332).
+
+    A tuple (`np.nonzero(m)`, a call of a function that returns two
+    arrays) is followed into the item a constant subscript or a tuple
+    target picks (issue 332).
 
     In a `return`, a literal size takes the name too (`return
     np.zeros(0), np.zeros(0)`), and every position declared with one
@@ -498,6 +579,30 @@ def _name_born_sizes(
     does not keeps its own size, and mypy reports the return. A size with a
     name of the signature in it (`N`, `N+1`) is never renamed.
     """
+    proper = get_proper_type(tp)
+    if isinstance(proper, TupleType):
+        if not proper.items or not _plain_tuple(proper) or not _free_return_names(ctx):
+            return tp
+        try:
+            items = [
+                _name_born_array(ctx, item, index, len(proper.items)) for index, item in enumerate(proper.items)
+            ]
+            if all(new is old for new, old in zip(items, proper.items)):
+                return tp
+            return proper.copy_modified(items=items)
+        except Exception:
+            _swallowed(ctx, "_name_born_sizes")
+            return tp
+    return _name_born_array(ctx, tp, None, 0)
+
+
+def _name_born_array(
+    ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext,
+    tp: Type,
+    item: int | None,
+    length: int,
+) -> Type:
+    """`_name_born_sizes` for one array: the hooked value, or its item `item` of `length` items."""
     proper = get_proper_type(tp)
     if not isinstance(proper, Instance) or proper.type.fullname != NDARRAY_FULLNAME or len(proper.args) != 2:
         return tp
@@ -507,8 +612,8 @@ def _name_born_sizes(
     free = _free_return_names(ctx)
     if not free:
         return tp
-    items = [get_proper_type(item) for item in shape.items]
-    if not any(_is_born_dim(item) or _is_literal_dim(item) for item in items):
+    items = [get_proper_type(i) for i in shape.items]
+    if not any(_is_born_dim(i) or _is_literal_dim(i) for i in items):
         return tp
     try:
         tree = getattr(ctx.api, "tree", None)
@@ -525,42 +630,64 @@ def _name_born_sizes(
         def here(node: ast.AST) -> bool:
             return (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col)
 
-        # (declared shape, the return and tuple index it is a position of)
+        def whole(node: ast.AST) -> bool:
+            # A tuple display starts where its first item does.
+            return here(node) and not isinstance(node, (ast.Tuple, ast.List))
+
+        def match(node: ast.AST) -> bool:
+            if item is None:
+                return whole(node)
+            return (
+                isinstance(node, ast.Subscript)
+                and whole(node.value)
+                and _const_index(node.slice, length) == item
+            )
+
+        ret_stack = getattr(ctx.api, "return_types", None)
+        want_ret = get_proper_type(ret_stack[-1]) if ret_stack else None
+        # (declared shape, and the positions it is declared at: the
+        # return, its tuple index, and the binding for a local)
         declared: list[Type] | None = None
-        direct: list[tuple[ast.Return, int]] = []
+        uses: list[tuple[ast.Return, int, tuple[int, ...]]] = []
         for ret, _ in returns:
             if ret.value is not None:
-                direct.extend((ret, -1 if p is None else p) for p in _return_positions(ret.value, here))
+                uses.extend((ret, -1 if p is None else p, ()) for p in _return_positions(ret.value, match))
         stack = getattr(getattr(ctx.api, "expr_checker", None), "type_context", None)
         context = stack[-1] if stack else None
         shapes = _array_shapes(context, len(items))
-        if len(shapes) == 1:
-            declared = shapes[0]
-        elif not direct:
-            # A plain local, bound once, that is returned.
-            ret_stack = getattr(ctx.api, "return_types", None)
+        if uses:
+            if len(shapes) == 1:
+                declared = shapes[0]
+            elif item is not None and want_ret is not None:
+                # `return np.nonzero(m)[0]`: the call is checked with no
+                # context, so the declared type is read from the return.
+                for ret, p, _ in uses:
+                    found = _shapes_at(want_ret, None if p < 0 else p, len(items))
+                    if len(found) != 1 or (declared is not None and declared != found[0]):
+                        return tp
+                    declared = found[0]
+        else:
+            bound: list[tuple[str, tuple]] = []
             for assign, fstack in assigns:
-                targets = assign.targets
-                if len(targets) != 1 or not isinstance(targets[0], ast.Name) or not here(assign.value):
-                    continue
-                name = targets[0].id
-                if not fstack or not ret_stack or not _bound_once(fstack[-1], name):
-                    break
-                want = get_proper_type(ret_stack[-1])
-                for ret, rstack in returns:
-                    if rstack != fstack or ret.value is None:
-                        continue
-                    for p in _return_positions(ret.value, lambda n: isinstance(n, ast.Name) and n.id == name):
-                        if p is None:
-                            found = _array_shapes(want, len(items))
-                        elif isinstance(want, TupleType) and p < len(want.items):
-                            found = _array_shapes(want.items[p], len(items))
-                        else:
-                            found = []
-                        if len(found) == 1 and (declared is None or declared == found[0]):
-                            declared = found[0]
-                            direct.append((ret, -1 if p is None else p))
-                break
+                bound.extend((name, fstack) for name in _bound_names(assign, match, whole, item, length))
+            # A plain local is checked under the type its first binding
+            # gave it: that is no declaration, so only a local the
+            # function annotates takes a name from its context.
+            plain = [(name, fstack) for name, fstack in bound if fstack and name not in _annotated_names(fstack[-1])]
+            if not plain:
+                if len(shapes) == 1:
+                    declared = shapes[0]
+            elif want_ret is not None:
+                site = (line, col, -1 if item is None else item)
+                for name, fstack in plain:
+                    for ret, rstack in returns:
+                        if rstack != fstack or ret.value is None:
+                            continue
+                        for p in _return_positions(ret.value, lambda n: isinstance(n, ast.Name) and n.id == name):
+                            found = _shapes_at(want_ret, p, len(items))
+                            if len(found) == 1 and (declared is None or declared == found[0]):
+                                declared = found[0]
+                                uses.append((ret, -1 if p is None else p, site))
         if declared is None:
             return tp
         new_items: list[Type] = list(shape.items)
@@ -569,10 +696,11 @@ def _name_born_sizes(
             # argument is checked under) is not this function's name.
             if not isinstance(want, TypeVarType) or want.fullname not in free or want.id != free[want.fullname].id:
                 continue
-            if not (_is_born_dim(have) or (direct and _is_literal_dim(have))):
+            if not (_is_born_dim(have) or (uses and _is_literal_dim(have))):
                 continue
             if all(
-                _fits_first((path, ret.lineno, ret.col_offset, want.fullname), (p, axis), have) for ret, p in direct
+                _fits_first((path, ret.lineno, ret.col_offset, want.fullname), (p, axis, *site), have)
+                for ret, p, site in uses
             ):
                 new_items[axis] = want
                 if isinstance(have, TypeVarType) and _is_unknown_fullname(have.fullname):
