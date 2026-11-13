@@ -24,6 +24,7 @@ from ._heads import (
 import ast
 
 from ._returns import _module_ast
+from ._casts import _report_cast
 from ._unknowns import _fresh_mask_count
 from ._ops import flatnonzero_function_hook
 from ._reshape import (
@@ -1723,13 +1724,15 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
     mask-length errors fire on writes too, then requires the value to
     broadcast one-directionally into the target. Scalars always fit;
     unpack and unknown targets bail. Returns the stub default (None) in
-    every case.
+    every case. The value's dtype is the opt-in `[numty-cast]` check
+    (issue 308), made whatever the shapes are.
     """
     pairs = _all_positionals(ctx)
     if len(pairs) != 2:
         return ctx.default_return_type
     index_pair, value_pair = pairs[0], pairs[1]
     value_type = value_pair[0]
+    _report_cast(ctx, ctx.type, value_type)
     # Union LHS: emit target errors per member, then bail on the value.
     if _union_members(ctx.type) is not None:
         _distribute_solve([ctx.type], lambda t: _getitem_types(ctx, t, index_pair))

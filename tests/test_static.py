@@ -6455,3 +6455,44 @@ def test_svd_qr_symbolic_reduced_is_not_square() -> None:
     assert '(got "ndarray[tuple[?U@17, d], dtype[float64]]", expected "ndarray[tuple[d, d]' in errors[17][0]
     assert all(errors[line][0].endswith("[return-value]") for line in errors), result.stdout
     assert _run_fixture("bad_svd_symbolic.py") == ["(2, 3) (2, 3) (3, 3)"]
+
+
+def test_setitem_cast_optin() -> None:
+    # Issue 308: an indexed assignment casts with casting="unsafe", so
+    # floats written into an integer array are truncated silently. The
+    # opt-in `numty-cast` code reports a value whose kind the target
+    # cannot hold (numpy's can_cast(..., "same_kind") is False); default
+    # mode is silent, and the in-place `rows += times` the stubs refuse
+    # is not a setitem and is not reported again.
+    fixture = FIXTURES / "bad_setitem_cast.py"
+    off = run_mypy(fixture)
+    assert off.returncode == 0, off.stdout
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-cast"))
+    messages = _messages_by_line(on)
+    assert sorted(messages) == [17, 18, 19, 20, 21, 22, 23, 24, 28, 29, 30, 31, 32, 33, 37], on.stdout
+    assert all(len(messages[line]) == 1 for line in messages), on.stdout
+    assert all(messages[line][0].endswith("use .astype(...) if this is meant  [numty-cast]") for line in messages)
+    truncated = "(values are truncated); use .astype(...) if this is meant  [numty-cast]"
+    for line in (17, 18, 20, 21, 24):
+        assert messages[line] == [f"assignment casts float32 into int64 {truncated}"], on.stdout
+    assert messages[19] == messages[22] == [f"assignment casts float into int64 {truncated}"], on.stdout
+    assert messages[23] == messages[37] == [f"assignment casts float64 into int64 {truncated}"], on.stdout
+    assert messages[28][0].startswith("assignment casts complex128 into float64 (the imaginary part is dropped);")
+    assert messages[29][0].startswith(
+        "assignment casts complex128 into int32 (the imaginary part is dropped and values are truncated);"
+    )
+    assert messages[30][0].startswith("assignment casts float64 into bool (values become True or False);")
+    assert messages[31][0].startswith("assignment casts int32 into bool (values become True or False);")
+    assert messages[32][0].startswith("assignment casts int into bool (values become True or False);")
+    assert messages[33][0].startswith("assignment casts int32 into uint8 (negative values wrap around);")
+    assert _run_fixture("bad_setitem_cast.py") == ["[0, 1, 2, 3]", "[255, 3]", "[False, True]"]
+
+
+def test_setitem_cast_ok_stays_clean() -> None:
+    # Issue 308: integer into float, same-kind widths, Python scalars that
+    # fit, `.astype(...)` and unknown dtypes are silent with the code on.
+    fixture = FIXTURES / "setitem_cast_ok.py"
+    assert run_mypy(fixture).returncode == 0
+    on = run_mypy(fixture, flags=("--enable-error-code", "numty-cast"))
+    assert on.returncode == 0, on.stdout
+    assert _run_fixture("setitem_cast_ok.py") == ["[1.0, 2.0, 3.0] [0, 1, 2] [False, True]"]

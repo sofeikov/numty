@@ -137,3 +137,13 @@ its own, not the whole write: in a buffer `a = np.empty((x.shape[0], n))`
 of shape `(N, int)`, `a[:, -1] = np.ones(x.shape[0] + 1)` is `cannot
 assign value of shape (N+1,) into target of shape (N,)`
 (`tests/fixtures/bad_setitem_int_axis.py`).
+
+The dtype of the value is checked under the opt-in `numty-cast` code
+(`enable_error_code = numty-cast`). numpy casts an indexed assignment
+with `casting="unsafe"`, so `rows[:] = times` with `rows: I64[N]` and
+`times: F32[N]` truncates the floats with no error at run time; with
+the code on it is `assignment casts float32 into int64 (values are
+truncated); use .astype(...) if this is meant`. Integer into float,
+Python scalars that fit and unknown dtypes stay silent, and
+`.astype(...)` on the value says the cast is meant (see
+[Error codes](../reference/error-codes.md#lossy-indexed-assignment-the-opt-in-numty-cast-code)).

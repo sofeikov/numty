@@ -10,15 +10,15 @@ from mypy.plugin import Plugin
 
 # Phase 5 (#199) facade: eager submodule imports + explicit re-exports.
 from . import (  # noqa: F401
-    _broadcast, _broadcast_core, _builders, _callbind, _callsite, _dtypes, _einsum, _errors, _exprs, _fft, _forms,
-    _frames, _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _returns, _state, _trace,
+    _broadcast, _broadcast_core, _builders, _callbind, _callsite, _casts, _dtypes, _einsum, _errors, _exprs, _fft,
+    _forms, _frames, _heads, _hooks, _indexing, _linalg, _matmul, _ops, _reshape, _reductions, _returns, _state, _trace,
     _types, _unions, _unknowns,
 )
 from ._state import (  # noqa: F401
     STATE
 )
 from ._errors import (  # noqa: F401
-    NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_INTERNAL, NUMTY_NAMES,
+    NUMTY_ANNOTATION, NUMTY_AXIS, NUMTY_BAIL, NUMTY_BROADCAST, NUMTY_CALLSITE, NUMTY_CAST, NUMTY_INTERNAL, NUMTY_NAMES,
     NUMTY_SHAPE, NUMTY_UNSOLVED, _CANARY_BY_MODULE, _CANARY_FULLNAMES, _MIN_NUMPY_VERSION,
     _TESTED_MYPY_MAJOR, _TESTED_MYPY_MINOR, _TESTED_MYPY_VERSION, _bail, _mypy_version_warning,
     _numpy_version_warning, _numty_debug, _parse_version_tuple, _swallowed, _warn_startup,
@@ -45,6 +45,9 @@ from ._exprs import (  # noqa: F401
     _EXPR_PREFIX, _LATE_PREFIXES, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _expr_var,
     _form_from_fullname, _form_of, _implicit_scope_vars, _materialize_dim, _mono_str, _ns_of_ctx,
     _normalize_ns, _resolve_dim, _seen_vars, _short_var, _current_scope_vars, _iter_tvarlikes,
+)
+from ._casts import (  # noqa: F401
+    _array_dtype, _report_cast, _value_kind,
 )
 from ._fft import (  # noqa: F401
     _complex_dtype, _fft_axis_n, _fft_pair, _fft_s_axes, _fftn_solve, _rfft_complex_input,
