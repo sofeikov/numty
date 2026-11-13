@@ -774,6 +774,41 @@ def _fam_ensure_implicit(
     return bound
 
 
+def _fam_bind_local_name(ctx: AnalyzeTypeContext, arg: UnboundType, late_bound: set[str]) -> None:
+    """Bind a size TypeVar that a function names in its body only.
+
+    `frame_id: I64[Rows] = frame["id"].to_numpy()` in a function whose
+    signature does not mention `Rows`: mypy refuses it (`Type variable
+    "Rows" is unbound`), so a size read inside the body could not be
+    named there. Inside a function, such a name is bound here, once per
+    function (the object is kept by namespace and fullname, as for the
+    implicit dims of a string spec), so every local annotated with it
+    has the same size. At module or class level nothing changes.
+    """
+    try:
+        analyzer = cast(TypeAnalyser, ctx.api)
+        if analyzer.allow_unbound_tvars or not analyzer.api.is_func_scope():
+            return
+        scope = analyzer.tvar_scope
+        sym = analyzer.lookup_qualified(arg.name, arg, suppress_errors=True)
+        if sym is None or not isinstance(sym.node, TypeVarExpr) or not sym.fullname:
+            return
+        if scope.get_binding(sym) is not None or not scope.allow_binding(sym.fullname):
+            return
+        upper = get_proper_type(sym.node.upper_bound)
+        if not (isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME):
+            return
+        key = (_normalize_ns(scope.namespace), sym.fullname)
+        cached = _implicit_scope_vars.get(key)
+        if cached is not None and getattr(cached, "fullname", None) == sym.fullname:
+            scope.bind_existing(cached)
+            return
+        _implicit_scope_vars[key] = scope.bind_new(arg.name, sym.node, analyzer.fail_func, arg)
+        late_bound.add(sym.fullname)
+    except Exception:
+        _swallowed(ctx, "_fam_bind_local_name")
+
+
 def _fam_bare(
     ctx: AnalyzeTypeContext, head: str, arg: UnboundType,
     late_bound: set[str]) -> int | Type:
@@ -789,6 +824,7 @@ def _fam_bare(
             f'{head} dim "{arg.name}" is not a TypeVar or integer;'
             " declare a TypeVar for it, or use Unpack[Ts]"
         )
+    _fam_bind_local_name(ctx, arg, late_bound)
     analyzed = ctx.api.analyze_type(arg)
     if isinstance(analyzed, TypeVarType):
         upper = get_proper_type(analyzed.upper_bound)

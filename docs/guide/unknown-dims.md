@@ -122,10 +122,27 @@ selection count is: `seconds - seconds[starts]` with `seconds: F64[N]`
 is `N and ?K@12 are different names`
 (`tests/fixtures/bad_own_size_optin.py`).
 
-What stays out: a name used only in the body (`Type variable "E" is
-unbound`, mypy's own rule: bind it in the return), a bare parameter
-returned under a free name, and a name a parameter binds, which is the
-caller's and still refuses an unknown.
+**A name used only in the body** works the same way. With mypy alone
+a TypeVar the signature does not mention is `Type variable "Rows" is
+unbound`. Under one of the numty heads (`F64[Rows]`, `Arr[Any, Rows]`,
+`Floating[Rows]`) it is bound for the body, once per function, so the
+arrays read from one frame can share a size in a function that returns
+none of them:
+
+```python
+def report(frame: pl.DataFrame) -> pl.DataFrame:
+    frame_id: I64[Rows] = frame["frameId"].to_numpy()
+    seconds: F64[Rows] = frame["seconds"].cast(pl.Float64).to_numpy()
+    np.diff(frame_id) > seconds     # Rows-1 vs Rows
+```
+
+At module or class level the name is still unbound, and a plain
+generic alias (`MyVec[Rows]` for `np.ndarray[tuple[Rows], ...]`) is
+mypy's to analyze, so it still needs the name in the signature
+(`tests/fixtures/local_only_name.py`).
+
+What stays out: a bare parameter returned under a free name, and a name
+a parameter binds, which is the caller's and still refuses an unknown.
 
 ## Dynamic sizes in returned values
 
