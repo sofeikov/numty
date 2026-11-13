@@ -24,10 +24,13 @@ def f(table: F32[P, E], rows: Index[P, E], valid: I64[E], order: I64[E]) -> None
 
 if __name__ == "__main__":
     t = np.zeros((3, 5), dtype=np.float32)
-    r, c = np.array([0, 1, 2, 0, 1]), np.arange(5)
+    # Two lines: records are kept per line, so `r, c = ..., np.arange(5)`
+    # would give `r` the record of `c` (both are (5,)).
+    r = np.array([0, 1, 2, 0, 1])
+    c = np.arange(5)
     k = np.array([True, False, True, True, False])
     print(t[r[k], c[k]].shape)
     try:
-        t[c[k], r[k]]
+        t[c[k], r[k]]  # E (opt-in): positions on 5 on the axis of size 3
     except IndexError as exc:
         print(type(exc).__name__)

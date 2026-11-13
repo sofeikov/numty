@@ -24,7 +24,12 @@ resizes).
 stacked axis, `vstack`/`hstack`/`dstack`/`column_stack` promote then
 concatenate — including enum-driven stacks; mismatches error. Lists
 built at runtime whose items share one shape (typed lists, list
-comprehensions) leave only the joined axis unknown.
+comprehensions) leave only the joined axis unknown. Items typed as a
+union of arrays of one rank join too: `np.hstack([l.ravel() for l in
+(W, b)])` is `(?U,)`. An axis the join does not grow keeps a name one
+item has there against an `int` or unknown size, since the items must
+agree: `np.hstack` of two `(N, N, ?U)` arrays is `(N, 2*N, ?U)`. Two
+unknowns, or two different names, make it unknown.
 
 ## Reshape
 
@@ -33,6 +38,11 @@ Conserves the total with symbolic sizes and infers `-1`
 `(N, 10)` to `(M, 10)` bails). Over `*Ts` the spelled target is the
 whole new shape (`(*Ts, 2, 3)` to `(6,)`; a `-1` that would absorb
 `*Ts`, or a total no `*Ts` can absorb, bails or errors respectively).
+A target spelled in literals and names, with no `-1`, is the result
+whatever the input's size, since numpy raises otherwise: from a `?U`
+slice (`np.reshape(p[k:k + n * h], (n, h))`), from an `int` input, and
+to a tuple-typed value (`x.reshape(W.shape)`) it is `(N, H)` for `n: N`,
+`h: H`, in the method form (`p.reshape(n, h)`) as in the function form.
 
 ## Rank changes
 
@@ -126,9 +136,15 @@ lengths are an error, two different names an opt-in report.
 `np.array` of a list
 comprehension or of a `list[...]` value has one `?U` axis in front:
 `np.array([i == 1 for i in kinds])` is `(?U,)` bool, and a list of
-`F64[N]` items is `(?U, N)`, as for `np.stack`. `np.array([a, b])` of
+`F64[N]` items is `(?U, N)`, as for `np.stack`. An unfiltered
+comprehension with one `for` over a known size has that many items, in
+`np.array` and `np.stack`: over `range(3)` it is 3, over the rows of an
+`(N, M)` array, `zip` of such arrays or `enumerate` of one it is `N`,
+over a tuple of two arrays 2. A filter (`if`), a second `for`, or an
+`int` length (`range(n)` with `n: int`) leave the `?U`. `np.array([a, b])` of
 two arrays of one shape is `(2, *shape)`. The dtype is the one the call
-names, else `bool` for `bool` items, else the item arrays' dtype; for
+names, else `bool` for `bool` items (a display too: `np.array([True])`
+is `(1,)` bool), else the item arrays' dtype; for
 `int` and `float` items it is left to numpy's stubs, because a
 `list[int]` may hold bools and a `list[float]` may hold ints. A builder
 whose sizes are all runtime ints keeps the dtype it is given

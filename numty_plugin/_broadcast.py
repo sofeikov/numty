@@ -20,11 +20,10 @@ from ._dtypes import (
 )
 from ._types import (
     DTYPE_FULLNAME, INT_FULLNAME, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
-    _fold_int, _has_unpack, _int_value, _ndarray_parts, _ndarray_type, _parts_or_unpack, _report_mask_names,
-    _report_names, _same_own_size,
-    _shape_from_arg,
-    _split_flat, _union_members,
+    _fold_int, _has_unpack, _int_value, _kept_name, _ndarray_parts, _ndarray_type, _parts_or_unpack,
+    _report_mask_names, _report_names, _same_own_size, _shape_from_arg, _split_flat, _union_members,
 )
+from ._sequences import _comprehension_length
 from ._reshape import (
     _all_positionals, _all_positionals_expanded, _bool_value, _datetime_kind, _dims_str,
     _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _is_plain_int, _known_rank_parts,
@@ -47,7 +46,6 @@ from ._ops import (
 if TYPE_CHECKING:
     from mypy.plugin import FunctionContext
     from mypy.plugin import MethodContext
-    
 
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import Expression, FloatExpr, IndexExpr, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
@@ -120,7 +118,8 @@ def _broadcast_result(
             _report_mask_names(
                 ctx, x, y, f"broadcast at trailing axis {k} (shapes {_dims_str(a)} vs {_dims_str(b)})"
             )
-            out.append(_fresh_unknown(ctx, "bcast", k))
+            kept = _kept_name(x, y)
+            out.append(_fresh_unknown(ctx, "bcast", k) if kept is None else kept)
     shared = min(len(a), len(b))
     prefix = a[: len(a) - shared] + b[: len(b) - shared]
     return [*prefix, *reversed(out)], None
@@ -1079,9 +1078,9 @@ def _scalar_item(tp: Type, expr: Expression | None) -> tuple[str, str | None] | 
     """What a display item that is certainly a scalar brings, else None.
 
     ("exact", dtype name) for a literal (`0.0`, `3`, `True`): numpy reads
-    it in its default dtype. ("loose", builtins name) for a value typed
-    `float` / `int` / `bool` / `complex`: a `float` may hold an int and
-    an `int` a bool. ("strong", dtype name) for a numpy scalar, with
+    it in its default dtype, as is a `bool` (no subclass, issue 333). ("loose",
+    builtins name) for a value typed `float` / `int` / `complex`: a `float`
+    may hold an int and an `int` a bool. ("strong", dtype name) for a numpy scalar, with
     None for one of unknown width (`floating[Any]`). An `Any`, an array
     or a sequence is not a scalar: it may add an axis.
     """
@@ -1098,7 +1097,7 @@ def _scalar_item(tp: Type, expr: Expression | None) -> tuple[str, str | None] | 
         return ("exact", "numpy.float64")
     weak = _weak_name(tp)
     if weak is not None:
-        return ("loose", weak)
+        return ("exact", "numpy.bool") if weak == "builtins.bool" else ("loose", weak)
     key = _scalar_key(tp)
     if key is not None:
         return key
@@ -1356,12 +1355,12 @@ def _asarray_dynamic(
     """`np.array` of a list built at runtime: one unknown axis in front (issue 283).
 
     A list comprehension or a `list[...]` value has an unknowable length
-    and one item type. Items that are arrays of one declared shape give
-    `(?U, *shape)`, as `np.stack` does. Items that are scalars give
-    `(?U,)`. The dtype is the one the call names, else `bool` for `bool`
-    items (exact: `bool` has no subclass), else the dtype of a numpy
-    scalar item, else the stubs' answer: a `list[int]` may hold bools and
-    a `list[float]` may hold ints, so nothing is claimed for them here.
+    (not an unfiltered comprehension over a known size, issue 333) and
+    one item type. Items that are arrays of one declared shape give
+    `(?U, *shape)`, as `np.stack` does; scalars give `(?U,)`. The dtype
+    is the one the call names, else `bool` for `bool` items (exact), else
+    the dtype of a numpy scalar item, else the stubs' answer: a
+    `list[int]` may hold bools, a `list[float]` ints; nothing is claimed.
     """
     from numty_plugin import _fresh_unknown
 
@@ -1374,7 +1373,8 @@ def _asarray_dynamic(
         return _asarray_stub(ctx, named)
     if item is None:
         return _asarray_stub(ctx, named)
-    lead = _fresh_unknown(ctx, "asarray", 0)
+    lead = _comprehension_length(ctx, expr)
+    lead = _fresh_unknown(ctx, "asarray", 0) if lead is None else lead
     part = _ndarray_parts(item)
     if part is not None:
         dims = _apply_ndmin(ctx, [lead, *part[0]])

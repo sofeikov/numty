@@ -4511,11 +4511,13 @@ def test_any_dim_arithmetic_keeps_rank() -> None:
     assert result.returncode == 0, result.stdout
     notes = reveals_by_line(result)
     f64 = "numpy.dtype[numpy.float64]"
-    for line in (17, 18, 19, 29):
+    for line in (17, 19, 29):
         assert notes[line] == f'"numpy.ndarray[tuple[?U@{line}], {f64}]"', result.stdout
+    # Issue 333: a name against an `Any` dim keeps the name.
+    assert notes[18] == f'"numpy.ndarray[tuple[N], {f64}]"', result.stdout
     for line in (20, 21):
-        assert notes[line] == f'"numpy.ndarray[tuple[Literal[3], ?U@{line}], {f64}]"', result.stdout
-    assert notes[22] == '"numpy.ndarray[tuple[?U@22], numpy.dtype[numpy.bool[bool]]]"', result.stdout
+        assert notes[line] == f'"numpy.ndarray[tuple[Literal[3], N], {f64}]"', result.stdout
+    assert notes[22] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.bool[bool]]]"', result.stdout
     assert notes[23] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
     assert notes[28] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
     # The result of the call keeps its rank in the next operations.
@@ -4624,11 +4626,12 @@ def test_any_dim_keeps_rank_in_ufuncs() -> None:
     assert result.returncode == 0, result.stdout
     notes = reveals_by_line(result)
     f64 = "numpy.dtype[numpy.float64]"
+    # Issue 333: the name of `c` is kept against the `Any` dim.
     for line in (12, 14, 15, 16, 21):
-        assert notes[line] == f'"numpy.ndarray[tuple[?U@{line}], {f64}]"', result.stdout
+        assert notes[line] == f'"numpy.ndarray[tuple[N], {f64}]"', result.stdout
     for line in (13, 17, 18, 19, 20):
         assert notes[line] == f'"numpy.ndarray[tuple[Any], {f64}]"', result.stdout
-    assert notes[22] == '"numpy.ndarray[tuple[?U@22], numpy.dtype[numpy.bool[bool]]]"', result.stdout
+    assert notes[22] == '"numpy.ndarray[tuple[N], numpy.dtype[numpy.bool[bool]]]"', result.stdout
 
 
 def test_any_dim_keeps_rank_outside_broadcast() -> None:
@@ -4877,8 +4880,9 @@ def test_property_and_method_own_size_is_unknown() -> None:
     assert notes[45] == f'"numpy.ndarray[tuple[?c.E], {_I64}]"', result.stdout
     assert notes[46] == f'"numpy.ndarray[tuple[?c.E], {_I64}]"', result.stdout
     assert notes[47] == f'"numpy.ndarray[tuple[?E@47], {_I64}]"', result.stdout
-    # `scores: F64[E]` plus the property is not `F64[E]`.
-    assert notes[48] == f'"numpy.ndarray[tuple[?U@48], {_F64}]"', result.stdout
+    # `scores: F64[E]` plus the property broadcasts to `E` (issue 333):
+    # the property's size is E or 1 whenever the sum is valid.
+    assert notes[48] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
     # A size of the class is still the caller's.
     assert notes[49] == f'"numpy.ndarray[tuple[E], {_F64}]"', result.stdout
     assert notes[50] == (
@@ -4970,7 +4974,8 @@ def test_coverage_batch() -> None:
         15: f'"{_ND}[tuple[?U@15], numpy.dtype[numpy.signedinteger[{_NB}_32Bit]]]"',
         16: f'"{_ND}[tuple[Literal[2], N], {_F64}]"',
         17: f'"{_ND}[tuple[N, Literal[2]], {_F64}]"',
-        18: f'"{_ND}[tuple[?U@18, N], {_F64}]"',
+        # A comprehension over a two-item tuple has two items (issue 333).
+        18: f'"{_ND}[tuple[Literal[2], N], {_F64}]"',
         19: f'"{_ND}[tuple[int, N], {_F64}]"',
         20: f'"{_ND}[tuple[int, int], {_F64}]"',
         21: f'"list[{_ND}[tuple[?U@21b], {_I64}]]"',
@@ -5503,13 +5508,13 @@ def test_return_of_helper_result() -> None:
     # only, so `return np.zeros(n)` passed and `return helper(n)`, with
     # `helper(...) -> F64[int]`, did not. A call of a project function or
     # method is covered through its signature. A literal that disagrees,
-    # an unknown, two names and a bare parameter (which is no call) are
-    # still errors.
+    # two names and a bare parameter (which is no call) are still errors.
+    # `a + helper(n)` is `(N,)` since issue 333: the name is kept against `int`.
     result = run_mypy(FIXTURES / "bad_ret_helper.py")
     assert result.returncode == 1, result.stdout
     errors = _errors_by_line(result)
-    assert sorted(errors) == [39, 48, 52, 56], result.stdout
-    for line in (39, 48, 52, 56):
+    assert sorted(errors) == [39, 52, 56], result.stdout
+    for line in (39, 52, 56):
         assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), result.stdout
     assert "tuple[Any, Literal[3]]" in errors[39][0] and "tuple[N, Literal[4]]" in errors[39][0], result.stdout
     assert "tuple[int]" in errors[52][0], result.stdout
@@ -5635,12 +5640,16 @@ def test_index_record_survives_a_selection() -> None:
     off = run_mypy(fixture)
     assert off.returncode == 0, off.stdout
     on = _errors_by_line(run_mypy(fixture, flags=("--enable-error-code", "numty-names")))
-    assert sorted(on) == [15, 17, 19, 20], on
+    assert sorted(on) == [15, 17, 19, 20, 34], on
     for line in (15, 17, 19, 20):
         assert len(on[line]) == 2, on
         assert "index positions on axis 0 (shape (P, E)): E and P are different names" in on[line][0], on
         assert "index positions on axis 1 (shape (P, E)): P and E are different names" in on[line][1], on
         assert all(text.endswith("[numty-names]") for text in on[line]), on
+    # The demo's IndexError line: since issue 333 `np.array([True, ...])`
+    # is a bool mask, so `c[k]` keeps the record of `np.arange(5)`.
+    assert len(on[34]) == 1, on
+    assert "index positions on 5 used on axis 0 of size 3 (shape (3, 5))" in on[34][0], on
     assert _run_fixture("index_selection.py") == ["(3,)", "IndexError"]
 
 
@@ -6455,3 +6464,57 @@ def test_svd_qr_symbolic_reduced_is_not_square() -> None:
     assert '(got "ndarray[tuple[?U@17, d], dtype[float64]]", expected "ndarray[tuple[d, d]' in errors[17][0]
     assert all(errors[line][0].endswith("[return-value]") for line in errors), result.stdout
     assert _run_fixture("bad_svd_symbolic.py") == ["(2, 3) (2, 3) (3, 3)"]
+
+
+# Issue 333: a named size stays named where numty knows it. A broadcast
+# of a name against an `int`, `Any` or `?U` size is the name; a reshape
+# to a target in names has that shape (also from a `?U` input, a
+# `W.shape` target and the method form); a join keeps the names of the
+# axes it does not grow and reads union items of one rank; an unfiltered
+# comprehension over a known size has that many items; `np.array([True])`
+# is bool.
+def test_kept_names_ok() -> None:
+    result = run_mypy(FIXTURES / "kept_names_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[27] == f'"{_ND}[tuple[N, N], {_F64}]"', result.stdout
+    assert notes[28] == f'"{_ND}[tuple[N], {_F64}]"', result.stdout
+    assert notes[34] == f'"{_ND}[tuple[N, c], {_F64}]"', result.stdout
+    for line in (39, 40, 41, 42, 43):
+        assert notes[line] == f'"{_ND}[tuple[N, H], {_F64}]"', result.stdout
+    assert notes[54] == f'"{_ND}[tuple[N, 2*N, ?U@54], {_F64}]"', result.stdout
+    assert notes[55] == f'"{_ND}[tuple[?U@55], {_F64}]"', result.stdout
+    assert notes[59] == f'"{_ND}[tuple[Literal[3], d], {_F64}]"', result.stdout
+    assert notes[61] == f'"{_ND}[tuple[N], {_F64}]"', result.stdout
+    assert notes[66] == f'"{_ND}[tuple[Literal[1]], {_BOOL}]"', result.stdout
+    assert notes[68] == f'"{_ND}[tuple[N], {_BOOL}]"', result.stdout
+    names = run_mypy(FIXTURES / "kept_names_ok.py", flags=("--enable-error-code", "numty-names"))
+    assert names.returncode == 0, names.stdout
+    assert _run_fixture("kept_names_ok.py") == ["(3, 3) (4, 2)", "(2, 3)", "(4,) (4,)", "(9,) (3, 6, 1)"]
+
+
+def test_kept_names_catch_later_bugs() -> None:
+    result = run_mypy(FIXTURES / "bad_kept_names.py")
+    messages = _messages_by_line(result)
+    assert sorted(messages) == [13, 17, 25, 29, 33, 38], result.stdout
+    assert all(len(texts) == 1 for texts in messages.values()), result.stdout
+    swapped = (
+        'Incompatible return value type (got "ndarray[tuple[H, N], dtype[float64]]", '
+        'expected "ndarray[tuple[N, H], dtype[float64]]")  [return-value]'
+    )
+    assert messages[13] == messages[17] == [swapped], result.stdout
+    assert messages[25] == [
+        'Incompatible return value type (got "ndarray[tuple[N, 2*N, K], dtype[float64]]", '
+        'expected "ndarray[tuple[N, N, K], dtype[float64]]")  [return-value]'
+    ], result.stdout
+    assert messages[29] == [
+        "broadcast shapes disagree at trailing axis 0: N-1 vs N (shapes (N-1,) vs (N,))  [numty-broadcast]"
+    ], result.stdout
+    assert messages[33] == [
+        "broadcast shapes disagree at trailing axis 0: H vs H-1 (shapes (?U@33, H) vs (H-1,))  [numty-broadcast]"
+    ], result.stdout
+    assert messages[38] == [
+        "boolean index did not match indexed array along axis 0; size of axis is (N,) but size of "
+        "corresponding boolean axis is (N+1,) (shape (N,))  [numty-axis]"
+    ], result.stdout
+    assert _run_fixture("bad_kept_names.py") == ["(2, 4, 1) (2, 2, 2)", "ValueError", "ValueError", "IndexError"]
