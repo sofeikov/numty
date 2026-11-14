@@ -7231,3 +7231,42 @@ def test_array_rank_catch() -> None:
 def test_coverage_idioms_ok() -> None:
     result = run_mypy(FIXTURES / "coverage_idioms_ok.py")
     assert result.returncode == 0, result.stdout
+
+
+# Review of issues 349-351, 360: a zero-size stand-in turns only its 0s
+# into `int`; r_/c_ read a 0-d array as a scalar; a 1-D object array's
+# concatenate is the stubs'; np.poly keeps float32; an attribute set
+# again in its class, or a module name bound again, keeps the stubs'
+# answer for a display or a scalar.
+def test_coverage_review_ok() -> None:
+    result = run_mypy(FIXTURES / "coverage_review_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        13: f'"{_ND}[tuple[int, Literal[3]], {_F64}]"',
+        15: f'"{_ND}[tuple[N+1], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[1], Literal[2]], {_F64}]"',
+        19: f'"{_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+        21: f'"{_ND}[tuple[N+1], {_F32}]"',
+        22: f'"{_ND}[tuple[N+1], {_F32}]"',
+        33: f'"{_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+        34: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
+        46: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
+        51: f'"{_ND}[tuple[()], {_F64}]"',
+    }, result.stdout
+
+
+def test_coverage_review_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_coverage_review.py")
+    assert _messages_by_line(result) == {
+        12: ["matmul inner dimensions disagree: 3 vs 4  [numty-shape]"],
+        19: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[2], Literal[2]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[3], Literal[3]], dtype[float64]]")  [assignment]'
+        ],
+        22: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[2], Literal[2]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[3], Literal[3]], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout

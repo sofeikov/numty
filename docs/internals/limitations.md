@@ -199,7 +199,8 @@ quiet, where it is approximate, and what to write instead.
     forms bail out. Same for unknown `keepdims`.
 - A zero-size builder that is a whole branch of a conditional (`A2 =
     f(A) if A is not None else np.zeros((0, 0))`, scipy's
-    `abcd_normalize`) has `int` sizes, not literal 0s: such code tells the
+    `abcd_normalize`) has `int` sizes where it has 0s (`np.zeros((0, 3))`
+    is `(int, 3)`): such code tells the
     stand-in apart later by `.size == 0` or an `or` over its sizes, which
     numty does not follow, and a literal `(0, 0)` member would not fit a
     declared `F64[N, N]` (issue 349). Only a conditional that is the value
@@ -214,7 +215,10 @@ quiet, where it is approximate, and what to write instead.
     shortened axis `int`; `np.concatenate` of one array leaves a product
     of two names unknown; a size written `n ** 2` stays `int`; `np.array`
     of a display, a repetition or a scalar keeps the stubs' answer as the
-    value of a local bound again.
+    value of a local, an attribute or a module name bound again. An
+    attribute counts as bound again only by another binding in its own
+    class or outside every class: a subclass or another class setting
+    `obj.Q` is not seen, and mypy's own `[assignment]` error stays.
 
 ## Aliases and masked arrays
 

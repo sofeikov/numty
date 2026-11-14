@@ -567,9 +567,10 @@ def _zeros_of(
     if 0 in dims and _is_conditional_branch(ctx, ctx.context):
         # An empty stand-in, `A2 = f(A) if A is not None else np.zeros((0, 0))`
         # (scipy's abcd_normalize): the code tells it apart later by `.size`
-        # or an `or` over its sizes, which numty does not follow. Its sizes
-        # are `int`, so the union still fits the declared `F64[N, N]`.
-        dims = [ctx.api.named_generic_type(INT_FULLNAME, []) if isinstance(d, int) else d for d in dims]
+        # or an `or` over its sizes, which numty does not follow. Its 0
+        # sizes are `int`, so the union still fits the declared `F64[N, N]`;
+        # the other sizes stay, or mypy's join would lose the other branch's.
+        dims = [ctx.api.named_generic_type(INT_FULLNAME, []) if isinstance(d, int) and d == 0 else d for d in dims]
     if not _dims_fit_intp(ctx, dims):
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -1425,7 +1426,12 @@ def _concatenate_array(
 
     `(2, n, m)` along axis 1 is `(n, 2*m)`; a product of two names
     (`(k, n, m)`) is an unknown. With `axis=None` it is the flat total. A 1-D array has 0-d items, which numpy refuses.
+    A 1-D object (or unknown-dtype) array's items may be arrays themselves
+    (ragged chunks in `np.empty(k, dtype=object)`), so it is left to the
+    stubs.
     """
+    if len(dims) == 1 and _items_may_be_arrays(dtype):
+        return ctx.default_return_type
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
         if named is None:
@@ -1464,6 +1470,19 @@ def _concatenate_array(
         # bound to a product (issue 359).
         out[norm] = _fresh_unknown(ctx, "concatenate", norm)
     return _ndarray_type(ctx, out, dtype)
+
+
+def _items_may_be_arrays(dtype: Type) -> bool:
+    """`Any`, `dtype[Any]` or `dtype[object_]`: items numty cannot see."""
+    proper = get_proper_type(dtype)
+    if isinstance(proper, AnyType):
+        return True
+    if not isinstance(proper, Instance) or len(proper.args) != 1:
+        return False
+    element = get_proper_type(proper.args[0])
+    return isinstance(element, AnyType) or (
+        isinstance(element, Instance) and element.type.fullname == "numpy.object_"
+    )
 
 
 def _concatenate_items(

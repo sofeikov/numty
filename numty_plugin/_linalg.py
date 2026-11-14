@@ -1365,10 +1365,11 @@ def poly_function_hook(ctx: FunctionContext) -> Type:
 
     `poly(z)` of `(k,)` roots and `poly(A)` of an `(n, n)` matrix (its
     characteristic polynomial) have one coefficient more than there
-    are roots: `(k+1,)`, `(n+1,)`. A real input gives float64 (complex
-    roots of a real polynomial come in pairs); a complex one is left to
-    the stubs. A 0-d input is one root; any other rank is numpy's
-    ValueError.
+    are roots: `(k+1,)`, `(n+1,)`. A real input gives float32 for
+    float32 and float64 otherwise (complex roots of a real polynomial
+    come in pairs); a complex one, and a float16 or long double matrix
+    (numpy's eigvals refuses those), are left to the stubs. A 0-d input
+    is one root; any other rank is numpy's ValueError.
     """
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
@@ -1388,7 +1389,9 @@ def poly_function_hook(ctx: FunctionContext) -> Type:
     ks = _dtype_kind_size(dtype)
     if ks is None or ks[0] not in ("b", "i", "u", "f"):
         return ctx.default_return_type
-    out_dtype = _construct_dtype(ctx, "numpy.float64")
+    if ks[0] == "f" and ks[1] not in (4, 8) and len(dims) == 2:
+        return ctx.default_return_type
+    out_dtype = _construct_dtype(ctx, "numpy.float32" if ks == ("f", 4) else "numpy.float64")
     if out_dtype is None:
         return ctx.default_return_type
     size = _dim_add2(ctx, "poly", 0, dims[-1], 1)

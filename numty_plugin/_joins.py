@@ -47,7 +47,7 @@ def _scalar_item_dtype(
 
 
 def _index_trick_items(ctx: MethodContext) -> list[Item] | None:
-    """Items of `np.r_[...]` / `np.c_[...]`: arrays as they are, scalars as (1,)."""
+    """Items of `np.r_[...]` / `np.c_[...]`: arrays as they are, scalars and 0-d arrays as (1,)."""
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         return None
@@ -66,7 +66,8 @@ def _index_trick_items(ctx: MethodContext) -> list[Item] | None:
         parts = _ndarray_parts(item_tp)
         if parts is not None:
             dims, dtype = parts
-            items.append((list(dims), dtype))
+            # numpy reads each item with ndmin=1: a 0-d array is (1,).
+            items.append((list(dims) or [1], dtype))
             continue
         scalar_dtype = _scalar_item_dtype(ctx, item_tp, item_expr)
         if scalar_dtype is None:

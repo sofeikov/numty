@@ -39,9 +39,9 @@ union of arrays of one rank join too: `np.hstack([l.ravel() for l in
 item has there against an `int` or unknown size, since the items must
 agree: `np.hstack` of two `(N, N, ?U)` arrays is `(N, 2*N, ?U)`. Two
 unknowns, or two different names (a `[numty-names]` report), make it
-unknown. `np.r_[...]` joins along the first axis and `np.c_[...]` like
-`column_stack` (a 1-D item is a column, a scalar `(1, 1)`), along the
-last. `np.block` of a nested list display promotes every item to the
+unknown. `np.r_[...]` joins along the first axis (a scalar or a 0-d
+array is `(1,)`) and `np.c_[...]` like `column_stack` (a 1-D item is a
+column, a scalar or a 0-d array `(1, 1)`), along the last. `np.block` of a nested list display promotes every item to the
 nesting depth (or the largest rank) and joins the innermost lists along
 the last axis, the lists around them along the one before:
 `np.block([a, b])` of matrices is `hstack`, `np.block([[a], [b]])` is
@@ -82,6 +82,10 @@ afterwards. `np.concatenate(x)` of one array joins its first-axis items:
 `(2, n, m)` along axis 1 is `(n, 2*m)`; a product of two names (`(k, n,
 m)`) is an unknown, since code names it on its own (`kp = k * p`
 declared `F64["kp kp"]`), as a local bound to a product stays `int`.
+A 1-D array has 0-d items, which numpy refuses, unless its dtype is
+`object` or unknown: an object array's items may be arrays (ragged
+chunks in `np.empty(k, dtype=object)`), so that one keeps the stubs'
+answer.
 
 ## Reductions
 
@@ -102,10 +106,11 @@ operand, so `(N,)` by `(T,)` is `(N, T)` and an `(N, D)` operand counts
 `D*N`), and `take` (the axis is
 swapped for the index shape; literal indices past the axis error unless
 `mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, while
-`kron` multiplies the aligned dims, symbolic ones too (`(a, a)` kron
-`(b, b)` is `(a*b, a*b)`; an `int` size gives `?U`). `dot` with a scalar or 0-d operand is multiplication (`np.dot(B, 0)` and
+`dot` with a scalar or 0-d operand is multiplication (`np.dot(B, 0)` and
 `B.dot(0)` keep `B`'s shape), and
 `linalg.norm` with an explicit `ord` needs one or two reduced axes.
+`kron` multiplies the aligned dims, symbolic ones too (`(a, a)` kron
+`(b, b)` is `(a*b, a*b)`; an `int` size gives `?U`).
 A union operand of `dot` or `matmul` solves per member, as `@` does: a
 member that fits no member of the other operand is the error
 (`matmul inner dimensions disagree: 3 vs 5`), otherwise the result is the
@@ -215,7 +220,10 @@ different lengths are numpy's error and keep the stubs' answer.
 scalar's dtype for a literal or a numpy scalar and an open dtype for a
 value typed `float` (issue 360); a scalar member of a union (`float |
 F64[n]`) keeps the stubs' answer. As the value of a local that is bound
-again (`Istar = np.array([[a, b]])`, grown in a loop), these displays,
+again (`Istar = np.array([[a, b]])`, grown in a loop), of an attribute
+set again in its class (`self.Q = np.array([[1.0, 0.0], [0.0, 1.0]])`
+in `__init__`, `self.Q = np.eye(n)` in a method) or of a module name
+bound again (at module level or under `global`), these displays,
 repetitions and scalars keep the stubs' answer, which the later
 bindings fit. The dtype is the one the call
 names, else `bool` for `bool` items (a display too: `np.array([True])`
@@ -320,7 +328,8 @@ the shape and dtype; a bool array comes back `float16`, and rounding
 one to `decimals` other than 0, which NumPy refuses, is typed `Any`
 (numty reports shape errors, not dtype errors). `np.poly` has
 one coefficient more than it has roots: `(k+1,)` for `(k,)` roots and
-`(n+1,)` for an `(n, n)` matrix, float64 for a real input; `np.roots` is
+`(n+1,)` for an `(n, n)` matrix, float32 for a float32 input and
+float64 for another real one; `np.roots` is
 `(?U,)` (leading and trailing zeros are dropped), complex or float as
 the stubs say. `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
 `dtype=` you name is used as-is when it resolves (a type such as `float`

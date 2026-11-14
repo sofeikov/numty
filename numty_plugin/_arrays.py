@@ -14,7 +14,7 @@ from ._dtypes import (
     _WEAK_DEFAULT,
 )
 from ._forms import _form_has_unknown
-from ._bindings import _value_of_rebound_name
+from ._bindings import _value_of_rebound_name, _value_of_rebound_target
 from ._types import (
     DTYPE_FULLNAME, _dim_eq, _dim_mul_const, _distribute_solve, _fold_dim_expr,
     _fold_int, _has_unpack, _ndarray_parts, _ndarray_type,
@@ -269,9 +269,11 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
         return _ndarray_type(ctx, dims, named if named is not None else part[1])
     tp, expr = pairs[0]
     # The shapes below are new (issue 360). As the value of a local that
-    # is bound again (`Istar = np.array([[a, b]])`, grown in a loop),
-    # they would refuse the later bindings: main's answer there.
-    rebound = _value_of_rebound_name(ctx, ctx.context)
+    # is bound again (`Istar = np.array([[a, b]])`, grown in a loop), or
+    # of an attribute or a global set again elsewhere (`self.Q =
+    # np.eye(n)` in another method), they would refuse the later
+    # bindings: main's answer there.
+    rebound = _value_of_rebound_name(ctx, ctx.context) or _value_of_rebound_target(ctx, ctx.context)
     if _repetition(expr) is not None:
         if rebound:
             return _asarray_stub(ctx, named)
