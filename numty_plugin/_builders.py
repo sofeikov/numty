@@ -569,7 +569,7 @@ def _zeros_of(
         # (scipy's abcd_normalize): the code tells it apart later by `.size`
         # or an `or` over its sizes, which numty does not follow. Its sizes
         # are `int`, so the union still fits the declared `F64[N, N]`.
-        dims = [ctx.api.named_type(INT_FULLNAME) if isinstance(d, int) else d for d in dims]
+        dims = [ctx.api.named_generic_type(INT_FULLNAME, []) if isinstance(d, int) else d for d in dims]
     if not _dims_fit_intp(ctx, dims):
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -1451,12 +1451,13 @@ def _concatenate_array(
         return ctx.default_return_type
     from numty_plugin import _fresh_unknown
     out = list(rest)
-    if isinstance(count, int) and isinstance(rest[norm], int):
-        out[norm] = count * rest[norm]
+    size = rest[norm]
+    if isinstance(count, int) and isinstance(size, int):
+        out[norm] = count * size
     elif isinstance(count, int):
-        out[norm] = _dim_mul_const(ctx, "concatenate", norm, rest[norm], count)
-    elif isinstance(rest[norm], int):
-        out[norm] = _dim_mul_const(ctx, "concatenate", norm, count, rest[norm])
+        out[norm] = _dim_mul_const(ctx, "concatenate", norm, size, count)
+    elif isinstance(size, int):
+        out[norm] = _dim_mul_const(ctx, "concatenate", norm, count, size)
     else:
         # A product of two names is an unknown: code names it on its
         # own (`kp = k * p` declared `F64["kp kp"]`), as for a local

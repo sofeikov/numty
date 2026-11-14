@@ -1577,7 +1577,7 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
         size = _fold_dim_expr(ctx, found_w[1], 0) if found_w[1] is not None else None
         if size is None:
             size = _dim_value(found_w[0])
-        widths = [ctx.api.named_type("builtins.int") if size is None else size]
+        widths = [ctx.api.named_generic_type("builtins.int", []) if size is None else size]
         scalar_window = True
     elif window == "bail":
         seq = _fft_seq_arg(found_w)
@@ -1601,12 +1601,12 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
             seq = _fft_seq_arg(found_ax)
             if not isinstance(seq, list):
                 return ctx.default_return_type
-            items = []
+            axis_items: list[int] = []
             for entry in seq:
                 if not isinstance(entry, int):
                     return ctx.default_return_type
-                items.append(entry)
-            axes = items
+                axis_items.append(entry)
+            axes = axis_items
         else:
             axes = None
     if axes is None:
@@ -1646,7 +1646,7 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
             # The shortened axis is `int`: code pads the input to a size
             # of its own name first (`n_padded`, which is `n + w - 1`), and
             # `n_padded - w + 1` would not be `n` (scipy's convolve1d).
-            out[ax] = ctx.api.named_type("builtins.int")
+            out[ax] = ctx.api.named_generic_type("builtins.int", [])
             continue
         if wval < 0:
             ctx.api.fail(

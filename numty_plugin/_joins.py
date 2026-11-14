@@ -182,12 +182,13 @@ def block_function_hook(ctx: FunctionContext) -> Type:
     if dtype is None:
         dtype = _default_dtype(ctx)
     promoted = [[1] * (ndim - len(dims)) + dims for _, (dims, _) in leaves]
+    out_dtype: Type = dtype
 
     def join(node: object, level: int) -> list[int | Type] | None:
         if isinstance(node, int):
             return promoted[node]
         assert isinstance(node, list)
-        parts = []
+        parts: list[list[int | Type]] = []
         for child in node:
             dims = join(child, level + 1)
             if dims is None:
@@ -197,7 +198,7 @@ def block_function_hook(ctx: FunctionContext) -> Type:
             return parts[0]
         # The outermost list (level 1) joins along axis -list_depth.
         merged = _concat_merge(
-            ctx, "block", [(dims, dtype) for dims in parts], dtype, ndim - (list_depth - level + 1)
+            ctx, "block", [(dims, out_dtype) for dims in parts], out_dtype, ndim - (list_depth - level + 1)
         )
         merged_parts = _ndarray_parts(merged)
         return None if merged_parts is None else list(merged_parts[0])
