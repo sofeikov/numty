@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
 
 from ._errors import _swallowed
-from ._forms import _REPEATS_MARK, _is_unknown_fullname
+from ._forms import _REPEATS_MARK, _is_own_size_fullname, _is_unknown_fullname
 from ._state import STATE
 
 if TYPE_CHECKING:
@@ -44,6 +44,23 @@ def _is_same_unknown(a: int | Type, b: int | Type) -> bool:
         and a.fullname == b.fullname
         and _is_unknown_fullname(a.fullname)
     )
+
+
+def _is_single_site(a: int | Type) -> bool:
+    """A site unknown minted outside a loop, a comprehension or a lambda (issue 352).
+
+    Its site ran once, so every use is one size: `q` and `r` of one
+    `np.linalg.qr` share it. One minted where it repeats stays unproved.
+    """
+    return isinstance(a, TypeVarType) and a.fullname in STATE.single_site_unknowns
+
+
+def _is_one_size_unknown(a: int | Type) -> bool:
+    """An unknown that is one size on every use: a site that ran once or an own size.
+
+    Not one minted in a loop or a comprehension (issues #63, 328).
+    """
+    return _is_single_site(a) or (isinstance(a, TypeVarType) and _is_own_size_fullname(a.fullname))
 
 
 def _unknown_display_name(module: str, line: int, fullname: str) -> str:
@@ -150,6 +167,8 @@ def _fresh_unknown(
         vid = TypeVarId.new(0)
         _unknown_ids[key] = vid
     fullname = f"__numty_unknown__.{key}"
+    if fullname not in STATE.single_site_unknowns and not _in_repeated_code(ctx):
+        STATE.single_site_unknowns.add(fullname)
     upper = ctx.api.named_generic_type("builtins.int", [])
     return TypeVarType(
         name=_unknown_display_name(module, line, fullname),

@@ -199,11 +199,12 @@ from ._frames import (  # noqa: F401
 from ._callsite import (  # noqa: F401
     _int_sizes_accept_any, _relax_dynamic_formals, _report_call_site_names, minmax_function_hook
 )
+from ._types import _shape_type  # noqa: F401
 from ._hooks import (  # noqa: F401
     NumtyPlugin, _reshape_signature_hook, _broadcast_signature_hook, _matmul_signature_hook,
     identity_method_hook, _identity_type, astype_method_hook, _astype_type, _has_expr_var,
     _subst_expr_dim, _subst_attr_type, substituted_attribute_hook, shape_attribute_hook,
-    _shape_type, t_attribute_hook, _t_type, len_function_hook, _numpy_function_hooks,
+    t_attribute_hook, _t_type, len_function_hook, _numpy_function_hooks,
     _NUMPY_FUNCTION_HOOKS,
 )
 def _installed_numpy_version() -> str | None:

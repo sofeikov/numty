@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, cast
 from mypy.errorcodes import ARG_TYPE
 from mypy.nodes import (
     ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, CallExpr, Context, Expression, IntExpr,
-    ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var,
+    ListExpr, MemberExpr, NameExpr, OperatorAssignmentStmt, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var,
 )
 from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
@@ -33,6 +33,7 @@ from ._exprs import (
     _expr_constituents, _expr_str, _form_of, _seen_vars,
 )
 from ._bindings import _mask_var_key, _single_rvalue_of
+from ._unknowns import _is_single_site
 
 NDARRAY_FULLNAME = "numpy.ndarray"
 INT_FULLNAME = "builtins.int"
@@ -245,6 +246,9 @@ _OWN_NAME_OF: dict[TypeVarId, set[str]] = {}
 def _same_own_size(a: int | Type, b: int | Type) -> bool:
     """One selection count, or one size a call chose, on both sides (issues 288, 307).
 
+    Also one site unknown minted outside a loop or a comprehension
+    (issue 352): `q` and `r` of one `np.linalg.qr` share their size.
+
     Also a free name against the unknown that took it: `sel * y[keep]`
     with `sel = x[keep]` named `K` is one count on both sides.
     """
@@ -256,7 +260,8 @@ def _same_own_size(a: int | Type, b: int | Type) -> bool:
         return True
     if b.fullname in _OWN_NAME_OF.get(a.id, ()) or a.fullname in _OWN_NAME_OF.get(b.id, ()):
         return True
-    return False
+    # One site unknown minted where it runs once (issue 352): `q @ r`.
+    return a.fullname == b.fullname and _is_single_site(a)
 
 
 def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
@@ -777,7 +782,9 @@ def _scalar_union_members(tp: Type) -> list[Type] | None:
 
     Issue 331. `F64[M] | float` and `float | int`: a union with at least
     one Python or NumPy scalar member and nothing but arrays and scalars
-    otherwise. A pure union of arrays is `_union_members`.
+    otherwise. A pure union of arrays is `_union_members`. An `Any`
+    member counts as a scalar (issue 354): `F64[5, 1] | Any` checks its
+    array member, the `Any` one solves to the stubs' answer.
     """
     proper = get_proper_type(tp)
     if not isinstance(proper, UnionType):
@@ -786,7 +793,7 @@ def _scalar_union_members(tp: Type) -> list[Type] | None:
     scalar = False
     for item in proper.items:
         item_proper = get_proper_type(item)
-        if _is_scalar_member(item_proper):
+        if _is_scalar_member(item_proper) or isinstance(item_proper, AnyType):
             scalar = True
         elif not (
             isinstance(item_proper, Instance)
@@ -876,6 +883,67 @@ def _in_loop_body(ctx: FunctionContext | MethodContext) -> bool:
     return bool(getattr(binder, "break_frames", None))
 
 
+def _target_is_union(ctx: MethodContext) -> bool:
+    """Whether the target of an in-place operator is a union, checked per member by mypy."""
+    stmt = ctx.context
+    if not isinstance(stmt, OperatorAssignmentStmt):
+        return False
+    if not isinstance(stmt.lvalue, (NameExpr, MemberExpr)):
+        return False
+    try:
+        return isinstance(get_proper_type(ctx.api.get_expression_type(stmt.lvalue)), UnionType)
+    except Exception:
+        _swallowed(ctx, "_target_is_union")
+        return True
+
+
+def shape_attribute_hook(ctx: AttributeContext) -> Type:
+    # A union's members keep a literal size as a literal where the members
+    # differ (issue 354): mypy joins the members' shapes, and `int`
+    # carrying 0 would absorb `N` (`tuple[N, N] | tuple[0?, 0?]` is
+    # `tuple[0?, 0?]`), or carrying 3 would absorb 4. An axis where every
+    # member has one int keeps the widening form, so `k = u.shape[1]`
+    # still widens to `int`.
+    members = _union_members(ctx.type)
+    if members is not None:
+        shapes = [_parts_or_unpack(member) for member in members]
+        sizes: dict[int, set[int | None]] = {}
+        for shape in shapes:
+            for axis, v in enumerate(shape[0] if shape is not None else ()):
+                sizes.setdefault(axis, set()).add(v if isinstance(v, int) else None)
+        literal = {axis for axis, seen in sizes.items() if len(seen) != 1 or None in seen}
+        return _union_results([_shape_type(ctx, member, literal) for member in members])
+    return _shape_type(ctx, ctx.type)
+
+
+def _shape_type(ctx: AttributeContext, tp: Type, literal: set[int] | None = None) -> Type:
+    parts = _parts_or_unpack(tp)
+    if parts is None:
+        return ctx.default_attr_type
+    dims, _ = parts
+    int_fallback = ctx.api.named_generic_type("builtins.int", [])
+    items: list[Type] = []
+    for axis, v in enumerate(dims):
+        if isinstance(v, int) and literal is not None and axis in literal:
+            items.append(LiteralType(v, fallback=int_fallback))
+        elif isinstance(v, int):
+            # mypy's widening form: a plain int carrying its literal
+            # value. Fresh locals widen to int (so `k = x.shape[0]; k -= 1`
+            # checks), while _int_value/_dim_value still read the value
+            # back for direct uses like reshape(x.shape[0], 3) (issue #62).
+            items.append(
+                int_fallback.copy_modified(
+                    last_known_value=LiteralType(v, fallback=int_fallback)
+                )
+            )
+        else:
+            items.append(v)
+    fallback = ctx.api.named_generic_type(
+        TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
+    )
+    return TupleType(items, fallback)
+
+
 def _union_results(results: list[Type]) -> Type:
     """Union of per-member results (collapses when they coincide)."""
     if len(results) == 1:
@@ -896,7 +964,13 @@ def _distribute_solve(types: list[Type], solve: Callable[..., Type]) -> Type | N
         return None
     width = max(len(members) for members in pairings)
     full = [members if len(members) == width else members * width for members in pairings]
-    return _union_results([solve(*combo) for combo in zip(*full)])
+    # An `Any` member (issue 354) gives Any, not the stubs' array that
+    # would absorb the other members' results.
+    results: list[Type] = []
+    for combo in zip(*full):
+        anys = [m for m in map(get_proper_type, combo) if isinstance(m, AnyType)]
+        results.append(AnyType(TypeOfAny.from_another_any, source_any=anys[0]) if anys else solve(*combo))
+    return _union_results(results)
 
 
 def _split_flat(

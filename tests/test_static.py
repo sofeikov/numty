@@ -3313,10 +3313,10 @@ def test_dot18_ok_clean() -> None:
 
 
 def test_dot_nd_mismatch() -> None:
-    assert_rank_mismatch(
+    # Issue 364: no `Never` [arg-type] follow-on from the overload trial.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_dot_nd.py"),
         "dot contracted dimensions disagree: 3 vs 4",
-        "incompatible type",
     )
 
 
@@ -6874,3 +6874,179 @@ def test_sizes_in_ints_bad() -> None:
         ],
     }, errors
     assert _run_fixture("bad_sizes_in_ints.py") == ["(5,)", "ValueError"]
+
+
+# Issue 352: np.dot / np.matmul / linalg.solve / lstsq gave Any for a scalar
+# operand, a union operand with a member that fits nothing, rows that are not
+# provably equal, and one unknown shared by both operands.
+def test_contraction_operands_ok() -> None:
+    result = run_mypy(FIXTURES / "contraction_operands_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[Literal[5], Literal[2]], {_F64}]"',
+        13: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}]"',
+        14: f'"{_ND}[tuple[Literal[5], Literal[2]], {_F64}]"',
+        18: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}] | {_ND}[tuple[Literal[5]], {_F64}]"',
+        19: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}] | {_ND}[tuple[Literal[5]], {_F64}]"',
+        # The (3,) member fits nothing, but the (2, 3) one does: as for `@`.
+        23: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}]"',
+        27: f'"{_ND}[tuple[N, Literal[3]], {_F64}]"',
+        28: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        33: f'"{_ND}[tuple[M, N], {_F64}]"',
+        35: f'"{_ND}[tuple[M, N], {_F64}]"',
+        36: f'"{_ND}[tuple[M, N], {_F64}]"',
+        37: f'"{_ND}[tuple[?U@34], {_F64}]"',
+        # Every pair, as `a @ b` gives: two parameters vary apart.
+        41: (
+            f'"{_ND}[tuple[Literal[2], Literal[1]], {_F64}] | {_ND}[tuple[Literal[2], Literal[7]], {_F64}] | '
+            f'{_ND}[tuple[Literal[4], Literal[1]], {_F64}] | {_ND}[tuple[Literal[4], Literal[7]], {_F64}]"'
+        ),
+    }, result.stdout
+
+
+def test_contraction_operands_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_contraction_operands.py")
+    assert _messages_by_line(result) == {
+        13: [
+            'Incompatible return value type (got "ndarray[tuple[Literal[5], Literal[2]], dtype[float64]]", '
+            'expected "ndarray[tuple[Literal[5], Literal[1]], dtype[float64]]")  [return-value]'
+        ],
+        17: ["matmul inner dimensions disagree: 3 vs 5  [numty-shape]"],
+        18: ["matmul inner dimensions disagree: 3 vs 5  [numty-shape]"],
+        19: ["matmul inner dimensions disagree: 4 vs 5  [numty-shape]"],
+        23: ["linalg.solve inner dimensions disagree: N vs N-1 (shapes (N, N) vs (N-1, N))  [numty-shape]"],
+        24: ["linalg.solve inner dimensions (shapes (N, N) vs (P, N)): N and P are different names  [numty-names]"],
+        25: ["linalg.lstsq inner dimensions (shapes (N, P) vs (P,)): N and P are different names  [numty-names]"],
+        30: [
+            'Incompatible return value type (got "ndarray[tuple[M, M], dtype[float64]]", '
+            'expected "ndarray[tuple[N, N], dtype[float64]]")  [return-value]'
+        ],
+        # Issue 364: no `Never` [arg-type] follow-on from the overload trial.
+        34: ["matmul inner dimensions disagree: 1 vs 5  [numty-shape]"],
+    }, result.stdout
+
+
+def test_dot_nested_names_no_follow_on() -> None:
+    # Issue 364: the inner np.dot's report failed each overload of the outer one.
+    result = run_mypy(FIXTURES / "bad_dot_nested_names.py")
+    assert _messages_by_line(result) == {
+        12: [
+            "broadcast at trailing axis 0 (shapes (N, N) vs (N, K)): N and K are different names  [numty-names]",
+            "matmul inner dimensions (shapes (K, K) vs (N, K)): K and N are different names  [numty-names]",
+        ],
+    }, result.stdout
+
+
+# Issue 354: atleast_2d / atleast_1d of a union, a right `| Any` operand,
+# a union value written into a target, `.shape` of a union with a literal
+# member and `u + u` skipped or misread members.
+def test_union_entry_points_ok() -> None:
+    result = run_mypy(FIXTURES / "union_entry_points_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        # A union and a list keep the stubs' answer: scipy's `normalize`
+        # lifts `F64[N] | F64[R, N]` and narrows on `.ndim`, which numty
+        # does not follow, and a list's rows are not followed into a
+        # declared size (filterpy's `self.sigmas_h: F64[n_sig, n_z]`).
+        16: f'"{_ND}[Any, Any]"',
+        17: f'"{_ND}[Any, Any]"',
+        18: f'"{_ND}[Any, Any]"',
+        22: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}] | Any"',
+        23: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}] | Any"',
+        28: '"N | Literal[0]"',
+        29: f'"{_ND}[tuple[N], {_F64}] | {_ND}[tuple[Literal[0]], {_F64}]"',
+        # Index-wise, as np.add(u, u): no names report on the cross pairs.
+        33: f'"{_ND}[tuple[A], {_F64}] | {_ND}[tuple[B], {_F64}]"',
+        # A union size in a tuple builds one array per size; line 41's
+        # `v += W.sum(axis=0)` keeps each member of `v` (no cross pair).
+        42: f'"{_ND}[tuple[N, Literal[3]], {_F64}] | {_ND}[tuple[Literal[0], Literal[3]], {_F64}]"',
+        # One size on every member keeps mypy's widening form.
+        45: '"int"',
+        47: f'"{_ND}[tuple[Literal[3], Literal[2]], {_F64}] | {_ND}[tuple[Literal[4], Literal[2]], {_F64}]"',
+    }, result.stdout
+
+
+def test_union_entry_points_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_union_entry_points.py")
+    assert _messages_by_line(result) == {
+        17: ["broadcast shapes disagree at trailing axis 1: 3 vs 5 (shapes (3, 1) vs (5, 1))  [numty-broadcast]"],
+        21: ["cannot assign value of shape (4,) into target of shape (3,)  [numty-broadcast]"],
+        22: ["cannot assign value of shape (3, 3) into target of shape (3,)  [numty-broadcast]"],
+        23: ["in-place result (3, 3) does not fit target (3,)  [numty-broadcast]"],
+        28: [
+            'Incompatible return value type (got "ndarray[tuple[N], dtype[float64]] | '
+            'ndarray[tuple[Literal[0]], dtype[float64]]", expected "ndarray[tuple[Literal[0]], dtype[float64]]")  '
+            "[return-value]"
+        ],
+        # A union target: each member is checked in place.
+        32: [
+            "in-place result (2, 3) does not fit target (3,)  [numty-broadcast]",
+            "broadcast shapes disagree at trailing axis 0: 4 vs 3 (shapes (4,) vs (2, 3))  [numty-broadcast]",
+        ],
+    }, result.stdout
+
+
+# Issue 355: the call-site check missed a conflict next to an `int` axis or
+# in a union-of-heads formal, read an overload item mypy did not select, and
+# a free name in the callee's return turned `int` + name into `object`.
+def test_callsite_binding_ok() -> None:
+    result = run_mypy(FIXTURES / "callsite_binding_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        23: f'"{_ND}[tuple[Literal[5]], {_F64}]"',
+        31: f'"{_ND}[tuple[?K@31], {_F64}]"',
+        32: f'"{_ND}[tuple[?K@32], {_F64}]"',
+    }, result.stdout
+
+
+def test_callsite_binding_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_callsite_binding.py")
+    i_conflict = (
+        "call-site shape conflict for 'I': 1 (argument 'b', axis 0) vs 3 (argument 'u', axis 1)  [numty-callsite]"
+    )
+    n_conflict = (
+        "call-site shape conflict for 'N': 4 (argument 'x', axis 0) vs 3 (argument 'P', axis 0)  [numty-callsite]"
+    )
+    assert _messages_by_line(result) == {
+        20: [i_conflict],
+        21: [i_conflict],
+        22: [n_conflict],
+        23: [n_conflict],
+    }, result.stdout
+
+
+# Issue 356: a size TypeVar bound through an `int` argument reaches a formula
+# return and an inline call; one fixed by the receiver is not solved again.
+def test_size_tvar_call_ok() -> None:
+    result = run_mypy(FIXTURES / "size_tvar_call_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        21: f'"{_ND}[tuple[K+1], {_F64}]"',
+        22: f'"{_ND}[tuple[Literal[11]], {_F64}]"',
+        23: f'"{_ND}[tuple[K, k], {_F64}]"',
+    }, result.stdout
+
+
+def test_size_tvar_call_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_size_tvar_call.py")
+    g_arg = (
+        'Argument 1 to "g" of "C" has incompatible type "ndarray[tuple[M], dtype[float64]]"; '
+        'expected "ndarray[tuple[N], dtype[float64]]"  [arg-type]'
+    )
+    assert _messages_by_line(result) == {
+        23: [g_arg],
+        24: [
+            'Argument 1 has incompatible type "ndarray[tuple[M], dtype[float64]]"; '
+            'expected "ndarray[tuple[N], dtype[float64]]"  [arg-type]'
+        ],
+        # No follow-on: the result is (N,), and `+ n` is checked quietly.
+        25: [g_arg],
+        29: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[S, k], dtype[float64]]", '
+            'variable has type "ndarray[tuple[T, k], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout
+    assert reveals_by_line(result) == {
+        23: f'"{_ND}[tuple[N], {_F64}]"',
+        24: f'"{_ND}[tuple[N], {_F64}]"',
+    }, result.stdout

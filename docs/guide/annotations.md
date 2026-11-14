@@ -165,6 +165,16 @@ is caught at the call site:
 error: call-site shape conflict for 'dim2': 4 (argument 'x', axis 1) vs 5 (argument 'y', axis 0)
 ```
 
+The check reads every literal size of an argument, also next to an `int`
+axis (`F64[int, 3]`, `np.zeros((n, 3))`), and a formal that is a union
+of heads (`x: F64[N] | F64[N, 1]`) through the member of the argument's
+rank. An overloaded method is not checked per item, as an overloaded
+function is not. A size formal (`def plus1(maxn: M) -> F64["M+1"]`)
+binds its name to the argument's size: `plus1(L)` with `L: K` is
+`(K+1,)` and `plus1(10)` is `(11,)`. A name the receiver already fixed
+(`c.g(a)` with `c: C[N]`) stays the receiver's: a different argument is
+mypy's `[arg-type]` error, and the result is still `(N,)`.
+
 String words resolve exactly like bare dims, so the styles mix freely:
 `F64["batch features"]` and `F64[batch, features]` (or even one of each
 in a single signature) mean the same thing. Only space-separated names

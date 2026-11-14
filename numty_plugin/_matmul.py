@@ -9,11 +9,11 @@ from functools import partial
 
 from mypy.nodes import ARG_POS, CallExpr, Expression, ListExpr, MemberExpr, NameExpr, OpExpr, TupleExpr, Var
 from mypy.plugin import FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
-from mypy.types import AnyType, CallableType, FunctionLike, Type, TypeOfAny, TypeVarType
+from mypy.types import AnyType, CallableType, FunctionLike, Type, TypeOfAny, TypeVarType, UnionType, get_proper_type
 
-from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _quiet_type, _swallowed
 from ._forms import _form_has_unknown, _forms_provably_ne, _is_unknown_fullname
-from ._unknowns import _is_same_unknown
+from ._unknowns import _is_one_size_unknown, _is_same_unknown
 from ._exprs import _expr_str
 
 from ._types import (
@@ -37,7 +37,7 @@ from ._linalg import (
 )
 from ._types import (
     _mask_counts_differ, _named_sizes_differ, _names_enabled, _report_mask_names, _report_names,
-    _union_members, _unknown_offset, _unpack_shape,
+    _union_members, _union_results, _unknown_offset, _unpack_shape,
 )
 from ._broadcast_core import (
     _merge_unpack_dims, _same_unpack, _solve_broadcast,
@@ -112,7 +112,7 @@ def _union_operand(ctx: FunctionContext | MethodContext | FunctionSigContext | M
         return False
     try:
         for e in exprs:
-            if _union_members(ctx.api.get_expression_type(e)) is not None:
+            if _union_members(_quiet_type(ctx, e)) is not None:
                 return True
             # In mypy's per-member check of a call the argument reads as
             # the member; the variable still holds the union.
@@ -157,14 +157,15 @@ def _matmul_result(
     way, the contracted size never reaches it. The one exception is the
     same ?U on both sides (issue #63): one mask site serves every
     comprehension element, so equality would falsely prove (3, 3) —
-    bail instead.
+    bail instead, unless the site ran once (issue 352: `q @ r` of one
+    `np.linalg.qr`).
     """
     from numty_plugin import _broadcast_result
     pair = _contracted_pair(a, b)
     if pair is None:
         return None, None
     x, y = pair
-    if _is_same_unknown(x, y):
+    if _is_same_unknown(x, y) and not _is_one_size_unknown(x):
         return None, None
     matched, message = _matmul_inner(x, y)
     if message is not None:
@@ -312,6 +313,9 @@ def _operand_parts(
 
 
 def _solve_matmul(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    union = _solve_union_contraction(ctx, left, right, partial(_solve_matmul, ctx), "matmul")
+    if union is not None:
+        return union
     parts_a, parts_b = _operand_parts(left, right)
     if parts_a is not None and parts_b is not None:
         (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
@@ -439,17 +443,134 @@ def _promoted_scalar(
     return scalar
 
 
-def dot_function_hook(ctx: FunctionContext) -> Type:
-    pair = _two_arrays(ctx)
-    if pair is None:
+def _contraction_members(tp: Type) -> list[Type] | None:
+    """The members of a union operand of a contraction, else None (issue 352).
+
+    Any union that holds an array: `F64[2, 3] | F64[3]`, `F64[3, 4] | float`.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, UnionType):
+        return None
+    items = list(proper.items)
+    if not any(_ndarray_parts(item) is not None or _unpack_shape(item) is not None for item in items):
+        return None
+    return items
+
+
+def _contraction_clash(left: Type, right: Type, op: str) -> str | None:
+    """The message of a provable mismatch of `matmul(left, right)` or `dot(left, right)`, else None.
+
+    A dry run: no error is reported and no unknown is made. For dot,
+    scalars and 0-d operands multiply, and an operand of rank above 2
+    has no batch: only the contracted pair can clash.
+    """
+    parts_a, parts_b = _operand_parts(left, right)
+    if parts_a is not None and parts_b is not None:
+        dims_a, dims_b = list(parts_a[0]), list(parts_b[0])
+        if op == "dot" and (not dims_a or not dims_b):
+            return None
+        if op == "dot" and max(len(dims_a), len(dims_b)) > 2:
+            pair = _contracted_pair(dims_a, dims_b)
+            return None if pair is None else _contract_pair("dot", *pair)[1]
+        return _matmul_result(dims_a, dims_b, None)[1]
+    return _matmul_unpack_dims(left, right)[1]
+
+
+def _union_contraction_verdict(left: Type, right: Type, op: str) -> str | None:
+    """One message when a member of the left operand fits no member of the right (issue 352).
+
+    The rule of `@` (issue #265): the members of two unions can be
+    paired, so a member is an error only when it fits none. Without a
+    union, the message of the one pair.
+    """
+    members_b = _contraction_members(right) or [right]
+    for member in _contraction_members(left) or [left]:
+        messages = [_contraction_clash(member, other, op) for other in members_b]
+        if all(message is not None for message in messages):
+            return messages[0]
+    return None
+
+
+def _solve_union_contraction(
+    ctx: FunctionContext | MethodContext,
+    left: Type,
+    right: Type,
+    solve: Callable[[Type, Type], Type],
+    op: str,
+) -> Type | None:
+    """np.dot / np.matmul with a union operand: check and solve per member (issue 352).
+
+    mypy first solves each member alone and, when one of them fails,
+    calls the hook once more with the whole union, where the stubs give
+    Any. A member that fits no member of the other operand is the
+    report, as for `@`; otherwise the result is the union of the
+    results of the pairs that fit. None when no operand is a union.
+    """
+    members_a = _contraction_members(left)
+    members_b = _contraction_members(right)
+    if members_a is None and members_b is None:
+        return None
+    # Two unions pair every member with every member, as `@` does: two
+    # parameters vary apart. A scalar member's pairs stay open (Any), so
+    # `dot(B, u)` with `B: F64[X, U] | float` and `u: F64[U, 1] | float`
+    # is `(X, 1) | Any`.
+    message = _union_contraction_verdict(left, right, op)
+    if message is not None:
+        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
-    parts_a, parts_b = _operand_parts(pair[0], pair[1])
+    results = [
+        _member_solve(solve, a, b)
+        for a in members_a or [left]
+        for b in members_b or [right]
+        if _contraction_clash(a, b, op) is None
+    ]
+    return _union_results(results) if results else ctx.default_return_type
+
+
+def _member_solve(solve: Callable[[Type, Type], Type], a: Type, b: Type) -> Type:
+    """One pair of members of a union contraction; a scalar member's product stays open."""
+    if _scalar_key(a) is not None or _scalar_key(b) is not None:
+        return AnyType(TypeOfAny.special_form)
+    return solve(a, b)
+
+
+def _scalar_member_trial(ctx: FunctionContext | MethodContext) -> bool:
+    """Whether a scalar operand is mypy's trial of one member of a union operand.
+
+    mypy solves `np.dot(B, u)` with `u: F64[N, 1] | float` once per
+    member, and the scalar member gives `B`'s own shape: a union
+    member the code never meant as a shape (issue 352).
+    """
+    call = ctx.context
+    if not isinstance(call, CallExpr):
+        return False
+    exprs = list(call.args) + ([call.callee.expr] if isinstance(call.callee, MemberExpr) else [])
+    try:
+        return any(_contraction_members(_quiet_type(ctx, e)) is not None for e in exprs)
+    except Exception:
+        _swallowed(ctx, "_scalar_member_trial")
+        return False
+
+
+def _solve_dot(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
+    """np.dot and ndarray.dot on (left, right)."""
+    union = _solve_union_contraction(ctx, left, right, partial(_solve_dot, ctx), "dot")
+    if union is not None:
+        return union
+    parts_a, parts_b = _operand_parts(left, right)
     if parts_a is None or parts_b is None:
+        if _scalar_key(left) is not None or _scalar_key(right) is not None:
+            if _scalar_member_trial(ctx):
+                # The scalar member of `F64[N, 1] | float` (`u=0`): its
+                # product is left open, the array member is checked.
+                return AnyType(TypeOfAny.special_form)
+            # A Python or numpy scalar operand: dot is multiplication (issue 352).
+            return _solve_broadcast(ctx, left, right)
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
     if not dims_a or not dims_b:
         # 0-d operand: dot is broadcast multiplication (issue #41).
-        return _solve_broadcast(ctx, pair[0], pair[1])
+        return _solve_broadcast(ctx, left, right)
     if len(dims_a) == 1 and len(dims_b) == 1:
         # Vector inner product is a scalar (the stubs agree).
         matched, message = _contract_pair("dot", dims_a[0], dims_b[0], ctx, (dims_a, dims_b))
@@ -461,7 +582,7 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
         return _promoted_scalar(ctx, dtype_a, dtype_b)
     if max(len(dims_a), len(dims_b)) <= 2:
         # Rank <= 2 is otherwise exactly matmul: reuse its solver.
-        return _solve_matmul(ctx, pair[0], pair[1])
+        return _solve_matmul(ctx, left, right)
     if len(dims_b) == 1:
         contracted, out = (dims_a[-1], dims_b[0]), dims_a[:-1]
     else:
@@ -473,7 +594,14 @@ def dot_function_hook(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if not matched:
         return ctx.default_return_type
-    return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), pair[0], pair[1])
+    return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), left, right)
+
+
+def dot_function_hook(ctx: FunctionContext) -> Type:
+    pair = _two_arrays(ctx)
+    if pair is None:
+        return ctx.default_return_type
+    return _solve_dot(ctx, pair[0], pair[1])
 
 
 def _contraction_names_report(op: str, left: Type, right: Type) -> bool:
@@ -494,24 +622,37 @@ def _contraction_names_report(op: str, left: Type, right: Type) -> bool:
 
 
 def _contraction_signature(ctx: FunctionSigContext, op: str) -> FunctionLike:
-    """np.dot / np.inner: Any formals where the function hook makes the names report.
+    """np.dot / np.inner: Any formals where the function hook makes a report.
 
     The report fails each overload mypy tries, and its fallback then adds
-    an `[arg-type]` error against the last one (issue 326). Calls the
-    code is off for, and every other call, keep the stubs' signature.
+    an `[arg-type]` error against the first one (issues 326, 364): a
+    names report, and for dot a provable mismatch, of the operands or of
+    a member of a union operand (issue 352). Every other call keeps the
+    stubs' signature.
     """
     sig = ctx.default_signature
     try:
         call = ctx.context
-        if not isinstance(sig, CallableType) or not _names_enabled(ctx) or _union_operand(ctx):
+        if not isinstance(sig, CallableType):
             return sig
         if not isinstance(call, CallExpr) or call.arg_kinds[:2] != [ARG_POS, ARG_POS]:
             return sig
-        left = ctx.api.get_expression_type(call.args[0])
-        right = ctx.api.get_expression_type(call.args[1])
+        with ctx.api.msg.filter_errors() as watcher:
+            left = ctx.api.get_expression_type(call.args[0])
+            right = ctx.api.get_expression_type(call.args[1])
+        widened = sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
+        if watcher.has_new_errors():
+            # An operand reports (a nested `np.dot` that does not fit): it
+            # fails each overload as well (issue 364). mypy reports it
+            # when it checks the arguments.
+            return widened
+        if op == "dot" and _union_contraction_verdict(left, right, op) is not None:
+            return widened
+        if not _names_enabled(ctx) or _union_operand(ctx):
+            return sig
         if not _contraction_names_report(op, left, right):
             return sig
-        return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
+        return widened
     except Exception:
         _swallowed(ctx, "_contraction_signature")
         return sig
@@ -528,36 +669,7 @@ def dot_method_hook(ctx: MethodContext) -> Type:
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    left, right = ctx.type, pairs[0][0]
-    parts_a, parts_b = _operand_parts(left, right)
-    if parts_a is None or parts_b is None:
-        return ctx.default_return_type
-    (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
-    if not dims_a or not dims_b:
-        # 0-d operand: dot is broadcast multiplication (issue #41).
-        return _solve_broadcast(ctx, left, right)
-    if len(dims_a) == 1 and len(dims_b) == 1:
-        matched, message = _contract_pair("dot", dims_a[0], dims_b[0], ctx, (dims_a, dims_b))
-        if message is not None:
-            ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
-            return ctx.default_return_type
-        if not matched:
-            return ctx.default_return_type
-        return _promoted_scalar(ctx, dtype_a, dtype_b)
-    if max(len(dims_a), len(dims_b)) <= 2:
-        return _solve_matmul(ctx, left, right)
-    if len(dims_b) == 1:
-        contracted, out = (dims_a[-1], dims_b[0]), dims_a[:-1]
-    else:
-        contracted = (dims_a[-1], dims_b[-2])
-        out = dims_a[:-1] + dims_b[:-2] + dims_b[-1:]
-    matched, message = _contract_pair("dot", *contracted, ctx, (dims_a, dims_b))
-    if message is not None:
-        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
-        return ctx.default_return_type
-    if not matched:
-        return ctx.default_return_type
-    return _mixed_result(_matmul_promoted(ctx, out, dtype_a, dtype_b), left, right)
+    return _solve_dot(ctx, ctx.type, pairs[0][0])
 
 
 def matmul_method_hook(ctx: MethodContext) -> Type:

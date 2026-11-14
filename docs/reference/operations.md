@@ -85,8 +85,21 @@ axes), `inner`/`outer`/`vdot` (scalars included; `outer` ravels each
 operand, so `(N,)` by `(T,)` is `(N, T)` and an `(N, D)` operand counts
 `D*N`), and `take` (the axis is
 swapped for the index shape; literal indices past the axis error unless
-`mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, and
+`mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, while
+`dot` with a scalar or 0-d operand is multiplication (`np.dot(B, 0)` and
+`B.dot(0)` keep `B`'s shape), and
 `linalg.norm` with an explicit `ord` needs one or two reduced axes.
+A union operand of `dot` or `matmul` solves per member, as `@` does: a
+member that fits no member of the other operand is the error
+(`matmul inner dimensions disagree: 3 vs 5`), otherwise the result is the
+union of the pairs that fit; two union operands pair every member with
+every member, as `@` does, and a scalar member's product stays `Any` (`np.dot(B, u)` with
+`u: F64[N, 1] | float` is `(X, 1) | Any`). `linalg.solve` and `linalg.lstsq` check b's
+rows like a matmul's inner pair: `N` against `N-1` is an error, two
+different names are the `[numty-names]` report, and the result keeps its
+shape. One unknown on both sides of a contraction (`q @ r` of one
+`np.linalg.qr`, `u @ vt` of one `svd`) is one size when the call that
+made it is not in a loop or a comprehension, so `q @ r` is `(M, N)`.
 
 ## Diagonals and covariance
 

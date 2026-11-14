@@ -29,7 +29,8 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._errors import _quiet_type
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -39,7 +40,7 @@ from ._unknowns import _fresh_unknown
 from ._types import (
     _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _mentions_ndarray,
     _info_mentions_array, _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, NDARRAY_FULLNAME,
-    TUPLE_FULLNAME, _OPERATOR_DUNDERS,
+    _OPERATOR_DUNDERS,
 )
 from ._callbind import (
     _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _union_actual_variants,
@@ -122,6 +123,8 @@ from ._unions import (
     _union_signature_clash,
 )
 from ._callsite import _relax_dynamic_formals, _report_call_site_names, _report_index_call_site, minmax_function_hook
+from ._callsite import _overloaded_method
+from ._types import shape_attribute_hook
 from ._returns import _holder_key, _return_sig_for_dynamic
 from ._unknowns import _fresh_own_size
 from ._sequences import len_function_hook, rows_function_hook, size_attribute_hook
@@ -421,8 +424,11 @@ class NumtyPlugin(Plugin):
             ctx.context.callee.node if hasattr(ctx.context.callee, "node") else None,
             OverloadedFuncDef,
         )
+        # An overloaded method reached through its receiver: no reports
+        # either, its signature is still put in the caller's terms.
+        quiet = overloaded or _overloaded_method(ctx, fullname)
         try:
-            if isinstance(sig, CallableType) and not overloaded:
+            if isinstance(sig, CallableType) and not quiet:
                 # A union actual is checked per member (issue 331).
                 for overrides in _union_actual_variants(sig, ctx):
                     _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx, overrides))
@@ -431,7 +437,8 @@ class NumtyPlugin(Plugin):
             _swallowed(ctx, "method_signature_hook")
             pass
         if isinstance(sig, CallableType) and not overloaded:
-            _report_call_site_names(sig, ctx)
+            if not quiet:
+                _report_call_site_names(sig, ctx)
             sig = _return_sig_for_dynamic(_relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx), ctx)
         _note_rank_mismatches(ctx, sig)
         return sig
@@ -1088,14 +1095,14 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             uu_right: Type | None = None
             if isinstance(call, _OpExpr0):
                 try:
-                    uu_left = ctx.api.get_expression_type(call.left)
-                    uu_right = ctx.api.get_expression_type(call.right)
+                    uu_left = _quiet_type(ctx, call.left)
+                    uu_right = _quiet_type(ctx, call.right)
                 except Exception:
                     _swallowed(ctx, "_broadcast_signature_hook")
                     uu_left = uu_right = None
             elif isinstance(call, _CallExpr0) and call.args:
                 try:
-                    uu_right = ctx.api.get_expression_type(call.args[0])
+                    uu_right = _quiet_type(ctx, call.args[0])
                     uu_left = ctx.type
                 except Exception:
                     _swallowed(ctx, "_broadcast_signature_hook")
@@ -1164,7 +1171,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             # (an inline complex operand otherwise matches the first
             # overload as `ndarray[Any, Any]` and nothing is said).
             for side in (call.left, call.right):
-                side_part = _parts_or_unpack(ctx.api.get_expression_type(side))
+                side_part = _parts_or_unpack(_quiet_type(ctx, side))
                 if side_part is not None and _dtype_base(side_part[1]) == "c":
                     return sig.copy_modified(
                         arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
@@ -1253,7 +1260,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             # Instead, try right first: if right type has known dims and mismatches, use it;
             # otherwise try left. Simplest: check both, if either mismatches with self, trigger.
             try:
-                right_tp = ctx.api.get_expression_type(call.right)
+                right_tp = _quiet_type(ctx, call.right)
                 right_list = _member_dims(right_tp)
                 if right_list is not None and _any_mismatch([list(dims_a)], right_list):
                     return sig.copy_modified(
@@ -1263,7 +1270,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
                 _swallowed(ctx, "_broadcast_signature_hook")
                 pass
             try:
-                left_tp = ctx.api.get_expression_type(call.left)
+                left_tp = _quiet_type(ctx, call.left)
                 left_list = _member_dims(left_tp)
                 if left_list is not None and _any_mismatch([list(dims_a)], left_list):
                     return sig.copy_modified(
@@ -1281,7 +1288,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         if other_expr is None:
             return ctx.default_signature
         try:
-            other_tp = ctx.api.get_expression_type(other_expr)
+            other_tp = _quiet_type(ctx, other_expr)
         except Exception:
             _swallowed(ctx, "_broadcast_signature_hook")
             return ctx.default_signature
@@ -1327,8 +1334,8 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             if call.op != "@":
                 return ctx.default_signature
             try:
-                left_tp = ctx.api.get_expression_type(call.left)
-                right_tp = ctx.api.get_expression_type(call.right)
+                left_tp = _quiet_type(ctx, call.left)
+                right_tp = _quiet_type(ctx, call.right)
             except Exception:
                 _swallowed(ctx, "_matmul_signature_hook")
                 return ctx.default_signature
@@ -1338,7 +1345,7 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             callee = call.callee
             name = getattr(callee, "name", None)
             try:
-                arg_tp = ctx.api.get_expression_type(call.args[0])
+                arg_tp = _quiet_type(ctx, call.args[0])
             except Exception:
                 _swallowed(ctx, "_matmul_signature_hook")
                 return ctx.default_signature
@@ -1650,39 +1657,6 @@ def substituted_attribute_hook(ctx: AttributeContext) -> Type:
     if sub is None:
         return default
     return sub
-
-
-def shape_attribute_hook(ctx: AttributeContext) -> Type:
-    dist = _distribute_solve([ctx.type], lambda t: _shape_type(ctx, t))
-    if dist is not None:
-        return dist
-    return _shape_type(ctx, ctx.type)
-
-
-def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
-    parts = _parts_or_unpack(tp)
-    if parts is None:
-        return ctx.default_attr_type
-    dims, _ = parts
-    int_fallback = ctx.api.named_generic_type("builtins.int", [])
-    items: list[Type] = []
-    for v in dims:
-        if isinstance(v, int):
-            # mypy's widening form: a plain int carrying its literal
-            # value. Fresh locals widen to int (so `k = x.shape[0]; k -= 1`
-            # checks), while _int_value/_dim_value still read the value
-            # back for direct uses like reshape(x.shape[0], 3) (issue #62).
-            items.append(
-                int_fallback.copy_modified(
-                    last_known_value=LiteralType(v, fallback=int_fallback)
-                )
-            )
-        else:
-            items.append(v)
-    fallback = ctx.api.named_generic_type(
-        TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
-    )
-    return TupleType(items, fallback)
 
 
 def t_attribute_hook(ctx: AttributeContext) -> Type:

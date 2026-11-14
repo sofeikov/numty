@@ -16,7 +16,7 @@ from ._types import (
     INT_FULLNAME, _dim_eq, _dim_str, _dims_provably_ne, _distribute_solve, _fold_int,
     _has_unpack, _int_value, _named_sizes_differ, _names_enabled, _ndarray_parts, _ndarray_type,
     _parts_or_unpack, _report_mask_names,
-    _report_names, _union_members,
+    _report_names, _scalar_union_members, _union_members,
 )
 from ._heads import (
     _index_dims_match, _index_on, _index_record_exact, _index_recorded_exceeds, _recorded_at_site, _recorded_index_on,
@@ -1479,12 +1479,19 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
             )
         return ctx.default_return_type
     target_dims = target_parts[0]
-    if _scalar_key(value_type) is not None:
-        return ctx.default_return_type
-    value_parts = _ndarray_parts(value_type) or _movable_parts(value_type)
-    if value_parts is None:
-        return ctx.default_return_type
-    value_dims = value_parts[0]
+    # Issue 354: each array member of a union value is checked, the first
+    # that does not fit is the report.
+    for member in _union_members(value_type) or _scalar_union_members(value_type) or [value_type]:
+        if _scalar_key(member) is not None or isinstance(get_proper_type(member), AnyType):
+            continue
+        value_parts = _ndarray_parts(member) or _movable_parts(member)
+        if value_parts is not None and not _value_fits(ctx, value_parts[0], target_dims):
+            break
+    return ctx.default_return_type
+
+
+def _value_fits(ctx: MethodContext, value_dims: list[int | Type], target_dims: list[int | Type]) -> bool:
+    """Whether a value of this shape fits a write target: False after the error."""
     if len(value_dims) > len(target_dims):
         ctx.api.fail(
             f"cannot assign value of shape {_dims_str(value_dims)} "
@@ -1492,7 +1499,7 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
             ctx.context,
             code=NUMTY_BROADCAST,
         )
-        return ctx.default_return_type
+        return False
     if _inplace_never_fits(list(target_dims), list(value_dims)):
         # A named value size into a literal-1 target axis fits only when
         # the name is 1 (issue 361), as for `col += P`.
@@ -1502,7 +1509,7 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
             ctx.context,
             code=NUMTY_BROADCAST,
         )
-        return ctx.default_return_type
+        return False
     offset = len(target_dims) - len(value_dims)
     for t, v in zip(target_dims[offset:], value_dims):
         if _dim_eq(t, v) or _unchecked_axis(t) or _unchecked_axis(v):
@@ -1520,7 +1527,7 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
                 ctx.context,
                 code=NUMTY_BROADCAST,
             )
-            return ctx.default_return_type
+            return False
         # Unknown, or two names that may be equal: unprovable. The
         # other axes are still compared.
         _report_names(
@@ -1529,7 +1536,7 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
         _report_mask_names(
             ctx, v, t, f"assignment of shape {_dims_str(value_dims)} into target of shape {_dims_str(target_dims)}"
         )
-    return ctx.default_return_type
+    return True
 
 
 def _unchecked_axis(d: int | Type) -> bool:

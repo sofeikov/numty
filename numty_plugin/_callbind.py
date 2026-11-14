@@ -212,6 +212,29 @@ def _union_actual_variants(
     ]
 
 
+def _literal_dims(tp: Type) -> list[int | Type] | None:
+    """The dims of an actual for the call-site check, an `int` or `Any` size as `Any`.
+
+    Only literal sizes are compared there, so an `int` axis
+    (`F64[int, 3]`, `np.zeros((n, 3))`) no longer hides its known
+    neighbours (issue 355).
+    """
+    parts = _parts_or_unpack(tp)
+    if parts is not None:
+        return list(parts[0])
+    proper = get_proper_type(tp)
+    if not (isinstance(proper, Instance) and proper.type.fullname == NDARRAY_FULLNAME and len(proper.args) == 2):
+        return None
+    shape = get_proper_type(proper.args[0])
+    if not isinstance(shape, TupleType) or any(isinstance(get_proper_type(i), UnpackType) for i in shape.items):
+        return None
+    dims: list[int | Type] = []
+    for item in shape.items:
+        value = _dim_value(item)
+        dims.append(AnyType(TypeOfAny.explicit) if value is None else value)
+    return dims
+
+
 def _pairs_for_actual(
     fname: str,
     formal_tp: Type,
@@ -226,16 +249,26 @@ def _pairs_for_actual(
     for list displays (and once for stored lists via the joined arg).
     """
     fparts = _parts_or_unpack(_strip_optional(formal_tp))
-    if fparts is not None:
+    members = _union_members(_strip_optional(formal_tp)) if fparts is None else None
+    if fparts is not None or members is not None:
         try:
             actual_tp = _actual_type(ctx, actual_expr, overrides)
         except Exception:
             _swallowed(ctx, "_pairs_for_actual")
             return []
-        aparts = _parts_or_unpack(actual_tp)
-        if aparts is None:
+        adims = _literal_dims(actual_tp)
+        if adims is None:
             return []
-        return _align_pair(fname, fparts[0], aparts[0])
+        if fparts is None:
+            # A union of heads (`x: F64[N] | F64[N, 1]`, issue 355): the one
+            # member of the actual's rank is the formal it binds.
+            ranked = [
+                p[0] for p in map(_parts_or_unpack, members or []) if p is not None and len(p[0]) == len(adims)
+            ]
+            if len(ranked) != 1:
+                return []
+            return _align_pair(fname, ranked[0], adims)
+        return _align_pair(fname, fparts[0], adims)
     elem = _sequence_element(_strip_optional(formal_tp))
     if elem is None:
         return []
@@ -364,12 +397,13 @@ def _callsite_formula_return(
             # Formula variables only the old return mentioned are no longer
             # the callee's to bind (see the note in `_substitute_return_exprs`).
             formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
+            ret_ids = {tv.id for tv in _iter_tvarlikes(new_ret)}
             sig = sig.copy_modified(
                 ret_type=new_ret,
                 variables=[
                     v
                     for v in sig.variables
-                    if v.id in formal_ids or not v.fullname.startswith(_EXPR_PREFIX)
+                    if v.id in formal_ids or (v.id in ret_ids and not v.fullname.startswith(_EXPR_PREFIX))
                 ],
             )
         return _settle_any_bound(sig, bindings)
@@ -424,6 +458,7 @@ def _callsite_expr_bindings(
     """
     from numty_plugin import _resolve_dim
     bindings: dict[str, int | Type | _LinForm] = {}
+    own_ids = {v.id for v in sig.variables}
     for i, positions in formals:
         if i >= len(ctx.args):
             continue
@@ -451,6 +486,12 @@ def _callsite_expr_bindings(
                 continue
             try:
                 form_f = _form_of(tvar)
+                if form_f is None and tvar.id not in own_ids:
+                    # Not the call's to bind (issue 356): a size the receiver
+                    # (`c: C[N]`) or the enclosing scope already fixed. It
+                    # stays itself; a different argument is mypy's error.
+                    bindings.setdefault(tvar.fullname, tvar)
+                    continue
                 if form_f is None:
                     # Plain formal: direct bind (first wins).
                     if tvar.fullname not in bindings:
@@ -507,6 +548,26 @@ def _callsite_expr_bindings(
             except Exception:
                 _swallowed(ctx, "_callsite_expr_bindings")
                 continue
+    # A size formal (`maxn: M`) binds its name to the argument's size, a
+    # caller's name or a literal (issue 356): `-> F64["M+1"]` is then put
+    # in the caller's terms as for an array argument.
+    for i, formal in enumerate(sig.arg_types):
+        tvar = get_proper_type(formal)
+        if (
+            i >= len(ctx.args)
+            or len(ctx.args[i]) != 1
+            or not isinstance(tvar, TypeVarType)
+            or tvar.id not in own_ids
+            or tvar.fullname in bindings
+        ):
+            continue
+        try:
+            size = _dim_value(ctx.api.get_expression_type(ctx.args[i][0]))
+        except Exception:
+            _swallowed(ctx, "_callsite_expr_bindings")
+            continue
+        if isinstance(size, (int, TypeVarType)) and not isinstance(size, bool):
+            bindings[tvar.fullname] = size
     # Unknown-rank actuals (plain NDArray) never infer: bind the
     # formal's still-unbound tvars to Any so the result keeps its rank
     # instead of collapsing to Never (issue #62) and stays compatible
