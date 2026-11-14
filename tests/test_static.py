@@ -5311,6 +5311,55 @@ def test_bad_free_return_forms() -> None:
     assert _run_fixture("bad_free_return_forms.py") == ["(1,)"]
 
 
+def test_generic_class_sizes() -> None:
+    # Issue 358: a method returning a formula over the class's names is in
+    # the receiver's terms; `Sys[N]` fits `Sys[int]` at a return and an
+    # annotated local; a formula is a type argument, in an annotation and
+    # (with an ignore for mypy's own expression check) a base class; a
+    # free name in a class return takes a size born in the body and is the
+    # call's own size.
+    fixture = "generic_class_sizes_ok.py"
+    result = run_mypy(FIXTURES / fixture)
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[68] == f'"numpy.ndarray[tuple[N, Literal[3]], {_F64}]"', result.stdout
+    assert notes[69] == f'"numpy.ndarray[tuple[N, J-1], {_F64}]"', result.stdout
+    assert notes[70] == f'"numpy.ndarray[tuple[Literal[9], Literal[4]], {_F64}]"', result.stdout
+    assert notes[71] == '"tests.fixtures.generic_class_sizes_ok.Model[N, N-1]"', result.stdout
+    assert notes[72] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
+    assert notes[73] == f'"numpy.ndarray[tuple[?W@73], {_F64}]"', result.stdout
+    assert notes[74] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
+    # A protocol keeps its own variance (no covariant-in-protocol error),
+    # and its formula position written `int` matches the class's formula.
+    assert notes[88] == f'"numpy.ndarray[tuple[int, Literal[4]], {_F64}]"', result.stdout
+    assert _run_fixture(fixture) == ["(2, 3) (9, 4) (2, 2) (4,)"]
+
+
+def test_bad_generic_class_sizes() -> None:
+    # Issue 358: with a class's size parameters covariant, the call-site
+    # check reads the sizes two arguments give one name (mypy would solve
+    # it as `int`); a formula method result and a formula type argument
+    # keep checking.
+    result = run_mypy(FIXTURES / "bad_generic_class_sizes.py")
+    errors = _messages_by_line(result)
+    assert sorted(errors) == [41, 46, 47, 48, 49, 50], result.stdout
+    for line in errors:
+        assert len(errors[line]) == 1, result.stdout
+    assert 'got "Model[N, N]", expected "Model[N, W]"' in errors[41][0], result.stdout
+    assert "J vs J-1" in errors[46][0] and errors[46][0].endswith("[numty-broadcast]"), result.stdout
+    assert errors[47][0] == (
+        "call-site shape conflict for 'N': 3 (argument 'a', type argument 0) vs "
+        "4 (argument 'b', type argument 0)  [numty-callsite]"
+    ), result.stdout
+    assert errors[48][0] == (
+        "call-site binding of 'N' (argument 'a', type argument 0, and argument 'b', type argument 0): "
+        "N and M are different names  [numty-names]"
+    ), result.stdout
+    assert errors[49][0].endswith("[assignment]"), result.stdout
+    assert '"Model[Literal[5], Literal[4]]"' in errors[50][0], result.stdout
+    assert _run_fixture("bad_generic_class_sizes.py") == ["(2, 2)"]
+
+
 def test_bad_own_size_optin() -> None:
     # Issues 306/307 (opt-in): the size a call chose, and the size an
     # object's properties name, are sizes of their own. Silent with numty-names off.
@@ -6705,8 +6754,10 @@ def test_kept_names_catch_later_bugs() -> None:
         'expected "ndarray[tuple[N, H], dtype[float64]]")  [return-value]'
     )
     assert messages[13] == messages[17] == [swapped], result.stdout
+    # The value does not fit (2*N on axis 1), so its own unknown is not
+    # renamed `K` (issue 357).
     assert messages[25] == [
-        'Incompatible return value type (got "ndarray[tuple[N, 2*N, K], dtype[float64]]", '
+        'Incompatible return value type (got "ndarray[tuple[N, 2*N, ?U@25], dtype[float64]]", '
         'expected "ndarray[tuple[N, N, K], dtype[float64]]")  [return-value]'
     ], result.stdout
     assert messages[29] == [

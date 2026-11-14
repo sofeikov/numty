@@ -21,7 +21,7 @@ from ._types import (
     _report_mask_names, _report_names,
 )
 from ._callbind import (
-    ActualOverrides, _actual_type, _formal_name, _shape_tvar_formals, _strip_optional,
+    ActualOverrides, _actual_type, _class_arg_dims, _formal_name, _shape_tvar_formals, _strip_optional, _where,
 )
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
 from ._linalg import _is_numpy_scalar
@@ -173,6 +173,30 @@ def _report_call_site_names(
         if len(ctx.args) != len(sig.arg_types):
             return
         first: dict[str, tuple[str, int, Type]] = {}
+
+        def check(tvar: TypeVarType, name: str, dim: int, adim: Type) -> None:
+            seen = first.setdefault(tvar.fullname, (name, dim, adim))
+            if seen[2] is adim:
+                return
+            if _dims_provably_ne(seen[2], adim):
+                # One name of the callee bound to two sizes that no
+                # values make equal (`N` and `N-1`): an error by
+                # default, like the literal case of issue #53.
+                ctx.api.fail(
+                    f"call-site shape conflict for '{tvar.name}': "
+                    f"{_dim_str(seen[2])} (argument '{seen[0]}', {_where(seen[1])}) vs "
+                    f"{_dim_str(adim)} (argument '{name}', {_where(dim)})",
+                    ctx.context,
+                    code=NUMTY_CALLSITE,
+                )
+                return
+            where = (
+                f"call-site binding of '{tvar.name}' (argument '{seen[0]}', {_where(seen[1])}, "
+                f"and argument '{name}', {_where(dim)})"
+            )
+            _report_names(ctx, seen[2], adim, where)
+            _report_mask_names(ctx, seen[2], adim, where)
+
         for i, positions in _shape_tvar_formals(sig):
             if len(ctx.args[i]) != 1:
                 continue
@@ -186,34 +210,15 @@ def _report_call_site_names(
                 adim = actual[0][dim]
                 if isinstance(adim, int):
                     continue
-                seen = first.setdefault(tvar.fullname, (name, dim, adim))
-                if seen[2] is not adim and _dims_provably_ne(seen[2], adim):
-                    # One name of the callee bound to two sizes that no
-                    # values make equal (`N` and `N-1`): an error by
-                    # default, like the literal case of issue #53.
-                    ctx.api.fail(
-                        f"call-site shape conflict for '{tvar.name}': "
-                        f"{_dim_str(seen[2])} (argument '{seen[0]}', axis {seen[1]}) vs "
-                        f"{_dim_str(adim)} (argument '{name}', axis {dim})",
-                        ctx.context,
-                        code=NUMTY_CALLSITE,
-                    )
-                    continue
-                if seen[2] is not adim:
-                    _report_names(
-                        ctx,
-                        seen[2],
-                        adim,
-                        f"call-site binding of '{tvar.name}' (argument '{seen[0]}', axis {seen[1]}, "
-                        f"and argument '{name}', axis {dim})",
-                    )
-                    _report_mask_names(
-                        ctx,
-                        seen[2],
-                        adim,
-                        f"call-site binding of '{tvar.name}' (argument '{seen[0]}', axis {seen[1]}, "
-                        f"and argument '{name}', axis {dim})",
-                    )
+                check(tvar, name, dim, adim)
+        # A class's size parameters (`box: Sys[N]`, issue 358), after the
+        # arrays; a type argument is written as a negative axis.
+        for i, tp in enumerate(sig.arg_types):
+            if len(ctx.args[i]) != 1:
+                continue
+            for index, tvar, adim in _class_arg_dims(tp, _actual_type(ctx, ctx.args[i][0], overrides)):
+                if isinstance(adim, TypeVarType):
+                    check(tvar, _formal_name(sig, i), -1 - index, adim)
     except Exception:
         _swallowed(ctx, "_report_call_site_names")
 

@@ -776,6 +776,97 @@ def _name_born_sizes(
     return _name_born_array(ctx, tp, None, 0)
 
 
+def _at_site(line: int, col: int) -> Callable[[ast.AST], bool]:
+    """Whether an `ast` node is the expression mypy places at `line`, `col`."""
+
+    def here(node: ast.AST) -> bool:
+        if (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col):
+            return True
+        # mypy places an operator at its left operand inside the
+        # parentheses: `(S**2) / n` is where `S**2` is, one column
+        # past the `(` (issue 330).
+        while isinstance(node, ast.BinOp):
+            node = node.left
+            if (node.lineno, node.col_offset) == (line, col):
+                return True
+        return False
+
+    return here
+
+
+def _name_born_class(ctx: FunctionContext | MethodContext, tp: Type) -> Type:
+    """`tp`, an object of a user generic class, with sizes born here written as the free name declared for them (issue 358).
+
+    `def ar(y: F64[N]) -> Model[N, W]` with `W` free: `return Model(y,
+    y[y > 0])` gives `Model[N, ?U]`, and the unknown takes `W` as it
+    would on an array axis. Only a value that is returned (whole, or as
+    an item of a returned tuple) under the class it is of takes it, and
+    every position declared with one name must hold one size.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance) or proper.type.fullname == NDARRAY_FULLNAME or not proper.args:
+        return tp
+    free = _free_return_names(ctx)
+    items = [get_proper_type(a) for a in proper.args]
+    if not free or not any(_is_born_dim(i) for i in items):
+        return tp
+    try:
+        tree = getattr(ctx.api, "tree", None)
+        path = getattr(tree, "path", None) if tree is not None else None
+        line = getattr(ctx.context, "line", None)
+        col = getattr(ctx.context, "column", None)
+        sites = _return_sites_of(path) if path is not None else None
+        ret_stack = getattr(ctx.api, "return_types", None)
+        if sites is None or line is None or col is None or not ret_stack:
+            return tp
+        here = _at_site(line, col)
+        want_ret = get_proper_type(ret_stack[-1])
+        declared: list[Type] | None = None
+        uses: list[tuple[ast.Return, int]] = []
+        for ret, _ in sites[0]:
+            if ret.value is None:
+                continue
+            for p in _return_positions(ret.value, lambda n: here(n) and not isinstance(n, (ast.Tuple, ast.List))):
+                want = want_ret
+                if p is not None:
+                    want = get_proper_type(want_ret.items[p]) if isinstance(want_ret, TupleType) and p < len(want_ret.items) else None
+                if not isinstance(want, Instance) or want.type is not proper.type or len(want.args) != len(items):
+                    return tp
+                args = [get_proper_type(a) for a in want.args]
+                if declared is not None and declared != args:
+                    return tp
+                declared = args
+                uses.append((ret, -1 if p is None else p))
+        if declared is None:
+            return tp
+        named = [
+            i
+            for i, (have, want) in enumerate(zip(items, declared))
+            if isinstance(want, TypeVarType)
+            and want.fullname in free
+            and want.id == free[want.fullname].id
+            and _is_born_dim(have)
+        ]
+        if not named or any(
+            i not in named and not _fits_declared(have, want) for i, (have, want) in enumerate(zip(items, declared))
+        ):
+            return tp
+        new_args = list(proper.args)
+        for i in named:
+            want = declared[i]
+            assert isinstance(want, TypeVarType)
+            if all(
+                _fits_first((path, ret.lineno, ret.col_offset, want.fullname), (p, -1 - i), items[i]) for ret, p in uses
+            ):
+                new_args[i] = want
+        if all(new is old for new, old in zip(new_args, proper.args)):
+            return tp
+        return proper.copy_modified(args=new_args)
+    except Exception:
+        _swallowed(ctx, "_name_born_class")
+        return tp
+
+
 def _name_born_array(
     ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext,
     tp: Type,
@@ -808,17 +899,7 @@ def _name_born_array(
             return tp
         returns, assigns = sites
 
-        def here(node: ast.AST) -> bool:
-            if (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col):
-                return True
-            # mypy places an operator at its left operand inside the
-            # parentheses: `(S**2) / n` is where `S**2` is, one column
-            # past the `(` (issue 330).
-            while isinstance(node, ast.BinOp):
-                node = node.left
-                if (node.lineno, node.col_offset) == (line, col):
-                    return True
-            return False
+        here = _at_site(line, col)
 
         def whole(node: ast.AST) -> bool:
             # A tuple display starts where its first item does.

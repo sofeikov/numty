@@ -18,6 +18,7 @@ from mypy.types import CallableType, Instance, Overloaded, Type, UnionType, get_
 from ._errors import _swallowed
 from ._builders import _guard_mixed
 from ._types import NDARRAY_FULLNAME, _ndarray_parts
+from ._returns import _name_born_class
 from ._reshape import _all_positionals, _formal_pair, _is_none_type
 
 MASKED_ARRAY_FULLNAME = "numpy.ma.core.MaskedArray"
@@ -152,7 +153,8 @@ def _variable_call(ctx: FunctionContext, name: str, table: _Table) -> Type:
     if len(names) > 1:
         names = [n for n in names if n.rsplit(".", 1)[-1] == name]
     if len(names) != 1:
-        return _other_plugins_answer(ctx, name)
+        # An object of a user class returned under a free name (issue 358).
+        return _name_born_class(ctx, _other_plugins_answer(ctx, name))
     hook = _guard_mixed(names[0], masked_function_hook(names[0], table[names[0]]))
     return hook(ctx) if hook is not None else ctx.default_return_type
 

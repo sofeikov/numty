@@ -10,24 +10,24 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from mypy.nodes import (
-    ARG_POS, CallExpr, Decorator, Expression, FuncDef, NameExpr, OpExpr, OverloadedFuncDef, TypeInfo,
-    TypeVarLikeExpr,
+    ARG_POS, COVARIANT, INVARIANT, CallExpr, Decorator, Expression, FuncDef, IndexExpr, NameExpr, OpExpr,
+    OverloadedFuncDef, RefExpr, TypeInfo, TypeVarLikeExpr,
 )
 from mypy.argmap import map_actuals_to_formals
 from mypy.expandtype import expand_type
 from mypy.plugin import (
-    AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
+    AnalyzeTypeContext, AttributeContext, ClassDefContext, FunctionContext, FunctionSigContext, MethodContext,
     MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
-    AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
+    PROTOCOL_NAMES, AnyType, CallableType, FunctionLike, RawExpressionType, Instance, LiteralType, Overloaded, TupleType, Type,
     TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.typeanal import TypeAnalyser
-    from mypy.types import RawExpressionType, UnboundType
+    from mypy.types import UnboundType
 
 from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, _CANARY_BY_MODULE, _swallowed, _warn_startup
 from ._errors import _quiet_type
@@ -109,7 +109,7 @@ from ._broadcast import (
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
 from ._heads import (
-    _FAM_HEAD_DTYPES, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
+    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string, _index_head,
 )
 from ._exprs import _iter_tvarlikes
@@ -197,6 +197,9 @@ class NumtyPlugin(Plugin):
                 )
         except Exception:
             _swallowed(None, "startup_check")
+
+    def get_customize_class_mro_hook(self, fullname: str) -> Callable[[ClassDefContext], None] | None:
+        return _sizes_covariant
 
     def get_function_signature_hook(
         self, fullname: str
@@ -604,8 +607,28 @@ class NumtyPlugin(Plugin):
         info = sym.node
         if not info.type_vars:
             return None
-        if not _info_mentions_array(info):
+        if fullname in self._bare_tuple_guard:
             return None
+        if not _info_mentions_array(info):
+            # A class whose fields are not analyzed yet (a base class
+            # list, `class AR(Model[N, "N-1"])`) still takes a formula
+            # as a type argument (issue 358); anything else is mypy's.
+
+            def formula_args_hook(ctx: AnalyzeTypeContext) -> Type:
+                if any(
+                    isinstance(a, RawExpressionType) and isinstance(a.literal_value, str) for a in ctx.type.args
+                ):
+                    try:
+                        return ctx.api.named_type(fullname, [self._class_arg(ctx, fullname, a) for a in ctx.type.args])
+                    except Exception:
+                        _swallowed(ctx, "formula_args_hook")
+                self._bare_tuple_guard.add(fullname)
+                try:
+                    return ctx.api.analyze_type(ctx.type)
+                finally:
+                    self._bare_tuple_guard.discard(fullname)
+
+            return formula_args_hook
         # Issues #219/#221: a generic NamedTuple (e.g. Block[int]) must keep
         # mypy's default TupleType handling, which carries per-field types for
         # _replace self-checks and tuple unpacking. Rebuilding via named_type
@@ -619,7 +642,7 @@ class NumtyPlugin(Plugin):
             or getattr(info, "tuple_type", None) is not None
             or getattr(info, "typeddict_type", None) is not None
         ):
-            if fullname in self._bare_tuple_guard or getattr(info, "typeddict_type", None) is not None:
+            if getattr(info, "typeddict_type", None) is not None:
                 return None
 
             def bare_tuple_hook(ctx: AnalyzeTypeContext) -> Type:
@@ -642,7 +665,7 @@ class NumtyPlugin(Plugin):
         def bare_hook(ctx: AnalyzeTypeContext) -> Type:
             try:
                 if list(ctx.type.args):
-                    analyzed = [ctx.api.analyze_type(a) for a in ctx.type.args]
+                    analyzed = [self._class_arg(ctx, fullname, a) for a in ctx.type.args]
                     return ctx.api.named_type(fullname, analyzed)
             except Exception:
                 _swallowed(ctx, "bare_hook")
@@ -661,6 +684,30 @@ class NumtyPlugin(Plugin):
             return AnyType(TypeOfAny.from_error)
 
         return bare_hook
+
+    def _class_arg(self, ctx: AnalyzeTypeContext, fullname: str, arg: Type) -> Type:
+        """One type argument of a user class: a formula string (`Model[N, "N-1"]`) is the size it spells (issue 358)."""
+        if isinstance(arg, RawExpressionType) and isinstance(arg.literal_value, str):
+            short = fullname.rsplit(".", 1)[-1]
+            try:
+                dims = self._fam_string(ctx, short, arg.literal_value, arg)
+            except _FamFail as exc:
+                ctx.api.fail(str(exc), ctx.context, code=NUMTY_ANNOTATION)
+                return AnyType(TypeOfAny.from_error)
+            except _FamBail:
+                return AnyType(TypeOfAny.from_error)
+            if len(dims) != 1:
+                ctx.api.fail(
+                    f'{short} takes one size per type argument; "{arg.literal_value}" spells {len(dims)}',
+                    ctx.context,
+                    code=NUMTY_ANNOTATION,
+                )
+                return AnyType(TypeOfAny.from_error)
+            dim = dims[0]
+            if isinstance(dim, int):
+                return LiteralType(dim, ctx.api.named_type(INT_FULLNAME, []), line=arg.line, column=arg.column)
+            return dim
+        return ctx.api.analyze_type(arg)
 
     # Phase 3 (#197) delegators: _fam_* bodies live in _heads.py as
     # module functions taking late_bound explicitly (same object as
@@ -1621,6 +1668,51 @@ def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
     except Exception:
         _swallowed(ctx, "_own_sizes_unknown")
         return default
+
+
+def _sizes_covariant(ctx: ClassDefContext) -> None:
+    """Make the size type parameters of a user class covariant for subtyping (issue 358).
+
+    `Sys[N]` into `Sys[int]`: a size declared `int` is one numty does not
+    follow, and `F64[N]` already fits `F64[int]` (the shape tuple is
+    covariant). A class invariant in `N` refused it at a return and an
+    annotated local. A type parameter bound to `int` and declared
+    invariant is treated as covariant by mypy's subtype check, which
+    reads the variance off the class definition; the class's methods
+    keep their own variables, so no variance rule for parameters
+    applies to them.
+    """
+    try:
+        # `is_protocol` is set after this hook: a protocol names
+        # `Protocol` among the bases mypy takes out of the list.
+        for expr in [*ctx.cls.removed_base_type_exprs, *ctx.cls.base_type_exprs]:
+            base = expr.base if isinstance(expr, IndexExpr) else expr
+            if isinstance(base, RefExpr) and base.fullname in PROTOCOL_NAMES:
+                return
+        changed = False
+        tvars: list[TypeVarLikeType] = []
+        for tv in ctx.cls.type_vars:
+            upper = get_proper_type(tv.upper_bound) if isinstance(tv, TypeVarType) else None
+            if (
+                isinstance(tv, TypeVarType)
+                and tv.variance == INVARIANT
+                and not tv.values
+                and isinstance(upper, Instance)
+                and upper.type.fullname == INT_FULLNAME
+            ):
+                tvars.append(
+                    TypeVarType(
+                        tv.name, tv.fullname, tv.id, tv.values, tv.upper_bound, tv.default,
+                        variance=COVARIANT, line=tv.line, column=tv.column,
+                    )
+                )
+                changed = True
+            else:
+                tvars.append(tv)
+        if changed:
+            ctx.cls.type_vars = tvars
+    except Exception:
+        _swallowed(None, "_sizes_covariant")
 
 
 def substituted_attribute_hook(ctx: AttributeContext) -> Type:

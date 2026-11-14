@@ -76,6 +76,23 @@ quiet, where it is approximate, and what to write instead.
     overloaded numpy call dissolves to `Any` (mypy keeps the
     overload-inferred type over the hook result): hoist it to a local
     first (`kernel = gaussian_kernel(...); np.where(cond, kernel, 0.0)`).
+- A formula as a type argument of a base class (`class AR(Model[N,
+    "N-1"])`) is also read by mypy as a runtime expression, where a string
+    that is not a type is `Invalid type comment or annotation
+    [valid-type]`. numty still gives the base its formula; silence that
+    line with `# type: ignore[valid-type]`. In an annotation the formula
+    needs nothing (issue 358).
+- A `Protocol` member that returns a formula over the protocol's names
+    does not match a class that returns the same formula over its own:
+    mypy compares the two methods without putting the type arguments into
+    a formula (`2*X+1` against `2*N+1`). Declare the protocol's formula
+    position with `int` (issue 358).
+- The size parameters of a user generic class (bound to `int` and
+    declared invariant) are covariant for mypy's subtype check, as the
+    shape of an array is, so `Sys[N]` fits `Sys[int]` everywhere. mypy
+    then solves a callee's name from two such arguments as their join
+    (`int`); numty's call-site check reports the two sizes instead
+    (issue 358). A protocol's parameters keep their declared variance.
 
 ## Symbolic sizes
 

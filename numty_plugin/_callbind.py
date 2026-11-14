@@ -8,7 +8,8 @@ function-local facade import is used only for a monkeypatch seam
 from __future__ import annotations
 
 from mypy.expandtype import expand_type
-from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, Expression, ListExpr, StarExpr, TupleExpr
+from mypy.maptype import map_instance_to_supertype
+from mypy.nodes import COVARIANT, ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, Expression, ListExpr, StarExpr, TupleExpr
 from mypy.plugin import FunctionSigContext, MethodSigContext
 from mypy.types import (
     AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,
@@ -312,6 +313,49 @@ def _pairs_for_actual(
     return []
 
 
+def _class_arg_dims(formal_tp: Type, actual_tp: Type) -> list[tuple[int, TypeVarType, Type]]:
+    """(type argument index, formal's size name, actual's size) for a covariant user-class formal (issue 358).
+
+    `def both(a: Sys[N], b: Sys[N])`: with `N` covariant (the size
+    parameters of a user class are, see `_sizes_covariant`), mypy solves
+    `N` from `Sys[Literal[3]]` and `Sys[Literal[4]]` as `int` and accepts
+    the call, as it does for two arrays. The call-site check reads the
+    sizes the arguments give the class instead.
+    """
+    formal = get_proper_type(_strip_optional(formal_tp))
+    actual = get_proper_type(actual_tp)
+    if (
+        not isinstance(formal, Instance)
+        or formal.type.fullname == NDARRAY_FULLNAME
+        or not formal.args
+        or not isinstance(actual, Instance)
+        or formal.type not in actual.type.mro
+    ):
+        return []
+    try:
+        mapped = map_instance_to_supertype(actual, formal.type)
+    except Exception:
+        _swallowed(None, "_class_arg_dims")
+        return []
+    out: list[tuple[int, TypeVarType, Type]] = []
+    for i, (farg, aarg, tv) in enumerate(zip(formal.args, mapped.args, formal.type.defn.type_vars)):
+        fp = get_proper_type(farg)
+        if (
+            isinstance(tv, TypeVarType)
+            and tv.variance == COVARIANT
+            and isinstance(fp, TypeVarType)
+            and not fp.fullname.startswith(_EXPR_PREFIX)
+            and _is_int_bound(fp)
+        ):
+            out.append((i, fp, get_proper_type(aarg)))
+    return out
+
+
+def _where(axis: int) -> str:
+    """`axis 1`, or for a class's type argument (a negative axis, see `_conflict_pairs`) `type argument 0`."""
+    return f"axis {axis}" if axis >= 0 else f"type argument {-1 - axis}"
+
+
 def _conflict_pairs(
     sig: CallableType,
     ctx: FunctionSigContext | MethodSigContext,
@@ -334,6 +378,17 @@ def _conflict_pairs(
             if len(actuals) != 1:
                 continue
             out.extend(_pairs_for_actual(fname, tp, actuals[0], ctx, overrides))
+            try:
+                actual_tp = _actual_type(ctx, actuals[0], overrides)
+            except Exception:
+                _swallowed(ctx, "_conflict_pairs")
+                continue
+            # A class's type argument is written as a negative axis.
+            out.extend(
+                (fname, -1 - index, tvar, adim.value, None)
+                for index, tvar, adim in _class_arg_dims(tp, actual_tp)
+                if isinstance(adim, LiteralType) and isinstance(adim.value, int) and not isinstance(adim.value, bool)
+            )
         elif kind == ARG_STAR:
             # *args: the formal type is the element type; every actual
             # binds to it, so each one is checked.
@@ -365,8 +420,8 @@ def _emit_call_site_conflicts(
             if other[2] != first[2]:
                 message = (
                     f"call-site shape conflict for '{name}': "
-                    f"{first[2]} (argument '{first[0]}', axis {first[1]}) vs "
-                    f"{other[2]} (argument '{other[0]}', axis {other[1]})"
+                    f"{first[2]} (argument '{first[0]}', {_where(first[1])}) vs "
+                    f"{other[2]} (argument '{other[0]}', {_where(other[1])})"
                 )
                 # No dedup here (issue #44): mypy already collapses
                 # identical messages on one line, and a process-lifetime
@@ -412,9 +467,63 @@ def _callsite_formula_return(
         return sig
 
 
+def _receiver_bindings(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> dict[str, int | Type]:
+    """The sizes the receiver of a method call gives its class's names, by fullname (issue 358).
+
+    `MN(w4).resid()` with `MN[N, Literal[4]]` gives `J` 4. The class is
+    the one that defines the method, so a subclass receiver is mapped to
+    it first. Only literals and names are given; `int` and `Any` are not
+    sizes to put in a formula.
+    """
+    if not isinstance(ctx, MethodSigContext):
+        return {}
+    receiver = get_proper_type(ctx.type)
+    info = getattr(sig.definition, "info", None)
+    if not isinstance(receiver, Instance) or info is None or info not in receiver.type.mro:
+        return {}
+    try:
+        mapped = map_instance_to_supertype(receiver, info)
+    except Exception:
+        _swallowed(ctx, "_receiver_bindings")
+        return {}
+    out: dict[str, int | Type] = {}
+    for tv, arg in zip(info.defn.type_vars, mapped.args):
+        proper = get_proper_type(arg)
+        if not isinstance(tv, TypeVarType):
+            continue
+        if isinstance(proper, LiteralType) and isinstance(proper.value, int) and not isinstance(proper.value, bool):
+            out[tv.fullname] = proper.value
+        elif isinstance(proper, TypeVarType):
+            out[tv.fullname] = proper
+    return out
+
+
 def _is_int_bound(tv: TypeVarType) -> bool:
     upper = get_proper_type(tv.upper_bound)
     return isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME
+
+
+def _substitute_size(
+    sig: CallableType,
+    dim: TypeVarType,
+    bindings: dict[str, int | Type | _LinForm],
+    ctx: FunctionSigContext | MethodSigContext,
+    seen: frozenset[TypeAliasType],
+) -> Type | None:
+    """One size of a return outside an array, in the caller's terms (None when nothing changed)."""
+    try:
+        shape = TupleType([dim], ctx.api.named_generic_type("builtins.tuple", [AnyType(TypeOfAny.special_form)]))
+        array = ctx.api.named_generic_type(NDARRAY_FULLNAME, [shape, AnyType(TypeOfAny.special_form)])
+        sub = get_proper_type(_substitute_return_exprs(sig.copy_modified(ret_type=array), bindings, ctx, seen))
+    except Exception:
+        _swallowed(ctx, "_substitute_size")
+        return None
+    if not isinstance(sub, Instance) or len(sub.args) != 2:
+        return None
+    items = get_proper_type(sub.args[0])
+    if not isinstance(items, TupleType) or len(items.items) != 1:
+        return None
+    return items.items[0]
 
 
 def _caller_names(ctx: FunctionSigContext | MethodSigContext) -> set[str]:
@@ -753,6 +862,7 @@ def _substitute_return_exprs(
             return None
         if (
             isinstance(proper_ret, TypeVarType)
+            and not proper_ret.fullname.startswith(_EXPR_PREFIX)
             and proper_ret.fullname not in bindings
             and proper_ret.fullname not in inferred
             and proper_ret.fullname not in in_formula
@@ -956,6 +1066,14 @@ def _substitute_return_exprs(
                         new_args.append(b)
                         changed_a = True
                     continue
+                if isinstance(ap, TypeVarType) and ap.fullname.startswith(_EXPR_PREFIX):
+                    # A formula type argument (`-> Model[N, "N-1"]`, issue
+                    # 358): solved as the one size of an array would be.
+                    sized = _substitute_size(sig, ap, bindings, ctx, _seen)
+                    if sized is not None:
+                        new_args.append(sized)
+                        changed_a = True
+                        continue
                 # Nested ndarray inside generic arg: recurse.
                 try:
                     sub_sig_a = sig.copy_modified(ret_type=arg)
@@ -980,6 +1098,7 @@ def _substitute_return_exprs(
     new_dims: list[int | Type] = []
     changed = False
     own_ids = {v.id for v in sig.variables}
+    receiver = _receiver_bindings(sig, ctx)
     # For building new expr vars we need constituent objects by fullname.
     # Caller-ns first (Phase 4 Phase 1 namespaced B keys), then any-ns.
     obj_by_fullname: dict[str, TypeVarType] = {}
@@ -1052,6 +1171,11 @@ def _substitute_return_exprs(
             else:
                 return None
             for cfull, _ in form_r.coeffs:
+                if cfull not in bindings and cfull in receiver:
+                    # A name of the receiver's class (`-> F64[N, "J-1"]`
+                    # on `MN[N, Literal[4]]`): mypy puts the class's
+                    # arguments in for plain names only (issue 358).
+                    bindings = {**bindings, cfull: receiver[cfull]}
                 if (
                     cfull not in bindings
                     and d.id in own_ids
