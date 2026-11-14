@@ -261,7 +261,13 @@ _ANNOTATED_VALUES_CACHE: dict[str, tuple[ast.Module, set[tuple[int, int]]]] = {}
 
 
 def _is_annotated_value(path: str, line: int, col: int) -> bool:
-    """Whether the expression at `(line, col)` is the value of an annotated assignment (`x: T = <here>`)."""
+    """Whether the expression at `(line, col)` is the value of an annotated assignment (`x: T = <here>`).
+
+    Also of a plain assignment to a name its function declared on an
+    earlier line (`d: F64[N, N]` then `d = <here>`, or a parameter
+    rebound, issue 359): mypy checks it under the declared type too, and
+    the annotation means the same wherever it is written.
+    """
     mod = _module_ast(path)
     if mod is None:
         return False
@@ -272,6 +278,27 @@ def _is_annotated_value(path: str, line: int, col: int) -> bool:
             for node in ast.walk(mod)
             if isinstance(node, ast.AnnAssign) and node.value is not None
         }
+        for func in ast.walk(mod):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            declared = _annotated_names(func) | {
+                arg.arg
+                for arg in (*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs)
+                if arg.annotation is not None
+            }
+            todo = list(func.body)
+            while todo:
+                node = todo.pop()
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                    continue
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id in declared
+                ):
+                    spots.add((node.value.lineno, node.value.col_offset))
+                todo.extend(ast.iter_child_nodes(node))
         hit = (mod, spots)
         _ANNOTATED_VALUES_CACHE[path] = hit
     return (line, col) in hit[1]

@@ -1178,6 +1178,72 @@ def _int_shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
     return out
 
 
+def _reshape_list_target(
+    ctx: FunctionContext | MethodContext, pairs: list[tuple[Type, Expression | None]]
+) -> list[tuple[Type, Expression | None]]:
+    """`pairs` with a list target (`reshape(H, [d, n])`) read as a tuple.
+
+    mypy types `[d, n]` as `list[int]`, which drops the sizes; numpy reads
+    the list exactly like the tuple `(d, n)` (issue 353). Each item is
+    read from its own expression: a literal, a size name, a formula.
+    """
+    if not pairs or not isinstance(pairs[0][1], ListExpr):
+        return pairs
+    items_expr = pairs[0][1].items
+    if not items_expr or any(isinstance(item, StarExpr) for item in items_expr):
+        return pairs
+    int_instance = ctx.api.named_generic_type(INT_FULLNAME, [])
+    items: list[Type] = []
+    for index, item in enumerate(items_expr):
+        dim = _fold_dim_expr(ctx, item, index)
+        if isinstance(dim, int):
+            items.append(LiteralType(dim, fallback=int_instance))
+        elif dim is not None:
+            items.append(dim)
+        else:
+            items.append(int_instance)
+    fallback = ctx.api.named_generic_type("builtins.tuple", [int_instance])
+    return [(TupleType(items, fallback=fallback), None), *pairs[1:]]
+
+
+def _is_unsized_tuple(tp: Type) -> bool:
+    """A tuple of unknown length (`tuple[Any, ...]`, `tuple[int, ...]`).
+
+    A `*Ts` shape (`tuple[N, *Ts]`) is not one: the stubs bind it.
+    """
+    proper = get_proper_type(tp)
+    if isinstance(proper, Instance):
+        return proper.type.fullname == "builtins.tuple"
+    if isinstance(proper, TupleType):
+        return any(
+            isinstance(item, UnpackType) and _is_unsized_tuple(item.type)
+            for item in proper.items
+        )
+    return False
+
+
+def _reshape_kept_axes(
+    dims_old: list[int | Type], raw: list[int | TypeVarType]
+) -> list[int | Type] | None:
+    """The target with its -1 solved from the input's own axes, else None.
+
+    `np.reshape(a, (a.shape[0], -1))`: the sizes around the -1 are the
+    input's leading and trailing axes, whatever their form (`n-1`,
+    `?stop-?start`), so the -1 is the one input axis between them
+    (issue 353). Only a single axis left over is spelled; more would be
+    a product the algebra may not hold.
+    """
+    j = raw.index(-1)
+    head, tail = raw[:j], raw[j + 1:]
+    if len(head) + len(tail) + 1 != len(dims_old):
+        return None
+    if not all(_dim_eq(a, b) for a, b in zip(head, dims_old)):
+        return None
+    if not all(_dim_eq(a, b) for a, b in zip(tail, dims_old[len(dims_old) - len(tail):])):
+        return None
+    return [*head, dims_old[j], *tail]
+
+
 def _builder_fold_dim_expr(
     ctx: FunctionContext | MethodContext, expr: Expression, index: int
 ) -> int | Type | None:
