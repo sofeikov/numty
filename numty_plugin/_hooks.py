@@ -29,7 +29,9 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _quiet_type, _swallowed, _warn_startup
+from ._errors import (
+    NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _quiet_type, _swallowed, _warn_startup,
+)
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -100,7 +102,8 @@ from ._indexing import (
     take_method_hook,
 )
 from ._broadcast import (
-    angle_function_hook, asarray_function_hook, atleast_function_hook, broadcast_method_hook, broadcast_to_function_hook,
+    angle_function_hook, asarray_function_hook, atleast_function_hook, broadcast_method_hook,
+    broadcast_to_function_hook,
     clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook,
     divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook,
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,

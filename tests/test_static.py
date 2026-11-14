@@ -6854,8 +6854,12 @@ def test_callsite_binding_ok() -> None:
 
 def test_callsite_binding_catch() -> None:
     result = run_mypy(FIXTURES / "bad_callsite_binding.py")
-    i_conflict = "call-site shape conflict for 'I': 1 (argument 'b', axis 0) vs 3 (argument 'u', axis 1)  [numty-callsite]"
-    n_conflict = "call-site shape conflict for 'N': 4 (argument 'x', axis 0) vs 3 (argument 'P', axis 0)  [numty-callsite]"
+    i_conflict = (
+        "call-site shape conflict for 'I': 1 (argument 'b', axis 0) vs 3 (argument 'u', axis 1)  [numty-callsite]"
+    )
+    n_conflict = (
+        "call-site shape conflict for 'N': 4 (argument 'x', axis 0) vs 3 (argument 'P', axis 0)  [numty-callsite]"
+    )
     assert _messages_by_line(result) == {
         20: [i_conflict],
         21: [i_conflict],
