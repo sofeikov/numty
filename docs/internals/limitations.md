@@ -93,8 +93,10 @@ quiet, where it is approximate, and what to write instead.
     in a loop or a comprehension (a call there, a mask variable bound
     there, a variable holding an object bound there) such a size is a
     size per run and nothing is proved from it; the same goes for any
-    other unknown (`?U@14` from an inline mask): one site can stand for
-    the items of a comprehension. A value kept across calls of a
+    other unknown (`?U@14` from an inline mask) minted there: one site can
+    stand for the items of a comprehension. One minted elsewhere ran once
+    and is one size against itself in a contraction or a broadcast
+    (`q @ r` of one `np.linalg.qr`, issue 352). A value kept across calls of a
     function (an attribute holding last call's selection) is not
     seen as another size.
 - An in-place op that grows a `1` axis to a size over names is
@@ -240,10 +242,12 @@ quiet, where it is approximate, and what to write instead.
     member: each member solves with the full solver and the results
     union. Members pair index-wise (exact for co-derived unions);
     unrelated unions of different member counts, and dunder ops with
-    unions on both sides (mypy matches those cartesianly), bail out
-    instead of guessing. A union with a Python or NumPy scalar
-    (`F64[M] | float`, `float | int`) distributes too when it is the
-    only union among the operands; `F64[N] | None` distributes in
+    two different unions on both sides (mypy matches those
+    cartesianly), bail out instead of guessing; one variable on both
+    sides (`u + u`) pairs index-wise. A union with a Python or NumPy
+    scalar or with `Any` (`F64[M] | float`, `float | int`,
+    `F64[M] | Any`) distributes too when it is the only union among
+    the operands; `F64[N] | None` distributes in
     `np.average(weights=...)` and at calls of user functions
     ([#331](https://github.com/sofeikov/numty/issues/331)). Other
     optional arguments of NumPy calls still keep the stubs' answer.
@@ -343,11 +347,24 @@ quiet, where it is approximate, and what to write instead.
     `X = list[3]` does). Spell the sizes with `Literal`
     (`Mat34: TypeAlias = F64[Literal[3], Literal[4]]`, or the PEP 695
     `type` form); uses then check and infer exactly.
+- `np.arange(ws, we)` over `int` variables stays the stubs' `(int,)`,
+    though the slice `x[ws:we]` is `(?we-?ws,)`: an unknown row count
+    there makes a local that is later bound to its transpose (`values =
+    np.swapaxes(values, 0, -1)`) an `[assignment]` error, where `Any`
+    fits. A builder reads a local bound to a sum (`m = n + 1`) but not one
+    bound to a product (`kp = k * p`), which a free name of the return
+    may stand for (issue 359).
 - Integer bookkeeping on a *symbolic* dim keeps the dim, like plain
     mypy for generic containers (`n = x.shape[0]` infers `N`, so
     `n //= 2` is an error). Concrete dims widen to `int` (keeping the
-    value for direct uses like `reshape(x.shape[0], 3)`), and unknown
-    (`?U`) dims are plain `int`. For a loop counter over a symbolic
+    value for direct uses like `reshape(x.shape[0], 3)`). `len()` and `.size` of a selection
+    count are plain `int`; a size a call chose for a name of its return
+    (`?K@14`) stays, as `.shape[0]` keeps every unknown (issue 359). On a
+    union, an axis where the members differ keeps each member's size
+    (`U.shape[0]` of `(N, N) | (0, 0)` is `N | Literal[0]`, of
+    `(3, 2) | (4, 2)` is `Literal[3, 4]`), so a local taken from it does
+    not widen either, while an axis with one int on every member widens
+    as usual. For a loop counter over a symbolic
     axis, write `int(...)` explicitly (`n = int(x.shape[0])`). In array
     arithmetic such a size is a Python `int` scalar: `X @ X.T / X.shape[0]`
     keeps `(N, N)` like `/ float(X.shape[0])` does.

@@ -21,7 +21,8 @@ from ._dtypes import (
 from ._types import (
     DTYPE_FULLNAME, INT_FULLNAME, _clash_dim, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
     _fold_int, _has_unpack, _int_value, _kept_name, _named_sizes_differ, _ndarray_parts, _ndarray_type,
-    _parts_or_unpack, _report_mask_names, _report_names, _same_own_size, _shape_from_arg, _split_flat, _union_members,
+    _parts_or_unpack, _report_mask_names, _report_names, _same_own_size, _scalar_union_members, _shape_from_arg,
+    _split_flat, _target_is_union, _union_members,
 )
 from ._sequences import _comprehension_length
 from ._reshape import (
@@ -316,23 +317,31 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
     lhs_dims, _ = lhs
     if _scalar_key(args[0]) is not None:
         return _checked_stub_type(ctx)
-    members = _union_members(args[0])
+    members = _union_members(args[0]) or _scalar_union_members(args[0])
     if members is not None:
-        # Issue #263: a union of arrays on the right. An error when no
-        # member fits the target; a dry run, so no unknown is made.
+        # Issue #263: a union on the right; a dry run, so no unknown is
+        # made. Each array member must fit the target (issue 354), unless
+        # the target is a member of the same kind of union (`v -= u` with
+        # `v = u[1:]`), whose members pair: then one fitting member does.
+        paired = _target_is_union(ctx)
         first: str | None = None
+        checked_all = True
         for member in members:
+            if _scalar_key(member) is not None or isinstance(get_proper_type(member), AnyType):
+                continue
             part = _ndarray_parts(member) or _known_rank_parts(member)
             if part is None:
                 return ctx.default_return_type
             checked, message = _inplace_check(lhs_dims, part[0], None)
             if message is None:
-                return _checked_stub_type(ctx) if checked else ctx.default_return_type
-            if first is None:
+                if paired:
+                    return _checked_stub_type(ctx) if checked else ctx.default_return_type
+                checked_all = checked_all and checked
+            elif first is None:
                 first = message
         if first is not None:
             ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
-        return _checked_stub_type(ctx)
+        return _checked_stub_type(ctx) if first is not None or checked_all else ctx.default_return_type
     rhs = _ndarray_parts(args[0]) or _known_rank_parts(args[0])
     if rhs is None:
         return ctx.default_return_type

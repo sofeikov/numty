@@ -37,6 +37,7 @@ from ._dtypes import (
 from ._types import (
     _fold_dim_expr, _has_unknown_shape, _distribute_solve, _in_loop_body,
 )
+from ._types import _is_unsized_tuple, _reshape_kept_axes, _reshape_list_target
 from collections.abc import (
     Iterator,
 )
@@ -250,12 +251,11 @@ def _solve_reshape_dynamic(
     a plain `int` like the input's dynamic dims ((n, 3) -> (-1, 3) is
     (int, 3)). Next to a plain `int` size it is a ratio the caller may
     know to be fixed ((n, 3) -> (n, -1) is (n, 3) again), so it is
-    unknown (Any), which fits where a literal was expected. Plain `int`
+    unknown (Any), which fits where a literal was expected, and so it
+    is next to size names only. Plain `int`
     target sizes go unknown where they may stand for a literal the name
     was first bound with: on a mixed input's literal axes, and anywhere
-    when the input has no literal axis to line them up with. With
-    neither a literal nor a plain `int` size (reshape(-1), TypeVar
-    sizes), the stubs' answer stays.
+    when the input has no literal axis to line them up with.
     """
     proper = get_proper_type(old)
     if not (
@@ -272,8 +272,14 @@ def _solve_reshape_dynamic(
     if plain:
         inferred = AnyType(TypeOfAny.explicit)
     if not plain and not any(d >= 0 for d in ints) and -1 in ints:
-        # reshape(-1), reshape(N, -1): the -1 is not readable here.
-        return ctx.default_return_type
+        # reshape(-1), reshape(N, -1): the -1 is not readable here. Next
+        # to a size name it is unknown (Any) as next to a plain `int`, so
+        # the name still checks and the -1 fits a declared size (issue
+        # 353); never the stubs' `Literal[-1]`.
+        if len(dims) == 1:
+            flat = ctx.api.named_generic_type(INT_FULLNAME, [])
+            return _mixed_result(_ndarray_type(ctx, [flat], proper.args[1]), old)
+        inferred = AnyType(TypeOfAny.explicit)
     out = [inferred if d == -1 else d for d in dims]
     if not _is_mixed_shape(proper):
         # No literal axis to line the sizes up with (x.ravel().reshape(n,
@@ -297,6 +303,21 @@ def _solve_reshape(
 ) -> Type:
     from numty_plugin import _materialize_dim, _fresh_unknown
 
+    pairs = _reshape_list_target(ctx, pairs)
+    if pairs and _is_unsized_tuple(pairs[0][0]):
+        # `reshape(b.shape)` with `b.shape` of unknown length (an
+        # untracked operand, issue 353): the rank is unknown too. The
+        # stubs bind it to `tuple[()]`, which a later `.shape[1]` refuses.
+        proper = get_proper_type(old)
+        dtype = (
+            proper.args[1]
+            if isinstance(proper, Instance) and proper.type.fullname == NDARRAY_FULLNAME
+            and len(proper.args) == 2
+            else AnyType(TypeOfAny.special_form)
+        )
+        return ctx.api.named_generic_type(
+            NDARRAY_FULLNAME, [AnyType(TypeOfAny.special_form), dtype]
+        )
     try:
         pairs = _reshape_fold_arithmetic(ctx, pairs)
     except Exception:
@@ -389,6 +410,9 @@ def _solve_reshape(
                 [inferred if d == -1 else d for d in raw],
                 dtype,
             )
+        kept = _reshape_kept_axes(dims_old, raw)
+        if kept is not None:
+            return _ndarray_type(ctx, kept, dtype)
         if old_vars != new_vars:
             # The inferred dim would absorb a symbolic size (N * 50 is not
             # expressible): track it with a fresh unknown instead of

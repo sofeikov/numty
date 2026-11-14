@@ -1,21 +1,30 @@
 """_sequences.py — what numty reads from a sequence built at runtime
 (issue 333): the length of a list comprehension, and the item shape of a
-sequence whose items are typed as a union of arrays. Kept out of
-_builders.py and _broadcast.py, which are near the 2000-line limit.
+sequence whose items are typed as a union of arrays. Also an array read
+as a sequence: `len()`, `.size`, and its rows through `list()`, `iter()`,
+`enumerate()` and `zip()` (issues 359, 361). Kept out of _builders.py,
+_broadcast.py, _hooks.py and _indexing.py, which are near the 2000-line
+limit.
 Top-level imports go to earlier layers only (order in tests/test_layout.py,
 _LAYERS).
 """
 from __future__ import annotations
 
-from mypy.nodes import ARG_POS, CallExpr, Expression, ListComprehension, ListExpr, NameExpr, StarExpr
-from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import TupleType, Type, UnpackType, get_proper_type
-
-from ._errors import _swallowed
-from ._types import (
-    _builder_fold_dim_expr, _dim_eq, _kept_name, _named_size, _ndarray_parts, _union_members,
+from mypy.nodes import ARG_POS, CallExpr, Expression, ListComprehension, ListExpr, NameExpr, OpExpr, StarExpr
+from mypy.plugin import AttributeContext, FunctionContext, MethodContext
+from mypy.types import (
+    CallableType, Instance, LiteralType, TupleType, Type, TypeVarType, UnpackType, get_proper_type,
 )
-from ._reshape import _known_rank_parts, _promote_all
+
+from ._bindings import _value_of_rebound_name
+from ._errors import NUMTY_SHAPE, _swallowed
+from ._forms import _form_has_unknown, _is_unknown_fullname, _LinForm
+from ._unknowns import _OWN_SIZE_MARK
+from ._types import (
+    _builder_fold_dim_expr, _dim_eq, _enum_member_count, _kept_name, _linear_product, _named_size,
+    _ndarray_parts, _ndarray_type, _union_members,
+)
+from ._reshape import _all_positionals, _known_rank_parts, _promote_all
 
 
 def _union_item_parts(
@@ -84,9 +93,18 @@ def _sequence_length(ctx: FunctionContext | MethodContext, seq: Expression) -> i
         name = seq.callee.fullname
         if any(kind != ARG_POS for kind in seq.arg_kinds):
             return None
-        if name == "builtins.range" and len(seq.args) == 1:
-            size = _builder_fold_dim_expr(ctx, seq.args[0], 0)
-            return max(size, 0) if isinstance(size, int) else size
+        if name == "builtins.range" and len(seq.args) in (1, 2):
+            # `range(lags, nobs)` has `nobs - lags` items, read as the
+            # formula `stop - start` (issue 359); like `np.arange(1, m + 1)`
+            # the bounds are taken to be in order.
+            span = seq.args[0] if len(seq.args) == 1 else OpExpr("-", seq.args[1], seq.args[0])
+            size = _builder_fold_dim_expr(ctx, span, 0)
+            if isinstance(size, int):
+                return max(size, 0)
+            if size is not None and not _may_be_positive(size):
+                # `range(x.shape[0], 2)` is empty from N = 2 on; never `2-N`.
+                return None
+            return size
         if name == "builtins.enumerate" and len(seq.args) == 1:
             return _sequence_length(ctx, seq.args[0])
         if name == "builtins.zip":
@@ -109,3 +127,144 @@ def _sequence_length(ctx: FunctionContext | MethodContext, seq: Expression) -> i
     if parts is None or not parts[0]:
         return None
     return parts[0][0]
+
+
+def _may_be_positive(size: Type) -> bool:
+    """Whether a size formula grows with one of its names (`N-2`, `?b-?a`; not `2-N`)."""
+    from numty_plugin import _resolve_dim
+
+    form = _resolve_dim(size)
+    if not isinstance(form, _LinForm):
+        return True
+    return any(c > 0 for _, c in form.coeffs)
+
+
+def len_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    int_fallback = ctx.api.named_generic_type("builtins.int", [])
+    proper = get_proper_type(pairs[0][0])
+    if isinstance(proper, CallableType):
+        # An enum class arrives as its constructor; len() counts members.
+        ret = get_proper_type(proper.ret_type)
+        if isinstance(ret, Instance) and ret.type.is_enum:
+            count = _enum_member_count(ret.type)
+            if count is not None:
+                return LiteralType(count, fallback=int_fallback)
+            return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, _ = parts
+    if not dims:
+        ctx.api.fail("len() of unsized object", ctx.context, code=NUMTY_SHAPE)
+        return ctx.default_return_type
+    first = dims[0]
+    if isinstance(first, TypeVarType):
+        if first.fullname.startswith("__numty_unknown__.") and _OWN_SIZE_MARK not in first.fullname:
+            # Unknown (data-dependent) lengths are plain ints: nothing
+            # nameable is lost, and `k = len(masked); k = max(k, 1)`
+            # checks (issue #62). Named dims stay exact, and so does a
+            # size a call chose for a name of its return (`?K@14`, issue
+            # 359): `len(d)` is what `d.shape[0]` is.
+            return int_fallback
+        if _value_of_rebound_name(ctx, ctx.context):
+            # `n = len(d)` with `n //= 2` later: mypy types `n` from this
+            # line, so a size would refuse the rebinding.
+            return int_fallback
+        return first
+    if not isinstance(first, int):
+        return ctx.default_return_type
+    # Same widening form as .shape items (issue #62): fresh locals get
+    # plain int (`k = len(x); k -= 1`), direct uses still read the value.
+    return int_fallback.copy_modified(
+        last_known_value=LiteralType(first, fallback=int_fallback)
+    )
+
+
+def size_attribute_hook(ctx: AttributeContext) -> Type:
+    """`x.size`: the product of the axes, as `len(x)` is the first (issue 359).
+
+    A literal total is `int` carrying its value, the form `.shape` items
+    take (issue #62); a total over names is the size it spells (`S` for
+    `(S,)`, `C*K` for `(C, K)`). Anything else stays `int`, as does the
+    value of a local that is bound again (`total = x.size; total += 1`).
+    """
+    from numty_plugin import _materialize_dim
+
+    try:
+        parts = _ndarray_parts(ctx.type)
+        if parts is None:
+            return ctx.default_attr_type
+        if _value_of_rebound_name(ctx, ctx.context):
+            # `total = x.size` with `total += y.size` later stays `int`.
+            return ctx.default_attr_type
+        dims = parts[0]
+        int_fallback = ctx.api.named_generic_type("builtins.int", [])
+        if all(isinstance(d, int) for d in dims):
+            total = 1
+            for d in dims:
+                assert isinstance(d, int)
+                total *= d
+            return int_fallback.copy_modified(last_known_value=LiteralType(total, fallback=int_fallback))
+        if len(dims) == 1 and isinstance(dims[0], TypeVarType):
+            first = dims[0]
+            # A selection count stays `int`, as for `len()`.
+            if _is_unknown_fullname(first.fullname) and _OWN_SIZE_MARK not in first.fullname:
+                return ctx.default_attr_type
+            return first
+        form = _linear_product(dims)
+        if form is None or _form_has_unknown(form):
+            return ctx.default_attr_type
+        dim = _materialize_dim(ctx, "size", 0, form)
+        if isinstance(dim, int):
+            return int_fallback.copy_modified(last_known_value=LiteralType(dim, fallback=int_fallback))
+        return dim
+    except Exception:
+        _swallowed(ctx, "size_attribute_hook")
+        return ctx.default_attr_type
+
+
+def _row_type(ctx: FunctionContext | MethodContext, tp: Type) -> Type | None:
+    """The type of one item of an array of rank 2 or more, else None."""
+    parts = _ndarray_parts(tp) or _known_rank_parts(tp)
+    if parts is None or len(parts[0]) < 2:
+        return None
+    dims, dtype = parts
+    return _ndarray_type(ctx, list(dims[1:]), dtype)
+
+
+def rows_function_hook(ctx: FunctionContext) -> Type:
+    """`list(m)`, `iter(m)`, `enumerate(m)`, `zip(m, w)` over an array's rows (issue 361).
+
+    mypy reads these through the stubs' `__iter__`, not through the
+    `for` hook (`iter_method_hook`), so the rows were rank-less arrays.
+    The item an array argument gives is its row, as in a plain `for`.
+    """
+    default = ctx.default_return_type
+    try:
+        proper = get_proper_type(default)
+        if not isinstance(proper, Instance) or len(proper.args) != 1:
+            return default
+        actuals = [
+            (kind, tp) for kinds, tps in zip(ctx.arg_kinds, ctx.arg_types) for kind, tp in zip(kinds, tps)
+        ]
+        if not actuals or any(kind != ARG_POS for kind, _ in actuals):
+            return default
+        item = get_proper_type(proper.args[0])
+        if proper.type.fullname == "builtins.zip":
+            if not isinstance(item, TupleType) or len(item.items) != len(actuals):
+                return default
+            rows = [_row_type(ctx, tp) for _, tp in actuals]
+            if all(row is None for row in rows):
+                return default
+            items = [old if row is None else row for old, row in zip(item.items, rows)]
+            return proper.copy_modified(args=[item.copy_modified(items=items)])
+        row = _row_type(ctx, actuals[0][1])
+        if row is None:
+            return default
+        return proper.copy_modified(args=[row])
+    except Exception:
+        _swallowed(ctx, "rows_function_hook")
+        return default

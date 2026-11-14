@@ -5,11 +5,11 @@ to earlier layers only (order in tests/test_layout.py, _LAYERS).
 from __future__ import annotations
 
 from mypy.expandtype import expand_type_by_instance
-from mypy.nodes import ARG_POS, CallExpr, NameExpr
+from mypy.nodes import ARG_POS, CallExpr, NameExpr, OverloadedFuncDef
 from mypy.plugin import FunctionContext, FunctionSigContext, MethodSigContext
 from mypy.typeops import make_simplified_union
 from mypy.types import (
-    AnyType, CallableType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnionType, get_proper_type,
+    AnyType, CallableType, Instance, TupleType, Type, TypeOfAny, TypeType, TypeVarType, UnionType, get_proper_type,
 )
 
 from ._errors import NUMTY_CALLSITE, NUMTY_NAMES, _swallowed
@@ -385,3 +385,18 @@ def minmax_function_hook(ctx: FunctionContext) -> Type:
     except Exception:
         _swallowed(ctx, "minmax_function_hook")
         return ctx.default_return_type
+
+
+def _overloaded_method(ctx: MethodSigContext, fullname: str) -> bool:
+    """Whether the method called on the receiver is overloaded (issue 355).
+
+    `a.predict(p, X)` names no node, so the callee check of a free
+    function misses it: the hook then ran on each item mypy tried and
+    reported the conflicts of an item it did not select.
+    """
+    proper = get_proper_type(ctx.type)
+    if isinstance(proper, TypeType):
+        proper = get_proper_type(proper.item)
+    if not isinstance(proper, Instance):
+        return False
+    return isinstance(proper.type.get_method(fullname.rpartition(".")[2]), OverloadedFuncDef)

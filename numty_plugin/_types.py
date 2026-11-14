@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, cast
 from mypy.errorcodes import ARG_TYPE
 from mypy.nodes import (
     ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, CallExpr, Context, Expression, IntExpr,
-    ListExpr, MemberExpr, NameExpr, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var,
+    ListExpr, MemberExpr, NameExpr, OperatorAssignmentStmt, OpExpr, StarExpr, TupleExpr, TypeInfo, UnaryExpr, Var,
 )
 from mypy.messages import callable_name
 from mypy.operators import op_methods_to_symbols
@@ -32,6 +32,8 @@ from ._forms import (
 from ._exprs import (
     _expr_constituents, _expr_str, _form_of, _seen_vars,
 )
+from ._bindings import _mask_var_key, _single_rvalue_of
+from ._unknowns import _is_single_site
 
 NDARRAY_FULLNAME = "numpy.ndarray"
 INT_FULLNAME = "builtins.int"
@@ -244,6 +246,9 @@ _OWN_NAME_OF: dict[TypeVarId, set[str]] = {}
 def _same_own_size(a: int | Type, b: int | Type) -> bool:
     """One selection count, or one size a call chose, on both sides (issues 288, 307).
 
+    Also one site unknown minted outside a loop or a comprehension
+    (issue 352): `q` and `r` of one `np.linalg.qr` share their size.
+
     Also a free name against the unknown that took it: `sel * y[keep]`
     with `sel = x[keep]` named `K` is one count on both sides.
     """
@@ -255,7 +260,8 @@ def _same_own_size(a: int | Type, b: int | Type) -> bool:
         return True
     if b.fullname in _OWN_NAME_OF.get(a.id, ()) or a.fullname in _OWN_NAME_OF.get(b.id, ()):
         return True
-    return False
+    # One site unknown minted where it runs once (issue 352): `q @ r`.
+    return a.fullname == b.fullname and _is_single_site(a)
 
 
 def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:
@@ -776,7 +782,9 @@ def _scalar_union_members(tp: Type) -> list[Type] | None:
 
     Issue 331. `F64[M] | float` and `float | int`: a union with at least
     one Python or NumPy scalar member and nothing but arrays and scalars
-    otherwise. A pure union of arrays is `_union_members`.
+    otherwise. A pure union of arrays is `_union_members`. An `Any`
+    member counts as a scalar (issue 354): `F64[5, 1] | Any` checks its
+    array member, the `Any` one solves to the stubs' answer.
     """
     proper = get_proper_type(tp)
     if not isinstance(proper, UnionType):
@@ -785,7 +793,7 @@ def _scalar_union_members(tp: Type) -> list[Type] | None:
     scalar = False
     for item in proper.items:
         item_proper = get_proper_type(item)
-        if _is_scalar_member(item_proper):
+        if _is_scalar_member(item_proper) or isinstance(item_proper, AnyType):
             scalar = True
         elif not (
             isinstance(item_proper, Instance)
@@ -875,6 +883,67 @@ def _in_loop_body(ctx: FunctionContext | MethodContext) -> bool:
     return bool(getattr(binder, "break_frames", None))
 
 
+def _target_is_union(ctx: MethodContext) -> bool:
+    """Whether the target of an in-place operator is a union, checked per member by mypy."""
+    stmt = ctx.context
+    if not isinstance(stmt, OperatorAssignmentStmt):
+        return False
+    if not isinstance(stmt.lvalue, (NameExpr, MemberExpr)):
+        return False
+    try:
+        return isinstance(get_proper_type(ctx.api.get_expression_type(stmt.lvalue)), UnionType)
+    except Exception:
+        _swallowed(ctx, "_target_is_union")
+        return True
+
+
+def shape_attribute_hook(ctx: AttributeContext) -> Type:
+    # A union's members keep a literal size as a literal where the members
+    # differ (issue 354): mypy joins the members' shapes, and `int`
+    # carrying 0 would absorb `N` (`tuple[N, N] | tuple[0?, 0?]` is
+    # `tuple[0?, 0?]`), or carrying 3 would absorb 4. An axis where every
+    # member has one int keeps the widening form, so `k = u.shape[1]`
+    # still widens to `int`.
+    members = _union_members(ctx.type)
+    if members is not None:
+        shapes = [_parts_or_unpack(member) for member in members]
+        sizes: dict[int, set[int | None]] = {}
+        for shape in shapes:
+            for axis, v in enumerate(shape[0] if shape is not None else ()):
+                sizes.setdefault(axis, set()).add(v if isinstance(v, int) else None)
+        literal = {axis for axis, seen in sizes.items() if len(seen) != 1 or None in seen}
+        return _union_results([_shape_type(ctx, member, literal) for member in members])
+    return _shape_type(ctx, ctx.type)
+
+
+def _shape_type(ctx: AttributeContext, tp: Type, literal: set[int] | None = None) -> Type:
+    parts = _parts_or_unpack(tp)
+    if parts is None:
+        return ctx.default_attr_type
+    dims, _ = parts
+    int_fallback = ctx.api.named_generic_type("builtins.int", [])
+    items: list[Type] = []
+    for axis, v in enumerate(dims):
+        if isinstance(v, int) and literal is not None and axis in literal:
+            items.append(LiteralType(v, fallback=int_fallback))
+        elif isinstance(v, int):
+            # mypy's widening form: a plain int carrying its literal
+            # value. Fresh locals widen to int (so `k = x.shape[0]; k -= 1`
+            # checks), while _int_value/_dim_value still read the value
+            # back for direct uses like reshape(x.shape[0], 3) (issue #62).
+            items.append(
+                int_fallback.copy_modified(
+                    last_known_value=LiteralType(v, fallback=int_fallback)
+                )
+            )
+        else:
+            items.append(v)
+    fallback = ctx.api.named_generic_type(
+        TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
+    )
+    return TupleType(items, fallback)
+
+
 def _union_results(results: list[Type]) -> Type:
     """Union of per-member results (collapses when they coincide)."""
     if len(results) == 1:
@@ -895,7 +964,13 @@ def _distribute_solve(types: list[Type], solve: Callable[..., Type]) -> Type | N
         return None
     width = max(len(members) for members in pairings)
     full = [members if len(members) == width else members * width for members in pairings]
-    return _union_results([solve(*combo) for combo in zip(*full)])
+    # An `Any` member (issue 354) gives Any, not the stubs' array that
+    # would absorb the other members' results.
+    results: list[Type] = []
+    for combo in zip(*full):
+        anys = [m for m in map(get_proper_type, combo) if isinstance(m, AnyType)]
+        results.append(AnyType(TypeOfAny.from_another_any, source_any=anys[0]) if anys else solve(*combo))
+    return _union_results(results)
 
 
 def _split_flat(
@@ -1178,6 +1253,72 @@ def _int_shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
     return out
 
 
+def _reshape_list_target(
+    ctx: FunctionContext | MethodContext, pairs: list[tuple[Type, Expression | None]]
+) -> list[tuple[Type, Expression | None]]:
+    """`pairs` with a list target (`reshape(H, [d, n])`) read as a tuple.
+
+    mypy types `[d, n]` as `list[int]`, which drops the sizes; numpy reads
+    the list exactly like the tuple `(d, n)` (issue 353). Each item is
+    read from its own expression: a literal, a size name, a formula.
+    """
+    if not pairs or not isinstance(pairs[0][1], ListExpr):
+        return pairs
+    items_expr = pairs[0][1].items
+    if not items_expr or any(isinstance(item, StarExpr) for item in items_expr):
+        return pairs
+    int_instance = ctx.api.named_generic_type(INT_FULLNAME, [])
+    items: list[Type] = []
+    for index, item in enumerate(items_expr):
+        dim = _fold_dim_expr(ctx, item, index)
+        if isinstance(dim, int):
+            items.append(LiteralType(dim, fallback=int_instance))
+        elif dim is not None:
+            items.append(dim)
+        else:
+            items.append(int_instance)
+    fallback = ctx.api.named_generic_type("builtins.tuple", [int_instance])
+    return [(TupleType(items, fallback=fallback), None), *pairs[1:]]
+
+
+def _is_unsized_tuple(tp: Type) -> bool:
+    """A tuple of unknown length (`tuple[Any, ...]`, `tuple[int, ...]`).
+
+    A `*Ts` shape (`tuple[N, *Ts]`) is not one: the stubs bind it.
+    """
+    proper = get_proper_type(tp)
+    if isinstance(proper, Instance):
+        return proper.type.fullname == "builtins.tuple"
+    if isinstance(proper, TupleType):
+        return any(
+            isinstance(item, UnpackType) and _is_unsized_tuple(item.type)
+            for item in proper.items
+        )
+    return False
+
+
+def _reshape_kept_axes(
+    dims_old: list[int | Type], raw: list[int | TypeVarType]
+) -> list[int | Type] | None:
+    """The target with its -1 solved from the input's own axes, else None.
+
+    `np.reshape(a, (a.shape[0], -1))`: the sizes around the -1 are the
+    input's leading and trailing axes, whatever their form (`n-1`,
+    `?stop-?start`), so the -1 is the one input axis between them
+    (issue 353). Only a single axis left over is spelled; more would be
+    a product the algebra may not hold.
+    """
+    j = raw.index(-1)
+    head, tail = raw[:j], raw[j + 1:]
+    if len(head) + len(tail) + 1 != len(dims_old):
+        return None
+    if not all(_dim_eq(a, b) for a, b in zip(head, dims_old)):
+        return None
+    if not all(_dim_eq(a, b) for a, b in zip(tail, dims_old[len(dims_old) - len(tail):])):
+        return None
+    return [*head, dims_old[j], *tail]
+
+
 def _builder_fold_dim_expr(
     ctx: FunctionContext | MethodContext, expr: Expression, index: int
 ) -> int | Type | None:
@@ -1238,7 +1379,7 @@ def _enum_member_count(info) -> int | None:
 
 
 def _fold_dim_expr(
-    ctx: FunctionContext | MethodContext, expr: Expression, index: int
+    ctx: FunctionContext | MethodContext, expr: Expression, index: int, depth: int = 0
 ) -> int | Type | None:
     """A size written as arithmetic over known sizes, else None.
 
@@ -1252,9 +1393,11 @@ def _fold_dim_expr(
     value = _fold_int(expr)
     if value is not None:
         return value
+    if depth > 4:
+        return None
     if isinstance(expr, OpExpr) and expr.op in ("+", "-", "*", "//"):
-        left = _fold_dim_expr(ctx, expr.left, index)
-        right = _fold_dim_expr(ctx, expr.right, index)
+        left = _fold_dim_expr(ctx, expr.left, index, depth + 1)
+        right = _fold_dim_expr(ctx, expr.right, index, depth + 1)
         if left is None or right is None:
             return None
         op = "shape-arith"
@@ -1285,7 +1428,82 @@ def _fold_dim_expr(
     if tp is None:
         return None
     dim = _dim_value(tp)
-    return dim if isinstance(dim, (int, TypeVarType)) else None
+    if isinstance(dim, (int, TypeVarType)):
+        return dim
+    proper = get_proper_type(tp)
+    if isinstance(expr, NameExpr) and isinstance(proper, Instance) and proper.type.fullname == INT_FULLNAME:
+        # `m = x.shape[0] + 1; np.zeros(m)` (issue 359): a local bound
+        # once spells the size its value spells. Nothing is minted for
+        # a name whose value is no size (`np.zeros(n)` stays `int`). A
+        # product stays `int` too: such a local is often given a name of
+        # its own in the return (`kp = k * p` declared `F64["kp kp"]`),
+        # which a size spelled with the signature's names cannot take.
+        rvalue = _single_rvalue_of(ctx, expr)
+        if rvalue is not None:
+            folded = _fold_dim_expr(ctx, rvalue, index, depth + 1)
+            if folded is None or isinstance(folded, int) or isinstance(_resolve_dim(folded), _LinForm):
+                return folded
+    return None
+
+
+def _int_expr_dim(ctx: MethodContext | FunctionContext, expr: Expression | None, depth: int = 0) -> int | Type | None:
+    """An `int` expression as a size: a literal, a named size, or a formula over `int` variables.
+
+    `len(x)` and `x.shape[i]` read the size of `x`. A variable bound
+    once by `n = <expr>` reads that expression; any other variable
+    bound once (a parameter, a loop variable) is the unknown `?name`.
+    `+`, `-` and a literal factor combine them. Anything else is None.
+    """
+    from numty_plugin import _materialize_dim, _resolve_dim
+    from ._forms import _lin_add, _lin_scale
+    from ._unknowns import _fresh_int_symbol
+
+    if expr is None or depth > 4:
+        return None
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+
+    def combine(left: int | Type | None, right: int | Type | None, sign: int) -> int | Type | None:
+        if left is None or right is None:
+            return None
+        fl, fr = _resolve_dim(left), _resolve_dim(right)
+        if not isinstance(fl, _LinForm) or not isinstance(fr, _LinForm):
+            return None
+        return _materialize_dim(ctx, "slice", 0, _lin_add(fl, _lin_scale(fr, sign)))
+
+    if isinstance(expr, OpExpr) and expr.op in ("+", "-"):
+        left = _int_expr_dim(ctx, expr.left, depth + 1)
+        return combine(left, _int_expr_dim(ctx, expr.right, depth + 1), 1 if expr.op == "+" else -1)
+    if isinstance(expr, OpExpr) and expr.op == "*":
+        for factor, other in ((expr.left, expr.right), (expr.right, expr.left)):
+            k = _fold_int(factor)
+            if k is not None:
+                return combine(0, _int_expr_dim(ctx, other, depth + 1), k)
+        return None
+    if isinstance(expr, CallExpr):
+        callee = expr.callee
+        if isinstance(callee, NameExpr) and callee.fullname == "builtins.len" and len(expr.args) == 1:
+            parts = _ndarray_parts(ctx.api.get_expression_type(expr.args[0]))
+            if parts is not None and parts[0] and isinstance(parts[0][0], (int, TypeVarType)):
+                return parts[0][0]
+        return None
+    tp = get_proper_type(ctx.api.get_expression_type(expr))
+    if isinstance(tp, TypeVarType):
+        return tp if isinstance(_resolve_dim(tp), _LinForm) else None  # `x.shape[i]` of a named size
+    if not isinstance(expr, NameExpr) or not isinstance(tp, Instance) or tp.type.fullname != INT_FULLNAME:
+        return None
+    if tp.last_known_value is not None and isinstance(tp.last_known_value.value, int):
+        return tp.last_known_value.value
+    key = _mask_var_key(ctx, expr)
+    if key is None:
+        return None
+    rvalue = _single_rvalue_of(ctx, expr)
+    if rvalue is not None:
+        inner = _int_expr_dim(ctx, rvalue, depth + 1)
+        if inner is not None:
+            return inner
+    return _fresh_int_symbol(ctx, expr.name, key)
 
 
 def _has_unknown_shape(tp: Type) -> bool:

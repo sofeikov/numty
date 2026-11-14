@@ -1654,12 +1654,9 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, dtype)
 
 
-def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
-    pairs = _all_positionals(ctx)
-    if len(pairs) != 1:
-        # Multi-arg form returns a tuple the stubs own.
-        return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
+def _atleast_lift(ctx: FunctionContext, tp: Type, rank: int) -> Type:
+    """One array lifted to at least `rank` dimensions, as `np.atleast_<rank>d` does."""
+    parts = _ndarray_parts(tp)
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
@@ -1678,6 +1675,20 @@ def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
         # rank == 3 with 2-D input: numpy appends the new axis.
         out = [*dims, 1]
     return _ndarray_type(ctx, out, dtype)
+
+
+def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
+    """np.atleast_1d/2d/3d of one array operand.
+
+    A union of arrays keeps the stubs' answer: code that lifts one
+    (`num = np.atleast_2d(b)` with `b: F64[N] | F64[R, N]`) narrows on
+    `.ndim` afterwards, which numty does not follow (issue 354).
+    """
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        # Multi-arg form returns a tuple the stubs own.
+        return ctx.default_return_type
+    return _atleast_lift(ctx, pairs[0][0], rank)
 
 
 def _fft_seq_entry(expr: Expression, tp: Type | None) -> int | None | str:

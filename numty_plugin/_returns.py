@@ -261,7 +261,13 @@ _ANNOTATED_VALUES_CACHE: dict[str, tuple[ast.Module, set[tuple[int, int]]]] = {}
 
 
 def _is_annotated_value(path: str, line: int, col: int) -> bool:
-    """Whether the expression at `(line, col)` is the value of an annotated assignment (`x: T = <here>`)."""
+    """Whether the expression at `(line, col)` is the value of an annotated assignment (`x: T = <here>`).
+
+    Also of a plain assignment to a name its function declared on an
+    earlier line (`d: F64[N, N]` then `d = <here>`, or a parameter
+    rebound, issue 359): mypy checks it under the declared type too, and
+    the annotation means the same wherever it is written.
+    """
     mod = _module_ast(path)
     if mod is None:
         return False
@@ -272,6 +278,27 @@ def _is_annotated_value(path: str, line: int, col: int) -> bool:
             for node in ast.walk(mod)
             if isinstance(node, ast.AnnAssign) and node.value is not None
         }
+        for func in ast.walk(mod):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            declared = _annotated_names(func) | {
+                arg.arg
+                for arg in (*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs)
+                if arg.annotation is not None
+            }
+            todo: list[ast.AST] = list(func.body)
+            while todo:
+                node = todo.pop()
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                    continue
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id in declared
+                ):
+                    spots.add((node.value.lineno, node.value.col_offset))
+                todo.extend(ast.iter_child_nodes(node))
         hit = (mod, spots)
         _ANNOTATED_VALUES_CACHE[path] = hit
     return (line, col) in hit[1]
@@ -529,14 +556,20 @@ def _bound_names(
 def _shapes_at(declared: Type, p: int | None, rank: int) -> list[list[Type]]:
     """Array shapes of the given rank declared at a position of a return.
 
-    The position is None for the value itself, else the tuple index.
+    The position is None for the value itself, else the tuple index. A
+    union of tuples (a function that also returns a null system of
+    rank-1 arrays) gives the shapes each member declares there.
     """
     if p is None:
         return _array_shapes(declared, rank)
     proper = get_proper_type(declared)
-    if isinstance(proper, TupleType) and p < len(proper.items):
-        return _array_shapes(proper.items[p], rank)
-    return []
+    members = proper.items if isinstance(proper, UnionType) else [proper]
+    out: list[list[Type]] = []
+    for member in members:
+        tup = get_proper_type(member)
+        if isinstance(tup, TupleType) and p < len(tup.items):
+            out.extend(shape for shape in _array_shapes(tup.items[p], rank) if shape not in out)
+    return out
 
 
 # Sizes already given to a free name in one `return`, by position:

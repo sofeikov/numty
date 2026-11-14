@@ -11,7 +11,9 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from mypy.nodes import AssignmentStmt, Block, Expression, ListExpr, NameExpr, StarExpr, TupleExpr
+from mypy.nodes import (
+    AssignmentStmt, Block, Expression, ListExpr, NameExpr, OperatorAssignmentStmt, OpExpr, StarExpr, TupleExpr,
+)
 from mypy.types import Type
 
 from ._errors import _trial_failed
@@ -37,6 +39,25 @@ def _fits_long_axis(form: _LinForm) -> bool:
     return form.const >= 0 or any(c > 0 for _, c in form.coeffs)
 
 
+class _FromEnd:
+    """A slice bound written `-k` with `k` an `int` variable (`x[:-k]`, issue 359).
+
+    It counts from the end, as a negative literal does, when `k` is
+    positive (`x[:-0]` is empty, which nothing about `?k` rules out: such
+    a size is an unknown, compared only under the numty-names code).
+    """
+
+    __slots__ = ("dim",)
+
+    def __init__(self, dim: Type) -> None:
+        self.dim = dim
+
+
+def _is_size_bound(bound: object) -> bool:
+    """A slice bound that is a size, or one counted from the end."""
+    return isinstance(bound, (Type, _FromEnd))
+
+
 def _symbolic_slice(
     ctx: MethodContext | FunctionContext, dim: int, size: int | Type, begin: object, end: object, stride: object
 ) -> int | Type | None:
@@ -47,7 +68,8 @@ def _symbolic_slice(
     axis; numpy clips them otherwise. So the answer is given when an
     `int` variable is left in it (such a size is an unknown, nothing is
     proved from it, and it is compared only under the numty-names code:
-    `N-?k` against `N-?k+1` are 1 apart), or when the bounds are over
+    `N-?k` against `N-?k+1` are 1 apart; `x[i:i + 1]` is 1, and `x[:-k]`
+    is `N-?k`), or when the bounds are over
     names alone and inside the axis (issue 333): `s[:n]` with
     `n = X.shape[1]` on an `M+1` axis is `(M,)`, since `0 <= M <= M+1`.
     As for `x[1:]`, the axis is assumed long enough for a constant
@@ -56,7 +78,7 @@ def _symbolic_slice(
     """
     from numty_plugin import _materialize_dim, _resolve_dim
 
-    if not isinstance(begin, Type) and not isinstance(end, Type):
+    if not _is_size_bound(begin) and not _is_size_bound(end):
         return None
     if stride not in ("missing", 1):
         return None
@@ -74,6 +96,11 @@ def _symbolic_slice(
         if isinstance(bound, Type):
             form = _resolve_dim(bound)
             return form if isinstance(form, _LinForm) else None
+        if isinstance(bound, _FromEnd):
+            form = _resolve_dim(bound.dim)
+            if not isinstance(form, _LinForm) or not _form_has_unknown(form):
+                return None
+            return _lin_add(whole, _lin_scale(form, -1))
         return None
 
     lo = position(begin, _LinForm((), 0))
@@ -81,7 +108,15 @@ def _symbolic_slice(
     if lo is None or hi is None:
         return None
     form = _lin_add(hi, _lin_scale(lo, -1))
-    if not _form_has_unknown(form):
+    # An `int` variable in a bound (`x[i:i + 1]`, `R[s:s + len(z)]`, issue
+    # 359) is assumed inside the axis, as for `x[m:]`, also where it
+    # cancels out of the size. A constant width other than 1 is not:
+    # `X[i:i + 32]` in a batching loop is clipped on the last batch, as
+    # `X[:32]` may be, and only a 1 broadcasts where it is wrong.
+    if not _form_has_unknown(form) and (_form_has_unknown(lo) or _form_has_unknown(hi)):
+        if not form.coeffs and form.const != 1:
+            return None
+    elif not _form_has_unknown(form):
         inside = _lin_add(whole, _lin_scale(hi, -1))
         if not (_fits_long_axis(lo) and _fits_long_axis(form) and _fits_long_axis(inside)):
             return None
@@ -113,8 +148,10 @@ def _strided_count(ctx: MethodContext | FunctionContext, dim: int, size: int | T
     return None
 
 
-def _tuple_targets(stmts: object, out: dict[int, list[AssignmentStmt]]) -> None:
-    """Collect the assignments with a tuple target, by line, at any depth.
+def _tuple_targets(
+    stmts: object, out: dict[int, list[AssignmentStmt]], aug: dict[int, list[OperatorAssignmentStmt]]
+) -> None:
+    """Collect the assignments with a tuple target, and the `x <op>= y` statements, by line, at any depth.
 
     A plain walk: mypy's compiled `TraverserVisitor` cannot be subclassed
     from a plugin. Statement bodies are reached through the attributes
@@ -128,17 +165,53 @@ def _tuple_targets(stmts: object, out: dict[int, list[AssignmentStmt]]) -> None:
     for stmt in stmts:
         if isinstance(stmt, AssignmentStmt) and any(isinstance(lv, (TupleExpr, ListExpr)) for lv in stmt.lvalues):
             out.setdefault(stmt.line, []).append(stmt)
+        if isinstance(stmt, OperatorAssignmentStmt):
+            aug.setdefault(stmt.line, []).append(stmt)
         for attr in ("body", "else_body", "finally_body", "defs", "handlers", "bodies"):
             inner = getattr(stmt, attr, None)
             for block in inner if isinstance(inner, list) else [inner]:
                 if isinstance(block, Block):
-                    _tuple_targets(block, out)
+                    _tuple_targets(block, out, aug)
         func = getattr(stmt, "func", None)
         if func is not None and isinstance(getattr(func, "body", None), Block):
-            _tuple_targets(func.body, out)
+            _tuple_targets(func.body, out, aug)
 
 
-_TARGETS: dict[int, tuple[object, dict[int, list[AssignmentStmt]]]] = {}
+_TARGETS: dict[
+    int, tuple[object, dict[int, list[AssignmentStmt]], dict[int, list[OperatorAssignmentStmt]]]
+] = {}
+
+
+def _statements(
+    ctx: object,
+) -> tuple[dict[int, list[AssignmentStmt]], dict[int, list[OperatorAssignmentStmt]]] | None:
+    """The tuple-target assignments and the `x <op>= y` statements of the checked file, by line."""
+    tree = getattr(getattr(ctx, "api", None), "tree", None)
+    if tree is None:
+        return None
+    cached = _TARGETS.get(id(tree))
+    if cached is None or cached[0] is not tree:
+        by_line: dict[int, list[AssignmentStmt]] = {}
+        aug: dict[int, list[OperatorAssignmentStmt]] = {}
+        _tuple_targets(getattr(tree, "defs", None), by_line, aug)
+        cached = (tree, by_line, aug)
+        _TARGETS[id(tree)] = cached
+    return cached[1], cached[2]
+
+
+def _augmented_target(ctx: object, expr: object) -> bool:
+    """Whether `expr` is the `x <op> y` mypy checks for `x <op>= y` (issue 354).
+
+    A target with no in-place method, such as a union of arrays, is
+    checked as `x = x <op> y`: an `OpExpr` mypy makes, whose left operand
+    is the statement's own target node.
+    """
+    if not isinstance(expr, OpExpr):
+        return False
+    found = _statements(ctx)
+    if found is None:
+        return False
+    return any(stmt.lvalue is expr.left and stmt.rvalue is expr.right for stmt in found[1].get(expr.line, []))
 
 
 def _tuple_target_value(ctx: object, node: object) -> Expression | None:
@@ -149,17 +222,11 @@ def _tuple_target_value(ctx: object, node: object) -> Expression | None:
     variable was not bound by a tuple target, or the value is no display
     of as many items.
     """
-    tree = getattr(getattr(ctx, "api", None), "tree", None)
     line = getattr(node, "line", 0) or 0
-    if tree is None or line <= 0:
+    found = _statements(ctx) if line > 0 else None
+    if found is None:
         return None
-    cached = _TARGETS.get(id(tree))
-    if cached is None or cached[0] is not tree:
-        by_line: dict[int, list[AssignmentStmt]] = {}
-        _tuple_targets(getattr(tree, "defs", None), by_line)
-        cached = (tree, by_line)
-        _TARGETS[id(tree)] = cached
-    for stmt in cached[1].get(line, []):
+    for stmt in found[0].get(line, []):
         rvalue = stmt.rvalue
         if not isinstance(rvalue, (TupleExpr, ListExpr)):
             continue

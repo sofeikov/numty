@@ -528,6 +528,7 @@ _LAYERS = (
     "_forms",
     "_unknowns",
     "_exprs",
+    "_bindings",
     "_types",
     "_callbind",
     "_returns",

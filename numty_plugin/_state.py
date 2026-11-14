@@ -49,6 +49,9 @@ class NumtyState:
     unknown_ids: dict[str, TypeVarId] = field(default_factory=dict)
     unknown_names: dict[str, str] = field(default_factory=dict)
     unknown_per_line: dict[tuple[str, int], int] = field(default_factory=dict)
+    # Site unknowns minted outside a loop, a comprehension or a lambda
+    # (issue 352): one evaluation, so one size on every use.
+    single_site_unknowns: set[str] = field(default_factory=set)
     recheck_depth: int = 0
     # Instance-mirrored sets (per-Plugin lifetime; STATE fields alias the
     # owning plugin's objects - see NumtyPlugin.__init__).
