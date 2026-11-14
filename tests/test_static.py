@@ -6740,3 +6740,46 @@ def test_clash_unknown_is_not_absorbed_by_a_later_name() -> None:
     assert sorted(on) == [21, 26], on
     assert all("D and N are different names  [numty-names]" in m for line in on.values() for m in line), on
     assert _run_fixture("bad_clash_unknown.py") == ["ValueError", "[2.0, 1.5, 1.3333333333333333]", "(3, 3)", "(2, 3)"]
+
+
+def test_reshape_targets_ok() -> None:
+    # Issue 353: a -1 next to a size name on an `int`-sized input is an
+    # unknown (never `Literal[-1]`), a list target reads like a tuple, a
+    # -1 next to the input's own leading axis is its trailing axis, and
+    # a `.shape` of unknown length gives an unknown rank, not 0-d.
+    result = run_mypy(FIXTURES / "reshape_targets_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        23: f'"{_ND}[tuple[K, ?U@23], {f64}]"',
+        24: f'"{_ND}[tuple[K, ?U@24], {f64}]"',
+        25: f'"{_ND}[tuple[int], {f64}]"',
+        31: f'"{_ND}[tuple[X, N], {f64}]"',
+        32: f'"{_ND}[tuple[X, N], {f64}]"',
+        33: f'"{_ND}[tuple[Literal[3], Literal[2]], {f64}]"',
+        34: f'"{_ND}[tuple[X, ?U@34], {f64}]"',
+        39: f'"{_ND}[tuple[n-1, c], {f64}]"',
+        41: f'"{_ND}[tuple[-?start+?stop, c], {f64}]"',
+        42: f'"{_ND}[tuple[n, c], {f64}]"',
+        48: f'"{_ND}[Any, {f64}]"',
+    }, result.stdout
+
+
+def test_reshape_targets_bad() -> None:
+    # Issue 353: the sizes read above are checked where they are declared.
+    errors = _messages_by_line(run_mypy(FIXTURES / "bad_reshape_targets.py"))
+    assert errors == {
+        14: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[K, ?U@14], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N, int], dtype[float64]]")  [assignment]'
+        ],
+        18: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[X, N], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N, X], dtype[float64]]")  [assignment]'
+        ],
+        23: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[n-1, c], dtype[float64]]", '
+            'variable has type "ndarray[tuple[n-1, n], dtype[float64]]")  [assignment]'
+        ],
+    }, errors
+    assert _run_fixture("bad_reshape_targets.py") == ["(3, 2)"]

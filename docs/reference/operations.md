@@ -44,6 +44,13 @@ whatever the input's size, since numpy raises otherwise: from a `?U`
 slice (`np.reshape(p[k:k + n * h], (n, h))`), from an `int` input, and
 to a tuple-typed value (`x.reshape(W.shape)`) it is `(N, H)` for `n: N`,
 `h: H`, in the method form (`p.reshape(n, h)`) as in the function form.
+A list target reads like a tuple (`np.reshape(H, [d, n])` is `(X, N)`).
+A `-1` next to the input's own leading (or trailing) axes is the one
+axis left, whatever the form of the kept ones: `np.reshape(a, (a.shape[0],
+-1))` of `(n-1, c)` is `(n-1, c)`. Next to a size name on an input of
+`int` sizes it is an unknown (`params.reshape(k, -1)` is `(K, ?U)`), and
+a target `.shape` of unknown length (an untracked join) gives an unknown
+rank, `ndarray[Any, ...]` (issue 353).
 
 ## Rank changes
 
