@@ -5,23 +5,26 @@ to earlier layers only (order in tests/test_layout.py, _LAYERS).
 from __future__ import annotations
 
 from mypy.expandtype import expand_type_by_instance
-from mypy.nodes import ARG_POS, CallExpr, NameExpr, OverloadedFuncDef
+from mypy.maptype import map_instance_to_supertype
+from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, CallExpr, NameExpr, OverloadedFuncDef
 from mypy.plugin import FunctionContext, FunctionSigContext, MethodSigContext
 from mypy.typeops import make_simplified_union
 from mypy.types import (
-    AnyType, CallableType, Instance, TupleType, Type, TypeOfAny, TypeType, TypeVarType, UnionType, get_proper_type,
+    AnyType, CallableType, Instance, TupleType, Type, TypeOfAny, TypeType, TypeVarType, UnionType, UnpackType,
+    get_proper_type,
 )
 
 from ._errors import NUMTY_CALLSITE, NUMTY_NAMES, _swallowed
-from ._exprs import _iter_tvarlikes
+from ._exprs import _expr_str, _form_of, _iter_tvarlikes, _short_var
+from ._forms import _LinForm, _form_has_unknown, _forms_provably_ne
 from ._indexing import _recorded_for_operand
 from ._types import (
-    INT_FULLNAME, NDARRAY_FULLNAME, _dim_str, _dims_provably_ne,
+    INT_FULLNAME, NDARRAY_FULLNAME, _dim_str, _dim_value, _dims_provably_ne,
     _info_mentions_array, _names_enabled, _ndarray_parts, _parts_or_unpack,
     _report_mask_names, _report_names,
 )
 from ._callbind import (
-    ActualOverrides, _actual_type, _arg_phrase, _class_arg_dims, _formal_name, _shape_tvar_formals, _strip_optional,
+    ActualOverrides, _actual_type, _arg_phrase, _formal_name, _shape_tvar_formals, _strip_optional,
     _where,
 )
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
@@ -220,16 +223,128 @@ def _report_call_site_names(
                 if isinstance(adim, int):
                     continue
                 check(tvar, name, dim, adim)
-        # A class's size parameters (`box: Sys[N]`, issue 358), after the
-        # arrays; a type argument is written as a negative axis.
-        for i, tp in enumerate(sig.arg_types):
-            if len(ctx.args[i]) != 1:
-                continue
-            for index, tvar, adim in _class_arg_dims(tp, _actual_type(ctx, ctx.args[i][0], overrides)):
-                if isinstance(adim, TypeVarType):
-                    check(tvar, _formal_name(sig, i), -1 - index, adim)
+        _report_formula_bindings(sig, ctx, overrides)
     except Exception:
         _swallowed(ctx, "_report_call_site_names")
+
+
+def _sized_positions(formal: Type, actual: Type) -> list[tuple[int, TypeVarType, int | Type]]:
+    """(axis, the formal's size, the actual's size) of one argument.
+
+    An array formal gives its axes; a user class's type arguments
+    (`m: Model[N, "N+1"]`) are written as negative axes (`_where`).
+    """
+    parts = _parts_or_unpack(formal)
+    if parts is None:
+        stripped = _strip_optional(formal)
+        parts = _parts_or_unpack(stripped) if stripped is not formal else None
+    if parts is not None:
+        have = _parts_or_unpack(actual)
+        if have is None or len(have[0]) != len(parts[0]):
+            return []
+        return [
+            (axis, tvar, adim)
+            for axis, (tvar, adim) in enumerate(zip(parts[0], have[0]))
+            if isinstance(tvar, TypeVarType)
+            and (isinstance(adim, int) or not isinstance(get_proper_type(adim), UnpackType))
+        ]
+    inst = get_proper_type(_strip_optional(formal))
+    have_inst = get_proper_type(actual)
+    if (
+        not isinstance(inst, Instance)
+        or inst.type.fullname == NDARRAY_FULLNAME
+        or not inst.args
+        or not isinstance(have_inst, Instance)
+        or inst.type not in have_inst.type.mro
+    ):
+        return []
+    mapped = map_instance_to_supertype(have_inst, inst.type)
+    out: list[tuple[int, TypeVarType, int | Type]] = []
+    for index, (farg, aarg) in enumerate(zip(inst.args, mapped.args)):
+        tvar = get_proper_type(farg)
+        if not isinstance(tvar, TypeVarType):
+            continue
+        size = _dim_value(aarg)
+        out.append((-1 - index, tvar, size if isinstance(size, int) and not isinstance(size, bool) else aarg))
+    return out
+
+
+def _report_formula_bindings(
+    sig: CallableType,
+    ctx: FunctionSigContext | MethodSigContext,
+    overrides: ActualOverrides | None = None,
+) -> None:
+    """A formula parameter against the size another parameter gives its name (issue 358).
+
+    `def g(a: F64[N], b: F64["N+1"])` called with an `F64[5]` and an
+    `F64[4]`, or `wide(m: Model[N, "N+1"])` with a `Model[K, K]`: mypy
+    solves the formula as a name of its own, so nothing refused the
+    call. Positions are read in order: a plain one binds its name, a
+    formula over one unbound name solves it (`N+1` given 6 is 5), and
+    any later position over bound names is compared. Two plain ones are
+    the call-site check's; a formula that no size solves is
+    `_callsite_expr_bindings`'s.
+    """
+    from numty_plugin import _resolve_dim
+    own = {v.fullname for v in sig.variables}
+    own_ids = {v.id for v in sig.variables}
+    # name -> (its value, the expression that gave it, the size there,
+    # argument, axis, whether that position was the plain name)
+    bound: dict[str, tuple[_LinForm, str, int | Type, str, int, bool]] = {}
+    for i, (tp, kind) in enumerate(zip(sig.arg_types, sig.arg_kinds)):
+        if kind not in (ARG_POS, ARG_OPT, ARG_NAMED, ARG_NAMED_OPT) or len(ctx.args[i]) != 1:
+            continue
+        positions = _sized_positions(tp, _actual_type(ctx, ctx.args[i][0], overrides))
+        fname = _formal_name(sig, i)
+        for axis, tvar, adim in positions:
+            fa = _resolve_dim(adim)
+            if not isinstance(fa, _LinForm) or _form_has_unknown(fa):
+                continue
+            form = _form_of(tvar)
+            plain = form is None
+            if form is None:
+                if tvar.id not in own_ids:
+                    continue
+                form = _LinForm(((tvar.fullname, 1),), 0)
+            if not isinstance(form, _LinForm) or not form.coeffs or any(n not in own for n, _ in form.coeffs):
+                continue
+            missing = [n for n, _ in form.coeffs if n not in bound]
+            if missing:
+                if len(form.coeffs) == 1:
+                    # Solve the one name: (A - k) / c, when that is whole.
+                    name, scale = form.coeffs[0]
+                    rest = fa.const - form.const
+                    if scale > 0 and rest % scale == 0 and all(c % scale == 0 for _, c in fa.coeffs):
+                        value = _LinForm(tuple((n, c // scale) for n, c in fa.coeffs), rest // scale)
+                        if fa.coeffs or value.const >= 0:
+                            bound[name] = (value, _expr_str(form), adim, fname, axis, plain)
+                continue
+            if plain and bound[form.coeffs[0][0]][5]:
+                # Two plain positions: the call-site check's.
+                continue
+            const = form.const
+            coeffs: dict[str, int] = {}
+            for name, scale in form.coeffs:
+                value = bound[name][0]
+                const += scale * value.const
+                for n, c in value.coeffs:
+                    coeffs[n] = coeffs.get(n, 0) + scale * c
+            expected = _LinForm(tuple(sorted((n, c) for n, c in coeffs.items() if c)), const)
+            if not _forms_provably_ne(expected, fa):
+                continue
+            src_expr, src_dim, src_arg, src_axis, _ = bound[form.coeffs[0][0]][1:]
+            given = src_expr if _dim_str(src_dim) == src_expr else f"{src_expr} = {_dim_str(src_dim)}"
+            # The caller's name may print as the callee's (`N` for `N`).
+            want, said = _expr_str(form), _expr_str(expected)
+            makes = f"gives {said}" if want == said else f"makes {want} equal {said}"
+            ctx.api.fail(
+                f"call-site shape conflict for '{_short_var(form.coeffs[0][0])}': "
+                f"{given} ({_arg_phrase(src_arg)}, {_where(src_axis)}) {makes}, "
+                f"not {_dim_str(adim)} ({_arg_phrase(fname)}, {_where(axis)})",
+                ctx.context,
+                code=NUMTY_CALLSITE,
+            )
+            return
 
 
 def _index_formal_recorded(ann: object | None) -> int | str | None:

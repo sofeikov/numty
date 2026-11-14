@@ -1194,7 +1194,7 @@ def test_callsite_formula_returns() -> None:
         41: f'"{f64.format("Literal[3], Literal[7]")}"',
     }, result.stdout
     assert _run_fixture("callsite_formula_ok.py") == [
-        "(7, 13)", "(4, 5)", "(3, 4)", "(3, 2)", "(3, 4)", "(3, 7)",
+        "(7, 13)", "(4, 5)", "(3, 4)", "(3, 2)", "(1, 2)", "(3, 7)",
     ]
 
 
@@ -5292,7 +5292,17 @@ def test_free_return_forms() -> None:
     assert notes[55] == '"?K@50"', result.stdout
     assert notes[56] == f'"numpy.ndarray[tuple[?K@50], {_F64}]"', result.stdout
     assert notes[57] == f'"numpy.ndarray[tuple[?K@50], {_F64}]"', result.stdout
-    assert _run_fixture("free_return_forms_ok.py") == ["(2,) (2,) (3,) (3,) 2 (2,)"]
+    # A caller whose own parameter is annotated with the same module-level
+    # `K` still gets the callee's `K` as the call's size.
+    assert notes[88] == (
+        f'"tuple[numpy.ndarray[tuple[?K@88], {_F64}], numpy.ndarray[tuple[?K@88+1], {_F64}]]"'
+    ), result.stdout
+    assert notes[89] == f'"numpy.ndarray[tuple[?K@89+1], {_F64}]"', result.stdout
+    # A name a `Callable` or `type[...]` parameter mentions is mypy's to solve.
+    assert notes[94] == '"Literal[3]"', result.stdout
+    assert notes[95] == '"int"', result.stdout
+    assert notes[96] == f'"tuple[numpy.ndarray[tuple[Literal[2]], {_F64}], Literal[2]]"', result.stdout
+    assert _run_fixture("free_return_forms_ok.py") == ["(2,) (2,) (3,) (3,) 2 (2,)", "3 0 2"]
 
 
 def test_bad_free_return_forms() -> None:
@@ -5313,50 +5323,58 @@ def test_bad_free_return_forms() -> None:
 
 def test_generic_class_sizes() -> None:
     # Issue 358: a method returning a formula over the class's names is in
-    # the receiver's terms; `Sys[N]` fits `Sys[int]` at a return and an
-    # annotated local; a formula is a type argument, in an annotation and
-    # (with an ignore for mypy's own expression check) a base class; a
+    # the receiver's terms; a formula is a type argument, in an annotation
+    # and (with an ignore for mypy's own expression check) a base class; a
     # free name in a class return takes a size born in the body and is the
-    # call's own size.
+    # call's own size. A size parameter keeps its declared variance, so a
+    # method or a property setter takes the bare name without mypy's
+    # covariant-parameter error.
     fixture = "generic_class_sizes_ok.py"
     result = run_mypy(FIXTURES / fixture)
     assert result.returncode == 0, result.stdout
     notes = reveals_by_line(result)
-    assert notes[68] == f'"numpy.ndarray[tuple[N, Literal[3]], {_F64}]"', result.stdout
-    assert notes[69] == f'"numpy.ndarray[tuple[N, J-1], {_F64}]"', result.stdout
-    assert notes[70] == f'"numpy.ndarray[tuple[Literal[9], Literal[4]], {_F64}]"', result.stdout
-    assert notes[71] == '"tests.fixtures.generic_class_sizes_ok.Model[N, N-1]"', result.stdout
-    assert notes[72] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
-    assert notes[73] == f'"numpy.ndarray[tuple[?W@73], {_F64}]"', result.stdout
-    assert notes[74] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
-    # A protocol keeps its own variance (no covariant-in-protocol error),
-    # and its formula position written `int` matches the class's formula.
-    assert notes[88] == f'"numpy.ndarray[tuple[int, Literal[4]], {_F64}]"', result.stdout
-    assert _run_fixture(fixture) == ["(2, 3) (9, 4) (2, 2) (4,)"]
+    assert notes[74] == f'"numpy.ndarray[tuple[N, Literal[3]], {_F64}]"', result.stdout
+    assert notes[75] == f'"numpy.ndarray[tuple[N, J-1], {_F64}]"', result.stdout
+    assert notes[76] == f'"numpy.ndarray[tuple[Literal[9], Literal[4]], {_F64}]"', result.stdout
+    assert notes[77] == '"tests.fixtures.generic_class_sizes_ok.Model[N, N-1]"', result.stdout
+    assert notes[78] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
+    assert notes[79] == f'"numpy.ndarray[tuple[?W@79], {_F64}]"', result.stdout
+    assert notes[80] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
+    # A protocol's formula position written `int` matches the class's formula.
+    assert notes[94] == f'"numpy.ndarray[tuple[int, Literal[4]], {_F64}]"', result.stdout
+    assert _run_fixture(fixture) == ["(2, 3) (9, 4) 2 (4,)"]
 
 
 def test_bad_generic_class_sizes() -> None:
-    # Issue 358: with a class's size parameters covariant, the call-site
-    # check reads the sizes two arguments give one name (mypy would solve
-    # it as `int`); a formula method result and a formula type argument
-    # keep checking.
-    result = run_mypy(FIXTURES / "bad_generic_class_sizes.py")
+    # Issue 358: a class's size parameters keep their declared variance, so
+    # two arguments that give one name two sizes are mypy's own error, also
+    # through *args; a formula method result and a formula type argument
+    # keep checking. A formula parameter is held to the size another
+    # parameter gives its name, for a class's type arguments and an
+    # array's axes alike (mypy solves the formula as a name of its own).
+    # mypy's `Cannot infer value of type parameter` lines carry
+    # `# type: ignore[misc]`, which --warn-unused-ignores proves still fire.
+    result = run_mypy(FIXTURES / "bad_generic_class_sizes.py", flags=("--warn-unused-ignores",))
     errors = _messages_by_line(result)
-    assert sorted(errors) == [41, 46, 47, 48, 49, 50], result.stdout
+    assert sorted(errors) == [44, 59, *range(65, 70)], result.stdout
     for line in errors:
         assert len(errors[line]) == 1, result.stdout
-    assert 'got "Model[N, N]", expected "Model[N, W]"' in errors[41][0], result.stdout
-    assert "J vs J-1" in errors[46][0] and errors[46][0].endswith("[numty-broadcast]"), result.stdout
-    assert errors[47][0] == (
-        "call-site shape conflict for 'N': 3 (argument 'a', type argument 0) vs "
-        "4 (argument 'b', type argument 0)  [numty-callsite]"
+    assert 'got "Model[N, N]", expected "Model[N, W]"' in errors[44][0], result.stdout
+    assert "J vs J-1" in errors[59][0] and errors[59][0].endswith("[numty-broadcast]"), result.stdout
+    assert errors[65][0].endswith("[assignment]"), result.stdout
+    assert '"Model[Literal[5], Literal[4]]"' in errors[66][0], result.stdout
+    assert errors[67][0] == (
+        "call-site shape conflict for 'N': N (argument 'm', type argument 0) gives N+1, "
+        "not N (argument 'm', type argument 1)  [numty-callsite]"
     ), result.stdout
-    assert errors[48][0] == (
-        "call-site binding of 'N' (argument 'a', type argument 0, and argument 'b', type argument 0): "
-        "N and M are different names  [numty-names]"
+    assert errors[68][0] == (
+        "call-site shape conflict for 'N': N = 5 (argument 'm', type argument 0) makes N+1 equal 6, "
+        "not 5 (argument 'm', type argument 1)  [numty-callsite]"
     ), result.stdout
-    assert errors[49][0].endswith("[assignment]"), result.stdout
-    assert '"Model[Literal[5], Literal[4]]"' in errors[50][0], result.stdout
+    assert errors[69][0] == (
+        "call-site shape conflict for 'N': N = 5 (argument 'y', axis 0) makes N+1 equal 6, "
+        "not 4 (argument 'w', axis 0)  [numty-callsite]"
+    ), result.stdout
     assert _run_fixture("bad_generic_class_sizes.py") == ["(2, 2)"]
 
 
@@ -5365,13 +5383,16 @@ def test_bad_names_messages() -> None:
     # mismatched argument is mypy's `[arg-type]` alone (it was also a
     # names report naming `argument '?'`); a names report inside an
     # operand is the operator's only error, on either side of it.
+    # Only a numty report in an operand does that: another error there
+    # (a wrong call) keeps mypy's own check of the operand type.
     result = run_mypy(FIXTURES / "bad_names_messages.py")
     messages = _messages_by_line(result)
-    assert sorted(messages) == [21, 25, 26, 27, 28, 29, 30], result.stdout
-    assert all(len(texts) == 1 for texts in messages.values()), result.stdout
-    assert messages[21][0].startswith("Argument 1 has incompatible type"), result.stdout
-    assert messages[21][0].endswith("[arg-type]"), result.stdout
-    for line in range(25, 31):
+    assert sorted(messages) == [22, 26, 27, 28, 29, 30, 31, 36], result.stdout
+    assert all(len(texts) == 1 for line, texts in messages.items() if line != 36), result.stdout
+    assert messages[22][0].startswith("Argument 1 has incompatible type"), result.stdout
+    assert messages[22][0].endswith("[arg-type]"), result.stdout
+    assert sorted(text.rsplit("[", 1)[1] for text in messages[36]) == ["call-arg]", "operator]"], result.stdout
+    for line in range(26, 32):
         assert messages[line] == [
             "matmul inner dimensions (shapes (S, S) vs (I,)): S and I are different names  [numty-names]"
         ], result.stdout
@@ -5399,7 +5420,10 @@ def test_dtype_generic_shapes() -> None:
     assert notes[35] == '"numpy.ndarray[tuple[n, n], numpy.dtype[Any]]"', result.stdout
     assert notes[36] == f'"numpy.ndarray[tuple[int], {_BOOL}]"', result.stdout
     assert notes[37] == f'"numpy.ndarray[tuple[?U@37], {_I64}]"', result.stdout
-    assert _run_fixture(fixture) == ["(2, 2) (4, 2) (2,) (2, 2)", "(3,) (2,)"]
+    # The arrays of one `np.nonzero` of an `int`-sized input share their
+    # unknown, so stacking them keeps the shape.
+    assert notes[44] == f'"numpy.ndarray[tuple[Literal[2], ?U@44], {_I64}]"', result.stdout
+    assert _run_fixture(fixture) == ["(2, 2) (4, 2) (2,) (2, 2)", "(2, 2)", "(3,) (2,)"]
 
 
 def test_bad_dtype_generic_shapes() -> None:

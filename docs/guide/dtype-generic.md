@@ -59,7 +59,9 @@ linalg functions whose result is of the input's kind (`inv`, `pinv`,
 `cholesky`, `qr`, `matrix_power`) keep it; joins of one such dtype
 (`np.vstack((p, p))`, `np.concatenate`) keep it. An element `p[i, j]`
 is a `PT`, and its product with an array has the array's shape and a
-dtype numty does not know. So `np.sum(p, axis=1) @ p[1:]` and
+dtype numty does not know. A full reduction (`np.sum(q)`) is a `PT` too,
+which mypy does not take where a `float` or a `complex` is declared (a
+`PT` may be a `float32`): declare `-> PT`, or convert with `float(...)`. So `np.sum(p, axis=1) @ p[1:]` and
 `np.linalg.qr(fl)[0] @ fl[1:]` are reported as their `F64` twins are
 (`tests/fixtures/dtype_generic_shapes_ok.py`,
 `tests/fixtures/bad_dtype_generic_shapes.py`). A join of a family with

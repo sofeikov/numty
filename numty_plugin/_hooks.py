@@ -16,7 +16,7 @@ from mypy.nodes import (
 from mypy.argmap import map_actuals_to_formals
 from mypy.expandtype import expand_type
 from mypy.plugin import (
-    AnalyzeTypeContext, AttributeContext, ClassDefContext, FunctionContext, FunctionSigContext, MethodContext,
+    AnalyzeTypeContext, AttributeContext, FunctionContext, FunctionSigContext, MethodContext,
     MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
@@ -44,7 +44,7 @@ from ._types import (
     _OPERATOR_DUNDERS,
 )
 from ._callbind import (
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _sizes_covariant, _union_actual_variants,
+    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _union_actual_variants,
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
@@ -199,20 +199,6 @@ class NumtyPlugin(Plugin):
                 )
         except Exception:
             _swallowed(None, "startup_check")
-
-    def get_customize_class_mro_hook(self, fullname: str) -> Callable[[ClassDefContext], None] | None:
-        def hook(ctx: ClassDefContext) -> None:
-            _sizes_covariant(ctx)
-            # mypy takes the first plugin's hook: the later plugins' runs too.
-            chain = getattr(getattr(ctx.api, "plugin", None), "_plugins", None)
-            if isinstance(chain, list) and self in chain:
-                for plugin in chain[chain.index(self) + 1 :]:
-                    later = plugin.get_customize_class_mro_hook(fullname)
-                    if later is not None:
-                        later(ctx)
-                        return
-
-        return hook
 
     def get_function_signature_hook(
         self, fullname: str

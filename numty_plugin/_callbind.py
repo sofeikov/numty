@@ -9,13 +9,11 @@ from __future__ import annotations
 
 from mypy.expandtype import expand_type
 from mypy.maptype import map_instance_to_supertype
-from mypy.nodes import (
-    ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, COVARIANT, INVARIANT, Expression, IndexExpr, ListExpr,
-    RefExpr, StarExpr, TupleExpr,
-)
-from mypy.plugin import ClassDefContext, FunctionSigContext, MethodSigContext
+from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, Expression, ListExpr, StarExpr, TupleExpr
+from mypy.plugin import FunctionSigContext, MethodSigContext
+from mypy.typeops import get_all_type_vars
 from mypy.types import (
-    PROTOCOL_NAMES, AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,
+    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,
     TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
@@ -323,91 +321,8 @@ def _pairs_for_actual(
     return []
 
 
-def _class_arg_dims(formal_tp: Type, actual_tp: Type) -> list[tuple[int, TypeVarType, Type]]:
-    """(type argument index, formal's size name, actual's size) for a covariant user-class formal (issue 358).
-
-    `def both(a: Sys[N], b: Sys[N])`: with `N` covariant (the size
-    parameters of a user class are, see `_sizes_covariant`), mypy solves
-    `N` from `Sys[Literal[3]]` and `Sys[Literal[4]]` as `int` and accepts
-    the call, as it does for two arrays. The call-site check reads the
-    sizes the arguments give the class instead.
-    """
-    formal = get_proper_type(_strip_optional(formal_tp))
-    actual = get_proper_type(actual_tp)
-    if (
-        not isinstance(formal, Instance)
-        or formal.type.fullname == NDARRAY_FULLNAME
-        or not formal.args
-        or not isinstance(actual, Instance)
-        or formal.type not in actual.type.mro
-    ):
-        return []
-    try:
-        mapped = map_instance_to_supertype(actual, formal.type)
-    except Exception:
-        _swallowed(None, "_class_arg_dims")
-        return []
-    out: list[tuple[int, TypeVarType, Type]] = []
-    for i, (farg, aarg, tv) in enumerate(zip(formal.args, mapped.args, formal.type.defn.type_vars)):
-        fp = get_proper_type(farg)
-        if (
-            isinstance(tv, TypeVarType)
-            and tv.variance == COVARIANT
-            and isinstance(fp, TypeVarType)
-            and not fp.fullname.startswith(_EXPR_PREFIX)
-            and _is_int_bound(fp)
-        ):
-            out.append((i, fp, get_proper_type(aarg)))
-    return out
-
-
-def _sizes_covariant(ctx: ClassDefContext) -> None:
-    """Make the size type parameters of a user class covariant for subtyping (issue 358).
-
-    `Sys[N]` into `Sys[int]`: a size declared `int` is one numty does not
-    follow, and `F64[N]` already fits `F64[int]` (the shape tuple is
-    covariant). A class invariant in `N` refused it at a return and an
-    annotated local. A type parameter bound to `int` and declared
-    invariant is treated as covariant by mypy's subtype check, which
-    reads the variance off the class definition; the class's methods
-    keep their own variables, so no variance rule for parameters
-    applies to them.
-    """
-    try:
-        # `is_protocol` is set after this hook: a protocol names
-        # `Protocol` among the bases mypy takes out of the list.
-        for expr in [*ctx.cls.removed_base_type_exprs, *ctx.cls.base_type_exprs]:
-            base = expr.base if isinstance(expr, IndexExpr) else expr
-            if isinstance(base, RefExpr) and base.fullname in PROTOCOL_NAMES:
-                return
-        changed = False
-        tvars: list[TypeVarLikeType] = []
-        for tv in ctx.cls.type_vars:
-            upper = get_proper_type(tv.upper_bound) if isinstance(tv, TypeVarType) else None
-            if (
-                isinstance(tv, TypeVarType)
-                and tv.variance == INVARIANT
-                and not tv.values
-                and isinstance(upper, Instance)
-                and upper.type.fullname == INT_FULLNAME
-            ):
-                tvars.append(
-                    TypeVarType(
-                        tv.name, tv.fullname, tv.id, tv.values, tv.upper_bound, tv.default,
-                        variance=COVARIANT, line=tv.line, column=tv.column,
-                    )
-                )
-                changed = True
-            else:
-                tvars.append(tv)
-        if changed:
-            ctx.cls.type_vars = tvars
-    except Exception:
-        _swallowed(None, "_sizes_covariant")
-
-
 def _where(axis: int) -> str:
-    """`axis 1`, or for a class's type argument (a negative axis, see `_conflict_pairs`) `type argument 0`."""
+    """`axis 1`, or for a class's type argument (a negative axis, see `_sized_positions`) `type argument 0`."""
     return f"axis {axis}" if axis >= 0 else f"type argument {-1 - axis}"
 
 
@@ -433,17 +348,6 @@ def _conflict_pairs(
             if len(actuals) != 1:
                 continue
             out.extend(_pairs_for_actual(fname, tp, actuals[0], ctx, overrides))
-            try:
-                actual_tp = _actual_type(ctx, actuals[0], overrides)
-            except Exception:
-                _swallowed(ctx, "_conflict_pairs")
-                continue
-            # A class's type argument is written as a negative axis.
-            out.extend(
-                (fname, -1 - index, tvar, adim.value, None)
-                for index, tvar, adim in _class_arg_dims(tp, actual_tp)
-                if isinstance(adim, LiteralType) and isinstance(adim.value, int) and not isinstance(adim.value, bool)
-            )
         elif kind == ARG_STAR:
             # *args: the formal type is the element type; every actual
             # binds to it, so each one is checked.
@@ -509,7 +413,8 @@ def _callsite_formula_return(
         if new_ret is not None:
             # Formula variables only the old return mentioned are no longer
             # the callee's to bind (see the note in `_substitute_return_exprs`).
-            formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
+            # Also a name in a `Callable[..., F64[K]]` formal (issue 357).
+            formal_ids = {tv.id for formal in sig.arg_types for tv in get_all_type_vars(formal)}
             ret_ids = {tv.id for tv in _iter_tvarlikes(new_ret)}
             sig = sig.copy_modified(
                 ret_type=new_ret,
@@ -584,8 +489,20 @@ def _substitute_size(
     return items.items[0]
 
 
-def _caller_names(ctx: FunctionSigContext | MethodSigContext) -> set[str]:
-    """Names the function holding the call binds (its parameters, an enclosing function's, its class's)."""
+def _enclosing_names(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> set[str]:
+    """Names the scope of the callee binds: its class's, or for a local function the caller's.
+
+    A function defined at the top of a module or in a class binds a
+    name its parameters do not mention only through its class; one
+    defined in a function (its fullname is not qualified, or a local
+    class's carries `@line`) also sees the names of the functions
+    around it, which hold the call too.
+    """
+    definition = sig.definition
+    fullname = getattr(definition, "fullname", None) or ""
+    if definition is not None and "." in fullname and "@" not in fullname:
+        info = getattr(definition, "info", None)
+        return {tv.fullname for tv in getattr(getattr(info, "defn", None), "type_vars", None) or []}
     scope = getattr(ctx.api, "scope", None)
     func = scope.current_function() if scope is not None else None
     return _signature_names(scope, func) if func is not None else set()
@@ -876,12 +793,13 @@ def _substitute_return_exprs(
         _swallowed(ctx, "_substitute_return_exprs")
         pass
     # Dims mypy infers by itself: every variable a formal mentions,
-    # wherever it sits (`x: F64["N+1"]`, `xs: dict[str, F64[N, M]]`).
+    # wherever it sits (`x: F64["N+1"]`, `xs: dict[str, F64[N, M]]`), also
+    # through a `Callable[..., K]` or a `type[K]` (issue 357).
     inferred: set[str] = set()
     for formal in sig.arg_types:
         try:
             inferred.update(
-                tv.fullname for tv in _iter_tvarlikes(formal) if isinstance(tv, TypeVarType)
+                tv.fullname for tv in get_all_type_vars(formal) if isinstance(tv, TypeVarType)
             )
         except Exception:
             _swallowed(ctx, "_substitute_return_exprs")
@@ -890,7 +808,7 @@ def _substitute_return_exprs(
     in_formula: set[str] = set()
     for formal in sig.arg_types:
         try:
-            for tv in _iter_tvarlikes(formal):
+            for tv in get_all_type_vars(formal):
                 form = _form_of(tv) if isinstance(tv, TypeVarType) else None
                 if isinstance(form, _LinForm):
                     in_formula.update(name for name, _ in form.coeffs)
@@ -925,6 +843,8 @@ def _substitute_return_exprs(
             and proper_ret.fullname not in inferred
             and proper_ret.fullname not in in_formula
             and proper_ret.id in {v.id for v in sig.variables}
+            # A `Callable` value's names are its holder's (issue #35).
+            and sig.definition is not None
             and not proper_ret.values
             and _is_int_bound(proper_ret)
         ):
@@ -1237,10 +1157,11 @@ def _substitute_return_exprs(
                 if (
                     cfull not in bindings
                     and d.id in own_ids
+                    and sig.definition is not None
                     and cfull not in inferred
                     and cfull not in in_formula
                     and not cfull.startswith(_EXPR_PREFIX)
-                    and cfull not in _caller_names(ctx)
+                    and cfull not in _enclosing_names(sig, ctx)
                 ):
                     # A name of the return alone inside a formula
                     # (`-> F64["K+1"]`): the size the call chose for

@@ -44,6 +44,7 @@ from ._types import (
     _enum_member_count,
 )
 from ._sequences import _comprehension_length, _union_item_parts
+from ._unknowns import _is_one_size_unknown, _is_same_unknown
 from ._reshape import (
     _construct_dtype, _is_mixed_shape, _is_plain_int, _literal_positions, _ndarrays_in,
     _widen_literal_dims,
@@ -1775,8 +1776,14 @@ def _stack_new_axis(
     if not isinstance(axis, int):
         return ctx.default_return_type
     first = list(items[0][0])
+
+    def same(x: int | Type, y: int | Type) -> bool:
+        # One unknown minted once is one size (`np.stack(np.nonzero(m))`
+        # of a `Bool[int, int]`, whose arrays share it).
+        return _dim_eq(x, y) or (_is_same_unknown(x, y) and _is_one_size_unknown(x))
+
     for dims, _ in items[1:]:
-        if len(dims) != len(first) or not all(_dim_eq(x, y) for x, y in zip(first, dims)):
+        if len(dims) != len(first) or not all(same(x, y) for x, y in zip(first, dims)):
             provable = len(dims) != len(first) or any(
                 _dims_provably_ne(x, y) for x, y in zip(first, dims)
             )

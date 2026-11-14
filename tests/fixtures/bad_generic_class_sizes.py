@@ -37,17 +37,36 @@ def ar(y: F64[N]) -> Model[N, "N-1"]:
 def both(a: Sys[N], b: Sys[N]) -> None: ...
 
 
+def star(*ss: Sys[N]) -> None: ...
+
+
 def chosen(y: F64[N]) -> Model[N, W]:
     return Model(y, y)  # E: N is the caller's, not a size the function chose
 
 
-def use(wj: F64[N, J], s3: Sys[Literal[3]], s4: Sys[Literal[4]], sn: Sys[N], sm: Sys[M], y5: F64[5]) -> None:
+def wide(m: Model[N, "N+1"]) -> F64["N+1"]:
+    return m.wy
+
+
+def lag(y: F64[N], w: F64["N+1"]) -> None: ...
+
+
+def use(
+    wj: F64[N, J], s3: Sys[Literal[3]], s4: Sys[Literal[4]], sn: Sys[N], sm: Sys[M], y5: F64[5], y4: F64[4],
+    mn: Model[N, N],
+) -> None:
     m = MN(wj)
     m.w - m.resid()  # E: J vs J-1
-    both(s3, s4)  # E: 3 vs 4
-    both(sn, sm)  # E: N and M
+    # mypy's own error (a class is invariant in N), held by the ignores:
+    # the test runs with --warn-unused-ignores.
+    both(s3, s4)  # type: ignore[misc]
+    both(sn, sm)  # type: ignore[misc]
+    star(s3, s4)  # type: ignore[misc]
     t: Sys[Literal[3]] = s4  # E: 4 is not 3
     u: Model[Literal[5], Literal[3]] = ar(y5)  # E: N-1 is 4
+    wide(mn)  # E: N+1 is not N
+    wide(Model(y5, y5))  # E: N+1 is 6, not 5
+    lag(y5, y4)  # E: N+1 is 6, not 4
 
 
 if __name__ == "__main__":

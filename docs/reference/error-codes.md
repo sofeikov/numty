@@ -7,7 +7,7 @@ can be silenced or selected on its own:
 |---|---|---|
 | `numty-shape` | dims, ranks or size arguments that do not fit the operation (matmul, reshape, concatenate, linalg, einsum, …) | `matmul inner dimensions disagree: 3 vs 2` |
 | `numty-broadcast` | elementwise operands (arithmetic, comparisons, ufuncs, `where`, `broadcast_*`, index arrays) that do not broadcast | `broadcast shapes disagree at trailing axis 0: 3 vs 4` |
-| `numty-callsite` | one shape variable bound to two sizes by the arguments of a call: two literals, or two symbolic sizes that no values make equal (`R` and `R-1`) | `call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)` |
+| `numty-callsite` | one shape variable bound to two sizes by the arguments of a call: two literals, two symbolic sizes that no values make equal (`R` and `R-1`), or a formula parameter (`F64["R+1"]`) against the size another parameter gives `R` | `call-site shape conflict for 'batch': 4 (argument 'x', axis 0) vs 5 (argument 'y', axis 0)` |
 | `numty-axis` | axis or index arguments out of range, duplicated or mismatched; zero slice steps; non-integer index arrays; einsum output labels | `axis 2 is out of range for 2 dimensions (shape (4, 3))` |
 | `numty-bail` | correct code numty cannot check and says so loudly (stacks of dynamically built sequences whose items have no known shape) | `stack: the items have no known shape; annotate the items or ignore` |
 | `numty-annotation` | malformed `F64[...]`-style annotations | `F64 needs its dims, e.g. F64[N, M], or F64[()] for a 0-d array` |
@@ -110,13 +110,14 @@ contraction (`@`, `matmul`, `dot` and `ndarray.dot`, `inner`,
 contracted axes are the forgotten `.T`, and a call that binds one name
 of the callee to two names of the caller
 (`score(ids: I64[K], d: F64[P, K])` given an `I64[B]` and an
-`F64[B, A]`, or a `Sys[N]` parameter of a generic class given a
-`Sys[B]` next to a `Sys[A]`, which names the type argument). Only a
+`F64[B, A]`). Only a
 name the call binds counts: in a `Callable[[F64[N], F64[N]], ...]`
 parameter `N` is the caller's, so an argument of another size is
 mypy's `[arg-type]` alone (issue 363). A report inside an operand is
 the operator's only error: `v - np.dot(A, x)` gets no `Unsupported
-operand types` follow-on (`tests/fixtures/bad_names_messages.py`):
+operand types` follow-on; another error in an operand (a wrong call in
+it) keeps mypy's own check of the operator
+(`tests/fixtures/bad_names_messages.py`):
 
 ```python
 def f(a: F64[N, H], w: F64[K, H]) -> None:

@@ -4,6 +4,7 @@ A `Callable[[F64[N], ...], ...]` parameter binds no name at a call (its
 `N` is the caller's), so an argument of another size is mypy's
 `[arg-type]` alone. A names report inside an operand is the only error
 of the operator: mypy's `Unsupported operand types` follow-on is gone.
+Another error in an operand leaves mypy's check of the operand type.
 """
 from typing import Callable, TypeVar
 
@@ -29,6 +30,11 @@ def names(A: F64[S, S], x: F64[I], v: F64[S]) -> None:
     e = v @ np.dot(A, x)  # E: names
     f = v + A @ x  # E: names
     print(a, b, c, d, e, f)
+
+
+def other(v: F64[S], s: str) -> None:
+    g = v + s.upper(1)  # E: call-arg, and mypy's operator error (not a numty report)
+    print(g)
 
 
 if __name__ == "__main__":

@@ -155,7 +155,9 @@ it is numpy's tuple: the index and counts arrays are int64 and share
 the values' `?U`, and the inverse has the input's shape (its axis length
 with `axis=`). `count_nonzero(a, axis=...)` drops the axes like
 `a.sum(axis=...)` (keeps them as 1 with `keepdims=True`) in int64; a
-full count stays numpy's scalar. `nonzero`/`where` with one argument return per-dim `?U` tuples
+full count stays numpy's scalar. `nonzero`/`where` with one argument return per-dim `?U` tuples (one
+`?U` shared by every axis when the input has an `int` size, so
+`np.stack(np.nonzero(m))` is `(2, ?U)`)
 (`flatnonzero` flattens, `argwhere` pairs), `isin` keeps the input shape
 with a bool dtype, `searchsorted` follows the values shape; 0-d nonzero
 errors. `histogram` returns `(counts, edges)` with one edge more than

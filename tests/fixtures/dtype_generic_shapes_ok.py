@@ -3,7 +3,7 @@
 `Floating` and `Arr[PT, ...]` with `PT` bound by `np.inexact` keep their
 shapes through linalg, joins, reductions and a scalar element; `Arr`
 takes a TypeVar with values; and `np.where` of a `Bool[N]` call result
-is rank-1 positions, as for a parameter.
+is rank-1 positions, as for a parameter, one length for every axis.
 """
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -38,6 +38,14 @@ def f(fl: Floating["n n"], p: Arr[PT, "n n"], A: F64["n n"], b: Bool[int], j: in
     print(np.linalg.qr(fl)[0].shape, np.vstack((fl, fl)).shape, np.sum(p, axis=1).shape, (p[j, j] * A).shape)
 
 
+def positions(m: Bool[int, int]) -> None:
+    # The arrays of one `np.nonzero` have one length.
+    if TYPE_CHECKING:
+        reveal_type(np.stack(np.nonzero(m)))
+    print(np.stack(np.nonzero(m)).shape)
+
+
 if __name__ == "__main__":
     f(np.eye(2), np.eye(2), np.eye(2), np.array([True, False]), 0)
+    positions(np.eye(2, dtype=bool))
     print(order(np.zeros(3)).shape, order(np.zeros(2, dtype=np.complex128)).shape)

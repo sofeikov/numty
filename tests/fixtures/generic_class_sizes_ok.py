@@ -1,10 +1,10 @@
 """Issue 358: sizes carried by a user generic class.
 
 A method that returns a formula over the class's names is put in the
-receiver's terms, as an attribute is; `Sys[N]` fits `Sys[int]` at a
-return and an annotated local, as `F64[N]` fits `F64[int]`; a formula
-is a type argument (`Model[N, "N-1"]`); and a free name in a class
-return is the size the call chose.
+receiver's terms, as an attribute is; a formula is a type argument
+(`Model[N, "N-1"]`); and a free name in a class return is the size the
+call chose. A size parameter keeps its declared variance, so a method
+may take the bare name.
 """
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
@@ -35,13 +35,19 @@ class Merwe(Generic[N]):
 
 
 class Sys(Generic[N]):
-    def __init__(self, a: F64[N, N]) -> None:
-        self.a = a
+    def __init__(self, n: N) -> None:
+        self.n = n
 
+    def resize(self, n: N) -> None:
+        self.n = n
 
-def widen(s: Sys[N]) -> Sys[int]:
-    t: Sys[int] = s
-    return t
+    @property
+    def size(self) -> N:
+        return self.n
+
+    @size.setter
+    def size(self, v: N) -> None:
+        self.n = v
 
 
 class Model(Generic[N, W]):
@@ -72,7 +78,7 @@ def use(w4: F64[N, Literal[4]], wj: F64[N, J], x4: F64[4], y: F64[N], y5: F64[5]
         reveal_type(ar(y5).wy)
         reveal_type(chosen(y).wy)
         reveal_type(AR(y5, y5[1:]).lag())
-    print(MN(w4).resid().shape, Merwe(4).sigmas(x4).shape, widen(Sys(np.eye(2))).a.shape, ar(y5).wy.shape)
+    print(MN(w4).resid().shape, Merwe(4).sigmas(x4).shape, Sys(2).size, ar(y5).wy.shape)
 
 
 class Pts(Protocol[X]):

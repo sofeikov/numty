@@ -1164,11 +1164,18 @@ def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
     Only the rank is read, so an `int` or `Any` axis is fine (issue 362):
     a call result `Bool[int]` is checked under each overload with its
     own context, and the stubs' answers differ by rank, which mypy
-    erased to `Any`.
+    erased to `Any`. There the arrays share one unknown, which numpy
+    guarantees (`np.stack(np.nonzero(m))` is `(2, ?U)`), and no
+    positions are recorded: no axis has a size to hold them on.
     """
-    parts = _ndarray_parts(arg) or _known_rank_parts(arg)
+    parts = _ndarray_parts(arg)
+    shared: Type | None = None
     if parts is None:
-        return ctx.default_return_type
+        parts = _known_rank_parts(arg)
+        if parts is None:
+            return ctx.default_return_type
+        from numty_plugin import _fresh_unknown
+        shared = _fresh_unknown(ctx, op, 0)
     dims, _ = parts
     if not dims:
         ctx.api.fail(
@@ -1179,10 +1186,11 @@ def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
         return ctx.default_return_type
     elems: list[Type] = []
     for i in range(len(dims)):
-        elem = _select_index_elem(ctx, op, i)
+        elem = _select_index_elem(ctx, op, i, shared)
         if elem is None:
             return ctx.default_return_type
-        _record_flat_positions(ctx, elem, dims[i])
+        if shared is None:
+            _record_flat_positions(ctx, elem, dims[i])
         elems.append(elem)
     return _linalg_tuple(ctx, elems)
 

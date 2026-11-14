@@ -90,12 +90,14 @@ quiet, where it is approximate, and what to write instead.
     mypy compares the two methods without putting the type arguments into
     a formula (`2*X+1` against `2*N+1`). Declare the protocol's formula
     position with `int` (issue 358).
-- The size parameters of a user generic class (bound to `int` and
-    declared invariant) are covariant for mypy's subtype check, as the
-    shape of an array is, so `Sys[N]` fits `Sys[int]` everywhere. mypy
-    then solves a callee's name from two such arguments as their join
-    (`int`); numty's call-site check reports the two sizes instead
-    (issue 358). A protocol's parameters keep their declared variance.
+- A user generic class is invariant in its size parameters, as mypy
+    declares it: `Sys[N]` where `Sys[int]` is declared is accepted at a
+    call (issue 279) but not at a `return` or an annotated local, which
+    stay mypy's `[return-value]` and `[assignment]` errors (issue 358).
+    numty does not make the parameters covariant: mypy would then refuse
+    every method that takes the bare name (`def resize(self, n: N)`).
+    Where the class never takes the name in a method, declare the
+    variable `covariant=True` yourself.
 
 ## Symbolic sizes
 
@@ -154,7 +156,11 @@ quiet, where it is approximate, and what to write instead.
     unknown. So is a result dim that would be spelled exactly like one
     of the callee's own formula parameters over the same module-level
     name: `def g(x: F64[N], y: F64["N+1"]) -> F64[N]` called with an
-    `N+1`-sized `x` returns an unknown size, not `N+1`.
+    `N+1`-sized `x` returns an unknown size, not `N+1`. A formula
+    parameter whose names another parameter gives is held to them
+    (`F64[5]` and `F64[4]` for `x` and `y` is `N = 5 ... makes N+1 equal
+    6, not 4`, issue 358); a formula against a size with an unknown in
+    it, or a factor apart (`2*N` against `N`), is not reported.
 
 ## Dynamic shapes and dtypes
 

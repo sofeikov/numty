@@ -42,15 +42,13 @@ it does in an array. At a call, a parameter `box: Box[int]` accepts a
 `Box[N]` and a `Box[Literal[1]]`, although mypy itself treats a class as
 invariant in its parameters. This holds for a `NamedTuple`, a dataclass
 or any generic class of arrays, also as `Box[int] | None` and inside
-`list[...]`. A user class's size parameters (a type variable bound to
-`int`, declared invariant) are covariant for numty, as the shape of an
-array is, so an assignment or a `return` of a `Box[N]` where `Box[int]`
-is declared is accepted too (issue 358). Two arguments that give one
-name two sizes are still caught by the call-site check, which reads the
-type arguments: `both(a: Sys[N], b: Sys[N])` called with a
-`Sys[Literal[3]]` and a `Sys[Literal[4]]` is `call-site shape conflict
-for 'N': 3 (argument 'a', type argument 0) vs 4 (argument 'b', type
-argument 0)`, and two names are a `[numty-names]` report
+`list[...]`. It holds at calls only: an assignment or a `return` of a
+`Box[N]` where `Box[int]` is declared is still mypy's `[assignment]` or
+`[return-value]` error (see the [limitations](../internals/limitations.md)).
+A class keeps the variance its type variables declare, so two arguments
+that give one name two sizes (`both(a: Sys[N], b: Sys[N])` with a
+`Sys[Literal[3]]` and a `Sys[Literal[4]]`, also through `*args`) are
+mypy's `Cannot infer value of type parameter "N"`
 (`tests/fixtures/bad_generic_class_sizes.py`). An array argument whose size is `int` does not
 bind a name that a container argument binds too: `pair(flags: F64[int,
 S], box: Box[S])` called with `np.zeros((n, n))` and a `Box[S]` takes
@@ -68,7 +66,12 @@ line the base still carries the formula. A name of a class return that
 no parameter binds (`-> Model[N, W]`) is a size the function chooses,
 as on an array axis: the body returns a value whose size there is born
 in it (`Model(y, y[y > 0])`), and a call gives `Model[N, ?W@line]`
-(`tests/fixtures/generic_class_sizes_ok.py`).
+(`tests/fixtures/generic_class_sizes_ok.py`). A formula type argument of
+a parameter is held at a call to the size the other type arguments give
+its names, as a formula axis of an array parameter is: `wide(m:
+Model[N, "N+1"])` given a `Model[K, K]` is `call-site shape conflict for
+'N': N (argument 'm', type argument 0) gives N+1, not N (argument 'm',
+type argument 1)` (`tests/fixtures/bad_generic_class_sizes.py`).
 
 A `Protocol` member that returns a formula over the protocol's names
 (`def sigmas(self, x: F64[X]) -> F64["2*X+1", X]`) is not matched by a
