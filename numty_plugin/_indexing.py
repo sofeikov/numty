@@ -28,6 +28,7 @@ from ._casts import _report_cast
 from ._index_sources import _past_overload_trial, _strided_count, _symbolic_slice, _tuple_target_value
 from ._unknowns import _fresh_mask_count
 from ._ops import flatnonzero_function_hook
+from ._broadcast_core import _inplace_never_fits
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _is_plain_int, _known_rank_parts, _movable_parts,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
@@ -47,7 +48,7 @@ from mypy.nodes import (
     ARG_POS, CallExpr, EllipsisExpr, Expression, IndexExpr, IntExpr, ListExpr, NameExpr, OpExpr, SliceExpr, StarExpr,
     TupleExpr,
 )
-from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
+from mypy.types import AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
 from ._linalg import (
     _dtype_base, _kind_of, _scalar_of_dtype, _string_value,
 )
@@ -929,12 +930,22 @@ def _parse_index_item(
     if isinstance(expr, (ListExpr, TupleExpr)) and expr.items:
         if all(_fold_int(e) is not None for e in expr.items):
             return ("fancy", [len(expr.items)])
+    proper_tp = get_proper_type(tp)
+    if _is_int_list(proper_tp) and not isinstance(expr, TupleExpr):
+        # A list of integers is a 1-D fancy index (issue 361): a display
+        # (`x[:, [k]]`) has its length, a `list[int]` value an unknown one.
+        if isinstance(expr, ListExpr):
+            if expr.items and not any(isinstance(e, StarExpr) for e in expr.items):
+                return ("fancy", [len(expr.items)])
+        else:
+            from numty_plugin import _fresh_unknown
+
+            return ("fancy", [_fresh_unknown(ctx, "list-index", getattr(expr, "column", 0))])
     if isinstance(expr, SliceExpr):
         # Unprovable bounds no longer bail the whole getitem (issue #57):
         # they become "unknown" and the consumer mints a fresh unknown
         # for that axis while keeping the sibling dims.
         return _slice_item(ctx, expr.begin_index, expr.end_index, expr.stride)
-    proper_tp = get_proper_type(tp)
     if expr is not None:
         # `slice(...)` behind a Final name, or a local bound once to it (issue 333).
         init = _final_slice_call(ctx, expr) or _local_call(ctx, expr, "builtins.slice")
@@ -979,6 +990,18 @@ def _parse_index_item(
             if key is not None and key[0] == "strong" and _kind_of(key[1]) in ("i", "u"):
                 return ("int_any",)
     return None
+
+
+def _is_int_list(proper: object) -> bool:
+    """A `list` of Python or numpy integers (not of `bool`, a mask)."""
+    if not (isinstance(proper, Instance) and proper.type.fullname == "builtins.list" and len(proper.args) == 1):
+        return False
+    item = get_proper_type(proper.args[0])
+    if isinstance(item, LiteralType):
+        item = item.fallback
+    return isinstance(item, Instance) and item.type.fullname in (
+        INT_FULLNAME, "numpy.signedinteger", "numpy.unsignedinteger", "numpy.integer",
+    )
 
 
 def _slice_item(
@@ -1711,6 +1734,50 @@ def iter_method_hook(ctx: MethodContext) -> Type:
         return default
 
 
+def _row_type(ctx: FunctionContext | MethodContext, tp: Type) -> Type | None:
+    """The type of one item of an array of rank 2 or more, else None."""
+    parts = _ndarray_parts(tp) or _known_rank_parts(tp)
+    if parts is None or len(parts[0]) < 2:
+        return None
+    dims, dtype = parts
+    return _ndarray_type(ctx, list(dims[1:]), dtype)
+
+
+def rows_function_hook(ctx: FunctionContext) -> Type:
+    """`list(m)`, `iter(m)`, `enumerate(m)`, `zip(m, w)` over an array's rows (issue 361).
+
+    mypy reads these through the stubs' `__iter__`, not through the
+    `for` hook (`iter_method_hook`), so the rows were rank-less arrays.
+    The item an array argument gives is its row, as in a plain `for`.
+    """
+    default = ctx.default_return_type
+    try:
+        proper = get_proper_type(default)
+        if not isinstance(proper, Instance) or len(proper.args) != 1:
+            return default
+        actuals = [
+            (kind, tp) for kinds, tps in zip(ctx.arg_kinds, ctx.arg_types) for kind, tp in zip(kinds, tps)
+        ]
+        if not actuals or any(kind != ARG_POS for kind, _ in actuals):
+            return default
+        item = get_proper_type(proper.args[0])
+        if proper.type.fullname == "builtins.zip":
+            if not isinstance(item, TupleType) or len(item.items) != len(actuals):
+                return default
+            rows = [_row_type(ctx, tp) for _, tp in actuals]
+            if all(row is None for row in rows):
+                return default
+            items = [old if row is None else row for old, row in zip(item.items, rows)]
+            return proper.copy_modified(args=[item.copy_modified(items=items)])
+        row = _row_type(ctx, actuals[0][1])
+        if row is None:
+            return default
+        return proper.copy_modified(args=[row])
+    except Exception:
+        _swallowed(ctx, "rows_function_hook")
+        return default
+
+
 def _unpack_target_count(ctx: MethodContext) -> int | None:
     """The number of names `a, b, c = <this value>` unpacks into, else None (no star, plain tuple target)."""
     tree = getattr(ctx.api, "tree", None)
@@ -1785,6 +1852,16 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
         return ctx.default_return_type
     value_dims = value_parts[0]
     if len(value_dims) > len(target_dims):
+        ctx.api.fail(
+            f"cannot assign value of shape {_dims_str(value_dims)} "
+            f"into target of shape {_dims_str(target_dims)}",
+            ctx.context,
+            code=NUMTY_BROADCAST,
+        )
+        return ctx.default_return_type
+    if _inplace_never_fits(list(target_dims), list(value_dims)):
+        # A named value size into a literal-1 target axis fits only when
+        # the name is 1 (issue 361), as for `col += P`.
         ctx.api.fail(
             f"cannot assign value of shape {_dims_str(value_dims)} "
             f"into target of shape {_dims_str(target_dims)}",

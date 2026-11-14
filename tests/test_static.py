@@ -6783,3 +6783,41 @@ def test_reshape_targets_bad() -> None:
         ],
     }, errors
     assert _run_fixture("bad_reshape_targets.py") == ["(3, 2)"]
+
+
+def test_index_rows_ok() -> None:
+    # Issue 361: a list of integers is a 1-D fancy index (a display has
+    # its length, a `list[int]` value an unknown one), and `list()`,
+    # `iter()`, `enumerate()` and `zip()` give an array's rows.
+    result = run_mypy(FIXTURES / "index_rows_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        17: f'"{_ND}[tuple[N, Literal[1]], {f64}]"',
+        18: f'"{_ND}[tuple[Literal[2], K], {f64}]"',
+        19: f'"{_ND}[tuple[?U@19, K], {f64}]"',
+        20: f'"{_ND}[tuple[N, Literal[1]], {f64}]"',
+        25: f'"list[{_ND}[tuple[X], {f64}]]"',
+        26: f'"typing.Iterator[{_ND}[tuple[X], {f64}]]"',
+        28: f'"{_ND}[tuple[X], {f64}]"',
+        30: f'"{_ND}[tuple[X], {f64}]"',
+        32: f'"{_ND}[tuple[N], {f64}]"',
+        33: '"list[numpy.float64]"',
+    }, result.stdout
+
+
+def test_index_rows_bad() -> None:
+    # Issue 361: a named value size into a literal-1 target axis fits
+    # only when the name is 1, as the in-place rule says for `col += P`.
+    errors = _messages_by_line(run_mypy(FIXTURES / "bad_index_rows.py"))
+    assign = 'Incompatible types in assignment (expression has type "ndarray[tuple[{}], dtype[float64]]", ' \
+        'variable has type "ndarray[tuple[{}], dtype[float64]]")  [assignment]'
+    assert errors == {
+        18: [assign.format("Literal[1], K", "N, Literal[1]")],
+        22: ["cannot assign value of shape (N, N) into target of shape (N, 1)  [numty-broadcast]"],
+        23: ["cannot assign value of shape (N, N) into target of shape (N, 1)  [numty-broadcast]"],
+        24: ["cannot assign value of shape (1, N) into target of shape (N, 1)  [numty-broadcast]"],
+        28: [assign.format("X", "N")],
+        30: [assign.format("N", "X")],
+    }, errors
+    assert _run_fixture("bad_index_rows.py") == ["ValueError", "ValueError"]

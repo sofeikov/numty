@@ -32,7 +32,14 @@ removed: a row of `F64[3, 2]` is `(2,)`, and the two halves of a
 `(2, ?U)` array are `(?U,)` each. With a literal first axis, an
 unpacking into another number of names is an error (`a, b =
 np.zeros((3, 2))`, `tests/fixtures/array_unpack.py`). A rank-1 array
-gives scalars, which stay with the stubs.
+gives scalars, which stay with the stubs. `list(m)`, `iter(m)`,
+`enumerate(m)` and `zip(m, w)` give the same rows: `for i, s in
+enumerate(sigmas)` with `sigmas: F64[N, X]` has `s: (X,)`
+(`tests/fixtures/index_rows_ok.py`).
+
+A list of integers is a 1-D fancy index whatever its items: `x[:, [k]]`
+is `(N, 1)` for an `int` `k`, as `x[:, [3]]` is, and a `list[int]`
+value adds an axis of unknown length (`x[idx]` is `(?U, K)`).
 
 ## Bounds over `int` variables
 
@@ -162,6 +169,10 @@ v[:-1]` with `out: F64[S, C]` and `v: F64[C]` is `cannot assign value of
 shape (C-1,) into target of shape (C,)`. Two different names (`S` into
 `C`) and a mask's count against a name are not provable either: they
 are `[numty-names]` reports (on by default), silent with that code off.
+A named value size into a literal-1 target axis fits only when the name
+is 1, as for an in-place operator: `col[:] = P` with `col: F64[N, 1]`
+and `P: F64[N, N]` is `cannot assign value of shape (N, N) into target
+of shape (N, 1)` (`tests/fixtures/bad_index_rows.py`).
 Other unknowns and an `int` size stay silent
 (`tests/fixtures/bad_setitem_symbolic.py`). An `int` axis is skipped on
 its own, not the whole write: in a buffer `a = np.empty((x.shape[0], n))`

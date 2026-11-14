@@ -96,7 +96,7 @@ from ._linalg import (
     linalg_cross_function_hook, linalg_function_hook,
 )
 from ._indexing import (
-    flatnonzero_mask_hook, getitem_method_hook, iter_method_hook,
+    flatnonzero_mask_hook, getitem_method_hook, iter_method_hook, rows_function_hook,
     setitem_method_hook, take_along_axis_function_hook, take_function_hook,
     take_method_hook,
 )
@@ -739,6 +739,8 @@ class NumtyPlugin(Plugin):
     def _function_hook(self, fullname: str) -> Callable[..., Type] | None:
         if fullname == "builtins.len":
             return len_function_hook
+        if fullname in ("builtins.list", "builtins.iter", "builtins.enumerate", "builtins.zip"):
+            return rows_function_hook
         if fullname == "builtins.divmod":
             return divmod_function_hook
         if fullname in ("builtins.max", "builtins.min"):
