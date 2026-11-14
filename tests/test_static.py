@@ -7084,3 +7084,45 @@ def test_dtype_float64_catch() -> None:
             'expected "ndarray[tuple[P+2], dtype[float64]]")  [return-value]'
         ],
     }, result.stdout
+
+
+# Issue 350: functions with a hooked sibling are solved like it: eigvals
+# like eig, isreal like isnan, np.block like hstack/vstack, np.c_ like
+# column_stack; np.poly has one coefficient more than roots.
+def test_coverage_functions_ok() -> None:
+    result = run_mypy(FIXTURES / "coverage_functions_ok.py")
+    assert result.returncode == 0, result.stdout
+    bool_ = "numpy.dtype[numpy.bool[bool]]"
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[n], numpy.dtype[numpy.complex128]]"',
+        13: f'"{_ND}[tuple[n], {_F64}]"',
+        14: f'"{_ND}[tuple[k], {bool_}]"',
+        15: f'"{_ND}[tuple[k], {bool_}]"',
+        16: f'"{_ND}[tuple[?U@16], {_F64}]"',
+        17: f'"{_ND}[tuple[n, k+n], {_F64}]"',
+        18: f'"{_ND}[tuple[k+n, n], {_F64}]"',
+        19: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
+        20: f'"{_ND}[tuple[n, n+1], {_F64}]"',
+        21: f'"{_ND}[tuple[Literal[3], Literal[3]], {_F64}]"',
+        22: f'"{_ND}[tuple[k+1], {_F64}]"',
+        23: (
+            f'"{_ND}[tuple[?U@23], numpy.dtype[numpy.complexfloating[Any, Any]]]'
+            f' | {_ND}[tuple[?U@23], numpy.dtype[numpy.floating[Any]]]"'
+        ),
+    }, result.stdout
+
+
+def test_coverage_functions_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_coverage_functions.py")
+    assert _messages_by_line(result) == {
+        7: [
+            "linalg.eigvals requires a square (..., M, M) array, got shape (3, 4)  [numty-shape]",
+            # The stubs' own refusal, as for eig.
+            'Argument 1 to "eigvals" has incompatible type "ndarray[tuple[Literal[3], Literal[4]], '
+            'dtype[float64]]"; expected "ndarray[tuple[Any, ...], dtype[inexact[Never, Any]]]"  [arg-type]',
+        ],
+        8: ["block dimension 1 differs: 5 vs 4 (shapes (2, 5) vs (3, 4))  [numty-shape]"],
+        9: ["c_ dimension 0 differs: 2 vs 4 (shapes (2, 5) vs (4, 1))  [numty-shape]"],
+        10: ["poly requires a 1-D or square 2-D array, got shape (3, 4)  [numty-shape]"],
+        11: ["roots requires a 1-D array, got shape (3, 3)  [numty-shape]"],
+    }, result.stdout

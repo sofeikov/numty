@@ -536,6 +536,7 @@ _LAYERS = (
     "_reshape",
     "_sequences",
     "_builders",
+    "_joins",
     "_arange",
     "_einsum",
     "_linalg",

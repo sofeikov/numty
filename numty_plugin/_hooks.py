@@ -50,8 +50,9 @@ from ._builders import (
     ascontiguousarray_function_hook, full_function_hook, linspace_function_hook,
     tri_function_hook, concatenate_function_hook,
     vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook,
-    stack_function_hook, r_getitem_hook,
+    stack_function_hook,
 )
+from ._joins import block_function_hook, c_getitem_hook, r_getitem_hook
 from ._arange import arange_function_hook
 from ._matmul import (
     _matmul_names_report, _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook,
@@ -94,7 +95,7 @@ from ._fft import (
 from ._einsum import _einsum_signature_hook, einsum_function_hook
 from ._linalg import (
     _linalg_cross_signature_hook, _norm_signature_hook, cross_function_hook,
-    linalg_cross_function_hook, linalg_function_hook,
+    linalg_cross_function_hook, linalg_function_hook, poly_function_hook, roots_function_hook,
 )
 from ._indexing import (
     flatnonzero_mask_hook, getitem_method_hook, iter_method_hook,
@@ -912,6 +913,8 @@ class NumtyPlugin(Plugin):
             return setitem_method_hook
         if fullname == "numpy.lib._index_tricks_impl.RClass.__getitem__":
             return r_getitem_hook
+        if fullname == "numpy.lib._index_tricks_impl.CClass.__getitem__":
+            return c_getitem_hook
         short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.ndarray.") and short in {
             "__eq__",
@@ -1788,6 +1791,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "atleast_1d": partial(atleast_function_hook, rank=1),
             "atleast_2d": partial(atleast_function_hook, rank=2),
             "atleast_3d": partial(atleast_function_hook, rank=3),
+            "block": block_function_hook,
             "hstack": hstack_function_hook,
             "stack": stack_function_hook,
             "vstack": vstack_function_hook,
@@ -1833,6 +1837,10 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "sinc": partial(ufunc_function_hook, group="float"),
         },
         "numpy.lib._histograms_impl": {"histogram": histogram_function_hook},
+        "numpy.lib._polynomial_impl": {
+            "poly": poly_function_hook,
+            "roots": roots_function_hook,
+        },
         "numpy.lib._nanfunctions_impl": {
             "nanargmax": partial(arg_function_hook, op="nanargmax"),
             "nanargmin": partial(arg_function_hook, op="nanargmin"),
@@ -1874,6 +1882,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
         "numpy.lib._type_check_impl": {
             "imag": partial(ufunc_function_hook, group="real"),
             "real": partial(ufunc_function_hook, group="real"),
+            "iscomplex": partial(ufunc_function_hook, group="bool"),
+            "isreal": partial(ufunc_function_hook, group="bool"),
             "nan_to_num": copy_function_hook,
         },
         "numpy.lib._ufunclike_impl": {
@@ -1893,6 +1903,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
                     "det",
                     "eig",
                     "eigh",
+                    "eigvals",
+                    "eigvalsh",
                     "inv",
                     "lstsq",
                     "matrix_power",

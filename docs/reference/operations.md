@@ -39,7 +39,13 @@ union of arrays of one rank join too: `np.hstack([l.ravel() for l in
 item has there against an `int` or unknown size, since the items must
 agree: `np.hstack` of two `(N, N, ?U)` arrays is `(N, 2*N, ?U)`. Two
 unknowns, or two different names (a `[numty-names]` report), make it
-unknown.
+unknown. `np.r_[...]` joins along the first axis and `np.c_[...]` like
+`column_stack` (a 1-D item is a column, a scalar `(1, 1)`), along the
+last. `np.block` of a nested list display promotes every item to the
+nesting depth (or the largest rank) and joins the innermost lists along
+the last axis, the lists around them along the one before:
+`np.block([a, b])` of matrices is `hstack`, `np.block([[a], [b]])` is
+`vstack`, with the same errors (issue 350).
 
 ## Reshape
 
@@ -266,7 +272,8 @@ across all operands, `linalg.solve` maps ints to `float64` and rejects
 `mean` is `float64`, complex `std` is real).
 `einsum` parses the subscript string (explicit, implicit,
 ellipsis, diagonals) and `linalg` checks squareness and inner dims while
-tracking dtypes (`eigh` stays real, `svd` shrinks with
+tracking dtypes (`eigh` and `eigvalsh` stay real, `eigvals` is
+`eig`'s first result, `svd` shrinks with
 `full_matrices=False`). `svd` and `qr` of a symbolic `(M, N)` matrix
 (stacked ones too) give `K = min(M, N)` as one fresh unknown per call,
 shared by the factors: `qr` (reduced) is `(M, ?K)` and `(?K, N)`, `svd`
@@ -277,7 +284,12 @@ stubs (`tests/fixtures/svd_qr_symbolic_ok.py`). `linalg.cross` takes batches of 
 rank, where NumPy's stubs stop at 2-D. `np.round` and `np.around` keep
 the shape and dtype; a bool array comes back `float16`, and rounding
 one to `decimals` other than 0, which NumPy refuses, is typed `Any`
-(numty reports shape errors, not dtype errors). `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
+(numty reports shape errors, not dtype errors). `np.isreal` and
+`np.iscomplex` keep the shape in bool, like `np.isnan`. `np.poly` has
+one coefficient more than it has roots: `(k+1,)` for `(k,)` roots and
+`(n+1,)` for an `(n, n)` matrix, float64 for a real input; `np.roots` is
+`(?U,)` (leading and trailing zeros are dropped), complex or float as
+the stubs say. `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
 `dtype=` you name is used as-is when it resolves (a type such as `float`
 or `np.float64`, a scalar constructor such as `np.float32`, a string
 such as `"float64"`, or an `np.dtype`); anything exotic bails out

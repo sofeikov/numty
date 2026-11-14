@@ -13,7 +13,7 @@ from ._dtypes import (
     _GENERIC_KIND, _NAME_OF_KIND_SIZE,
 )
 from ._types import (
-    TUPLE_FULLNAME, _check_dim_eq, _dim_eq, _dim_str, _dims_provably_ne, _has_unpack, _int_value, _ndarray_parts,
+    TUPLE_FULLNAME, _check_dim_eq, _dim_add2, _dim_eq, _dim_str, _dims_provably_ne, _has_unpack, _int_value, _ndarray_parts,
     _ndarray_type, _report_mask_names, _report_names,
 )
 from ._reshape import (
@@ -40,7 +40,7 @@ from ._dtypes import (
     _DTYPE_INFO,
 )
 from mypy.types import (
-    Instance, LiteralType, TypeVarType, get_proper_type,
+    Instance, LiteralType, TypeVarType, UnionType, get_proper_type,
 )
 
 def _linalg_tuple(ctx: FunctionContext | MethodContext, items: list[Type]) -> Type:
@@ -325,6 +325,7 @@ def _linalg_pinv(ctx: FunctionContext) -> Type:
 
 
 def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
+    """eig/eigh: (values, vectors); eigvals/eigvalsh: the values alone."""
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -351,7 +352,7 @@ def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
     ks = _dtype_kind_size(dtype)
     if ks is None:
         return ctx.default_return_type
-    names = _linalg_eig_names(*ks, hermitian=op == "eigh")
+    names = _linalg_eig_names(*ks, hermitian=op in ("eigh", "eigvalsh"))
     if names is None:
         return ctx.default_return_type
     values_dtype = _linalg_dtype(ctx, dtype, names[0])
@@ -360,6 +361,8 @@ def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
         return ctx.default_return_type
     batch = dims[:-2]
     size = dims[-1]
+    if op in ("eigvals", "eigvalsh"):
+        return _ndarray_type(ctx, [*batch, size], values_dtype)
     return _linalg_tuple(
         ctx,
         [
@@ -708,7 +711,7 @@ def linalg_function_hook(ctx: FunctionContext, op: str) -> Type:
         return _linalg_same_shape(ctx, op)
     if op == "pinv":
         return _linalg_pinv(ctx)
-    if op in ("eig", "eigh"):
+    if op in ("eig", "eigh", "eigvals", "eigvalsh"):
         return _linalg_eig(ctx, op)
     if op == "svd":
         return _linalg_svd(ctx)
@@ -1341,3 +1344,74 @@ def _maybe_scalar(
         return _ndarray_type(ctx, dims, dtype)
     scalar = _scalar_of_dtype(dtype)
     return scalar if scalar is not None else ctx.default_return_type
+
+
+def poly_function_hook(ctx: FunctionContext) -> Type:
+    """np.poly: the coefficients of a 1-D root list or a square matrix (issue 350).
+
+    `poly(z)` of `(k,)` roots and `poly(A)` of an `(n, n)` matrix (its
+    characteristic polynomial) have one coefficient more than there
+    are roots: `(k+1,)`, `(n+1,)`. A real input gives float64 (complex
+    roots of a real polynomial come in pairs); a complex one is left to
+    the stubs. A 0-d input is one root; any other rank is numpy's
+    ValueError.
+    """
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, dtype = part
+    # numpy reads the input through atleast_1d: a 0-d root is (1,).
+    dims = list(dims) or [1]
+    message = f"poly requires a 1-D or square 2-D array, got shape {_dims_str(dims)}"
+    if len(dims) not in (1, 2):
+        ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
+        return ctx.default_return_type
+    if len(dims) == 2 and not _check_dim_eq(ctx, dims[0], dims[1], message):
+        return ctx.default_return_type
+    ks = _dtype_kind_size(dtype)
+    if ks is None or ks[0] not in ("b", "i", "u", "f"):
+        return ctx.default_return_type
+    out_dtype = _construct_dtype(ctx, "numpy.float64")
+    if out_dtype is None:
+        return ctx.default_return_type
+    size = _dim_add2(ctx, "poly", 0, dims[-1], 1)
+    return _ndarray_type(ctx, [size], out_dtype)
+
+
+def roots_function_hook(ctx: FunctionContext) -> Type:
+    """np.roots of a 1-D coefficient array: `(?U,)` (issue 350).
+
+    Leading and trailing zero coefficients are dropped first, so the
+    count is data-dependent. The dtype is the stubs' union (complex, or
+    float when every root is real), one unknown shared by both members.
+    Any other rank is numpy's ValueError.
+    """
+    from numty_plugin import _fresh_unknown
+
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        return ctx.default_return_type
+    part = _ndarray_parts(pairs[0][0]) or _mixed_parts(pairs[0][0])
+    if part is None:
+        return ctx.default_return_type
+    dims, _ = part
+    if len(dims) != 1:
+        ctx.api.fail(
+            f"roots requires a 1-D array, got shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    default = get_proper_type(ctx.default_return_type)
+    members = default.items if isinstance(default, UnionType) else [default]
+    count = _fresh_unknown(ctx, "roots", 0)
+    out: list[Type] = []
+    for member in members:
+        member = get_proper_type(member)
+        if not (isinstance(member, Instance) and len(member.args) == 2):
+            return ctx.default_return_type
+        out.append(_ndarray_type(ctx, [count], member.args[1]))
+    return UnionType.make_union(out)
