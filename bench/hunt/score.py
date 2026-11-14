@@ -25,6 +25,7 @@ not a real bug for this harness) or ``timeout``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -143,10 +144,25 @@ def run(harness: Path, target: Path, timeout: float) -> dict:
         return json.loads(out.read_text())
 
 
+def plugin_digest() -> str:
+    """A hash of the numty_plugin sources this interpreter imports.
+
+    mypy's cache does not notice edits to the plugin's submodules, so the
+    cache directory is keyed on them: a plugin edit gets a fresh cache.
+    """
+    import numty_plugin
+
+    digest = hashlib.sha256()
+    for path in sorted(Path(numty_plugin.__file__).parent.rglob("*.py")):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
 def score(area: Path, static_only: bool, timeout: float) -> dict:
     clean = area / "clean.py"
     mutants = sorted((area / "mutants").glob("*.py"))
-    cache = Path(tempfile.gettempdir()) / "numty-hunt-cache" / area.as_posix().replace("/", "_")
+    cache = Path(tempfile.gettempdir()) / "numty-hunt-cache" / plugin_digest() / area.as_posix().replace("/", "_")
     result: dict = {"area": str(area), "clean": {}, "mutants": []}
     per_mode = {mode: mypy([clean, *mutants], mode, cache) for mode in MODES}
     for mode in MODES:
