@@ -264,3 +264,39 @@ def _assignment_lines(func_node: object | None, varname: str) -> list[int]:
 
     _walk(getattr(getattr(func_node, "body", None), "body", None))
     return lines
+
+
+def _mask_var_key(ctx: MethodContext | FunctionContext, mask_expr: Expression | None) -> str | None:
+    """Stable key for a mask variable use, else None to mint per site (issue #288).
+
+    Same `Name` in the same function (module::func::name), not rebound
+    between uses, reuses one unknown. Inline masks (`x[x > 0]`), member
+    access, `flatnonzero` results and any rebinding bail to a fresh
+    per-site unknown (documented limits).
+    """
+    if not isinstance(mask_expr, NameExpr):
+        return None
+    varname = mask_expr.name
+    if not varname or varname in ("True", "False", "None"):
+        return None
+    try:
+        use_line = getattr(mask_expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+        func_fullname, func_node = _enclosing_func(ctx, use_line)
+        count, is_param = _count_var_assignments(func_node, varname)
+        if is_param:
+            if count >= 1:
+                return None
+        elif count > 1:
+            return None
+        tree = getattr(ctx.api, "tree", None)
+        module = getattr(tree, "fullname", "") or ""
+        return f"{module}::{func_fullname}::{varname}"
+    except Exception:
+        _swallowed(ctx, "_mask_var_key")
+        return None
+
+
+def _single_rvalue_of(ctx: MethodContext | FunctionContext, expr: NameExpr) -> Expression | None:
+    """The value of `expr`'s variable when `name = <value>` is its only binding in the enclosing function."""
+    use_line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
+    return _single_rvalue(_enclosing_func(ctx, use_line)[1], expr.name)

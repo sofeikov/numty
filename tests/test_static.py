@@ -6821,3 +6821,47 @@ def test_index_rows_bad() -> None:
         30: [assign.format("N", "X")],
     }, errors
     assert _run_fixture("bad_index_rows.py") == ["ValueError", "ValueError"]
+
+
+def test_sizes_in_ints_ok() -> None:
+    # Issue 359: sizes spelled through an `int` expression, a local,
+    # `.size` or `len()` keep what numty knows, and an `int` size fits a
+    # name declared on an earlier line as on the annotated line.
+    result = run_mypy(FIXTURES / "sizes_in_ints_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    intp = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]"
+    assert reveals_by_line(result) == {
+        21: f'"{_ND}[tuple[c, Literal[1]], {f64}]"',
+        22: f'"{_ND}[tuple[?we-?ws], {intp}]"',
+        23: f'"{_ND}[tuple[c, n-?m], {f64}]"',
+        27: f'"{_ND}[tuple[K, K], {f64}]"',
+        33: f'"{_ND}[tuple[N+1], {f64}]"',
+        38: '"S"',
+        39: '"Literal[12]?"',
+        40: '"S*X"',
+        41: f'"{_ND}[tuple[X, S], {f64}]"',
+        43: f'"{_ND}[tuple[S], {f64}]"',
+        52: '"?K@51"',
+    }, result.stdout
+
+
+def test_sizes_in_ints_bad() -> None:
+    # Issue 359: what the sizes above read is checked.
+    errors = _messages_by_line(run_mypy(FIXTURES / "bad_sizes_in_ints.py"))
+    assert errors == {
+        15: [
+            "broadcast at trailing axis 0 (shapes (-?k+N-1,) vs (-?k+N,)): -?k+N-1 and -?k+N are 1 apart"
+            "  [numty-names]"
+        ],
+        20: [
+            'Incompatible return value type (got "ndarray[tuple[N+2], dtype[float64]]", '
+            'expected "ndarray[tuple[N+1], dtype[float64]]")  [return-value]'
+        ],
+        25: ["assignment of shape (X,) into target of shape (S,): X and S are different names  [numty-names]"],
+        35: [
+            "r_ dimension 1 differs: ?K@33-1 vs ?K@33-2 (shapes (1, ?K@33-1) vs (?K@33-1, ?K@33-2))"
+            "  [numty-shape]"
+        ],
+    }, errors
+    assert _run_fixture("bad_sizes_in_ints.py") == ["(5,)", "ValueError"]

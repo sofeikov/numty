@@ -16,7 +16,12 @@ dtype=other.dtype)` with a bare `np.ndarray` is `(int, int)` with dtype
 `Any`). `np.eye(n)` and `np.identity(n)` read their size like a
 builder: with `n = X.shape[1]` both are `(D, D)`, `np.eye(k + 1)` is
 `(D+1, D+1)`, and `np.eye(n, m, k=1)` is `(n, m)` (the offset never
-resizes).
+resizes). A local bound once to a size formula is read through
+(`m = x.shape[0] + 1; np.zeros(m)` is `(N+1,)`), and `np.arange(ws, we)`
+over `int` variables is `(?we-?ws,)`. `x.size` is the product of the
+axes (`S` for `(S,)`, `12` for `(3, 4)`, `S*X` for `(S, X)`), and
+`len()` of a size a call chose is that size, as `.shape[0]` is (issue
+359).
 
 ## Joining
 
@@ -97,7 +102,11 @@ dtype is `result_type(m, float64)` (`float32` input gives `float64`).
 Consumes leading dims without an ellipsis (`v[0]`,
 `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax`
 drops the axis, `sort` keeps the shape, and a literal `partition` kth
-past the axis errors.
+past the axis errors. A list of integers is a 1-D fancy index
+(`x[:, [k]]` is `(N, 1)`, a `list[int]` value adds a `?U` axis), and
+`list()`, `iter()`, `enumerate()` and `zip()` give an array's rows as a
+`for` does (issue 361). Slice bounds over `int` variables are in
+[Indexing](../guide/indexing.md).
 
 ## Shape math
 

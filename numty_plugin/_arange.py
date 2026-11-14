@@ -13,7 +13,8 @@ from mypy.types import Type, TypeVarType
 
 from ._errors import NUMTY_SHAPE, _swallowed
 from ._heads import _record_index_on
-from ._types import _builder_dim_add_const, _builder_fold_dim_expr, _dim_value, _ndarray_type
+from ._forms import _LinForm, _form_has_unknown, _lin_add, _lin_scale
+from ._types import _builder_dim_add_const, _builder_fold_dim_expr, _dim_value, _int_expr_dim, _ndarray_type
 from ._reshape import _all_positionals, _formal_pair
 from ._builders import _default_dtype, _explicit_dtype, _fold_single, _named_dtype
 
@@ -80,11 +81,11 @@ def _arange_symbolic_kw(
     start_p, stop_p, step_p = ordered
     if stop_p is None:
         return None
-    start = 0 if start_p is None else _fold_single(start_p)
-    if start is None:
-        return None
     if step_p is not None and _fold_single(step_p) != 1:
         return None
+    start = 0 if start_p is None else _fold_single(start_p)
+    if start is None:
+        return _arange_between(ctx, start_p, stop_p)
     stop = _arange_stop(ctx, stop_p)
     if stop is None:
         return None
@@ -98,6 +99,33 @@ def _arange_symbolic_kw(
     if isinstance(size, int) and size < 0:
         size = 0
     return [size], None
+
+
+def _arange_between(
+    ctx: FunctionContext,
+    start_p: tuple[Type, Expression | None] | None,
+    stop_p: tuple[Type, Expression | None],
+) -> tuple[list[int | Type], int | Type | None] | None:
+    """`arange(ws, we)` over `int` variables: `?we-?ws` elements (issue 359).
+
+    Read like the slice `x[ws:we]`: the bounds are assumed in order, so
+    the answer is given only when an `int` variable is in it (an unknown,
+    compared only under the numty-names code).
+    """
+    from numty_plugin import _materialize_dim, _resolve_dim
+
+    if start_p is None or start_p[1] is None or stop_p[1] is None:
+        return None
+    start = _int_expr_dim(ctx, start_p[1])
+    stop = _int_expr_dim(ctx, stop_p[1])
+    if start is None or stop is None:
+        return None
+    lo, hi = _resolve_dim(start), _resolve_dim(stop)
+    if not isinstance(lo, _LinForm) or not isinstance(hi, _LinForm):
+        return None
+    if not (_form_has_unknown(lo) or _form_has_unknown(hi)):
+        return None
+    return [_materialize_dim(ctx, "arange", 0, _lin_add(hi, _lin_scale(lo, -1)))], None
 
 
 def _record_arange(

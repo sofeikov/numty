@@ -346,8 +346,10 @@ quiet, where it is approximate, and what to write instead.
 - Integer bookkeeping on a *symbolic* dim keeps the dim, like plain
     mypy for generic containers (`n = x.shape[0]` infers `N`, so
     `n //= 2` is an error). Concrete dims widen to `int` (keeping the
-    value for direct uses like `reshape(x.shape[0], 3)`), and unknown
-    (`?U`) dims are plain `int`. For a loop counter over a symbolic
+    value for direct uses like `reshape(x.shape[0], 3)`). `len()` and
+    `.size` of a selection count are plain `int`; a size a call chose
+    for a name of its return (`?K@14`) stays, as `.shape[0]` keeps every
+    unknown (issue 359). For a loop counter over a symbolic
     axis, write `int(...)` explicitly (`n = int(x.shape[0])`). In array
     arithmetic such a size is a Python `int` scalar: `X @ X.T / X.shape[0]`
     keeps `(N, N)` like `/ float(X.shape[0])` does.

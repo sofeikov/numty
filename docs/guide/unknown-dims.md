@@ -226,7 +226,9 @@ size.
 
 The same holds at an annotated local: `out: F64[S, C] =
 np.full((len(steps), len(channels)), np.nan)` is accepted, the `int`
-taking the declared name. The annotation is the author's word for a
+taking the declared name. So it does where the name was declared on an
+earlier line (`d: F64[N, N]` then `d = np.eye(n)`) or by a parameter
+the body binds again (`R = np.eye(n) * R`, issue 359). The annotation is the author's word for a
 size numty does not follow, as a declared return is. Only a plain `int`
 on an axis declared with a name is taken: a literal, a selection count
 and an axis declared with a literal are still `[assignment]` errors

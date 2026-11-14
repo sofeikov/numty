@@ -25,13 +25,16 @@ import ast
 
 from ._returns import _module_ast
 from ._casts import _report_cast
-from ._index_sources import _past_overload_trial, _strided_count, _symbolic_slice, _tuple_target_value
+from ._index_sources import (
+    _FromEnd, _is_size_bound, _past_overload_trial, _strided_count, _symbolic_slice, _tuple_target_value,
+)
 from ._unknowns import _fresh_mask_count
 from ._ops import flatnonzero_function_hook
 from ._broadcast_core import _inplace_never_fits
 from ._bindings import (
-    _assignment_lines, _bound_in_loop, _count_var_assignments, _enclosing_func, _single_rvalue,
+    _assignment_lines, _bound_in_loop, _count_var_assignments, _enclosing_func, _mask_var_key, _single_rvalue,
 )
+from ._types import _int_expr_dim
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _is_plain_int, _known_rank_parts, _movable_parts,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
@@ -49,7 +52,7 @@ if TYPE_CHECKING:
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import (
     ARG_POS, CallExpr, EllipsisExpr, Expression, IndexExpr, IntExpr, ListExpr, NameExpr, OpExpr, SliceExpr, StarExpr,
-    TupleExpr,
+    TupleExpr, UnaryExpr,
 )
 from mypy.types import (
     AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type,
@@ -83,67 +86,6 @@ def _recorded_on_lines(module: str, lines: list[int], idims: list[int | Type]) -
         if first is not None and _index_dims_match(first, idims)
     ]
     return found[0] if len(found) == 1 else None
-
-
-def _int_expr_dim(ctx: MethodContext | FunctionContext, expr: Expression | None, depth: int = 0) -> int | Type | None:
-    """An `int` expression as a size: a literal, a named size, or a formula over `int` variables.
-
-    `len(x)` and `x.shape[i]` read the size of `x`. A variable bound
-    once by `n = <expr>` reads that expression; any other variable
-    bound once (a parameter, a loop variable) is the unknown `?name`.
-    `+`, `-` and a literal factor combine them. Anything else is None.
-    """
-    from numty_plugin import _materialize_dim, _resolve_dim
-    from ._forms import _lin_add, _lin_scale
-    from ._unknowns import _fresh_int_symbol
-
-    if expr is None or depth > 4:
-        return None
-    value = _fold_int(expr)
-    if value is not None:
-        return value
-
-    def combine(left: int | Type | None, right: int | Type | None, sign: int) -> int | Type | None:
-        if left is None or right is None:
-            return None
-        fl, fr = _resolve_dim(left), _resolve_dim(right)
-        if not isinstance(fl, _LinForm) or not isinstance(fr, _LinForm):
-            return None
-        return _materialize_dim(ctx, "slice", 0, _lin_add(fl, _lin_scale(fr, sign)))
-
-    if isinstance(expr, OpExpr) and expr.op in ("+", "-"):
-        left = _int_expr_dim(ctx, expr.left, depth + 1)
-        return combine(left, _int_expr_dim(ctx, expr.right, depth + 1), 1 if expr.op == "+" else -1)
-    if isinstance(expr, OpExpr) and expr.op == "*":
-        for factor, other in ((expr.left, expr.right), (expr.right, expr.left)):
-            k = _fold_int(factor)
-            if k is not None:
-                return combine(0, _int_expr_dim(ctx, other, depth + 1), k)
-        return None
-    if isinstance(expr, CallExpr):
-        callee = expr.callee
-        if isinstance(callee, NameExpr) and callee.fullname == "builtins.len" and len(expr.args) == 1:
-            parts = _ndarray_parts(ctx.api.get_expression_type(expr.args[0]))
-            if parts is not None and parts[0] and isinstance(parts[0][0], (int, TypeVarType)):
-                return parts[0][0]
-        return None
-    tp = get_proper_type(ctx.api.get_expression_type(expr))
-    if isinstance(tp, TypeVarType):
-        return tp if isinstance(_resolve_dim(tp), _LinForm) else None  # `x.shape[i]` of a named size
-    if not isinstance(expr, NameExpr) or not isinstance(tp, Instance) or tp.type.fullname != INT_FULLNAME:
-        return None
-    if tp.last_known_value is not None and isinstance(tp.last_known_value.value, int):
-        return tp.last_known_value.value
-    key = _mask_var_key(ctx, expr)
-    if key is None:
-        return None
-    use_line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
-    rvalue = _single_rvalue(_enclosing_func(ctx, use_line)[1], expr.name)
-    if rvalue is not None:
-        inner = _int_expr_dim(ctx, rvalue, depth + 1)
-        if inner is not None:
-            return inner
-    return _fresh_int_symbol(ctx, expr.name, key)
 
 
 def _own_index_annotation(func_node: object | None, varname: str, var_line: int) -> tuple[bool, bool, object | None]:
@@ -363,36 +305,6 @@ def _recorded_for_operand(
         except Exception:
             _swallowed(ctx, "_recorded_for_operand")
             return None
-
-
-def _mask_var_key(ctx: MethodContext | FunctionContext, mask_expr: Expression | None) -> str | None:
-    """Stable key for a mask variable use, else None to mint per site (issue #288).
-
-    Same `Name` in the same function (module::func::name), not rebound
-    between uses, reuses one unknown. Inline masks (`x[x > 0]`), member
-    access, `flatnonzero` results and any rebinding bail to a fresh
-    per-site unknown (documented limits).
-    """
-    if not isinstance(mask_expr, NameExpr):
-        return None
-    varname = mask_expr.name
-    if not varname or varname in ("True", "False", "None"):
-        return None
-    try:
-        use_line = getattr(mask_expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
-        func_fullname, func_node = _enclosing_func(ctx, use_line)
-        count, is_param = _count_var_assignments(func_node, varname)
-        if is_param:
-            if count >= 1:
-                return None
-        elif count > 1:
-            return None
-        tree = getattr(ctx.api, "tree", None)
-        module = getattr(tree, "fullname", "") or ""
-        return f"{module}::{func_fullname}::{varname}"
-    except Exception:
-        _swallowed(ctx, "_mask_var_key")
-        return None
 
 
 def _mask_count_for(ctx: MethodContext, mask_expr: Expression | None, dim: int) -> Type:
@@ -773,7 +685,12 @@ def _slice_item(
         value: object = _fold_index_bound(ctx, bound)
         if value is None and i < 2:
             try:
-                value = _int_expr_dim(ctx, bound)
+                if isinstance(bound, UnaryExpr) and bound.op == "-":
+                    # `x[:-k]` counts from the end (issue 359).
+                    inner = _int_expr_dim(ctx, bound.expr)
+                    value = _FromEnd(inner) if isinstance(inner, Type) else None
+                else:
+                    value = _int_expr_dim(ctx, bound)
             except Exception:
                 _swallowed(ctx, "_slice_item")
         out.append("unknown" if value is None else value)
@@ -881,7 +798,7 @@ def _consume_one(
         )
         return None
     _, begin, end, stride = item
-    if isinstance(begin, Type) or isinstance(end, Type):
+    if _is_size_bound(begin) or _is_size_bound(end):
         return [_fresh_unknown(ctx, role, pos)]  # a symbolic bound: not followed on this path
     if isinstance(size, int):
         if "unknown" in (begin, end, stride):
@@ -1359,13 +1276,13 @@ def _solve_getitem(
             size = dims[dim]
             frag: int | Type
             symbolic = None
-            if isinstance(begin, Type) or isinstance(end, Type):
+            if _is_size_bound(begin) or _is_size_bound(end):
                 try:
                     symbolic = _symbolic_slice(ctx, dim, size, begin, end, stride)
                 except Exception:
                     _swallowed(ctx, "_solve_getitem")
-                begin = "unknown" if isinstance(begin, Type) else begin
-                end = "unknown" if isinstance(end, Type) else end
+                begin = "unknown" if _is_size_bound(begin) else begin
+                end = "unknown" if _is_size_bound(end) else end
             slice_expr = pairs[n][1] if n < len(pairs) else None
             shared = _slice_var_count(ctx, slice_expr, size)
             if stride == "unknown" and begin == end == "missing" and isinstance(slice_expr, SliceExpr):
