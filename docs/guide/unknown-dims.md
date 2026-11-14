@@ -115,6 +115,23 @@ count does not make that count `K`.
 picks from a returned tuple) is followed like any other value, so for
 a 1-D mask it fits `I64[K]` or `Intp[K]` as `np.flatnonzero(m)` does.
 
+**Other return forms** take the name too (`tests/fixtures/free_return_forms_ok.py`).
+A call that returns a whole tuple, `return pick(x)` under the same
+`tuple[F64[K], F64[K]]`, forwards its sizes item by item. A union whose
+members differ in dtype alone (`F64[K] | Arr[np.complex128, K]`)
+declares one shape. A formula over a free name, `F64["K+1"]`, takes an
+unknown plus one (`np.r_[r, 1.0]` with `r` a selection), a literal of at
+least one, or an `int`; the name is then the unknown, and every position
+declared with `K` or `K+1` must agree on it, so `np.r_[r, 1.0, 2.0]`
+(`K+2`) is refused. A bare `K` in a returned tuple (`-> tuple[K,
+F64[K]]`) is held to the same size, but mypy checks a plain `int` value
+there itself, so return a size of an array that has the name
+(`a.shape[0]` with `a: F64[K]`), not the `int` it was cut with. A value
+that does not fit the declared shape keeps its sizes: `(3, 5)` returned
+as `F64["k 3"]` prints `got "ndarray[tuple[Literal[3], Literal[5]], ...]"`,
+not `k` over the 3 that shows the missing `.T`
+(`tests/fixtures/bad_free_return_forms.py`).
+
 **A local can be given the name**, which is how a size read from
 outside (a column of a frame, a count) is named for the rest of the
 body:
@@ -133,7 +150,9 @@ that the sizes given it are one size, as an annotation always is.
 **At a call**, the positions declared with one free name share one
 unknown, printed with the name and the line of the call: `starts, ends
 = bounds(seg)` gives two arrays of `(?K@12,)`, and `ends - starts` is
-`(?K@12,)` too. Another free name of the same return is another
+`(?K@12,)` too. A formula shares it (`F64["K+1"]` is `(?K@12+1,)`), and
+so does a bare `K` in the returned tuple, which is the size itself
+(`k, a = trunc(v, 2)` gives `k: ?K@12`, and `np.zeros(k) + a` checks). Another free name of the same return is another
 unknown, and so is another call. An `int` axis next to it stays `int`:
 `def rows_of(c: int) -> F64[R, int]` gives `(?R@12, int)` at a call.
 Being one size, the chosen size is checked against itself like a name: `np.diff(starts, n=1)` against `np.diff(starts,

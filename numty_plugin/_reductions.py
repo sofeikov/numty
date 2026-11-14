@@ -40,7 +40,7 @@ from ._reshape import (
     _construct_dtype, _is_plain_int, _unknown_axis_parts,
 )
 from ._linalg import (
-    _dtype_family, _kind_of,
+    _dtype_family, _is_inexact_dtype, _kind_of,
 )
 from ._linalg import (
     _maybe_scalar, _scalar_of_dtype,
@@ -97,17 +97,22 @@ def _family_reduction_dtype(op: str, dtype: Type) -> Type | None:
     elementwise operations (issue #277). The integer families are left
     out: their sum widens by a rule that needs the width.
     """
-    if _dtype_family(dtype) != "f":
-        return None
     base = op.removeprefix("nan")
+    if _dtype_family(dtype) != "f":
+        # A complex, or a float or complex of unknown kind (`inexact[Any]`,
+        # a TypeVar bound by `np.inexact`, issue 362): every reduction but
+        # std and var (real for a complex) keeps it.
+        if _is_inexact_dtype(dtype) and base in ("sum", "prod", "mean", "median", "max", "min", "ptp", "amax", "amin"):
+            return dtype
+        return None
     if base in ("sum", "prod", "mean", "std", "var", "median", "max", "min", "ptp", "amax", "amin"):
         return dtype
     return None
 
 
 def _family_keeps_dtype(dtype: Type) -> bool:
-    """A dtype a reduction may keep as it is: a named one, or the float family."""
-    return _dtype_fullname(dtype) in REDUCTION_DTYPES or _dtype_family(dtype) == "f"
+    """A dtype a reduction may keep as it is: a named one, the float family, or a float or complex of unknown width."""
+    return _dtype_fullname(dtype) in REDUCTION_DTYPES or _dtype_family(dtype) == "f" or _is_inexact_dtype(dtype)
 
 
 def _solve_reduction(
@@ -1482,10 +1487,23 @@ def flatten_method_hook(ctx: MethodContext) -> Type:
 
 
 def ravel_function_hook(ctx: FunctionContext) -> Type:
+    """np.ravel: as the method; a total it cannot spell is a fresh `?U`.
+
+    The method's stub keeps `(int,)` there, the function's loses the
+    rank and dtype (issue 351), so the function answers `(?U,)` with
+    the input's dtype.
+    """
+    from numty_plugin import _fresh_unknown
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    return _ravel_solve(ctx, pairs[0][0])
+    result = _ravel_solve(ctx, pairs[0][0])
+    if result is not ctx.default_return_type:
+        return result
+    parts = _parts_or_unpack(pairs[0][0]) or _known_rank_parts(pairs[0][0])
+    if parts is None:
+        return result
+    return _ndarray_type(ctx, [_fresh_unknown(ctx, "ravel", 0)], parts[1])
 
 
 def diff_function_hook(ctx: FunctionContext) -> Type:

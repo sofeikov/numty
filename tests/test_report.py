@@ -21,7 +21,7 @@ import numpy as np
 a = np.zeros((2, 3))
 n = int("3")
 b = np.zeros((n, 3))
-reveal_type(np.linalg.eigvals(a))
+reveal_type(np.isreal(a))
 """
 
 BAIL_SOURCE = """\
@@ -85,12 +85,12 @@ def test_report_counts_solved_bailed_unhooked(tmp_path: Path) -> None:
     )
     solved, bailed, unhooked, crashed, total = (int(x) for x in row.split()[1:6])
     assert solved >= 1, row
-    # MIXED_SOURCE has no numpy bail (zeros solved, eigvals unhooked;
+    # MIXED_SOURCE has no numpy bail (zeros solved, isreal unhooked;
     # non-numpy SupportsIndex bails are hidden); total is deduped sites.
     assert total == solved + bailed + unhooked + crashed, row
-    assert total <= 5, row  # deduped: 2 zeros + eigvals, not 18 events
+    assert total <= 5, row  # deduped: 2 zeros + isreal, not 18 events
     assert "top unhooked ops" in result.stdout, out
-    assert "numpy.linalg._linalg.eigvals" in result.stdout, out
+    assert "numpy.lib._type_check_impl.isreal" in result.stdout, out
 
 
 def test_report_counts_numpy_bail(tmp_path: Path) -> None:

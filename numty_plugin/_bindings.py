@@ -341,3 +341,175 @@ def _value_of_rebound_name(
     except Exception:
         _swallowed(ctx, "_value_of_rebound_name")
         return False
+
+
+def _is_conditional_branch(ctx: MethodContext | FunctionContext, expr: object) -> bool:
+    """Whether `expr` is a whole branch of a conditional expression (`a if c else expr`).
+
+    The conditional is looked for as the value of an assignment, a
+    `return` or an expression statement of the enclosing function.
+    """
+    from mypy.nodes import ConditionalExpr as _ConditionalExpr
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import FuncDef as _FuncDef
+
+    def _branch_of(value: object) -> bool:
+        if not isinstance(value, _ConditionalExpr):
+            return False
+        return (
+            value.if_expr is expr
+            or value.else_expr is expr
+            or _branch_of(value.if_expr)
+            or _branch_of(value.else_expr)
+        )
+
+    def _walk(stmts: object) -> bool:
+        for stmt in stmts if isinstance(stmts, list) else []:
+            if isinstance(stmt, (_FuncDef, _ClassDef)):
+                continue
+            if _branch_of(getattr(stmt, "rvalue", None)) or _branch_of(getattr(stmt, "expr", None)):
+                return True
+            if any(_walk(inner) for inner in _nested_bodies(stmt)):
+                return True
+        return False
+
+    try:
+        _, func_node = _enclosing_func(ctx, getattr(expr, "line", 0) or 0)
+        if func_node is None:
+            return False
+        return _walk(getattr(getattr(func_node, "body", None), "body", None))
+    except Exception:
+        _swallowed(ctx, "_is_conditional_branch")
+        return False
+
+
+# Per module tree: (tree, binding counts of attributes, of module names,
+# names declared `global`, targets per assignment value id). Rebuilt when
+# the tree is a new object (a daemon re-parse).
+_TargetIndex = tuple[
+    dict[tuple[str, str], int], dict[str, int], set[str], dict[int, list[tuple[str, str, str]]]
+]
+_TARGET_INDEX: dict[int, tuple[object, _TargetIndex]] = {}
+# The count an annotated binding adds: it marks the target declared.
+_DECLARED = 1 << 20
+
+
+def _target_index(tree: object) -> _TargetIndex:
+    """Bindings of attributes (per class) and module names across one module.
+
+    See _value_of_rebound_target. An attribute is keyed by the innermost
+    class around its binding, "" outside every class.
+    """
+    from mypy.nodes import AssignmentStmt as _AssignmentStmt
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import Decorator as _Decorator
+    from mypy.nodes import ForStmt as _ForStmt
+    from mypy.nodes import FuncDef as _FuncDef
+    from mypy.nodes import GlobalDecl as _GlobalDecl
+    from mypy.nodes import MemberExpr as _MemberExpr
+    from mypy.nodes import OperatorAssignmentStmt as _OpAssign
+    from mypy.nodes import OverloadedFuncDef as _OverloadedFuncDef
+    from mypy.nodes import WithStmt as _WithStmt
+
+    cached = _TARGET_INDEX.get(id(tree))
+    if cached is not None and cached[0] is tree:
+        return cached[1]
+    attrs: dict[tuple[str, str], int] = {}
+    names: dict[str, int] = {}
+    declared: set[str] = set()
+    values: dict[int, list[tuple[str, str, str]]] = {}
+
+    def _flat(lvalue: object) -> list[object]:
+        if isinstance(lvalue, (TupleExpr, ListExpr)):
+            return [leaf for item in lvalue.items for leaf in _flat(item)]
+        if isinstance(lvalue, StarExpr):
+            return _flat(lvalue.expr)
+        return [lvalue]
+
+    def _walk(stmts: object, level: str, owner: str = "") -> None:
+        for stmt in stmts if isinstance(stmts, list) else []:
+            if isinstance(stmt, _FuncDef):
+                _walk(stmt.body.body, "func", owner)
+                continue
+            if isinstance(stmt, _Decorator):
+                _walk(stmt.func.body.body, "func", owner)
+                continue
+            if isinstance(stmt, _OverloadedFuncDef):
+                for item in stmt.items:
+                    func = item.func if isinstance(item, _Decorator) else item
+                    _walk(func.body.body, "func", owner)
+                if stmt.impl is not None:
+                    impl = stmt.impl.func if isinstance(stmt.impl, _Decorator) else stmt.impl
+                    _walk(impl.body.body, "func", owner)
+                continue
+            if isinstance(stmt, _ClassDef):
+                _walk(stmt.defs.body, "class", stmt.fullname)
+                continue
+            if isinstance(stmt, _GlobalDecl):
+                declared.update(stmt.names)
+            lvalues: list[object] = []
+            if isinstance(stmt, _AssignmentStmt):
+                lvalues = list(stmt.lvalues)
+            elif isinstance(stmt, _OpAssign):
+                lvalues = [stmt.lvalue]
+            elif isinstance(stmt, _ForStmt):
+                lvalues = [stmt.index]
+            elif isinstance(stmt, _WithStmt):
+                lvalues = [target for target in stmt.target if target is not None]
+            found: list[tuple[str, str, str]] = []
+            # An annotated binding declares the type, which every binding
+            # is checked against: such a target is never "bound again".
+            annotated = isinstance(stmt, _AssignmentStmt) and stmt.unanalyzed_type is not None
+            for lvalue in lvalues:
+                for leaf in _flat(lvalue):
+                    if isinstance(leaf, _MemberExpr) or (isinstance(leaf, NameExpr) and level == "class"):
+                        key = (owner, leaf.name)
+                        attrs[key] = attrs.get(key, 0) + (_DECLARED if annotated else 1)
+                        found.append(("attr", owner, leaf.name))
+                    elif isinstance(leaf, NameExpr):
+                        if level == "module" or leaf.name in declared:
+                            names[leaf.name] = names.get(leaf.name, 0) + (_DECLARED if annotated else 1)
+                        found.append((level, owner, leaf.name))
+            if isinstance(stmt, _AssignmentStmt):
+                values[id(stmt.rvalue)] = found
+            for inner in _nested_bodies(stmt):
+                _walk(inner, level, owner)
+
+    _walk(getattr(tree, "defs", None), "module")
+    if len(_TARGET_INDEX) > 64:
+        _TARGET_INDEX.clear()
+    index = (attrs, names, declared, values)
+    _TARGET_INDEX[id(tree)] = (tree, index)
+    return index
+
+
+def _value_of_rebound_target(ctx: MethodContext | FunctionContext, expr: object) -> bool:
+    """Whether `expr` is the whole value of an attribute or a module name bound elsewhere too.
+
+    _value_of_rebound_name for the bindings it does not see: mypy types
+    `self.Q = np.array([[1.0, 0.0], [0.0, 1.0]])` of an `__init__` from
+    that binding, so a method's `self.Q = np.eye(n)` is refused, and a
+    module's `g = np.array(0.0)` refuses a function's `global g; g =
+    np.zeros(n)`. Flow-insensitive: another binding of `<anything>.Q`
+    in the same class or outside every class, or of `g` at module level
+    or under `global g`, counts. A target with an annotated binding is
+    declared, and every binding is checked against the declaration.
+    """
+    try:
+        tree = getattr(ctx.api, "tree", None)
+        if tree is None:
+            return False
+        attrs, names, declared, values = _target_index(tree)
+        for kind, owner, name in values.get(id(expr), []):
+            if kind == "attr":
+                count = attrs.get((owner, name), 0) + (attrs.get(("", name), 0) if owner else 0)
+            elif kind == "module":
+                count = names.get(name, 0) + (2 if name in declared else 0)
+            else:
+                continue
+            if 1 < count < _DECLARED:
+                return True
+        return False
+    except Exception:
+        _swallowed(ctx, "_value_of_rebound_target")
+        return False

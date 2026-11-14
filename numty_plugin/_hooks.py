@@ -20,17 +20,18 @@ from mypy.plugin import (
     MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
-    AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
+    AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, RawExpressionType,
+    TupleType, Type,
     TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.typeanal import TypeAnalyser
-    from mypy.types import RawExpressionType, UnboundType
+    from mypy.types import UnboundType
 
 from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, _CANARY_BY_MODULE, _swallowed, _warn_startup
-from ._errors import _quiet_type
+from ._errors import _checked_operand, _quiet_type
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -50,8 +51,9 @@ from ._builders import (
     ascontiguousarray_function_hook, full_function_hook, linspace_function_hook,
     tri_function_hook, concatenate_function_hook,
     vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook,
-    stack_function_hook, r_getitem_hook,
+    stack_function_hook,
 )
+from ._joins import block_function_hook, c_getitem_hook, r_getitem_hook
 from ._arange import arange_function_hook
 from ._matmul import (
     _matmul_names_report, _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook,
@@ -67,7 +69,7 @@ from ._ops import (
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
-    atleast_function_hook,
+    atleast_function_hook, append_function_hook, insert_function_hook, delete_function_hook,
 )
 from ._matrix import (
     cov_function_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, eye_function_hook,
@@ -77,8 +79,8 @@ from ._reshape import (
     _reshape_new_dims, _scalar_key, reshape_method_hook, reshape_function_hook,
     transpose_method_hook, transpose_function_hook, swapaxes_function_hook, swapaxes_method_hook,
     moveaxis_function_hook, rollaxis_function_hook, matrix_transpose_function_hook,
-    mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook,
-    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook,
+    mt_attribute_hook, permute_dims_function_hook, squeeze_method_hook, squeeze_function_hook,
+    expand_dims_function_hook,
 )
 from ._reductions import (
     allany_method_hook, allany_function_hook, reduction_method_hook, ufunc_method_hook,
@@ -94,22 +96,24 @@ from ._fft import (
 from ._einsum import _einsum_signature_hook, einsum_function_hook
 from ._linalg import (
     _linalg_cross_signature_hook, _norm_signature_hook, cross_function_hook,
-    linalg_cross_function_hook, linalg_function_hook,
+    linalg_cross_function_hook, linalg_function_hook, poly_function_hook, roots_function_hook,
 )
 from ._indexing import (
     flatnonzero_mask_hook, getitem_method_hook, iter_method_hook,
     setitem_method_hook, take_along_axis_function_hook, take_function_hook,
     take_method_hook,
 )
+from ._arrays import asarray_function_hook
 from ._broadcast import (
-    angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook,
+    angle_function_hook, broadcast_method_hook, broadcast_to_function_hook,
     clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook,
     divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook,
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
 from ._heads import (
-    _FAM_HEAD_DTYPES, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
+    _FAM_HEAD_DTYPES, _arr_head, _class_type_arg, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
+    _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string, _index_head,
 )
 from ._exprs import _iter_tvarlikes
@@ -604,8 +608,28 @@ class NumtyPlugin(Plugin):
         info = sym.node
         if not info.type_vars:
             return None
-        if not _info_mentions_array(info):
+        if fullname in self._bare_tuple_guard:
             return None
+        if not _info_mentions_array(info):
+            # A class whose fields are not analyzed yet (a base class
+            # list, `class AR(Model[N, "N-1"])`) still takes a formula
+            # as a type argument (issue 358); anything else is mypy's.
+
+            def formula_args_hook(ctx: AnalyzeTypeContext) -> Type:
+                if any(
+                    isinstance(a, RawExpressionType) and isinstance(a.literal_value, str) for a in ctx.type.args
+                ):
+                    try:
+                        return ctx.api.named_type(fullname, [self._class_arg(ctx, fullname, a) for a in ctx.type.args])
+                    except Exception:
+                        _swallowed(ctx, "formula_args_hook")
+                self._bare_tuple_guard.add(fullname)
+                try:
+                    return ctx.api.analyze_type(ctx.type)
+                finally:
+                    self._bare_tuple_guard.discard(fullname)
+
+            return formula_args_hook
         # Issues #219/#221: a generic NamedTuple (e.g. Block[int]) must keep
         # mypy's default TupleType handling, which carries per-field types for
         # _replace self-checks and tuple unpacking. Rebuilding via named_type
@@ -619,7 +643,7 @@ class NumtyPlugin(Plugin):
             or getattr(info, "tuple_type", None) is not None
             or getattr(info, "typeddict_type", None) is not None
         ):
-            if fullname in self._bare_tuple_guard or getattr(info, "typeddict_type", None) is not None:
+            if getattr(info, "typeddict_type", None) is not None:
                 return None
 
             def bare_tuple_hook(ctx: AnalyzeTypeContext) -> Type:
@@ -642,7 +666,7 @@ class NumtyPlugin(Plugin):
         def bare_hook(ctx: AnalyzeTypeContext) -> Type:
             try:
                 if list(ctx.type.args):
-                    analyzed = [ctx.api.analyze_type(a) for a in ctx.type.args]
+                    analyzed = [self._class_arg(ctx, fullname, a) for a in ctx.type.args]
                     return ctx.api.named_type(fullname, analyzed)
             except Exception:
                 _swallowed(ctx, "bare_hook")
@@ -661,6 +685,9 @@ class NumtyPlugin(Plugin):
             return AnyType(TypeOfAny.from_error)
 
         return bare_hook
+
+    def _class_arg(self, ctx: AnalyzeTypeContext, fullname: str, arg: Type) -> Type:
+        return _class_type_arg(ctx, fullname, arg, self._fam_late_bound)
 
     # Phase 3 (#197) delegators: _fam_* bodies live in _heads.py as
     # module functions taking late_bound explicitly (same object as
@@ -912,6 +939,8 @@ class NumtyPlugin(Plugin):
             return setitem_method_hook
         if fullname == "numpy.lib._index_tricks_impl.RClass.__getitem__":
             return r_getitem_hook
+        if fullname == "numpy.lib._index_tricks_impl.CClass.__getitem__":
+            return c_getitem_hook
         short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.ndarray.") and short in {
             "__eq__",
@@ -1095,11 +1124,16 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             uu_right: Type | None = None
             if isinstance(call, _OpExpr0):
                 try:
-                    uu_left = _quiet_type(ctx, call.left)
-                    uu_right = _quiet_type(ctx, call.right)
+                    uu_left, left_reports = _checked_operand(ctx, call.left)
+                    uu_right, right_reports = _checked_operand(ctx, call.right)
                 except Exception:
                     _swallowed(ctx, "_broadcast_signature_hook")
                     uu_left = uu_right = None
+                    left_reports = right_reports = False
+                if left_reports or right_reports:
+                    # An operand that reports fails every overload, and
+                    # mypy adds `Unsupported operand types` (issue 363).
+                    return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
             elif isinstance(call, _CallExpr0) and call.args:
                 try:
                     uu_right = _quiet_type(ctx, call.args[0])
@@ -1325,6 +1359,9 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         from mypy.nodes import OpExpr as _OpExpr
 
         call = ctx.context
+        if isinstance(call, _OpExpr) and any(_checked_operand(ctx, side)[1] for side in (call.left, call.right)):
+            # An operand that reports fails every overload (issue 363).
+            return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
         left_tp: Type | None = None
         right_tp: Type | None = None
         if isinstance(call, _OpExpr):
@@ -1788,6 +1825,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "atleast_1d": partial(atleast_function_hook, rank=1),
             "atleast_2d": partial(atleast_function_hook, rank=2),
             "atleast_3d": partial(atleast_function_hook, rank=3),
+            "block": block_function_hook,
             "hstack": hstack_function_hook,
             "stack": stack_function_hook,
             "vstack": vstack_function_hook,
@@ -1833,6 +1871,10 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "sinc": partial(ufunc_function_hook, group="float"),
         },
         "numpy.lib._histograms_impl": {"histogram": histogram_function_hook},
+        "numpy.lib._polynomial_impl": {
+            "poly": poly_function_hook,
+            "roots": roots_function_hook,
+        },
         "numpy.lib._nanfunctions_impl": {
             "nanargmax": partial(arg_function_hook, op="nanargmax"),
             "nanargmin": partial(arg_function_hook, op="nanargmin"),
@@ -1893,6 +1935,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
                     "det",
                     "eig",
                     "eigh",
+                    "eigvals",
+                    "eigvalsh",
                     "inv",
                     "lstsq",
                     "matrix_power",
