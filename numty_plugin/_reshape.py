@@ -1068,11 +1068,14 @@ def _solve_squeeze(
     dims: list[int | Type],
     dtype: Type,
     axis: list[int] | None | str,
+    names: bool = True,
 ) -> Type:
     from numty_plugin import _resolve_dim
     ndim = len(dims)
     if not isinstance(axis, list):
         if axis in ("absent", "none"):
+            if not names and any(not isinstance(d, int) for d in dims):
+                return ctx.default_return_type
             # Literal 1s go; a size name is taken not to be 1, as np.cov
             # does (issue 351). An `int` or unknown size may be 1, so the
             # rank is open there: any rank, the input's dtype.
@@ -1503,7 +1506,15 @@ def squeeze_method_hook(ctx: MethodContext) -> Type:
     if parts is None:
         return ctx.default_return_type
     dims, dtype = parts
-    return _solve_squeeze(ctx, dims, dtype, _parse_axis_arg(_formal_pair(ctx, "axis")))
+    # mypy calls the hook per member of a union receiver: `np.asarray(s).squeeze()`
+    # of `float | F64[n] | F64[n, n]` (statsmodels) is narrowed on `.ndim`
+    # afterwards, which numty does not follow, so a member keeps main's answer.
+    callee = getattr(ctx.context, "callee", None)
+    receiver = getattr(callee, "expr", None)
+    lookup = getattr(ctx.api, "lookup_type_or_none", None)
+    whole = lookup(receiver) if lookup is not None and isinstance(receiver, Expression) else None
+    names = whole is None or not isinstance(get_proper_type(whole), UnionType)
+    return _solve_squeeze(ctx, dims, dtype, _parse_axis_arg(_formal_pair(ctx, "axis")), names)
 
 
 def squeeze_function_hook(ctx: FunctionContext) -> Type:

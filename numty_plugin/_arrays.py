@@ -14,8 +14,9 @@ from ._dtypes import (
     _WEAK_DEFAULT,
 )
 from ._forms import _form_has_unknown
+from ._bindings import _value_of_rebound_name
 from ._types import (
-    DTYPE_FULLNAME, _dim_eq, _dim_mul_const, _distribute_solve, _fold_dim_expr,
+    DTYPE_FULLNAME, INT_FULLNAME, _dim_eq, _dim_mul_const, _distribute_solve, _fold_dim_expr,
     _fold_int, _has_unpack, _ndarray_parts, _ndarray_type,
     _parts_or_unpack,
 )
@@ -235,12 +236,13 @@ def _asarray_array_type(
 ) -> Type:
     """asarray over one array operand: same shape, optional new dtype.
 
-    A scalar (a member of `float | F64[n]`) is 0-d (issue 360).
+    A scalar member of a union (`float | F64[n]`) keeps the stubs'
+    answer: such code tests `w.shape == ()` and rebinds `w`, which numty
+    does not follow (statsmodels' WLS).
     """
     part = _parts_or_unpack(tp)
     if part is None:
-        scalar = _scalar_array(ctx, tp, None, named)
-        return ctx.default_return_type if scalar is None else scalar
+        return ctx.default_return_type
     dims = _apply_ndmin(ctx, part[0])
     if dims is None:
         return ctx.default_return_type
@@ -266,9 +268,15 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
         return _ndarray_type(ctx, dims, named if named is not None else part[1])
     tp, expr = pairs[0]
+    # The shapes below are new (issue 360). As the value of a local that
+    # is bound again (`Istar = np.array([[a, b]])`, grown in a loop),
+    # they would refuse the later bindings: main's answer there.
+    rebound = _value_of_rebound_name(ctx, ctx.context)
     if _repetition(expr) is not None:
+        if rebound:
+            return _asarray_stub(ctx, named)
         return _display_result(ctx, _display_shape(ctx, tp, expr, 0), named)
-    scalar = _scalar_array(ctx, tp, expr, named)
+    scalar = None if rebound else _scalar_array(ctx, tp, expr, named)
     if scalar is not None:
         return scalar
     elems: list[tuple[Type, Expression | None]] = []
@@ -313,7 +321,10 @@ def _solve_asarray(ctx: FunctionContext) -> Type:
             return _ndarray_type(ctx, dims, named if named is not None else _default_dtype(ctx))
         # Nested displays and arrays of one shape: `[[a, b]]` is (1, 2),
         # `[x, x]` of `(N,)` is (2, N), as `np.stack` gives (issue 360).
-        return _display_result(ctx, _display_shape(ctx, tp, expr, 0), named)
+        shape = _display_shape(ctx, tp, expr, 0)
+        if shape is not None and rebound and not _arrays_of_one_shape(shape):
+            return _asarray_stub(ctx, named)
+        return _display_result(ctx, shape, named)
     if named is None:
         if "builtins.complex" in kinds:
             default_name = "numpy.complex128"
@@ -393,7 +404,8 @@ def _display_shape(
         display, times = repetition
         n = _fold_dim_expr(ctx, times, depth)
         if n is None:
-            n = _fresh_unknown(ctx, "asarray", depth)
+            # An `int` count is an `int` size, as in a builder.
+            n = ctx.api.named_type(INT_FULLNAME)
         width = len(display.items)
         count = width * n if isinstance(n, int) else _dim_mul_const(ctx, "asarray", depth, n, width)
         exprs: list[Expression | None] = list(display.items)
@@ -426,11 +438,11 @@ def _display_shape(
     dims = list(first[0])
     specs: list[tuple[str, str | None]] = []
     dtypes: list[Type] = []
-    for shape in shapes:
+    for k, shape in enumerate(shapes):
         assert shape is not None
         specs.extend(shape[1])
         dtypes.extend(shape[2])
-        for axis, d in enumerate(shape[0]):
+        for axis, d in enumerate(shape[0] if k else []):
             if _dim_eq(dims[axis], d):
                 continue
             if isinstance(dims[axis], int) and isinstance(d, int):
@@ -439,6 +451,12 @@ def _display_shape(
                 return None
             dims[axis] = _fresh_unknown(ctx, "asarray", depth + 1 + axis)
     return [count, *dims], specs, dtypes
+
+
+def _arrays_of_one_shape(shape: _Shape) -> bool:
+    """A display of arrays of one exact shape, which main solved already (issue 283)."""
+    dims, specs, _ = shape
+    return not specs and not any(_open_dim(d) for d in dims)
 
 
 def _open_dim(d: int | Type) -> bool:

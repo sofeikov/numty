@@ -195,8 +195,26 @@ quiet, where it is approximate, and what to write instead.
     builder falls through to numpy's catch-all overload and goes
     unchecked, as before. Assign it to a name first to have it checked.
 - An explicit `dtype=` is honored when it resolves (`np.float32`,
-    `"float64"`, bare `int`/`float`/`bool`, ...); exotic forms bail out.
-    Same for unknown `keepdims`.
+    `np.float64`, `"float64"`, bare `int`/`float`/`bool`, ...); exotic
+    forms bail out. Same for unknown `keepdims`.
+- A zero-size builder that is a whole branch of a conditional (`A2 =
+    f(A) if A is not None else np.zeros((0, 0))`, scipy's
+    `abcd_normalize`) has `int` sizes, not literal 0s: such code tells the
+    stand-in apart later by `.size == 0` or an `or` over its sizes, which
+    numty does not follow, and a literal `(0, 0)` member would not fit a
+    declared `F64[N, N]` (issue 349). Only a conditional that is the value
+    of an assignment, a `return` or an expression statement is seen.
+- Some answers stay looser than numpy's, so real code keeps checking
+    (issues 350, 351, 360): `np.linalg.eigvals` checks squareness but
+    keeps the stubs' type (its dtype depends on the data, and `r =
+    min(abs(real(vals))); r = 1.0` relies on the stubs' answer);
+    `np.isreal` and `np.iscomplex` are not hooked (a selection by them
+    makes `np.arange` over its count give numpy integers that a `list[int]`
+    refuses); `sliding_window_view` with a size window leaves the
+    shortened axis `int`; `np.concatenate` of one array leaves a product
+    of two names unknown; a size written `n ** 2` stays `int`; `np.array`
+    of a display, a repetition or a scalar keeps the stubs' answer as the
+    value of a local bound again.
 
 ## Aliases and masked arrays
 

@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.typeops import make_simplified_union
 from mypy.types import AnyType, CallableType, TupleType, Type, TypeOfAny
 from ._reshape import (
     _construct_dtype, _mixed_parts,
@@ -326,7 +325,7 @@ def _linalg_pinv(ctx: FunctionContext) -> Type:
 
 
 def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
-    """eig/eigh: (values, vectors); eigvals/eigvalsh: the values alone."""
+    """eig/eigh: (values, vectors); eigvalsh: the values alone; eigvals: checked only."""
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -362,7 +361,13 @@ def _linalg_eig(ctx: FunctionContext, op: str) -> Type:
         return ctx.default_return_type
     batch = dims[:-2]
     size = dims[-1]
-    if op in ("eigvals", "eigvalsh"):
+    if op == "eigvals":
+        # Checked like eig, typed by the stubs: numpy returns float64
+        # when every eigenvalue is real, complex otherwise, and code
+        # such as scipy's `r = min(abs(real(vals))); r = 1.0` relies
+        # on the stubs' loose answer (issue 350).
+        return ctx.default_return_type
+    if op == "eigvalsh":
         return _ndarray_type(ctx, [*batch, size], values_dtype)
     return _linalg_tuple(
         ctx,
@@ -382,6 +387,7 @@ def _linalg_flag(ctx: FunctionContext, name: str, default: bool) -> bool | None:
 
 
 def _linalg_svd(ctx: FunctionContext) -> Type:
+    from numty_plugin import _fresh_unknown
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -431,17 +437,23 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
     s_type = _ndarray_type(ctx, [*batch, inner], s_dtype)
     if not compute_uv:
         return s_type
-    # A `bool` full_matrices (issue 351) makes u and vh the union of
-    # both answers; s is the same either way.
-    shapes = [] if full is False else [([*batch, rows, rows], [*batch, cols, cols])]
-    if full is not True:
-        shapes.append(([*batch, rows, inner], [*batch, inner, cols]))
+    if full is None:
+        # A `bool` full_matrices (issue 351): u is (M, M) or (M, K), vh
+        # (N, N) or (K, N). An axis the two answers agree on is kept, the
+        # other is an unknown of its own; s is the same either way.
+        u_last = rows if _dim_eq(rows, inner) else _fresh_unknown(ctx, "svd-u", 0)
+        vh_first = cols if _dim_eq(cols, inner) else _fresh_unknown(ctx, "svd-vh", 0)
+        u_dims, vh_dims = [*batch, rows, u_last], [*batch, vh_first, cols]
+    elif full:
+        u_dims, vh_dims = [*batch, rows, rows], [*batch, cols, cols]
+    else:
+        u_dims, vh_dims = [*batch, rows, inner], [*batch, inner, cols]
     return _linalg_named(
         ctx,
         [
-            make_simplified_union([_ndarray_type(ctx, u, uv_dtype) for u, _ in shapes]),
+            _ndarray_type(ctx, u_dims, uv_dtype),
             s_type,
-            make_simplified_union([_ndarray_type(ctx, vh, uv_dtype) for _, vh in shapes]),
+            _ndarray_type(ctx, vh_dims, uv_dtype),
         ],
     )
 

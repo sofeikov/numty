@@ -1551,7 +1551,6 @@ def histogram_function_hook(ctx: FunctionContext) -> Type:
 
 
 def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
-    from numty_plugin import _fresh_unknown, _resolve_dim
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
@@ -1573,13 +1572,12 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
         widths = [window]
         scalar_window = True
     elif window == "bail" and _is_single_index(found_w[0]):
-        # A size window (`w.shape[0]`, `n + 1`) is that size; an `int`
-        # one a fresh unknown, shared by the shortened axis and the
-        # window axis (issue 351).
+        # A size window (`w.shape[0]`, `n + 1`) is that size on the
+        # window axis, an `int` one `int` (issue 351).
         size = _fold_dim_expr(ctx, found_w[1], 0) if found_w[1] is not None else None
         if size is None:
             size = _dim_value(found_w[0])
-        widths = [_fresh_unknown(ctx, "sliding_window_view", ndim) if size is None else size]
+        widths = [ctx.api.named_type("builtins.int") if size is None else size]
         scalar_window = True
     elif window == "bail":
         seq = _fft_seq_arg(found_w)
@@ -1645,13 +1643,10 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
     out = list(dims)
     for ax, wval in zip(eff, widths):
         if not isinstance(wval, int):
-            op = "sliding_window_view"
-            if _form_has_unknown(_resolve_dim(wval)):
-                # `N - ?k + 1` reads no better than an unknown of its own.
-                out[ax] = _fresh_unknown(ctx, op, ax)
-                continue
-            shorter = _dim_add2(ctx, op, ax, out[ax], _dim_mul_const(ctx, op, ax, wval, -1))
-            out[ax] = _dim_add_const(ctx, op, ax, shorter, 1)
+            # The shortened axis is `int`: code pads the input to a size
+            # of its own name first (`n_padded`, which is `n + w - 1`), and
+            # `n_padded - w + 1` would not be `n` (scipy's convolve1d).
+            out[ax] = ctx.api.named_type("builtins.int")
             continue
         if wval < 0:
             ctx.api.fail(

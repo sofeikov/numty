@@ -1395,15 +1395,6 @@ def _fold_dim_expr(
         return value
     if depth > 4:
         return None
-    if isinstance(expr, OpExpr) and expr.op == "**":
-        # `n ** 2` is `n * n` (issue 351); a small literal power only.
-        power = _fold_int(expr.right)
-        base = _fold_dim_expr(ctx, expr.left, index, depth + 1)
-        if power is None or not 1 <= power <= 4 or base is None:
-            return None
-        if isinstance(base, int):
-            return base**power
-        return _mul_dims(ctx, "shape-arith", index, [base] * power)
     if isinstance(expr, OpExpr) and expr.op in ("+", "-", "*", "//"):
         left = _fold_dim_expr(ctx, expr.left, index, depth + 1)
         right = _fold_dim_expr(ctx, expr.right, index, depth + 1)

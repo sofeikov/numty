@@ -1883,8 +1883,6 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
         "numpy.lib._type_check_impl": {
             "imag": partial(ufunc_function_hook, group="real"),
             "real": partial(ufunc_function_hook, group="real"),
-            "iscomplex": partial(ufunc_function_hook, group="bool"),
-            "isreal": partial(ufunc_function_hook, group="bool"),
             "nan_to_num": copy_function_hook,
         },
         "numpy.lib._ufunclike_impl": {

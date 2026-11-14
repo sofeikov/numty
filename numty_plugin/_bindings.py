@@ -341,3 +341,43 @@ def _value_of_rebound_name(
     except Exception:
         _swallowed(ctx, "_value_of_rebound_name")
         return False
+
+
+def _is_conditional_branch(ctx: MethodContext | FunctionContext, expr: object) -> bool:
+    """Whether `expr` is a whole branch of a conditional expression (`a if c else expr`).
+
+    The conditional is looked for as the value of an assignment, a
+    `return` or an expression statement of the enclosing function.
+    """
+    from mypy.nodes import ConditionalExpr as _ConditionalExpr
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import FuncDef as _FuncDef
+
+    def _branch_of(value: object) -> bool:
+        if not isinstance(value, _ConditionalExpr):
+            return False
+        return (
+            value.if_expr is expr
+            or value.else_expr is expr
+            or _branch_of(value.if_expr)
+            or _branch_of(value.else_expr)
+        )
+
+    def _walk(stmts: object) -> bool:
+        for stmt in stmts if isinstance(stmts, list) else []:
+            if isinstance(stmt, (_FuncDef, _ClassDef)):
+                continue
+            if _branch_of(getattr(stmt, "rvalue", None)) or _branch_of(getattr(stmt, "expr", None)):
+                return True
+            if any(_walk(inner) for inner in _nested_bodies(stmt)):
+                return True
+        return False
+
+    try:
+        _, func_node = _enclosing_func(ctx, getattr(expr, "line", 0) or 0)
+        if func_node is None:
+            return False
+        return _walk(getattr(getattr(func_node, "body", None), "body", None))
+    except Exception:
+        _swallowed(ctx, "_is_conditional_branch")
+        return False

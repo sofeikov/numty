@@ -75,9 +75,13 @@ permutations, repeated axes and non-1 squeeze axes error. `squeeze`
 without `axis=` drops the literal 1s and keeps the names (a size name
 is taken not to be 1, as for `np.cov`): `(n, 1)` is `(n,)`. An `int` or
 unknown axis may be 1, so the rank is open there: `ndarray[tuple[Any,
-...]]` with the input's dtype (issue 351). `np.concatenate(x)` of one
-array joins its first-axis items: `(k, n, m)` along axis 1 is `(n,
-k*m)`.
+...]]` with the input's dtype (issue 351). The method on a union
+(`np.asarray(s).squeeze()` of `float | F64[n] | F64[n, n]`) keeps the
+stubs' answer, as `atleast_2d` does: such code narrows on `.ndim`
+afterwards. `np.concatenate(x)` of one array joins its first-axis items:
+`(2, n, m)` along axis 1 is `(n, 2*m)`; a product of two names (`(k, n,
+m)`) is an unknown, since code names it on its own (`kp = k * p`
+declared `F64["kp kp"]`), as a local bound to a product stays `int`.
 
 ## Reductions
 
@@ -99,8 +103,7 @@ operand, so `(N,)` by `(T,)` is `(N, T)` and an `(N, D)` operand counts
 swapped for the index shape; literal indices past the axis error unless
 `mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, while
 `kron` multiplies the aligned dims, symbolic ones too (`(a, a)` kron
-`(b, b)` is `(a*b, a*b)`; an `int` size gives `?U`), and a size written
-`n ** 2` is `n*n`. `dot` with a scalar or 0-d operand is multiplication (`np.dot(B, 0)` and
+`(b, b)` is `(a*b, a*b)`; an `int` size gives `?U`). `dot` with a scalar or 0-d operand is multiplication (`np.dot(B, 0)` and
 `B.dot(0)` keep `B`'s shape), and
 `linalg.norm` with an explicit `ord` needs one or two reduced axes.
 A union operand of `dot` or `matmul` solves per member, as `@` does: a
@@ -204,11 +207,15 @@ two arrays of one shape is `(2, *shape)`; an axis where an item has an
 `np.stack`). A nested display has one axis per level
 (`np.array([[-a, a]])` is `(1, 2)`), and a list repetition repeats its
 items: `np.array([0.0] * 3)` is `(3,)`, `np.array([v] * n)` of `(N,)` is
-`(n, N)` for a size `n` and `(?U, N)` for an `int` one. Rows of
+`(n, N)` for a size `n` and `(int, N)` for an `int` one. Rows of
 different lengths are numpy's error and keep the stubs' answer.
 `np.array(1.0)` and `np.asarray(x)` of a scalar are 0-d, with the
 scalar's dtype for a literal or a numpy scalar and an open dtype for a
-value typed `float` (issue 360). The dtype is the one the call
+value typed `float` (issue 360); a scalar member of a union (`float |
+F64[n]`) keeps the stubs' answer. As the value of a local that is bound
+again (`Istar = np.array([[a, b]])`, grown in a loop), these displays,
+repetitions and scalars keep the stubs' answer, which the later
+bindings fit. The dtype is the one the call
 names, else `bool` for `bool` items (a display too: `np.array([True])`
 is `(1,)` bool), else the item arrays' dtype; for
 `int` and `float` items it is left to numpy's stubs, because a
@@ -293,22 +300,23 @@ across all operands, `linalg.solve` maps ints to `float64` and rejects
 `mean` is `float64`, complex `std` is real).
 `einsum` parses the subscript string (explicit, implicit,
 ellipsis, diagonals) and `linalg` checks squareness and inner dims while
-tracking dtypes (`eigh` and `eigvalsh` stay real, `eigvals` is
-`eig`'s first result, `svd` shrinks with
+tracking dtypes (`eigh` and `eigvalsh` stay real, `eigvals` checks
+squareness like `eig` and keeps the stubs' type, `svd` shrinks with
 `full_matrices=False`). `svd` and `qr` of a symbolic `(M, N)` matrix
 (stacked ones too) give `K = min(M, N)` as one fresh unknown per call,
 shared by the factors: `qr` (reduced) is `(M, ?K)` and `(?K, N)`, `svd`
 is `(M, ?K)`, `(?K,)`, `(?K, N)` with `full_matrices=False` and `(M, M)`,
 `(?K,)`, `(N, N)` with the default; a square `(D, D)` input is exact.
-A `full_matrices` that is a `bool` variable makes `u` and `vh` the
-union of both answers (`(N, N) | (?K, N)`), `s` is `(?K,)` either way.
+With a `full_matrices` that is a `bool` variable, `s` is `(?K,)` either
+way, and `u` and `vh` keep the axes the two answers agree on: `(M, ?U)`
+and `(?V, N)` for a symbolic matrix, `(3, 3)` and `(?V, 5)` for a `(3,
+5)` one.
 The result keeps its NamedTuple fields (`.U`, `.S`, `.Q`), typed by the
 stubs (`tests/fixtures/svd_qr_symbolic_ok.py`). `linalg.cross` takes batches of vectors of any
 rank, where NumPy's stubs stop at 2-D. `np.round` and `np.around` keep
 the shape and dtype; a bool array comes back `float16`, and rounding
 one to `decimals` other than 0, which NumPy refuses, is typed `Any`
-(numty reports shape errors, not dtype errors). `np.isreal` and
-`np.iscomplex` keep the shape in bool, like `np.isnan`. `np.poly` has
+(numty reports shape errors, not dtype errors). `np.poly` has
 one coefficient more than it has roots: `(k+1,)` for `(k,)` roots and
 `(n+1,)` for an `(n, n)` matrix, float64 for a real input; `np.roots` is
 `(?U,)` (leading and trailing zeros are dropped), complex or float as

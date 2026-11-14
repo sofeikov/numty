@@ -7086,28 +7086,25 @@ def test_dtype_float64_catch() -> None:
     }, result.stdout
 
 
-# Issue 350: functions with a hooked sibling are solved like it: eigvals
-# like eig, isreal like isnan, np.block like hstack/vstack, np.c_ like
-# column_stack; np.poly has one coefficient more than roots.
+# Issue 350: functions with a hooked sibling are solved like it: eigvalsh
+# like eigh, np.block like hstack/vstack, np.c_ like column_stack; np.poly
+# has one coefficient more than roots. eigvals is checked like eig and
+# typed by the stubs.
 def test_coverage_functions_ok() -> None:
     result = run_mypy(FIXTURES / "coverage_functions_ok.py")
     assert result.returncode == 0, result.stdout
-    bool_ = "numpy.dtype[numpy.bool[bool]]"
     assert reveals_by_line(result) == {
-        12: f'"{_ND}[tuple[n], numpy.dtype[numpy.complex128]]"',
+        12: f'"{_ND}[Any, Any]"',
         13: f'"{_ND}[tuple[n], {_F64}]"',
-        14: f'"{_ND}[tuple[k], {bool_}]"',
-        15: f'"{_ND}[tuple[k], {bool_}]"',
-        16: f'"{_ND}[tuple[?U@16], {_F64}]"',
-        17: f'"{_ND}[tuple[n, k+n], {_F64}]"',
-        18: f'"{_ND}[tuple[k+n, n], {_F64}]"',
-        19: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
-        20: f'"{_ND}[tuple[n, n+1], {_F64}]"',
-        21: f'"{_ND}[tuple[Literal[3], Literal[3]], {_F64}]"',
-        22: f'"{_ND}[tuple[k+1], {_F64}]"',
-        23: (
-            f'"{_ND}[tuple[?U@23], numpy.dtype[numpy.complexfloating[Any, Any]]]'
-            f' | {_ND}[tuple[?U@23], numpy.dtype[numpy.floating[Any]]]"'
+        14: f'"{_ND}[tuple[n, k+n], {_F64}]"',
+        15: f'"{_ND}[tuple[k+n, n], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
+        17: f'"{_ND}[tuple[n, n+1], {_F64}]"',
+        18: f'"{_ND}[tuple[Literal[3], Literal[3]], {_F64}]"',
+        19: f'"{_ND}[tuple[k+1], {_F64}]"',
+        20: (
+            f'"{_ND}[tuple[?U@20], numpy.dtype[numpy.complexfloating[Any, Any]]]'
+            f' | {_ND}[tuple[?U@20], numpy.dtype[numpy.floating[Any]]]"'
         ),
     }, result.stdout
 
@@ -7138,19 +7135,23 @@ def test_symbolic_args_ok() -> None:
     assert result.returncode == 0, result.stdout
     assert reveals_by_line(result) == {
         16: f'"{_ND}[tuple[a*b, a*b], {_F64}]"',
-        17: f'"{_ND}[tuple[a*a, a*a], {_F64}]"',
+        # `** 2` is not read as a product (a local's size stays `int`).
+        17: f'"{_ND}[tuple[int, int], {_F64}]"',
         18: f'"{_ND}[tuple[n], {_F64}]"',
         19: f'"{_ND}[tuple[t, p], {_F64}]"',
         # A `?U` axis may be 1: any rank, the dtype kept.
         20: f'"{_ND}[tuple[Any, ...], {_F64}]"',
         21: f'"{_ND}[tuple[?U@21], {_F64}]"',
         25: f'"{_ND}[tuple[?U@25], {_F64}]"',
-        26: f'"{_ND}[tuple[c, -W+n+1, W], {_F64}]"',
-        27: f'"{_ND}[tuple[c, ?U@27b, ?U@27], {_F64}]"',
-        28: f'"{_ND}[tuple[n, k*m], {_F64}]"',
+        # A size window keeps its name on the window axis; the shortened
+        # axis is `int` (scipy pads to a name of its own first).
+        26: f'"{_ND}[tuple[c, int, W], {_F64}]"',
+        27: f'"{_ND}[tuple[c, int, int], {_F64}]"',
+        # A product of two names is an unknown, as a local bound to one is `int`.
+        28: f'"{_ND}[tuple[n, ?U@28], {_F64}]"',
         29: f'"{_ND}[tuple[Literal[6], Literal[4]], {_F64}]"',
         31: f'"{_ND}[tuple[?U@30], {_F64}]"',
-        32: f'"{_ND}[tuple[n, n], {_F64}] | {_ND}[tuple[?U@30, n], {_F64}]"',
+        32: f'"{_ND}[tuple[?U@30c, n], {_F64}]"',
         33: f'"{_ND}[tuple[c, n-1], {_F64}]"',
         34: f'"{_ND}[tuple[Literal[4], Literal[3]], {_F64}]"',
         35: f'"{_ND}[tuple[c, ?U@35], {_F64}]"',
@@ -7166,7 +7167,7 @@ def test_symbolic_args_catch() -> None:
             'expected "ndarray[tuple[Never], dtype[float64]]"  [arg-type]'
         ],
         21: ["too many indices for 1 dimensions (got 2, shape (?U@21,))  [numty-axis]"],
-        22: ["too many indices for 3 dimensions (got 4, shape (c, p-W+1, W))  [numty-axis]"],
+        22: ["too many indices for 3 dimensions (got 4, shape (c, ?, W))  [numty-axis]"],
         24: ["cannot assign value of shape (6, 4) into target of shape (3, 8)  [numty-broadcast]"],
         25: [
             'Incompatible types in assignment (expression has type '
@@ -7189,14 +7190,15 @@ def test_array_rank_ok() -> None:
         # A value typed `float` may hold an int: the dtype stays open.
         13: f'"{_ND}[tuple[()], {any_dt}]"',
         14: f'"{_ND}[tuple[()], {_F64}]"',
-        15: f'"{_ND}[tuple[()], {any_dt}] | {_ND}[tuple[N], {_F64}]"',
+        # A scalar member of a union keeps the stubs' answer.
+        15: f'"{_ND}[tuple[Any, ...], {any_dt}] | {_ND}[tuple[N], {_F64}]"',
         16: f'"{_ND}[tuple[Literal[1], Literal[2]], {_F64}]"',
         17: f'"{_ND}[tuple[Literal[2], Literal[2]], {i64}]"',
         18: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
         19: f'"{_ND}[tuple[Literal[3], N], {_F64}]"',
         20: f'"{_ND}[tuple[N], {_F64}]"',
-        # filterpy's missing-measurement marker: an object array.
-        21: f'"{_ND}[tuple[?U@21, Literal[1]], {any_dt}]"',
+        # filterpy's missing-measurement marker: an object array, `int` long.
+        21: f'"{_ND}[tuple[int, Literal[1]], {any_dt}]"',
         22: f'"{_ND}[tuple[Literal[2], ?U@22], {_F64}]"',
         # Ragged rows are numpy's error: the stubs' answer.
         23: f'"{_ND}[tuple[Any, ...], {any_dt}]"',
@@ -7217,3 +7219,14 @@ def test_array_rank_catch() -> None:
             'variable has type "ndarray[tuple[N], dtype[float64]]")  [assignment]'
         ],
     }, result.stdout
+
+
+# Issues 349-351, 360: the new answers stay out of the way of real code
+# that numty cannot follow: an empty stand-in in a conditional, a local
+# grown in a loop, `.squeeze()` of a union narrowed on `.ndim`, a window
+# over an input padded to a size of its own name, `full_matrices` from a
+# flag, a product of names the return names on its own, and eigvals'
+# stub-typed values (scipy, statsmodels, filterpy).
+def test_coverage_idioms_ok() -> None:
+    result = run_mypy(FIXTURES / "coverage_idioms_ok.py")
+    assert result.returncode == 0, result.stdout

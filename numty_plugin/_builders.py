@@ -28,13 +28,14 @@ from ._dtypes import (
 )
 
 from ._types import (
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int, _dim_mul_const,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
     _distribute_pairings, _in_loop_body, _kept_name, _union_members, _union_results, _has_unpack,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
+from ._bindings import _is_conditional_branch
 from ._reshape import (
     _check_axis, _fail_axis,
     _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,
@@ -563,6 +564,12 @@ def _zeros_of(
         if _explicit_dtype(ctx):
             return _stub_shape_named_dtype(ctx, _named_dtype(ctx), (shape_arg, shape_expr))
         return _stub_shape_named_dtype(ctx, None)
+    if 0 in dims and _is_conditional_branch(ctx, ctx.context):
+        # An empty stand-in, `A2 = f(A) if A is not None else np.zeros((0, 0))`
+        # (scipy's abcd_normalize): the code tells it apart later by `.size`
+        # or an `or` over its sizes, which numty does not follow. Its sizes
+        # are `int`, so the union still fits the declared `F64[N, N]`.
+        dims = [ctx.api.named_type(INT_FULLNAME) if isinstance(d, int) else d for d in dims]
     if not _dims_fit_intp(ctx, dims):
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -1416,8 +1423,8 @@ def _concatenate_array(
 ) -> Type:
     """np.concatenate of one array: its first-axis items, joined (issue 351).
 
-    `(k, n, m)` along axis 1 is `(n, k*m)`; with `axis=None` it is the
-    flat total. A 1-D array has 0-d items, which numpy refuses.
+    `(2, n, m)` along axis 1 is `(n, 2*m)`; a product of two names
+    (`(k, n, m)`) is an unknown. With `axis=None` it is the flat total. A 1-D array has 0-d items, which numpy refuses.
     """
     if _explicit_dtype(ctx):
         named = _named_dtype(ctx)
@@ -1442,11 +1449,19 @@ def _concatenate_array(
     norm = _check_axis(ctx, "concatenate axis", axis, rest, len(rest))
     if norm is None:
         return ctx.default_return_type
+    from numty_plugin import _fresh_unknown
     out = list(rest)
     if isinstance(count, int) and isinstance(rest[norm], int):
         out[norm] = count * rest[norm]
+    elif isinstance(count, int):
+        out[norm] = _dim_mul_const(ctx, "concatenate", norm, rest[norm], count)
+    elif isinstance(rest[norm], int):
+        out[norm] = _dim_mul_const(ctx, "concatenate", norm, count, rest[norm])
     else:
-        out[norm] = _mul_dims(ctx, "concatenate", norm, [count, rest[norm]])
+        # A product of two names is an unknown: code names it on its
+        # own (`kp = k * p` declared `F64["kp kp"]`), as for a local
+        # bound to a product (issue 359).
+        out[norm] = _fresh_unknown(ctx, "concatenate", norm)
     return _ndarray_type(ctx, out, dtype)
 
 
