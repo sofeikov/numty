@@ -5274,6 +5274,43 @@ def test_bad_own_size_return() -> None:
     assert _run_fixture("bad_own_size_return.py") == ["(3,) (4,)"]
 
 
+def test_free_return_forms() -> None:
+    # Issue 357: a free return name in a forwarded tuple, in a union whose
+    # members differ in dtype alone, inside a formula (`K+1` takes an
+    # unknown plus one), and bare in a returned tuple. At a call `K+1` and
+    # a bare `K` share the unknown the call gives `K`.
+    result = run_mypy(FIXTURES / "free_return_forms_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[52] == (
+        f'"tuple[numpy.ndarray[tuple[?K@52], {_F64}], numpy.ndarray[tuple[?K@52], {_F64}]]"'
+    ), result.stdout
+    assert notes[53] == f'"numpy.ndarray[tuple[?K@48+1], {_F64}]"', result.stdout
+    assert notes[54] == (
+        f'"tuple[numpy.ndarray[tuple[?K@49], {_F64}], numpy.ndarray[tuple[?K@49+1], {_F64}]]"'
+    ), result.stdout
+    assert notes[55] == '"?K@50"', result.stdout
+    assert notes[56] == f'"numpy.ndarray[tuple[?K@50], {_F64}]"', result.stdout
+    assert notes[57] == f'"numpy.ndarray[tuple[?K@50], {_F64}]"', result.stdout
+    assert _run_fixture("free_return_forms_ok.py") == ["(2,) (2,) (3,) (3,) 2 (2,)"]
+
+
+def test_bad_free_return_forms() -> None:
+    # Issue 357: two sizes under one free name are refused through a
+    # forwarded tuple and a formula, and a value that does not fit keeps
+    # its literal sizes (the name is not printed over the 3).
+    result = run_mypy(FIXTURES / "bad_free_return_forms.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [18, 23, 28, 32], result.stdout
+    for line in errors:
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), result.stdout
+    assert "ndarray[tuple[?J@18]" in errors[18][0], result.stdout
+    assert 'got "ndarray[tuple[?U@22+2]' in errors[23][0], result.stdout
+    assert "ndarray[tuple[K+2]" in errors[28][0], result.stdout
+    assert 'got "ndarray[tuple[Literal[3], Literal[5]]' in errors[32][0], result.stdout
+    assert _run_fixture("bad_free_return_forms.py") == ["(1,)"]
+
+
 def test_bad_own_size_optin() -> None:
     # Issues 306/307 (opt-in): the size a call chose, and the size an
     # object's properties name, are sizes of their own. Silent with numty-names off.

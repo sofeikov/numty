@@ -20,7 +20,7 @@ from ._unknowns import _fresh_own_size
 from ._forms import _LinForm, _form_has_unknown
 from ._exprs import (
     _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _iter_tvarlikes,
-    _lookup_ns, _ns_of_ctx, _seen_vars, _short_var,
+    _lookup_ns, _ns_of_ctx, _seen_vars, _short_var, _signature_names,
 )
 from ._types import (
     INT_FULLNAME, NDARRAY_FULLNAME, _dim_value, _has_unknown_shape, _optional_members, _parts_or_unpack,
@@ -412,6 +412,18 @@ def _callsite_formula_return(
         return sig
 
 
+def _is_int_bound(tv: TypeVarType) -> bool:
+    upper = get_proper_type(tv.upper_bound)
+    return isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME
+
+
+def _caller_names(ctx: FunctionSigContext | MethodSigContext) -> set[str]:
+    """Names the function holding the call binds (its parameters, an enclosing function's, its class's)."""
+    scope = getattr(ctx.api, "scope", None)
+    func = scope.current_function() if scope is not None else None
+    return _signature_names(scope, func) if func is not None else set()
+
+
 def _settle_any_bound(sig: CallableType, bindings: dict[str, int | Type | _LinForm]) -> CallableType:
     """`sig` with every size the call bound to `Any` written as `Any`.
 
@@ -739,6 +751,18 @@ def _substitute_return_exprs(
         except Exception:
             _swallowed(ctx, "_substitute_return_exprs")
             return None
+        if (
+            isinstance(proper_ret, TypeVarType)
+            and proper_ret.fullname not in bindings
+            and proper_ret.fullname not in inferred
+            and proper_ret.fullname not in in_formula
+            and proper_ret.id in {v.id for v in sig.variables}
+            and not proper_ret.values
+            and _is_int_bound(proper_ret)
+        ):
+            # A bare name of the return alone (`-> tuple[K, F64[K]]`):
+            # the size the call chose, as in an array position (issue 357).
+            return _fresh_own_size(ctx, proper_ret.name, proper_ret.fullname)
         if isinstance(proper_ret, TupleType):
             # Issues 244/220: a generic NamedTuple value is a TupleType
             # whose fallback is the NamedTuple Instance. Substituting field
@@ -1027,6 +1051,22 @@ def _substitute_return_exprs(
                 form_r = form_early
             else:
                 return None
+            for cfull, _ in form_r.coeffs:
+                if (
+                    cfull not in bindings
+                    and d.id in own_ids
+                    and cfull not in inferred
+                    and cfull not in in_formula
+                    and not cfull.startswith(_EXPR_PREFIX)
+                    and cfull not in _caller_names(ctx)
+                ):
+                    # A name of the return alone inside a formula
+                    # (`-> F64["K+1"]`): the size the call chose for
+                    # `K`, shared with the positions declared `K`
+                    # (issue 357).
+                    own = _fresh_own_size(ctx, cfull.rsplit(".", 1)[-1], cfull)
+                    bindings = {**bindings, cfull: own}
+                    obj_by_fullname[own.fullname] = own
             if any(cfull not in bindings for cfull, _ in form_r.coeffs):
                 # A name the call did not bind: mypy's own answer if
                 # the whole dim is a formal dim, else nothing is known.
