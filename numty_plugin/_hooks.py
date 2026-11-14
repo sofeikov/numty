@@ -102,8 +102,9 @@ from ._indexing import (
     setitem_method_hook, take_along_axis_function_hook, take_function_hook,
     take_method_hook,
 )
+from ._arrays import asarray_function_hook
 from ._broadcast import (
-    angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook,
+    angle_function_hook, broadcast_method_hook, broadcast_to_function_hook,
     clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook,
     divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook,
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,

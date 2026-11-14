@@ -7174,3 +7174,46 @@ def test_symbolic_args_catch() -> None:
             '"ndarray[tuple[Literal[4], Literal[4]], dtype[float64]]")  [assignment]'
         ],
     }, result.stdout
+
+
+# Issue 360: np.array / np.asarray of a scalar is 0-d; a nested display
+# has one axis per level; `[x] * n` repeats the items (`n` a size, else
+# an unknown); items with an `int` size join like np.stack.
+def test_array_rank_ok() -> None:
+    result = run_mypy(FIXTURES / "array_rank_ok.py")
+    assert result.returncode == 0, result.stdout
+    any_dt = "numpy.dtype[Any]"
+    i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[()], {_F64}]"',
+        # A value typed `float` may hold an int: the dtype stays open.
+        13: f'"{_ND}[tuple[()], {any_dt}]"',
+        14: f'"{_ND}[tuple[()], {_F64}]"',
+        15: f'"{_ND}[tuple[()], {any_dt}] | {_ND}[tuple[N], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[1], Literal[2]], {_F64}]"',
+        17: f'"{_ND}[tuple[Literal[2], Literal[2]], {i64}]"',
+        18: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        19: f'"{_ND}[tuple[Literal[3], N], {_F64}]"',
+        20: f'"{_ND}[tuple[N], {_F64}]"',
+        # filterpy's missing-measurement marker: an object array.
+        21: f'"{_ND}[tuple[?U@21, Literal[1]], {any_dt}]"',
+        22: f'"{_ND}[tuple[Literal[2], ?U@22], {_F64}]"',
+        # Ragged rows are numpy's error: the stubs' answer.
+        23: f'"{_ND}[tuple[Any, ...], {any_dt}]"',
+    }, result.stdout
+
+
+def test_array_rank_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_array_rank.py")
+    assert _messages_by_line(result) == {
+        11: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[Literal[3]], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N, N], dtype[float64]]")  [assignment]'
+        ],
+        12: ["too many indices for 2 dimensions (got 3, shape (2, ?U@12))  [numty-axis]"],
+        13: ["matmul inner dimensions disagree: 2 vs 3  [numty-shape]"],
+        14: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[()], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout

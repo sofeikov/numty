@@ -11,8 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
-from ._dtypes import _promote_strong as _promote_strong_names
+from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE
 from ._dtypes import (
     _UFUNC_ABS, _UFUNC_BINARY_BOOL, _UFUNC_BINARY_FLOAT, _UFUNC_BINARY_PROMOTE,
     _UFUNC_BOOL, _UFUNC_FLOAT, _UFUNC_KEEP, _UFUNC_NO_COMPLEX, _UFUNC_REAL, _WEAK_DEFAULT,
@@ -24,15 +23,13 @@ from ._types import (
     _parts_or_unpack, _report_mask_names, _report_names, _same_own_size, _scalar_union_members, _shape_from_arg,
     _split_flat, _target_is_union, _union_members,
 )
-from ._sequences import _comprehension_length
 from ._reshape import (
     _all_positionals, _all_positionals_expanded, _bool_value, _datetime_kind, _dims_str,
     _dtype_fullname, _dtype_kind_size, _formal_pair, _is_none_type, _is_plain_int, _known_rank_parts,
     _scalar_key, _weak_name,
 )
 from ._builders import (
-    _apply_out_dtype, _default_dtype, _element_expr_type, _explicit_dtype, _fold_single, _is_dynamic_sequence,
-    _named_dtype, _scalar_ret_name, _scalar_spec, _stub_shape_named_dtype,
+    _apply_out_dtype, _default_dtype, _fold_single, _scalar_spec,
 )
 from ._linalg import (
     _linalg_dtype, _linalg_real_name, _linalg_tuple,
@@ -49,9 +46,8 @@ if TYPE_CHECKING:
     from mypy.plugin import MethodContext
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import Expression, FloatExpr, IndexExpr, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
+from mypy.nodes import Expression, OpExpr, StarExpr, TupleExpr
 from mypy.copytype import copy_type
-from mypy.subtypes import is_same_type
 from mypy.types import (
     AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, UninhabitedType, UnionType,
     get_proper_type,
@@ -1048,364 +1044,6 @@ def _broadcast_to_types(ctx: FunctionContext, tp: Type, dims: list[int | Type]) 
     return _ndarray_type(ctx, dims, dtype)
 
 
-def _display_element_kind(tp: Type, expr: Expression | None) -> str | None:
-    """weak scalar kind of a flat display element, else None to bail."""
-    value = _fold_int(expr) if expr is not None else None
-    if isinstance(value, bool):
-        return "builtins.bool"
-    if isinstance(value, int):
-        return "builtins.int"
-    proper = get_proper_type(tp)
-    if isinstance(proper, LiteralType):
-        if isinstance(proper.value, bool):
-            return "builtins.bool"
-        if isinstance(proper.value, int):
-            return "builtins.int"
-        if isinstance(proper.value, float):
-            return "builtins.float"
-        if isinstance(proper.value, complex):
-            return "builtins.complex"
-        return None
-    if isinstance(proper, Instance) and proper.type.fullname in (
-        "builtins.float",
-        "builtins.complex",
-    ):
-        return proper.type.fullname
-    return None
-
-
-def _scalar_item(tp: Type, expr: Expression | None) -> tuple[str, str | None] | None:
-    """What a display item that is certainly a scalar brings, else None.
-
-    ("exact", dtype name) for a literal (`0.0`, `3`, `True`): numpy reads
-    it in its default dtype, as is a `bool` (no subclass, issue 333). ("loose",
-    builtins name) for a value typed `float` / `int` / `complex`: a `float`
-    may hold an int and an `int` a bool. ("strong", dtype name) for a numpy scalar, with
-    None for one of unknown width (`floating[Any]`). An `Any`, an array
-    or a sequence is not a scalar: it may add an axis.
-    """
-    value = _fold_int(expr) if expr is not None else None
-    if isinstance(value, bool):
-        return ("exact", "numpy.bool")
-    if isinstance(value, int):
-        return ("exact", "numpy.int64")
-    proper = get_proper_type(tp)
-    if isinstance(proper, LiteralType):
-        weak = _weak_name(proper)
-        return ("exact", _WEAK_DEFAULT[weak]) if weak is not None else None
-    if isinstance(expr, FloatExpr):
-        return ("exact", "numpy.float64")
-    weak = _weak_name(tp)
-    if weak is not None:
-        return ("exact", "numpy.bool") if weak == "builtins.bool" else ("loose", weak)
-    key = _scalar_key(tp)
-    if key is not None:
-        return key
-    if isinstance(proper, Instance) and any(base.fullname == "numpy.generic" for base in proper.type.mro):
-        return ("strong", _scalar_ret_name(proper))
-    return None
-
-
-def _scalar_items_dtype(
-    ctx: FunctionContext | MethodContext, specs: list[tuple[str, str | None]]
-) -> Type:
-    """The dtype `np.array` gives a display of scalars (issue #300).
-
-    numpy promotes the items as arrays: a Python float counts as
-    float64 here, not as a weak scalar (`np.array([np.float32(1), 0.0])`
-    is float64). A value typed `float` or `int` is claimed only where
-    what it may really hold cannot change the answer: next to a float64
-    or complex128 item. Anything else is `dtype[Any]`.
-    """
-    unknown = ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)])
-    current: str | None = None
-    for kind, name in specs:
-        if kind == "loose":
-            continue
-        if name is None:
-            return unknown
-        current = name if current is None else _promote_strong_names(current, name)
-        if current is None:
-            return unknown
-    loose = {name for kind, name in specs if kind == "loose"}
-    if loose:
-        if "builtins.complex" in loose:
-            return unknown
-        if current not in ("numpy.float64", "numpy.complex128"):
-            return unknown
-    if current is None:
-        return unknown
-    dtype = _construct_dtype(ctx, current)
-    return dtype if dtype is not None else unknown
-
-
-def _may_be_anything(tp: Type) -> bool:
-    """An `Any`, or a union of `Any` with scalars (`float | Any`)."""
-    proper = get_proper_type(tp)
-    if isinstance(proper, AnyType):
-        return True
-    if isinstance(proper, UnionType):
-        return all(_may_be_anything(item) or _scalar_item(item, None) is not None for item in proper.items)
-    return False
-
-
-def _indexed_scalar(ctx: FunctionContext | MethodContext, expr: Expression | None) -> tuple[str, str | None] | None:
-    """`a[i]` / `m[i, j]`: every axis of an array of known rank indexed with an integer.
-
-    The type of such an item is `Any` when the array's dtype is, but it
-    is one value whatever the dtype: a scalar of unknown width.
-    """
-    if not isinstance(expr, IndexExpr):
-        return None
-    try:
-        base = ctx.api.get_expression_type(expr.base)
-        parts = _ndarray_parts(base) if base is not None else None
-        if parts is None:
-            return None
-        index = expr.index
-        items = list(index.items) if isinstance(index, TupleExpr) else [index]
-        if len(items) != len(parts[0]):
-            return None
-        for item in items:
-            tp = get_proper_type(ctx.api.get_expression_type(item))
-            if not isinstance(tp, Instance):
-                return None
-            if tp.type.fullname != "builtins.int" and not any(b.fullname == "numpy.integer" for b in tp.type.mro):
-                return None
-        return ("strong", None)
-    except Exception:
-        _swallowed(ctx, "_indexed_scalar")
-        return None
-
-
-def _scalar_row_width(tp: Type) -> int | None:
-    """k for a `tuple[T1, ..., Tk]` of scalars: one row of a table (issue #300).
-
-    Items typed `Any` count next to at least one certain scalar: were
-    one of them an array, numpy would refuse the ragged row, so the row
-    has k values or the call raises.
-    """
-    proper = get_proper_type(tp)
-    if not isinstance(proper, TupleType) or not proper.items:
-        return None
-    scalars = [_scalar_item(item, None) is not None for item in proper.items]
-    if not any(scalars):
-        return None
-    if not all(ok or _may_be_anything(item) for ok, item in zip(scalars, proper.items)):
-        return None
-    return len(proper.items)
-
-
-def _asarray_stub(ctx: FunctionContext | MethodContext, named: Type | None) -> Type:
-    """The stubs' answer, with the dtype the call names (issue #300).
-
-    `dtype=np.float64` is typed by the stubs and `dtype=float` is not,
-    whatever the items are.
-    """
-    return _stub_shape_named_dtype(ctx, named) if named is not None else ctx.default_return_type
-
-
-def _apply_ndmin(
-    ctx: FunctionContext | MethodContext, dims: list[int | Type]
-) -> list[int | Type] | None:
-    """Prepend 1s until the rank reaches `ndmin` (issue #46), else None.
-
-    No `ndmin` argument leaves dims untouched. An unprovable `ndmin`
-    (or one over a `*Ts` shape) bails instead of guessing; a negative
-    one fails loudly.
-    """
-    pair = _formal_pair(ctx, "ndmin")
-    if pair is None:
-        return dims
-    if _has_unpack(dims):
-        return None
-    value = _fold_single(pair)
-    if value is None:
-        return None
-    if value < 0:
-        ctx.api.fail(
-            f"ndmin must be non-negative, got {value}",
-            ctx.context,
-            code=NUMTY_SHAPE,
-        )
-        return None
-    if len(dims) >= value:
-        return dims
-    return [1] * (value - len(dims)) + list(dims)
-
-
-def _asarray_array_type(
-    ctx: FunctionContext | MethodContext, tp: Type, named: Type | None
-) -> Type:
-    """asarray over one array operand: same shape, optional new dtype."""
-    part = _parts_or_unpack(tp)
-    if part is None:
-        return ctx.default_return_type
-    dims = _apply_ndmin(ctx, part[0])
-    if dims is None:
-        return ctx.default_return_type
-    return _ndarray_type(ctx, dims, named if named is not None else part[1])
-
-
-def _solve_asarray(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if not pairs:
-        return ctx.default_return_type
-    named = _named_dtype(ctx) if _explicit_dtype(ctx) else None
-    if _explicit_dtype(ctx) and named is None:
-        return ctx.default_return_type
-    dist = _distribute_solve(
-        [pairs[0][0]], lambda t: _asarray_array_type(ctx, t, named)
-    )
-    if dist is not None:
-        return dist
-    part = _parts_or_unpack(pairs[0][0])
-    if part is not None:
-        dims = _apply_ndmin(ctx, part[0])
-        if dims is None:
-            return ctx.default_return_type
-        return _ndarray_type(ctx, dims, named if named is not None else part[1])
-    tp, expr = pairs[0]
-    elems: list[tuple[Type, Expression | None]] = []
-    proper = get_proper_type(tp)
-    if isinstance(proper, TupleType):
-        elems = list(zip(proper.items, [None] * len(proper.items)))
-    elif isinstance(expr, (ListExpr, TupleExpr)):
-        checked = [ctx.api.get_expression_type(e) for e in expr.items]
-        if any(t is None for t in checked):
-            return ctx.default_return_type
-        elems = list(zip([t for t in checked if t is not None], expr.items))
-    if not elems:
-        return _asarray_dynamic(ctx, tp, expr, named)
-    kinds = [_display_element_kind(t, e) for t, e in elems]
-    if any(k is None for k in kinds):
-        # Numpy scalars among the items (`[v[0], v[1], 0.0]`): no item
-        # adds an axis, so the length is the display's (issue #300).
-        specs = [_scalar_item(t, e) or _indexed_scalar(ctx, e) for t, e in elems]
-        # An `Any` item next to a certain scalar is one value too, or
-        # numpy refuses the ragged display.
-        loose_any = any(spec is not None for spec in specs) and all(
-            spec is not None or _may_be_anything(t) for spec, (t, _) in zip(specs, elems)
-        )
-        if all(spec is not None for spec in specs) or loose_any:
-            dims = _apply_ndmin(ctx, [len(elems)])
-            if dims is None:
-                return _asarray_stub(ctx, named)
-            if named is not None:
-                dtype = named
-            elif all(spec is not None for spec in specs):
-                dtype = _scalar_items_dtype(ctx, [spec for spec in specs if spec is not None])
-            else:
-                dtype = ctx.api.named_generic_type(DTYPE_FULLNAME, [AnyType(TypeOfAny.special_form)])
-            return _ndarray_type(ctx, dims, dtype)
-        # Rows written as tuples of scalars: `[(x, y), (x, y)]` is (2, 2).
-        widths = [_scalar_row_width(t) for t, _ in elems]
-        width = widths[0]
-        if width is not None and all(w == width for w in widths):
-            dims = _apply_ndmin(ctx, [len(elems), width])
-            if dims is None:
-                return _asarray_stub(ctx, named)
-            return _ndarray_type(ctx, dims, named if named is not None else _default_dtype(ctx))
-        return _asarray_of_arrays(ctx, [t for t, _ in elems], named)
-    if named is None:
-        if "builtins.complex" in kinds:
-            default_name = "numpy.complex128"
-        elif "builtins.float" in kinds:
-            default_name = "numpy.float64"
-        elif "builtins.int" in kinds:
-            default_name = "numpy.int64"
-        else:
-            default_name = "numpy.bool"
-        dtype = _construct_dtype(ctx, default_name)
-        if dtype is None:
-            return ctx.default_return_type
-    else:
-        dtype = named
-    dims = _apply_ndmin(ctx, [len(elems)])
-    if dims is None:
-        return ctx.default_return_type
-    return _ndarray_type(ctx, dims, dtype)
-
-
-def _asarray_of_arrays(ctx: FunctionContext, items: list[Type], named: Type | None) -> Type:
-    """`np.array([a, b])` of arrays of one shape and dtype: `(2, *shape)` (issue 283).
-
-    The same answer as `np.stack`. Items whose shapes or dtypes are not
-    provably the same stay with the stubs: numpy refuses different
-    shapes, and promotes different dtypes.
-    """
-    parts = [part for part in map(_ndarray_parts, items) if part is not None]
-    if not parts or len(parts) != len(items):
-        return _asarray_stub(ctx, named)
-    first_dims, first_dtype = parts[0]
-    for dims, dtype in parts[1:]:
-        if len(dims) != len(first_dims) or not all(_dim_eq(a, b) for a, b in zip(dims, first_dims)):
-            return _asarray_stub(ctx, named)
-        if named is None and not is_same_type(dtype, first_dtype):
-            return _asarray_stub(ctx, named)
-    out = _apply_ndmin(ctx, [len(items), *first_dims])
-    if out is None:
-        return _asarray_stub(ctx, named)
-    return _ndarray_type(ctx, out, named if named is not None else first_dtype)
-
-
-def _asarray_dynamic(
-    ctx: FunctionContext, tp: Type, expr: Expression | None, named: Type | None
-) -> Type:
-    """`np.array` of a list built at runtime: one unknown axis in front (issue 283).
-
-    A list comprehension or a `list[...]` value has an unknowable length
-    (not an unfiltered comprehension over a known size, issue 333) and
-    one item type. Items that are arrays of one declared shape give
-    `(?U, *shape)`, as `np.stack` does; scalars give `(?U,)`. The dtype
-    is the one the call names, else `bool` for `bool` items (exact), else
-    the dtype of a numpy scalar item, else the stubs' answer: a
-    `list[int]` may hold bools, a `list[float]` ints; nothing is claimed.
-    """
-    from numty_plugin import _fresh_unknown
-
-    if isinstance(expr, ListComprehension):
-        item = _element_expr_type(ctx, expr.generator.left_expr)
-    elif _is_dynamic_sequence(tp, expr):
-        proper = get_proper_type(tp)
-        item = proper.args[0] if isinstance(proper, Instance) and proper.args else None
-    else:
-        return _asarray_stub(ctx, named)
-    if item is None:
-        return _asarray_stub(ctx, named)
-    lead = _comprehension_length(ctx, expr)
-    lead = _fresh_unknown(ctx, "asarray", 0) if lead is None else lead
-    part = _ndarray_parts(item)
-    if part is not None:
-        dims = _apply_ndmin(ctx, [lead, *part[0]])
-        if dims is None:
-            return _asarray_stub(ctx, named)
-        return _ndarray_type(ctx, dims, named if named is not None else part[1])
-    width = _scalar_row_width(item)
-    if width is not None:
-        # A table built row by row: `list[tuple[float, float, float]]`
-        # is (?U, 3) (issue #300). The dtype is the one the call names;
-        # a `float` item may hold an int, so nothing else is claimed.
-        dims = _apply_ndmin(ctx, [lead, width])
-        if dims is None:
-            return _asarray_stub(ctx, named)
-        return _ndarray_type(ctx, dims, named if named is not None else _default_dtype(ctx))
-    key = _scalar_key(item)
-    if key is None:
-        return _asarray_stub(ctx, named)
-    dims = _apply_ndmin(ctx, [lead])
-    if dims is None:
-        return _asarray_stub(ctx, named)
-    if named is not None:
-        return _ndarray_type(ctx, dims, named)
-    kind, name = key
-    exact = name if kind == "strong" else ("numpy.bool" if name == "builtins.bool" else None)
-    dtype = _construct_dtype(ctx, exact) if exact is not None else None
-    if dtype is None:
-        dtype = _default_dtype(ctx)
-    return _ndarray_type(ctx, dims, dtype)
-
-
 def _solve_ufunc(ctx: FunctionContext | MethodContext, group: str) -> Type:
     pairs = _all_positionals_expanded(ctx)
     if pairs is None:
@@ -1645,10 +1283,6 @@ def clip_function_hook(ctx: FunctionContext) -> Type:
 
 def broadcast_to_function_hook(ctx: FunctionContext) -> Type:
     return _solve_broadcast_to(ctx)
-
-
-def asarray_function_hook(ctx: FunctionContext) -> Type:
-    return _solve_asarray(ctx)
 
 
 def _solve_truediv_pair(

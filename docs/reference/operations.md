@@ -199,7 +199,16 @@ grow, `range(N, 2)`, is left unknown), over the rows of an
 `(N, M)` array, `zip` of such arrays or `enumerate` of one it is `N`,
 over a tuple of two arrays 2. A filter (`if`), a second `for`, or an
 `int` length (`range(n)` with `n: int`) leave the `?U`. `np.array([a, b])` of
-two arrays of one shape is `(2, *shape)`. The dtype is the one the call
+two arrays of one shape is `(2, *shape)`; an axis where an item has an
+`int` or unknown size is a `?U` (`(2, ?U)` for two `F64[int]`, as for
+`np.stack`). A nested display has one axis per level
+(`np.array([[-a, a]])` is `(1, 2)`), and a list repetition repeats its
+items: `np.array([0.0] * 3)` is `(3,)`, `np.array([v] * n)` of `(N,)` is
+`(n, N)` for a size `n` and `(?U, N)` for an `int` one. Rows of
+different lengths are numpy's error and keep the stubs' answer.
+`np.array(1.0)` and `np.asarray(x)` of a scalar are 0-d, with the
+scalar's dtype for a literal or a numpy scalar and an open dtype for a
+value typed `float` (issue 360). The dtype is the one the call
 names, else `bool` for `bool` items (a display too: `np.array([True])`
 is `(1,)` bool), else the item arrays' dtype; for
 `int` and `float` items it is left to numpy's stubs, because a

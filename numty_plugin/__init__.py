@@ -74,15 +74,18 @@ from ._indexing import (  # noqa: F401
     _take_index_values, _take_indices, _take_solve, getitem_method_hook, setitem_method_hook,
     take_along_axis_function_hook, take_function_hook, take_method_hook,
 )
+from ._arrays import (  # noqa: F401
+    _apply_ndmin, _asarray_array_type, _display_element_kind, _solve_asarray, asarray_function_hook,
+)
 from ._broadcast import (  # noqa: F401
-    _apply_ndmin, _asarray_array_type, _broadcast_dims, _broadcast_dims_unpack, _broadcast_result,
+    _broadcast_dims, _broadcast_dims_unpack, _broadcast_result,
     _broadcast_shapes, _broadcast_to_compatible, _broadcast_to_types, _clip_types, _combine_specs,
-    _compare_types, _display_element_kind, _is_bool_operand, _is_builtin_int, _is_plain_bool,
-    _logical_types, _merge_shape_lists, _operand_spec, _smallest_float, _solve_asarray,
+    _compare_types, _is_bool_operand, _is_builtin_int, _is_plain_bool,
+    _logical_types, _merge_shape_lists, _operand_spec, _smallest_float,
     _solve_broadcast_to, _solve_clip, _solve_round, _solve_truediv_pair, _solve_ufunc,
     _solve_ufunc_binary_bool, _solve_ufunc_binary_float, _solve_where, _specs_dtype, _truediv_types,
     _ufunc_bool_types, _ufunc_call_solve, _ufunc_float_types, _ufunc_name, _ufunc_types,
-    _where_types, angle_function_hook, asarray_function_hook, broadcast_method_hook,
+    _where_types, angle_function_hook, broadcast_method_hook,
     broadcast_to_function_hook, clip_function_hook, clip_method_hook, compare_method_hook,
     divmod_function_hook, divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook,
     isclose_function_hook, logical_method_hook, round_function_hook, round_method_hook,

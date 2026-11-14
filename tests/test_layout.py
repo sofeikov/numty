@@ -547,6 +547,7 @@ _LAYERS = (
     "_matrix",
     "_aliases",
     "_broadcast",
+    "_arrays",
     "_fft",
     "_casts",
     "_index_sources",
