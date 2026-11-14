@@ -22,7 +22,10 @@ product stays `int`, since a free name of the return may stand for it
 (`kp = k * p` declared `F64["kp kp"]`). `x.size` is the product of the
 axes (`S` for `(S,)`, `12` for `(3, 4)`, `S*X` for `(S, X)`), and
 `len()` of a size a call chose is that size, as `.shape[0]` is (issue
-359).
+359). Assigned to a local that is bound again in the function (`total =
+x.size; total += y.size`, `n = len(d); n //= 2`, or a parameter),
+`.size` and `len()` stay `int`, since mypy types the local from its
+first binding.
 
 ## Joining
 
@@ -104,7 +107,9 @@ Consumes leading dims without an ellipsis (`v[0]`,
 `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax`
 drops the axis, `sort` keeps the shape, and a literal `partition` kth
 past the axis errors. A list of integers is a 1-D fancy index
-(`x[:, [k]]` is `(N, 1)`, a `list[int]` value adds a `?U` axis), and
+(`x[:, [k]]` is `(N, 1)`, a `list[int]` value adds a `?U` axis, or
+leaves the result unknown as before when it is assigned to a local
+bound again, such as `rows = x[train]; rows = x[test]`), and
 `list()`, `iter()`, `enumerate()` and `zip()` give an array's rows as a
 `for` does (issue 361). Slice bounds over `int` variables are in
 [Indexing](../guide/indexing.md).
@@ -158,7 +163,8 @@ comprehension or of a `list[...]` value has one `?U` axis in front:
 comprehension with one `for` over a known size has that many items, in
 `np.array` and `np.stack`: over `range(3)` it is 3, over `range(lags,
 nobs)` it is `nobs - lags` (`N-S` with `nobs = len(y)`, `lags: S`, the
-bounds taken in order, issue 359), over the rows of an
+bounds taken in order, issue 359; a formula that falls as its names
+grow, `range(N, 2)`, is left unknown), over the rows of an
 `(N, M)` array, `zip` of such arrays or `enumerate` of one it is `N`,
 over a tuple of two arrays 2. A filter (`if`), a second `for`, or an
 `int` length (`range(n)` with `n: int`) leave the `?U`. `np.array([a, b])` of

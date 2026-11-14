@@ -66,3 +66,23 @@ def lagged(y: F64[N, K], lags: S) -> F64["N-S", int]:
     z = np.array([y[t - lags:t].ravel() for t in range(lags, nobs)])
     reveal_type(z)
     return z
+
+
+def rebound(x: F64[N, K], y: F64[K], train: list[int], test: list[int], out: F64[S, K]) -> int:
+    # A size into a local bound again stays `int` (and a list index Any):
+    # mypy types the local from its first binding.
+    total = x.size
+    total += y.size
+    n = len(trim(y))
+    while n > 1:
+        n //= 2
+    rows = x[train]
+    rows = x[test]
+    out = x[train]
+    return total + n + rows.size + out.size
+
+
+def clipped(X: F64[N, K]) -> None:
+    for i in range(0, X.shape[0], 32):
+        reveal_type(X[i:i + 32])
+    reveal_type(np.array([X[i] for i in range(X.shape[0], 2)]))

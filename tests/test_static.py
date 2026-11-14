@@ -6828,7 +6828,9 @@ def test_sizes_in_ints_ok() -> None:
     # `.size` or `len()` keep what numty knows, and an `int` size fits a
     # name declared on an earlier line as on the annotated line. A local
     # bound to a product stays `int` (line 36): a free name of the return
-    # may stand for it (`kp = k * p` declared `F64["kp kp"]`).
+    # may stand for it (`kp = k * p` declared `F64["kp kp"]`). A local
+    # bound again (`total += y.size`, `rows = x[test]`) keeps main's
+    # `int` / Any, so `rebound` checks.
     result = run_mypy(FIXTURES / "sizes_in_ints_ok.py")
     assert result.returncode == 0, result.stdout
     f64 = "numpy.dtype[numpy.float64]"
@@ -6846,6 +6848,10 @@ def test_sizes_in_ints_ok() -> None:
         46: f'"{_ND}[tuple[S], {f64}]"',
         55: '"?K@54"',
         67: f'"{_ND}[tuple[N-S, K*S], {f64}]"',
+        # A constant width over a cancelled `int` stays unknown (the last
+        # batch is clipped), and so does `range(N, 2)`, never `2-N`.
+        87: f'"{_ND}[tuple[?U@87, K], {f64}]"',
+        88: f'"{_ND}[tuple[?U@88, K], {f64}]"',
     }, result.stdout
 
 

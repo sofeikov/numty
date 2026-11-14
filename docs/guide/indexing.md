@@ -63,6 +63,8 @@ otherwise (`x[i : i + bs]` on the last batch). So it is given when an
 unknown: nothing is proved from it with `numty-names` off. Where the
 variable cancels out the size is exact: `x[:, i : i + 1]` is `(c, 1)`
 and `R[s : s + len(z)]` is `(K,)` for `z: F64[K]` (issue 359). A
+constant width other than 1 stays unknown, as `x[:32]` does: the last
+batch of `X[i : i + 32]` in a batching loop is clipped. A
 negated stop counts from the end: `x[:-m]` is `(n-?m,)`, as `x[m:]` is
 (`tests/fixtures/sizes_in_ints_ok.py`). Under the `numty-names` code
 (on by default) two

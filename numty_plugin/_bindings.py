@@ -14,11 +14,11 @@ from mypy.nodes import Expression, ListExpr, NameExpr, StarExpr, TupleExpr
 from ._errors import _swallowed
 
 if TYPE_CHECKING:
-    from mypy.plugin import FunctionContext, FunctionSigContext, MethodContext
+    from mypy.plugin import AttributeContext, FunctionContext, FunctionSigContext, MethodContext
 
 
 def _enclosing_func(
-    ctx: MethodContext | FunctionSigContext | FunctionContext,
+    ctx: MethodContext | FunctionSigContext | FunctionContext | AttributeContext,
     use_line: int,
 ) -> tuple[str, object | None]:
     """Innermost function containing `use_line`: (fullname, node).
@@ -300,3 +300,44 @@ def _single_rvalue_of(ctx: MethodContext | FunctionContext, expr: NameExpr) -> E
     """The value of `expr`'s variable when `name = <value>` is its only binding in the enclosing function."""
     use_line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
     return _single_rvalue(_enclosing_func(ctx, use_line)[1], expr.name)
+
+
+def _value_of_rebound_name(
+    ctx: MethodContext | FunctionContext | AttributeContext, expr: object
+) -> bool:
+    """Whether `expr` is the whole value of `name = expr` for a name bound elsewhere too.
+
+    mypy types a local from its first binding, so a size there (`N`,
+    `K*N`, `?K@14`) refuses a later `total += y.size` or `n //= 2` that
+    is correct code. The readers that give a size (`.size`, `len()`, an
+    `int`-list index) give what main gave instead when the name is a
+    parameter or is bound more than once in the function.
+    """
+    from mypy.nodes import AssignmentStmt as _AssignmentStmt
+    from mypy.nodes import ClassDef as _ClassDef
+    from mypy.nodes import FuncDef as _FuncDef
+
+    try:
+        _, func_node = _enclosing_func(ctx, getattr(expr, "line", 0) or 0)
+        if func_node is None:
+            return False
+        names: list[str] = []
+
+        def _walk(stmts: object) -> None:
+            for stmt in stmts if isinstance(stmts, list) else []:
+                if isinstance(stmt, (_FuncDef, _ClassDef)):
+                    continue
+                if isinstance(stmt, _AssignmentStmt) and stmt.rvalue is expr:
+                    names.extend(lv.name for lv in stmt.lvalues if isinstance(lv, NameExpr))
+                for inner in _nested_bodies(stmt):
+                    _walk(inner)
+
+        _walk(getattr(getattr(func_node, "body", None), "body", None))
+        for name in names:
+            count, is_param = _count_var_assignments(func_node, name, deep=True)
+            if is_param or count > 1:
+                return True
+        return False
+    except Exception:
+        _swallowed(ctx, "_value_of_rebound_name")
+        return False

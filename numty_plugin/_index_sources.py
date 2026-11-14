@@ -108,8 +108,13 @@ def _symbolic_slice(
     form = _lin_add(hi, _lin_scale(lo, -1))
     # An `int` variable in a bound (`x[i:i + 1]`, `R[s:s + len(z)]`, issue
     # 359) is assumed inside the axis, as for `x[m:]`, also where it
-    # cancels out of the size.
-    if not (_form_has_unknown(form) or _form_has_unknown(lo) or _form_has_unknown(hi)):
+    # cancels out of the size. A constant width other than 1 is not:
+    # `X[i:i + 32]` in a batching loop is clipped on the last batch, as
+    # `X[:32]` may be, and only a 1 broadcasts where it is wrong.
+    if not _form_has_unknown(form) and (_form_has_unknown(lo) or _form_has_unknown(hi)):
+        if not form.coeffs and form.const != 1:
+            return None
+    elif not _form_has_unknown(form):
         inside = _lin_add(whole, _lin_scale(hi, -1))
         if not (_fits_long_axis(lo) and _fits_long_axis(form) and _fits_long_axis(inside)):
             return None

@@ -33,6 +33,7 @@ from ._ops import flatnonzero_function_hook
 from ._broadcast_core import _inplace_never_fits
 from ._bindings import (
     _assignment_lines, _bound_in_loop, _count_var_assignments, _enclosing_func, _mask_var_key, _single_rvalue,
+    _value_of_rebound_name,
 )
 from ._types import _int_expr_dim
 from ._reshape import (
@@ -608,6 +609,10 @@ def _parse_index_item(
         else:
             from numty_plugin import _fresh_unknown
 
+            if _value_of_rebound_name(ctx, ctx.context):
+                # `rows = x[train]; rows = x[test]`, or into a parameter:
+                # a fresh `?U` each time would refuse the rebinding.
+                return None
             return ("fancy", [_fresh_unknown(ctx, "list-index", getattr(expr, "column", 0))])
     if isinstance(expr, SliceExpr):
         # Unprovable bounds no longer bail the whole getitem (issue #57):

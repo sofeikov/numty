@@ -16,8 +16,9 @@ from mypy.types import (
     CallableType, Instance, LiteralType, TupleType, Type, TypeVarType, UnpackType, get_proper_type,
 )
 
+from ._bindings import _value_of_rebound_name
 from ._errors import NUMTY_SHAPE, _swallowed
-from ._forms import _form_has_unknown, _is_unknown_fullname
+from ._forms import _form_has_unknown, _is_unknown_fullname, _LinForm
 from ._unknowns import _OWN_SIZE_MARK
 from ._types import (
     _builder_fold_dim_expr, _dim_eq, _enum_member_count, _kept_name, _linear_product, _named_size,
@@ -98,7 +99,12 @@ def _sequence_length(ctx: FunctionContext | MethodContext, seq: Expression) -> i
             # the bounds are taken to be in order.
             span = seq.args[0] if len(seq.args) == 1 else OpExpr("-", seq.args[1], seq.args[0])
             size = _builder_fold_dim_expr(ctx, span, 0)
-            return max(size, 0) if isinstance(size, int) else size
+            if isinstance(size, int):
+                return max(size, 0)
+            if size is not None and not _may_be_positive(size):
+                # `range(x.shape[0], 2)` is empty from N = 2 on; never `2-N`.
+                return None
+            return size
         if name == "builtins.enumerate" and len(seq.args) == 1:
             return _sequence_length(ctx, seq.args[0])
         if name == "builtins.zip":
@@ -121,6 +127,16 @@ def _sequence_length(ctx: FunctionContext | MethodContext, seq: Expression) -> i
     if parts is None or not parts[0]:
         return None
     return parts[0][0]
+
+
+def _may_be_positive(size: Type) -> bool:
+    """Whether a size formula grows with one of its names (`N-2`, `?b-?a`; not `2-N`)."""
+    from numty_plugin import _resolve_dim
+
+    form = _resolve_dim(size)
+    if not isinstance(form, _LinForm):
+        return True
+    return any(c > 0 for _, c in form.coeffs)
 
 
 def len_function_hook(ctx: FunctionContext) -> Type:
@@ -153,6 +169,10 @@ def len_function_hook(ctx: FunctionContext) -> Type:
             # size a call chose for a name of its return (`?K@14`, issue
             # 359): `len(d)` is what `d.shape[0]` is.
             return int_fallback
+        if _value_of_rebound_name(ctx, ctx.context):
+            # `n = len(d)` with `n //= 2` later: mypy types `n` from this
+            # line, so a size would refuse the rebinding.
+            return int_fallback
         return first
     if not isinstance(first, int):
         return ctx.default_return_type
@@ -168,13 +188,17 @@ def size_attribute_hook(ctx: AttributeContext) -> Type:
 
     A literal total is `int` carrying its value, the form `.shape` items
     take (issue #62); a total over names is the size it spells (`S` for
-    `(S,)`, `C*K` for `(C, K)`). Anything else stays `int`.
+    `(S,)`, `C*K` for `(C, K)`). Anything else stays `int`, as does the
+    value of a local that is bound again (`total = x.size; total += 1`).
     """
     from numty_plugin import _materialize_dim
 
     try:
         parts = _ndarray_parts(ctx.type)
         if parts is None:
+            return ctx.default_attr_type
+        if _value_of_rebound_name(ctx, ctx.context):
+            # `total = x.size` with `total += y.size` later stays `int`.
             return ctx.default_attr_type
         dims = parts[0]
         int_fallback = ctx.api.named_generic_type("builtins.int", [])
