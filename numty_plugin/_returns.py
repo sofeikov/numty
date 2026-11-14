@@ -286,7 +286,7 @@ def _is_annotated_value(path: str, line: int, col: int) -> bool:
                 for arg in (*func.args.posonlyargs, *func.args.args, *func.args.kwonlyargs)
                 if arg.annotation is not None
             }
-            todo = list(func.body)
+            todo: list[ast.AST] = list(func.body)
             while todo:
                 node = todo.pop()
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):

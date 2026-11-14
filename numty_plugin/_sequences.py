@@ -189,7 +189,10 @@ def size_attribute_hook(ctx: AttributeContext) -> Type:
         form = _linear_product(dims)
         if form is None or _form_has_unknown(form):
             return ctx.default_attr_type
-        return _materialize_dim(ctx, "size", 0, form)
+        dim = _materialize_dim(ctx, "size", 0, form)
+        if isinstance(dim, int):
+            return int_fallback.copy_modified(last_known_value=LiteralType(dim, fallback=int_fallback))
+        return dim
     except Exception:
         _swallowed(ctx, "size_attribute_hook")
         return ctx.default_attr_type
