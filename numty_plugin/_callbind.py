@@ -32,7 +32,7 @@ from ._types import (
 
 
 def _formal_name(sig: CallableType, i: int) -> str:
-    """The name of formal `i` for a message, or "?" when it has none.
+    """The name of formal `i` for a message, or its position from 1 when it has none (see `_arg_phrase`).
 
     Issue 335: a positional-only parameter (`def __call__(self, Z, /)`,
     the usual spelling of a callback Protocol) has no name in the
@@ -51,7 +51,14 @@ def _formal_name(sig: CallableType, i: int) -> str:
                 return found
     except Exception:
         _swallowed(None, "_formal_name")
-    return "?"
+    # A `Callable[[...], ...]` value names none of its parameters:
+    # its position, as mypy's `Argument 1` (issue 363).
+    return str(i + 1)
+
+
+def _arg_phrase(name: str) -> str:
+    """`argument 'x'` for a named formal, `argument 1` for one known by its position (`_formal_name`)."""
+    return f"argument {name}" if name.isdigit() else f"argument '{name}'"
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
@@ -396,7 +403,10 @@ def _conflict_pairs(
             # binds to it, so each one is checked.
             for expr in actuals:
                 out.extend(_pairs_for_actual(fname, tp, expr, ctx))
-    return out
+    # Only a name the call binds (issue 363): a caller's name in a
+    # `Callable[[F64[N]], ...]` parameter is mypy's `[arg-type]`.
+    own = {v.id for v in sig.variables}
+    return [pair for pair in out if pair[2].id in own]
 
 
 def _emit_call_site_conflicts(
@@ -422,8 +432,8 @@ def _emit_call_site_conflicts(
             if other[2] != first[2]:
                 message = (
                     f"call-site shape conflict for '{name}': "
-                    f"{first[2]} (argument '{first[0]}', {_where(first[1])}) vs "
-                    f"{other[2]} (argument '{other[0]}', {_where(other[1])})"
+                    f"{first[2]} ({_arg_phrase(first[0])}, {_where(first[1])}) vs "
+                    f"{other[2]} ({_arg_phrase(other[0])}, {_where(other[1])})"
                 )
                 # No dedup here (issue #44): mypy already collapses
                 # identical messages on one line, and a process-lifetime
@@ -641,7 +651,7 @@ def _callsite_expr_bindings(
                         ctx.api.fail(
                             f"call-site shape conflict: no size '{_short_var(m_full)}' "
                             f"makes {_expr_str(form_f)} equal {fa.const} "
-                            f"(argument '{_formal_name(sig, i)}', axis {dim})",
+                            f"({_arg_phrase(_formal_name(sig, i))}, axis {dim})",
                             ctx.context,
                             code=NUMTY_CALLSITE,
                         )

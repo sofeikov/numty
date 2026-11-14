@@ -110,7 +110,13 @@ contraction (`@`, `matmul`, `dot` and `ndarray.dot`, `inner`,
 contracted axes are the forgotten `.T`, and a call that binds one name
 of the callee to two names of the caller
 (`score(ids: I64[K], d: F64[P, K])` given an `I64[B]` and an
-`F64[B, A]`):
+`F64[B, A]`, or a `Sys[N]` parameter of a generic class given a
+`Sys[B]` next to a `Sys[A]`, which names the type argument). Only a
+name the call binds counts: in a `Callable[[F64[N], F64[N]], ...]`
+parameter `N` is the caller's, so an argument of another size is
+mypy's `[arg-type]` alone (issue 363). A report inside an operand is
+the operator's only error: `v - np.dot(A, x)` gets no `Unsupported
+operand types` follow-on (`tests/fixtures/bad_names_messages.py`):
 
 ```python
 def f(a: F64[N, H], w: F64[K, H]) -> None:

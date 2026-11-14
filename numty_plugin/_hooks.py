@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from mypy.types import UnboundType
 
 from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, _CANARY_BY_MODULE, _swallowed, _warn_startup
-from ._errors import _quiet_type
+from ._errors import _checked_operand, _quiet_type
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -1144,11 +1144,16 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             uu_right: Type | None = None
             if isinstance(call, _OpExpr0):
                 try:
-                    uu_left = _quiet_type(ctx, call.left)
-                    uu_right = _quiet_type(ctx, call.right)
+                    uu_left, left_reports = _checked_operand(ctx, call.left)
+                    uu_right, right_reports = _checked_operand(ctx, call.right)
                 except Exception:
                     _swallowed(ctx, "_broadcast_signature_hook")
                     uu_left = uu_right = None
+                    left_reports = right_reports = False
+                if left_reports or right_reports:
+                    # An operand that reports fails every overload, and
+                    # mypy adds `Unsupported operand types` (issue 363).
+                    return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
             elif isinstance(call, _CallExpr0) and call.args:
                 try:
                     uu_right = _quiet_type(ctx, call.args[0])
@@ -1374,6 +1379,9 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         from mypy.nodes import OpExpr as _OpExpr
 
         call = ctx.context
+        if isinstance(call, _OpExpr) and any(_checked_operand(ctx, side)[1] for side in (call.left, call.right)):
+            # An operand that reports fails every overload (issue 363).
+            return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
         left_tp: Type | None = None
         right_tp: Type | None = None
         if isinstance(call, _OpExpr):

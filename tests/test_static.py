@@ -5360,6 +5360,24 @@ def test_bad_generic_class_sizes() -> None:
     assert _run_fixture("bad_generic_class_sizes.py") == ["(2, 2)"]
 
 
+def test_bad_names_messages() -> None:
+    # Issue 363: a `Callable` parameter binds no name at a call, so a
+    # mismatched argument is mypy's `[arg-type]` alone (it was also a
+    # names report naming `argument '?'`); a names report inside an
+    # operand is the operator's only error, on either side of it.
+    result = run_mypy(FIXTURES / "bad_names_messages.py")
+    messages = _messages_by_line(result)
+    assert sorted(messages) == [21, 25, 26, 27, 28, 29, 30], result.stdout
+    assert all(len(texts) == 1 for texts in messages.values()), result.stdout
+    assert messages[21][0].startswith("Argument 1 has incompatible type"), result.stdout
+    assert messages[21][0].endswith("[arg-type]"), result.stdout
+    for line in range(25, 31):
+        assert messages[line] == [
+            "matmul inner dimensions (shapes (S, S) vs (I,)): S and I are different names  [numty-names]"
+        ], result.stdout
+    assert _run_fixture("bad_names_messages.py") == ["(2,)"]
+
+
 def test_bad_own_size_optin() -> None:
     # Issues 306/307 (opt-in): the size a call chose, and the size an
     # object's properties name, are sizes of their own. Silent with numty-names off.

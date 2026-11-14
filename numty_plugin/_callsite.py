@@ -21,7 +21,8 @@ from ._types import (
     _report_mask_names, _report_names,
 )
 from ._callbind import (
-    ActualOverrides, _actual_type, _class_arg_dims, _formal_name, _shape_tvar_formals, _strip_optional, _where,
+    ActualOverrides, _actual_type, _arg_phrase, _class_arg_dims, _formal_name, _shape_tvar_formals, _strip_optional,
+    _where,
 )
 from ._reshape import _is_plain_int, _known_rank_parts, _scalar_key
 from ._linalg import _is_numpy_scalar
@@ -174,7 +175,15 @@ def _report_call_site_names(
             return
         first: dict[str, tuple[str, int, Type]] = {}
 
+        # A name the call binds: one of the callee's variables. A name of
+        # the caller's (a `Callable[[F64[N]], ...]` parameter, a receiver's
+        # class argument) is not bound here, and an argument of another
+        # size is mypy's own `[arg-type]` error (issue 363).
+        own = {v.id for v in sig.variables}
+
         def check(tvar: TypeVarType, name: str, dim: int, adim: Type) -> None:
+            if tvar.id not in own:
+                return
             seen = first.setdefault(tvar.fullname, (name, dim, adim))
             if seen[2] is adim:
                 return
@@ -184,15 +193,15 @@ def _report_call_site_names(
                 # default, like the literal case of issue #53.
                 ctx.api.fail(
                     f"call-site shape conflict for '{tvar.name}': "
-                    f"{_dim_str(seen[2])} (argument '{seen[0]}', {_where(seen[1])}) vs "
-                    f"{_dim_str(adim)} (argument '{name}', {_where(dim)})",
+                    f"{_dim_str(seen[2])} ({_arg_phrase(seen[0])}, {_where(seen[1])}) vs "
+                    f"{_dim_str(adim)} ({_arg_phrase(name)}, {_where(dim)})",
                     ctx.context,
                     code=NUMTY_CALLSITE,
                 )
                 return
             where = (
-                f"call-site binding of '{tvar.name}' (argument '{seen[0]}', {_where(seen[1])}, "
-                f"and argument '{name}', {_where(dim)})"
+                f"call-site binding of '{tvar.name}' ({_arg_phrase(seen[0])}, {_where(seen[1])}, "
+                f"and {_arg_phrase(name)}, {_where(dim)})"
             )
             _report_names(ctx, seen[2], adim, where)
             _report_mask_names(ctx, seen[2], adim, where)

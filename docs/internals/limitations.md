@@ -46,7 +46,10 @@ quiet, where it is approximate, and what to write instead.
     with a bad `n`). Ours is the readable one. An index error no longer
     gets mypy's `Invalid index type` on top (issue 333): it is reported
     past the overload trial that mypy runs for a key that is not all
-    arrays, so the trial does not fail.
+    arrays, so the trial does not fail. The same holds for an operator
+    whose operand reports (`v - np.dot(A, x)` with a names report inside
+    the `dot`): mypy no longer adds `Unsupported operand types` (issue
+    363).
 - Test runs use a dedicated mypy cache dir cleared per suite run (see
     `test_static.py`): mypy does not reliably invalidate plugin results
     across plugin edits, so never trust the default cache while hacking
