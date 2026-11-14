@@ -897,24 +897,33 @@ def _target_is_union(ctx: MethodContext) -> bool:
 
 
 def shape_attribute_hook(ctx: AttributeContext) -> Type:
-    # A union's members keep their literal sizes as literals (issue 354):
-    # mypy joins the members' shapes, and `int` carrying 0 would absorb
-    # `N` (`tuple[N, N] | tuple[0?, 0?]` is `tuple[0?, 0?]`).
-    dist = _distribute_solve([ctx.type], lambda t: _shape_type(ctx, t, literal=True))
-    if dist is not None:
-        return dist
+    # A union's members keep a literal size as a literal where the members
+    # differ (issue 354): mypy joins the members' shapes, and `int`
+    # carrying 0 would absorb `N` (`tuple[N, N] | tuple[0?, 0?]` is
+    # `tuple[0?, 0?]`), or carrying 3 would absorb 4. An axis where every
+    # member has one int keeps the widening form, so `k = u.shape[1]`
+    # still widens to `int`.
+    members = _union_members(ctx.type)
+    if members is not None:
+        shapes = [_parts_or_unpack(member) for member in members]
+        sizes: dict[int, set[int | None]] = {}
+        for shape in shapes:
+            for axis, v in enumerate(shape[0] if shape is not None else ()):
+                sizes.setdefault(axis, set()).add(v if isinstance(v, int) else None)
+        literal = {axis for axis, seen in sizes.items() if len(seen) != 1 or None in seen}
+        return _union_results([_shape_type(ctx, member, literal) for member in members])
     return _shape_type(ctx, ctx.type)
 
 
-def _shape_type(ctx: AttributeContext, tp: Type, literal: bool = False) -> Type:
+def _shape_type(ctx: AttributeContext, tp: Type, literal: set[int] | None = None) -> Type:
     parts = _parts_or_unpack(tp)
     if parts is None:
         return ctx.default_attr_type
     dims, _ = parts
     int_fallback = ctx.api.named_generic_type("builtins.int", [])
     items: list[Type] = []
-    for v in dims:
-        if isinstance(v, int) and literal:
+    for axis, v in enumerate(dims):
+        if isinstance(v, int) and literal is not None and axis in literal:
             items.append(LiteralType(v, fallback=int_fallback))
         elif isinstance(v, int):
             # mypy's widening form: a plain int carrying its literal

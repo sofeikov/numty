@@ -35,3 +35,7 @@ def shared(a: F64[M, N]) -> None:
     reveal_type(u @ vt)
     reveal_type(np.dot(u * s, vt))
     reveal_type(s * s)
+
+
+def two(a: F64[2, 3] | F64[4, 3], b: F64[3, 1] | F64[3, 7]) -> None:
+    reveal_type(np.dot(a, b))  # every pair, as `a @ b`: two parameters vary apart

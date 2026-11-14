@@ -483,16 +483,8 @@ def _union_contraction_verdict(left: Type, right: Type, op: str) -> str | None:
     paired, so a member is an error only when it fits none. Without a
     union, the message of the one pair.
     """
-    members_a = _contraction_members(left)
-    members_b = _contraction_members(right)
-    if members_a is not None and members_b is not None:
-        # Two unions pair index-wise (see `_solve_union_contraction`).
-        if len(members_a) != len(members_b):
-            return None
-        messages = [_contraction_clash(a, b, op) for a, b in zip(members_a, members_b)]
-        return messages[0] if all(message is not None for message in messages) else None
-    members_b = members_b or [right]
-    for member in members_a or [left]:
+    members_b = _contraction_members(right) or [right]
+    for member in _contraction_members(left) or [left]:
         messages = [_contraction_clash(member, other, op) for other in members_b]
         if all(message is not None for message in messages):
             return messages[0]
@@ -518,18 +510,10 @@ def _solve_union_contraction(
     members_b = _contraction_members(right)
     if members_a is None and members_b is None:
         return None
-    if members_a is not None and members_b is not None:
-        # Two unions pair index-wise, as elsewhere (`_distribute_pairings`):
-        # `dot(B, u)` with `B: F64[X, U] | float` and `u: F64[U, 1] | float`
-        # is `(X, 1) | float`, never the cross pairs. Other widths bail.
-        if len(members_a) != len(members_b):
-            return ctx.default_return_type
-        pairs = list(zip(members_a, members_b))
-        fitting = [(a, b) for a, b in pairs if _contraction_clash(a, b, op) is None]
-        if not fitting:
-            ctx.api.fail(_contraction_clash(*pairs[0], op) or "", ctx.context, code=NUMTY_SHAPE)
-            return ctx.default_return_type
-        return _union_results([_member_solve(solve, a, b) for a, b in fitting])
+    # Two unions pair every member with every member, as `@` does: two
+    # parameters vary apart. A scalar member's pairs stay open (Any), so
+    # `dot(B, u)` with `B: F64[X, U] | float` and `u: F64[U, 1] | float`
+    # is `(X, 1) | Any`.
     message = _union_contraction_verdict(left, right, op)
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)

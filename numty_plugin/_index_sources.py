@@ -11,7 +11,9 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from mypy.nodes import AssignmentStmt, Block, Expression, ListExpr, NameExpr, StarExpr, TupleExpr
+from mypy.nodes import (
+    AssignmentStmt, Block, Expression, ListExpr, NameExpr, OperatorAssignmentStmt, OpExpr, StarExpr, TupleExpr,
+)
 from mypy.types import Type
 
 from ._errors import _trial_failed
@@ -113,8 +115,10 @@ def _strided_count(ctx: MethodContext | FunctionContext, dim: int, size: int | T
     return None
 
 
-def _tuple_targets(stmts: object, out: dict[int, list[AssignmentStmt]]) -> None:
-    """Collect the assignments with a tuple target, by line, at any depth.
+def _tuple_targets(
+    stmts: object, out: dict[int, list[AssignmentStmt]], aug: dict[int, list[OperatorAssignmentStmt]]
+) -> None:
+    """Collect the assignments with a tuple target, and the `x <op>= y` statements, by line, at any depth.
 
     A plain walk: mypy's compiled `TraverserVisitor` cannot be subclassed
     from a plugin. Statement bodies are reached through the attributes
@@ -128,17 +132,53 @@ def _tuple_targets(stmts: object, out: dict[int, list[AssignmentStmt]]) -> None:
     for stmt in stmts:
         if isinstance(stmt, AssignmentStmt) and any(isinstance(lv, (TupleExpr, ListExpr)) for lv in stmt.lvalues):
             out.setdefault(stmt.line, []).append(stmt)
+        if isinstance(stmt, OperatorAssignmentStmt):
+            aug.setdefault(stmt.line, []).append(stmt)
         for attr in ("body", "else_body", "finally_body", "defs", "handlers", "bodies"):
             inner = getattr(stmt, attr, None)
             for block in inner if isinstance(inner, list) else [inner]:
                 if isinstance(block, Block):
-                    _tuple_targets(block, out)
+                    _tuple_targets(block, out, aug)
         func = getattr(stmt, "func", None)
         if func is not None and isinstance(getattr(func, "body", None), Block):
-            _tuple_targets(func.body, out)
+            _tuple_targets(func.body, out, aug)
 
 
-_TARGETS: dict[int, tuple[object, dict[int, list[AssignmentStmt]]]] = {}
+_TARGETS: dict[
+    int, tuple[object, dict[int, list[AssignmentStmt]], dict[int, list[OperatorAssignmentStmt]]]
+] = {}
+
+
+def _statements(
+    ctx: object,
+) -> tuple[dict[int, list[AssignmentStmt]], dict[int, list[OperatorAssignmentStmt]]] | None:
+    """The tuple-target assignments and the `x <op>= y` statements of the checked file, by line."""
+    tree = getattr(getattr(ctx, "api", None), "tree", None)
+    if tree is None:
+        return None
+    cached = _TARGETS.get(id(tree))
+    if cached is None or cached[0] is not tree:
+        by_line: dict[int, list[AssignmentStmt]] = {}
+        aug: dict[int, list[OperatorAssignmentStmt]] = {}
+        _tuple_targets(getattr(tree, "defs", None), by_line, aug)
+        cached = (tree, by_line, aug)
+        _TARGETS[id(tree)] = cached
+    return cached[1], cached[2]
+
+
+def _augmented_target(ctx: object, expr: object) -> bool:
+    """Whether `expr` is the `x <op> y` mypy checks for `x <op>= y` (issue 354).
+
+    A target with no in-place method, such as a union of arrays, is
+    checked as `x = x <op> y`: an `OpExpr` mypy makes, whose left operand
+    is the statement's own target node.
+    """
+    if not isinstance(expr, OpExpr):
+        return False
+    found = _statements(ctx)
+    if found is None:
+        return False
+    return any(stmt.lvalue is expr.left and stmt.rvalue is expr.right for stmt in found[1].get(expr.line, []))
 
 
 def _tuple_target_value(ctx: object, node: object) -> Expression | None:
@@ -149,17 +189,11 @@ def _tuple_target_value(ctx: object, node: object) -> Expression | None:
     variable was not bound by a tuple target, or the value is no display
     of as many items.
     """
-    tree = getattr(getattr(ctx, "api", None), "tree", None)
     line = getattr(node, "line", 0) or 0
-    if tree is None or line <= 0:
+    found = _statements(ctx) if line > 0 else None
+    if found is None:
         return None
-    cached = _TARGETS.get(id(tree))
-    if cached is None or cached[0] is not tree:
-        by_line: dict[int, list[AssignmentStmt]] = {}
-        _tuple_targets(getattr(tree, "defs", None), by_line)
-        cached = (tree, by_line)
-        _TARGETS[id(tree)] = cached
-    for stmt in cached[1].get(line, []):
+    for stmt in found[0].get(line, []):
         rvalue = stmt.rvalue
         if not isinstance(rvalue, (TupleExpr, ListExpr)):
             continue

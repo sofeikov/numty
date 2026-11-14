@@ -20,11 +20,16 @@ through mypy's native cartesian matching, so cross terms may dissolve.
 
 `np.atleast_1d` / `atleast_2d` / `atleast_3d` of a union keep the
 stubs' answer: code that lifts `F64[N] | F64[R, N]` narrows on `.ndim`
-afterwards, which numty does not follow. `.shape` of a union keeps literal sizes
-as literals, so `U.shape[0]` of `(N, N) | (0, 0)` is `N | Literal[0]`
-and `np.zeros(U.shape[0])` is `(N,) | (0,)`. A union value written with
+afterwards, which numty does not follow. `.shape` of a union keeps a
+literal size as a literal on an axis where the members differ, so
+`U.shape[0]` of `(N, N) | (0, 0)` is `N | Literal[0]`, and
+`np.zeros(U.shape[0])` is `(N,) | (0,)` (`np.empty((U.shape[0], 3))` is
+`(N, 3) | (0, 3)`). An axis with one size on every member widens to `int`
+in a local, as on a single array. A union value written with
 `out[i] = v` or `t += v` is checked per member: each array member must
-fit the target, unless the target is itself a member of a union.
+fit the target. A union target (`v += U.sum(axis=0)` with
+`v = np.zeros(U.shape[0])`) keeps each member's shape when one member of
+the value fits it in place, and is reported when none does.
 
 ## Optional and scalar members
 

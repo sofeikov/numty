@@ -33,3 +33,15 @@ def same(u: F64[A] | F64[B], out: F64[3], v: F64[3] | F64[3, 3]) -> None:
     reveal_type(u + u)
     out[:] = v[0]
     out += v[0]
+
+
+def sizes(A_: F64[N, N], Z_: F64[0, 0], flag: bool, U: F64[3, 2] | F64[4, 2]) -> None:
+    W = A_ if flag else Z_
+    v = np.zeros(W.shape[0])
+    v += W.sum(axis=0)  # in place: each member of `v` keeps its shape
+    reveal_type(np.empty((W.shape[0], 3)))
+    k = U.shape[1]  # one size on every member: widens to `int`
+    k = k * 2
+    reveal_type(k)
+    z = np.zeros((U.shape[0], 2))
+    reveal_type(z)

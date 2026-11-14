@@ -6,6 +6,8 @@ for a monkeypatch seam (_LAZY_SEAMS).
 from __future__ import annotations
 
 from collections.abc import Callable
+from itertools import product
+from math import prod
 from typing import cast
 
 from mypy.nodes import (
@@ -502,18 +504,55 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
             shape_arg, shape_expr = named
     if shape_arg is None:
         return ctx.default_return_type
-    proper = get_proper_type(shape_arg)
+    variants = _size_union_variants(shape_arg)
+    if variants is not None:
+        # A union of sizes (`U.shape[0]` of `F64[N, N] | F64[0, 0]`, issue
+        # 354), alone or in a tuple, builds one array per size, not one
+        # of a plain `int` size.
+        return _union_results([_zeros_of(ctx, shape, None, dims) for shape, dims in variants])
+    return _zeros_of(ctx, shape_arg, shape_expr, _builder_shape(ctx, shape_arg, shape_expr, ctx.default_return_type))
+
+
+_MAX_SIZE_VARIANTS = 8
+
+
+def _size_union_of(tp: Type) -> list[Type] | None:
+    """The members of a union of sizes (`N | Literal[0]`), else None."""
+    proper = get_proper_type(tp)
     if isinstance(proper, UnionType) and all(
         isinstance(_dim_value(item), (int, TypeVarType)) for item in proper.items
     ):
-        # A union of sizes (`U.shape[0]` of `F64[N, N] | F64[0, 0]`, issue
-        # 354) builds one array per size, not one of a plain `int` size.
-        return _union_results([
-            _zeros_of(ctx, item, None, [dim])
-            for item in proper.items
-            if isinstance(dim := _dim_value(item), (int, TypeVarType))
-        ])
-    return _zeros_of(ctx, shape_arg, shape_expr, _builder_shape(ctx, shape_arg, shape_expr, ctx.default_return_type))
+        return list(proper.items)
+    return None
+
+
+def _size_union_variants(shape_arg: Type) -> list[tuple[Type, list[int | Type]]] | None:
+    """(shape argument, dims) per member of the unions of sizes in it, else None (issue 354).
+
+    `N | Literal[0]` gives `(N,)` and `(0,)`; `(N | Literal[0], 3)` gives
+    `(N, 3)` and `(0, 3)`. None without such a union, with an item that
+    is no size, or with more than _MAX_SIZE_VARIANTS shapes.
+    """
+    members = _size_union_of(shape_arg)
+    if members is not None:
+        return [(member, [_size_dim(member)]) for member in members]
+    proper = get_proper_type(shape_arg)
+    if not isinstance(proper, TupleType):
+        return None
+    options = [_size_union_of(item) or [item] for item in proper.items]
+    if all(len(option) == 1 for option in options) or prod(len(option) for option in options) > _MAX_SIZE_VARIANTS:
+        return None
+    if not all(isinstance(_dim_value(item), (int, TypeVarType)) for option in options for item in option):
+        return None
+    return [
+        (proper.copy_modified(items=list(items)), [_size_dim(item) for item in items])
+        for items in product(*options)
+    ]
+
+
+def _size_dim(tp: Type) -> int | Type:
+    """The dim of a size the caller has read as an int or a name."""
+    return cast("int | Type", _dim_value(tp))
 
 
 def _zeros_of(

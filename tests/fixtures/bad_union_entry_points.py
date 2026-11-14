@@ -26,3 +26,7 @@ def writes(a: F64[4] | F64[5], b: F64[3] | F64[3, 3], out: F64[2, 3], t: F64[3])
 def shape(A_: F64[N, N], Z_: F64[0, 0], flag: bool) -> F64[0]:
     U = A_ if flag else Z_
     return np.zeros(U.shape[0])  # E: the (N,) member
+
+
+def grow(v: F64[3] | F64[4]) -> None:
+    v += np.zeros((2, 3))  # E: the value grows each member

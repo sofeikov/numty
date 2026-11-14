@@ -351,7 +351,11 @@ quiet, where it is approximate, and what to write instead.
     mypy for generic containers (`n = x.shape[0]` infers `N`, so
     `n //= 2` is an error). Concrete dims widen to `int` (keeping the
     value for direct uses like `reshape(x.shape[0], 3)`), and unknown
-    (`?U`) dims are plain `int`. For a loop counter over a symbolic
+    (`?U`) dims are plain `int`. On a union, an axis where the members
+    differ keeps each member's size (`U.shape[0]` of `(N, N) | (0, 0)`
+    is `N | Literal[0]`, of `(3, 2) | (4, 2)` is `Literal[3, 4]`), so a
+    local taken from it does not widen either, while an axis with one
+    int on every member widens as usual. For a loop counter over a symbolic
     axis, write `int(...)` explicitly (`n = int(x.shape[0])`). In array
     arithmetic such a size is a Python `int` scalar: `X @ X.T / X.shape[0]`
     keeps `(N, N)` like `/ float(X.shape[0])` does.

@@ -6762,6 +6762,11 @@ def test_contraction_operands_ok() -> None:
         35: f'"{_ND}[tuple[M, N], {_F64}]"',
         36: f'"{_ND}[tuple[M, N], {_F64}]"',
         37: f'"{_ND}[tuple[?U@34], {_F64}]"',
+        # Every pair, as `a @ b` gives: two parameters vary apart.
+        41: (
+            f'"{_ND}[tuple[Literal[2], Literal[1]], {_F64}] | {_ND}[tuple[Literal[2], Literal[7]], {_F64}] | '
+            f'{_ND}[tuple[Literal[4], Literal[1]], {_F64}] | {_ND}[tuple[Literal[4], Literal[7]], {_F64}]"'
+        ),
     }, result.stdout
 
 
@@ -6818,6 +6823,12 @@ def test_union_entry_points_ok() -> None:
         29: f'"{_ND}[tuple[N], {_F64}] | {_ND}[tuple[Literal[0]], {_F64}]"',
         # Index-wise, as np.add(u, u): no names report on the cross pairs.
         33: f'"{_ND}[tuple[A], {_F64}] | {_ND}[tuple[B], {_F64}]"',
+        # A union size in a tuple builds one array per size; line 41's
+        # `v += W.sum(axis=0)` keeps each member of `v` (no cross pair).
+        42: f'"{_ND}[tuple[N, Literal[3]], {_F64}] | {_ND}[tuple[Literal[0], Literal[3]], {_F64}]"',
+        # One size on every member keeps mypy's widening form.
+        45: '"int"',
+        47: f'"{_ND}[tuple[Literal[3], Literal[2]], {_F64}] | {_ND}[tuple[Literal[4], Literal[2]], {_F64}]"',
     }, result.stdout
 
 
@@ -6832,6 +6843,11 @@ def test_union_entry_points_catch() -> None:
             'Incompatible return value type (got "ndarray[tuple[N], dtype[float64]] | '
             'ndarray[tuple[Literal[0]], dtype[float64]]", expected "ndarray[tuple[Literal[0]], dtype[float64]]")  '
             "[return-value]"
+        ],
+        # A union target: each member is checked in place.
+        32: [
+            "in-place result (2, 3) does not fit target (3,)  [numty-broadcast]",
+            "broadcast shapes disagree at trailing axis 0: 4 vs 3 (shapes (4,) vs (2, 3))  [numty-broadcast]",
         ],
     }, result.stdout
 

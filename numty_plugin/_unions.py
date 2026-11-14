@@ -16,7 +16,8 @@ from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE, _quiet_type, _swallowed
 from ._types import _has_unpack, _parts_or_unpack, _scalar_union_members, _union_members, _union_results
 from ._reshape import _movable_parts
 from ._matmul import _matmul_result, _matmul_unpack_dims, _operand_parts
-from ._broadcast import _merge_shape_lists
+from ._broadcast import _inplace_check, _merge_shape_lists
+from ._index_sources import _augmented_target
 
 
 # Operator symbol for each reflected method that mypy calls on the right
@@ -191,6 +192,46 @@ def _paired_member(ctx: MethodContext) -> Type | None:
     return None
 
 
+def _augmented_verdict(ctx: FunctionContext | MethodContext, target: Type, value: Type) -> Type | None:
+    """`v <op>= w` on a union `v`, for its member `target` (issue 354).
+
+    mypy checks it as `v = v <op> w`, one member of `v` at a time, and
+    then assigns the result to `v`. In place, a member of `v` keeps its
+    shape whenever one member of `w` fits it: `v = np.zeros(u.shape[0])`
+    and `v += u.sum(axis=0)` pair the members of one `u`, and a cross
+    pair must not add a member `v` does not hold. When every member of
+    `w` provably does not fit, the in-place message is the report.
+    `target` is the result either way; None when this is no such
+    statement or a member cannot be read.
+    """
+    call = ctx.context
+    if not isinstance(call, OpExpr) or not _augmented_target(ctx, call):
+        return None
+    members = _union_members(_quiet_type(ctx, call.left))
+    lhs = _parts_or_unpack(target)
+    if members is None or lhs is None or _has_unpack(lhs[0]):
+        return None
+    if not any(is_same_type(target, member) for member in members):
+        return None
+    first: str | None = None
+    unread = False
+    for member in _members_or_self(value):
+        part = _parts_or_unpack(member)
+        if part is None or _has_unpack(part[0]):
+            unread = True
+            continue
+        checked, message = _inplace_check(list(lhs[0]), list(part[0]), None)
+        if checked and message is None:
+            return target
+        if message is None:
+            unread = True
+        first = first or message
+    if unread or first is None:
+        return None
+    ctx.api.fail(first, ctx.context, code=NUMTY_BROADCAST)
+    return target
+
+
 def _union_pair_hook(
     ctx: MethodContext, hook: Callable[[MethodContext], Type], name: str
 ) -> Type:
@@ -203,6 +244,10 @@ def _union_pair_hook(
     """
     try:
         if ctx.arg_types and len(ctx.arg_types[0]) == 1:
+            if name != "__matmul__":
+                augmented = _augmented_verdict(ctx, ctx.type, ctx.arg_types[0][0])
+                if augmented is not None:
+                    return augmented
             paired = _paired_member(ctx)
             if paired is not None:
                 return hook(ctx._replace(arg_types=[[paired], *ctx.arg_types[1:]]))
@@ -251,6 +296,9 @@ def _union_reflected_hook(
         operands = _operator_operands(ctx, _REFLECTED_BROADCAST[name], left)
         if operands is None:
             return ctx.default_return_type
+        augmented = None if name == "__rmatmul__" else _augmented_verdict(ctx, left, operands[1])
+        if augmented is not None:
+            return augmented
         members = _union_members(operands[1])
         # Issue 354: with a number or `Any` among the members (`F64[5, 1] | Any`)
         # each array member is checked alone, as the forward method does.
