@@ -719,8 +719,10 @@ def _scalar_ret_name(ret: Type) -> str | None:
     if not isinstance(proper, Instance):
         return None
     base = proper.type.fullname
-    if base == "numpy.bool":
-        return "numpy.bool"
+    if base in _DTYPE_INFO:
+        # np.float64 and np.complex128 are classes of their own, not a
+        # generic class with a width tag (issue #349).
+        return base
     kind = _GENERIC_KIND.get(base)
     if kind is None or len(proper.args) != 1:
         return None

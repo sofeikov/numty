@@ -278,5 +278,9 @@ rank, where NumPy's stubs stop at 2-D. `np.round` and `np.around` keep
 the shape and dtype; a bool array comes back `float16`, and rounding
 one to `decimals` other than 0, which NumPy refuses, is typed `Any`
 (numty reports shape errors, not dtype errors). `Generator` random methods solve from `size=`. Tuple and list displays keep per-item precision. An explicit
-`dtype=` you name is used as-is when it resolves; anything exotic bails
-out instead of guessing.
+`dtype=` you name is used as-is when it resolves (a type such as `float`
+or `np.float64`, a scalar constructor such as `np.float32`, a string
+such as `"float64"`, or an `np.dtype`); anything exotic bails out
+instead of guessing. Builders, `arange` and conversions keep their shape
+under every spelling: `np.zeros(n + 1, np.float64)` is `(N+1,)` and
+`np.asarray(c, np.float64)` keeps `c`'s shape (issue 349).

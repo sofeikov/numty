@@ -7052,3 +7052,35 @@ def test_size_tvar_call_catch() -> None:
         23: f'"{_ND}[tuple[N], {_F64}]"',
         24: f'"{_ND}[tuple[N], {_F64}]"',
     }, result.stdout
+
+
+# Issue 349: `np.float64` (a class of its own, not a generic class with a
+# width tag) names the dtype like `float` and `np.float32` do.
+def test_dtype_float64_ok() -> None:
+    result = run_mypy(FIXTURES / "dtype_float64_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[P+1], {_F64}]"',
+        13: f'"{_ND}[tuple[Literal[3], Literal[4]], {_F64}]"',
+        14: f'"{_ND}[tuple[S], {_F64}]"',
+        15: f'"{_ND}[tuple[n], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[3], Literal[4]], {_F64}]"',
+        17: f'"{_ND}[tuple[Literal[3], Literal[4]], {_F64}]"',
+        18: f'"{_ND}[tuple[Literal[3], Literal[4]], numpy.dtype[numpy.complex128]]"',
+    }, result.stdout
+
+
+def test_dtype_float64_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_dtype_float64.py")
+    assert _messages_by_line(result) == {
+        11: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[3], Literal[4]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[4], Literal[3]], dtype[float64]]")  [assignment]'
+        ],
+        12: ["broadcast shapes disagree at trailing axis 0: 4 vs 3 (shapes (4,) vs (4, 3))  [numty-broadcast]"],
+        13: [
+            'Incompatible return value type (got "ndarray[tuple[P+1], dtype[float64]]", '
+            'expected "ndarray[tuple[P+2], dtype[float64]]")  [return-value]'
+        ],
+    }, result.stdout
