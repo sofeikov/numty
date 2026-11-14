@@ -20,7 +20,8 @@ from mypy.plugin import (
     MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
-    PROTOCOL_NAMES, AnyType, CallableType, FunctionLike, RawExpressionType, Instance, LiteralType, Overloaded, TupleType, Type,
+    PROTOCOL_NAMES, AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, RawExpressionType,
+    TupleType, Type,
     TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
@@ -109,7 +110,8 @@ from ._broadcast import (
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
 from ._heads import (
-    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
+    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
+    _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string, _index_head,
 )
 from ._exprs import _iter_tvarlikes

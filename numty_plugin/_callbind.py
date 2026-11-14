@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from mypy.expandtype import expand_type
 from mypy.maptype import map_instance_to_supertype
-from mypy.nodes import COVARIANT, ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, Expression, ListExpr, StarExpr, TupleExpr
+from mypy.nodes import (
+    ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, COVARIANT, Expression, ListExpr, StarExpr, TupleExpr,
+)
 from mypy.plugin import FunctionSigContext, MethodSigContext
 from mypy.types import (
     AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,

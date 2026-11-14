@@ -34,14 +34,15 @@ from mypy.types import LiteralType
 
 from ._errors import _swallowed
 from ._exprs import (
-    _EXPR_PREFIX, _form_names, _form_of, _implicit_scope_vars, _iter_tvarlikes, _ns_of_ctx, _resolve_dim, _signature_names,
+    _EXPR_PREFIX, _form_names, _form_of, _implicit_scope_vars, _iter_tvarlikes, _ns_of_ctx, _resolve_dim,
+    _signature_names,
 )
 from ._forms import _LinForm, _form_has_unknown, _is_unknown_fullname
 from ._types import _OWN_NAME_OF, INT_FULLNAME, NDARRAY_FULLNAME
 from ._unknowns import _AST_REPEATED, _module_ast
 
 
-def _is_dynamic_return_dim(d: int | Type) -> bool:
+def _is_dynamic_return_dim(d: object) -> bool:
     """A dim the return-boundary rewrite turns into Any (issues #269/#271).
 
     A plain `int` (a builder's dynamic axis, e.g. `n` in `np.zeros(n)` or
@@ -253,7 +254,7 @@ def _declared_return_shapes(ctx: object, rank: int) -> list[list[Type]]:
         if isinstance(shape, TupleType) and len(shape.items) == rank:
             # Members that differ in dtype alone declare one shape
             # (`F64[K] | Arr[np.complex128, K]`, issue 357).
-            items = [get_proper_type(item) for item in shape.items]
+            items: list[Type] = [get_proper_type(item) for item in shape.items]
             if items not in out:
                 out.append(items)
     return out
@@ -396,7 +397,7 @@ def _free_return_names(ctx: object) -> dict[str, TypeVarType]:
 
 
 def _free_formula_names(ctx: object) -> frozenset[str]:
-    """Fullnames of the free names (see `_free_return_names`) inside a formula of the return (`F64["K+1"]`, issue 357)."""
+    """Fullnames of the free names (see `_free_return_names`) in a formula of the return (`F64["K+1"]`, issue 357)."""
     return _free_names(ctx)[1]
 
 
@@ -529,7 +530,7 @@ def _array_shapes(tp: Type | None, rank: int) -> list[list[Type]]:
         if isinstance(shape, TupleType) and len(shape.items) == rank:
             # Members that differ in dtype alone declare one shape
             # (`F64[K] | Arr[np.complex128, K]`, issue 357).
-            items = [get_proper_type(item) for item in shape.items]
+            items: list[Type] = [get_proper_type(item) for item in shape.items]
             if items not in out:
                 out.append(items)
     return out
@@ -795,7 +796,7 @@ def _at_site(line: int, col: int) -> Callable[[ast.AST], bool]:
 
 
 def _name_born_class(ctx: FunctionContext | MethodContext, tp: Type) -> Type:
-    """`tp`, an object of a user generic class, with sizes born here written as the free name declared for them (issue 358).
+    """`tp`, an object of a user generic class, with sizes born here written as their free name (issue 358).
 
     `def ar(y: F64[N]) -> Model[N, W]` with `W` free: `return Model(y,
     y[y > 0])` gives `Model[N, ?U]`, and the unknown takes `W` as it
@@ -815,9 +816,9 @@ def _name_born_class(ctx: FunctionContext | MethodContext, tp: Type) -> Type:
         path = getattr(tree, "path", None) if tree is not None else None
         line = getattr(ctx.context, "line", None)
         col = getattr(ctx.context, "column", None)
-        sites = _return_sites_of(path) if path is not None else None
+        sites = _return_sites_of(path) if isinstance(path, str) else None
         ret_stack = getattr(ctx.api, "return_types", None)
-        if sites is None or line is None or col is None or not ret_stack:
+        if not isinstance(path, str) or sites is None or line is None or col is None or not ret_stack:
             return tp
         here = _at_site(line, col)
         want_ret = get_proper_type(ret_stack[-1])
@@ -829,7 +830,8 @@ def _name_born_class(ctx: FunctionContext | MethodContext, tp: Type) -> Type:
             for p in _return_positions(ret.value, lambda n: here(n) and not isinstance(n, (ast.Tuple, ast.List))):
                 want = want_ret
                 if p is not None:
-                    want = get_proper_type(want_ret.items[p]) if isinstance(want_ret, TupleType) and p < len(want_ret.items) else None
+                    items_at = want_ret.items if isinstance(want_ret, TupleType) else []
+                    want = get_proper_type(items_at[p]) if p < len(items_at) else None
                 if not isinstance(want, Instance) or want.type is not proper.type or len(want.args) != len(items):
                     return tp
                 args = [get_proper_type(a) for a in want.args]
@@ -999,7 +1001,10 @@ def _name_born_array(
                 continue
             if _is_born_dim(have) or (uses and _is_literal_dim(have)):
                 named.append(axis)
-        if any(axis not in named and not _fits_declared(have, want) for axis, (have, want) in enumerate(zip(items, declared))):
+        if any(
+            axis not in named and not _fits_declared(have, want)
+            for axis, (have, want) in enumerate(zip(items, declared))
+        ):
             # A value that does not fit keeps its sizes: the name printed
             # over a literal would hide the one that shows the mistake
             # (`(3, 5)` returned as `F64["k 3"]`, issue 357).
