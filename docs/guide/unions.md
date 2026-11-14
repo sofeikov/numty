@@ -13,9 +13,18 @@ Members pair index-wise, which is exact for co-derived unions (the same
 value mapped through ops — the overwhelmingly common source):
 `np.append(1 - y, y, axis=1)` and `np.concatenate([x, x])` with `y`, `x`
 unions pair the first member with the first, never across. Unrelated
-unions of different member counts bail out instead of guessing, and
-dunder ops with unions on both sides (`u + u`) still go through mypy's
-native cartesian matching, so cross terms may dissolve.
+unions of different member counts bail out instead of guessing. A
+dunder op with one variable on both sides (`u + u`, `self.u * self.u`)
+pairs index-wise too; other dunder ops with unions on both sides go
+through mypy's native cartesian matching, so cross terms may dissolve.
+
+`np.atleast_1d` / `atleast_2d` / `atleast_3d` lift each member
+(`(S, I) | (S,)` is `(S, I) | (1, S)` for `atleast_2d`) and read a list
+of arrays as `np.asarray` does. `.shape` of a union keeps literal sizes
+as literals, so `U.shape[0]` of `(N, N) | (0, 0)` is `N | Literal[0]`
+and `np.zeros(U.shape[0])` is `(N,) | (0,)`. A union value written with
+`out[i] = v` or `t += v` is checked per member: each array member must
+fit the target, unless the target is itself a member of a union.
 
 ## Optional and scalar members
 
@@ -38,7 +47,10 @@ the wrong length errors although the `None` member would not. `None`
 distributes where it has a meaning (`np.average(weights=...)` and the
 arguments of a user function); in arithmetic and comparisons a scalar
 member is an operand like any other number. A union with a scalar
-distributes when it is the only union among the operands.
+distributes when it is the only union among the operands. So does one
+with an `Any` member (`F64[5, 1] | Any`, from `np.dot(B, u)` with an
+untyped `u`), on either side of an operator: the array member is
+checked, and the `Any` member stays `Any` in the result.
 
 ## Calls of your functions
 

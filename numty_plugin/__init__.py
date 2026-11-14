@@ -150,7 +150,7 @@ from ._ops import (  # noqa: F401
     bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook, _search_values_dims,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook,
-    sliding_window_view_function_hook, atleast_function_hook,
+    sliding_window_view_function_hook,
     _fft_seq_arg, _fft_seq_entry,
 )
 from ._matrix import (  # noqa: F401

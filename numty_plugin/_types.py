@@ -781,7 +781,9 @@ def _scalar_union_members(tp: Type) -> list[Type] | None:
 
     Issue 331. `F64[M] | float` and `float | int`: a union with at least
     one Python or NumPy scalar member and nothing but arrays and scalars
-    otherwise. A pure union of arrays is `_union_members`.
+    otherwise. A pure union of arrays is `_union_members`. An `Any`
+    member counts as a scalar (issue 354): `F64[5, 1] | Any` checks its
+    array member, the `Any` one solves to the stubs' answer.
     """
     proper = get_proper_type(tp)
     if not isinstance(proper, UnionType):
@@ -790,7 +792,7 @@ def _scalar_union_members(tp: Type) -> list[Type] | None:
     scalar = False
     for item in proper.items:
         item_proper = get_proper_type(item)
-        if _is_scalar_member(item_proper):
+        if _is_scalar_member(item_proper) or isinstance(item_proper, AnyType):
             scalar = True
         elif not (
             isinstance(item_proper, Instance)
@@ -900,7 +902,13 @@ def _distribute_solve(types: list[Type], solve: Callable[..., Type]) -> Type | N
         return None
     width = max(len(members) for members in pairings)
     full = [members if len(members) == width else members * width for members in pairings]
-    return _union_results([solve(*combo) for combo in zip(*full)])
+    # An `Any` member (issue 354) gives Any, not the stubs' array that
+    # would absorb the other members' results.
+    results: list[Type] = []
+    for combo in zip(*full):
+        anys = [m for m in map(get_proper_type, combo) if isinstance(m, AnyType)]
+        results.append(AnyType(TypeOfAny.from_another_any, source_any=anys[0]) if anys else solve(*combo))
+    return _union_results(results)
 
 
 def _split_flat(

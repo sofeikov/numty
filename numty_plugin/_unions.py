@@ -7,13 +7,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from mypy.nodes import ComparisonExpr, Expression, OpExpr
+from mypy.nodes import ComparisonExpr, Expression, MemberExpr, NameExpr, OpExpr
 from mypy.plugin import FunctionContext, MethodContext, MethodSigContext
 from mypy.subtypes import is_same_type
-from mypy.types import Type, get_proper_type
+from mypy.types import AnyType, Type, get_proper_type
 
 from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
-from ._types import _has_unpack, _parts_or_unpack, _union_members, _union_results
+from ._types import _has_unpack, _parts_or_unpack, _scalar_union_members, _union_members, _union_results
 from ._reshape import _movable_parts
 from ._matmul import _matmul_result, _matmul_unpack_dims, _operand_parts
 from ._broadcast import _merge_shape_lists
@@ -73,8 +73,13 @@ def _shape_clash(left: Type, right: Type, matmul: bool) -> str | None:
     return _broadcast_result(list(a[0]), list(b[0]), None)[1]
 
 
+def _array_union(tp: Type) -> list[Type] | None:
+    """The members of a union of arrays, or of arrays with numbers or `Any`, else None."""
+    return _union_members(tp) or _scalar_union_members(tp)
+
+
 def _members_or_self(tp: Type) -> list[Type]:
-    return _union_members(tp) or [tp]
+    return _array_union(tp) or [tp]
 
 
 def _union_verdict(left: Type, right: Type, matmul: bool) -> str | None:
@@ -120,8 +125,11 @@ def _operator_operands(
             continue
         left = ctx.api.get_expression_type(left_expr)
         right = ctx.api.get_expression_type(right_expr)
-        if _union_members(right) is None and (other is None or _union_members(left) is None):
-            # The reflected call (no `other`) is on a union on the right.
+        if other is None and _array_union(right) is None:
+            # The reflected call (no `other`) is on a union on the right, one
+            # with numbers or `Any` among its members too (issue 354).
+            continue
+        if other is not None and _union_members(right) is None and _union_members(left) is None:
             continue
         # A member, or the whole operand: mypy also calls the forward method
         # of a left member with the whole union on the right.
@@ -153,6 +161,36 @@ def _union_fail(ctx: FunctionContext | MethodContext, message: str, name: str) -
     ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
 
 
+def _same_operand(a: Expression, b: Expression) -> bool:
+    """Whether two operand expressions read one variable (`u + u`, `self.u * self.u`)."""
+    if isinstance(a, NameExpr) and isinstance(b, NameExpr):
+        return a.node is not None and a.node is b.node
+    if isinstance(a, MemberExpr) and isinstance(b, MemberExpr):
+        return a.name == b.name and _same_operand(a.expr, b.expr)
+    return False
+
+
+def _paired_member(ctx: MethodContext) -> Type | None:
+    """The member of `u` that pairs with `ctx.type` in `u <op> u`, else None (issue 354).
+
+    mypy calls the method of each member of the left operand with the
+    whole union on the right. Both sides are one value, so its members
+    pair index-wise, as in `np.add(u, u)`: the cross pairs never occur,
+    and `(A,) + (B,)` must not be the `[numty-names]` report.
+    """
+    call = ctx.context
+    if not isinstance(call, OpExpr) or not _same_operand(call.left, call.right):
+        return None
+    union = ctx.api.get_expression_type(call.left)
+    members = _union_members(union)
+    if members is None or not is_same_type(ctx.arg_types[0][0], union):
+        return None
+    for member in members:
+        if is_same_type(member, ctx.type):
+            return member
+    return None
+
+
 def _union_pair_hook(
     ctx: MethodContext, hook: Callable[[MethodContext], Type], name: str
 ) -> Type:
@@ -165,6 +203,9 @@ def _union_pair_hook(
     """
     try:
         if ctx.arg_types and len(ctx.arg_types[0]) == 1:
+            paired = _paired_member(ctx)
+            if paired is not None:
+                return hook(ctx._replace(arg_types=[[paired], *ctx.arg_types[1:]]))
             operands = _operator_operands(ctx, None, ctx.type, ctx.arg_types[0][0])
             if operands is not None:
                 message = _union_verdict(operands[0], operands[1], "matmul" in name)
@@ -211,24 +252,35 @@ def _union_reflected_hook(
         if operands is None:
             return ctx.default_return_type
         members = _union_members(operands[1])
+        # Issue 354: with a number or `Any` among the members (`F64[5, 1] | Any`)
+        # each array member is checked alone, as the forward method does.
+        loose = members is None
+        members = members or _scalar_union_members(operands[1])
         if members is None:
             return ctx.default_return_type
         matmul = name == "__rmatmul__"
         first: str | None = None
         fits: list[Type] = []
+        anys: list[Type] = []
         for member in members:
+            if isinstance(get_proper_type(member), AnyType):
+                anys.append(member)
+                continue
             message = _shape_clash(left, member, matmul)
             if message is None:
                 fits.append(member)
             elif first is None:
                 first = message
+        if first is not None and loose:
+            _union_fail(ctx, first, name)
+            return ctx.default_return_type
         if not fits:
             if first is not None:
                 _union_fail(ctx, _union_verdict(operands[0], operands[1], matmul) or first, name)
             return ctx.default_return_type
         if solve is None:
             return ctx.default_return_type
-        results = [
+        results = anys + [
             solve(
                 MethodContext(
                     type=get_proper_type(member),

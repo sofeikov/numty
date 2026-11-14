@@ -242,10 +242,12 @@ quiet, where it is approximate, and what to write instead.
     member: each member solves with the full solver and the results
     union. Members pair index-wise (exact for co-derived unions);
     unrelated unions of different member counts, and dunder ops with
-    unions on both sides (mypy matches those cartesianly), bail out
-    instead of guessing. A union with a Python or NumPy scalar
-    (`F64[M] | float`, `float | int`) distributes too when it is the
-    only union among the operands; `F64[N] | None` distributes in
+    two different unions on both sides (mypy matches those
+    cartesianly), bail out instead of guessing; one variable on both
+    sides (`u + u`) pairs index-wise. A union with a Python or NumPy
+    scalar or with `Any` (`F64[M] | float`, `float | int`,
+    `F64[M] | Any`) distributes too when it is the only union among
+    the operands; `F64[N] | None` distributes in
     `np.average(weights=...)` and at calls of user functions
     ([#331](https://github.com/sofeikov/numty/issues/331)). Other
     optional arguments of NumPy calls still keep the stubs' answer.

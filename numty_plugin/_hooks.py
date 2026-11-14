@@ -66,7 +66,6 @@ from ._ops import (
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
-    atleast_function_hook,
 )
 from ._matrix import (
     cov_function_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, eye_function_hook,
@@ -101,7 +100,7 @@ from ._indexing import (
     take_method_hook,
 )
 from ._broadcast import (
-    angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook,
+    angle_function_hook, asarray_function_hook, atleast_function_hook, broadcast_method_hook, broadcast_to_function_hook,
     clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook,
     divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook,
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,
@@ -1648,13 +1647,16 @@ def substituted_attribute_hook(ctx: AttributeContext) -> Type:
 
 
 def shape_attribute_hook(ctx: AttributeContext) -> Type:
-    dist = _distribute_solve([ctx.type], lambda t: _shape_type(ctx, t))
+    # A union's members keep their literal sizes as literals (issue 354):
+    # mypy joins the members' shapes, and `int` carrying 0 would absorb
+    # `N` (`tuple[N, N] | tuple[0?, 0?]` is `tuple[0?, 0?]`).
+    dist = _distribute_solve([ctx.type], lambda t: _shape_type(ctx, t, literal=True))
     if dist is not None:
         return dist
     return _shape_type(ctx, ctx.type)
 
 
-def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
+def _shape_type(ctx: AttributeContext, tp: Type, literal: bool = False) -> Type:
     parts = _parts_or_unpack(tp)
     if parts is None:
         return ctx.default_attr_type
@@ -1662,7 +1664,9 @@ def _shape_type(ctx: AttributeContext, tp: Type) -> Type:
     int_fallback = ctx.api.named_generic_type("builtins.int", [])
     items: list[Type] = []
     for v in dims:
-        if isinstance(v, int):
+        if isinstance(v, int) and literal:
+            items.append(LiteralType(v, fallback=int_fallback))
+        elif isinstance(v, int):
             # mypy's widening form: a plain int carrying its literal
             # value. Fresh locals widen to int (so `k = x.shape[0]; k -= 1`
             # checks), while _int_value/_dim_value still read the value

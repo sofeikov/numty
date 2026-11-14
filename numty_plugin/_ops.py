@@ -1654,32 +1654,6 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
     return _ndarray_type(ctx, out, dtype)
 
 
-def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
-    pairs = _all_positionals(ctx)
-    if len(pairs) != 1:
-        # Multi-arg form returns a tuple the stubs own.
-        return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
-    if parts is None:
-        return ctx.default_return_type
-    dims, dtype = parts
-    if len(dims) >= rank:
-        return _ndarray_type(ctx, list(dims), dtype)
-    out: list[int | Type]
-    if rank == 1:
-        out = [1]
-    elif rank == 2:
-        out = [1, 1] if not dims else [1, *dims]
-    elif not dims:
-        out = [1, 1, 1]
-    elif len(dims) == 1:
-        out = [1, dims[0], 1]
-    else:
-        # rank == 3 with 2-D input: numpy appends the new axis.
-        out = [*dims, 1]
-    return _ndarray_type(ctx, out, dtype)
-
-
 def _fft_seq_entry(expr: Expression, tp: Type | None) -> int | None | str:
     """An s/axes entry: int, None for keep, 'bad' when unprovable."""
     value = _fold_int(expr)

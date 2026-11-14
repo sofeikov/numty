@@ -14,7 +14,7 @@ from mypy.nodes import (
 )
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
 from mypy.types import (
-    AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarType,
+    AnyType, CallableType, Instance, LiteralType, Overloaded, TupleType, Type, TypeOfAny, TypeVarType, UnionType,
     get_proper_type,
 )
 
@@ -502,7 +502,24 @@ def zeros_like_hook(ctx: FunctionContext) -> Type:
             shape_arg, shape_expr = named
     if shape_arg is None:
         return ctx.default_return_type
-    dims = _builder_shape(ctx, shape_arg, shape_expr, ctx.default_return_type)
+    proper = get_proper_type(shape_arg)
+    if isinstance(proper, UnionType) and all(
+        isinstance(_dim_value(item), (int, TypeVarType)) for item in proper.items
+    ):
+        # A union of sizes (`U.shape[0]` of `F64[N, N] | F64[0, 0]`, issue
+        # 354) builds one array per size, not one of a plain `int` size.
+        return _union_results([
+            _zeros_of(ctx, item, None, [dim])
+            for item in proper.items
+            if isinstance(dim := _dim_value(item), (int, TypeVarType))
+        ])
+    return _zeros_of(ctx, shape_arg, shape_expr, _builder_shape(ctx, shape_arg, shape_expr, ctx.default_return_type))
+
+
+def _zeros_of(
+    ctx: FunctionContext, shape_arg: Type, shape_expr: Expression | None, dims: list[int | Type] | None
+) -> Type:
+    """zeros/ones/empty of one shape argument, read as `dims`."""
     if dims is None:
         if _explicit_dtype(ctx):
             return _stub_shape_named_dtype(ctx, _named_dtype(ctx), (shape_arg, shape_expr))
