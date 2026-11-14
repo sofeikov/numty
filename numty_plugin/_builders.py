@@ -669,6 +669,18 @@ def _stub_shape_named_dtype(
     return default.copy_modified(args=[default.args[0], dtype])
 
 
+def _one_dtype(dtypes: list[Type]) -> Type | None:
+    """The dtype every item has when it names no one type (`floating[Any]`, `dtype[PT]`), else None (issue 362).
+
+    A join keeps it, the same answer for every overload mypy tries: the
+    stubs' dtype differs between them, and mypy made such a result `Any`.
+    """
+    first = get_proper_type(dtypes[0]) if dtypes else None
+    if not isinstance(first, Instance) or not first.args or isinstance(get_proper_type(first.args[0]), AnyType):
+        return None
+    return dtypes[0] if all(dtype == dtypes[0] for dtype in dtypes) else None
+
+
 def _default_dtype(ctx: FunctionContext | MethodContext) -> Type:
     proper = get_proper_type(ctx.default_return_type)
     if isinstance(proper, Instance) and len(proper.args) == 2:
@@ -1419,7 +1431,7 @@ def _concatenate_items(
             # Issue #232: dtype[Any] items have no promotable dtype but the
             # shapes are known. Keep the stub dtype (Any) and continue with
             # rank/shape checks instead of bailing silently.
-            dtype = _default_dtype(ctx)
+            dtype = _one_dtype([dtype for _, dtype in items]) or _default_dtype(ctx)
     axis = _concat_axis(ctx, pairs)
     if axis is None:
         return ctx.default_return_type
@@ -1595,7 +1607,7 @@ def _stack_items(
             # Issue #232: dtype[Any] items have no promotable dtype but the
             # shapes are known. Keep the stub dtype (Any) and continue with
             # rank/shape checks instead of bailing silently.
-            dtype = _default_dtype(ctx)
+            dtype = _one_dtype([dtype for _, dtype in items]) or _default_dtype(ctx)
     promoted = [_stack_promote(dims, kind) for dims, _ in items]
     ranks = {len(dims) for dims in promoted}
     if len(ranks) != 1:
@@ -1756,7 +1768,7 @@ def _stack_new_axis(
             # Issue #232: dtype[Any] items have no promotable dtype but the
             # shapes are known. Keep the stub dtype (Any) and continue with
             # rank/shape checks instead of bailing silently.
-            dtype = _default_dtype(ctx)
+            dtype = _one_dtype([dtype for _, dtype in items]) or _default_dtype(ctx)
     axis = _concat_axis(ctx, pairs)
     if axis is None or axis == "none":
         return ctx.default_return_type

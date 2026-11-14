@@ -243,19 +243,24 @@ def _linalg_same_shape(ctx: FunctionContext, op: str) -> Type:
         return ctx.default_return_type
     if _reject_float16_linalg(ctx, dtype, op):
         return ctx.default_return_type
-    ks = _dtype_kind_size(dtype)
-    if ks is None:
-        return ctx.default_return_type
-    kind, size = ks
-    if kind in ("i", "u", "b"):
-        out_dtype = _construct_dtype(ctx, "numpy.float64")
-    elif kind in ("f", "c"):
-        out_dtype = dtype
-    else:
-        return ctx.default_return_type
+    out_dtype = _same_kind_out(ctx, dtype)
     if out_dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, dims, out_dtype)
+
+
+def _same_kind_out(ctx: FunctionContext | MethodContext, dtype: Type) -> Type | None:
+    """The dtype of a linalg result of the input's kind (inv, pinv, qr): float64 for bool and ints, else the input's.
+
+    A float or complex of unknown width (`Floating`, a dtype TypeVar
+    bound by `np.inexact`) is kept as it is (issue 362).
+    """
+    ks = _dtype_kind_size(dtype)
+    if ks is None:
+        return dtype if _is_inexact_dtype(dtype) else None
+    if ks[0] in ("i", "u", "b"):
+        return _construct_dtype(ctx, "numpy.float64")
+    return dtype if ks[0] in ("f", "c") else None
 
 
 def _reject_float16_linalg(ctx: FunctionContext | MethodContext, dtype: Type, op: str) -> bool:
@@ -309,16 +314,7 @@ def _linalg_pinv(ctx: FunctionContext) -> Type:
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
-    ks = _dtype_kind_size(dtype)
-    if ks is None:
-        return ctx.default_return_type
-    kind, _size = ks
-    if kind in ("i", "u", "b"):
-        out_dtype = _construct_dtype(ctx, "numpy.float64")
-    elif kind in ("f", "c"):
-        out_dtype = dtype
-    else:
-        return ctx.default_return_type
+    out_dtype = _same_kind_out(ctx, dtype)
     if out_dtype is None:
         return ctx.default_return_type
     return _ndarray_type(ctx, [*dims[:-2], dims[-1], dims[-2]], out_dtype)
@@ -865,16 +861,7 @@ def _linalg_qr(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     if _reject_float16_linalg(ctx, dtype, "qr"):
         return ctx.default_return_type
-    ks = _dtype_kind_size(dtype)
-    if ks is None:
-        return ctx.default_return_type
-    kind, _size = ks
-    if kind in ("i", "u", "b"):
-        out_dtype = _construct_dtype(ctx, "numpy.float64")
-    elif kind in ("f", "c"):
-        out_dtype = dtype
-    else:
-        return ctx.default_return_type
+    out_dtype = _same_kind_out(ctx, dtype)
     if out_dtype is None:
         return ctx.default_return_type
     batch = dims[:-2]
@@ -937,7 +924,8 @@ def _linalg_matrix_power(ctx: FunctionContext) -> Type:
         return ctx.default_return_type
     ks = _dtype_kind_size(dtype)
     if ks is None:
-        return ctx.default_return_type
+        # A float or complex of unknown width keeps its dtype (issue 362).
+        return _ndarray_type(ctx, dims, dtype) if _is_inexact_dtype(dtype) else ctx.default_return_type
     kind, _size = ks
     out_dtype: Type | None = dtype
     if kind in ("i", "u", "b"):
@@ -1283,6 +1271,17 @@ def _dtype_family(dtype: Type) -> str | None:
     return None
 
 
+def _is_inexact_dtype(dtype: Type) -> bool:
+    """Whether a dtype is a float or complex of any width (`floating[Any]`, `inexact[Any]`, a TypeVar bound by one)."""
+    proper = get_proper_type(dtype)
+    if not isinstance(proper, Instance) or not proper.args:
+        return False
+    element = get_proper_type(proper.args[0])
+    if isinstance(element, TypeVarType):
+        element = get_proper_type(element.upper_bound)
+    return isinstance(element, Instance) and any(base.fullname == "numpy.inexact" for base in element.type.mro)
+
+
 def _is_numpy_scalar(tp: Type) -> bool:
     """A numpy scalar type of any width: `np.float32`, `floating[Any]`, `np.integer`."""
     proper = get_proper_type(tp)
@@ -1324,6 +1323,10 @@ def _scalar_of_dtype(dtype: Type) -> Type | None:
         if isinstance(inner, Instance):
             if inner.type.fullname == "numpy.object_":
                 return AnyType(TypeOfAny.implementation_artifact)
+            return inner
+        if isinstance(inner, TypeVarType) and _is_numpy_scalar(inner.upper_bound):
+            # `dtype[PT]`, PT bound by a numpy scalar type: an element is
+            # a PT (issue 362).
             return inner
     return None
 

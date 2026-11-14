@@ -1159,8 +1159,14 @@ def _record_searchsorted(
 
 
 def _nonzero_like(ctx: FunctionContext, op: str, arg: Type) -> Type:
-    """Tuple of 1-d int ?U arrays, one per dim; 0-d fails loudly."""
-    parts = _ndarray_parts(arg)
+    """Tuple of 1-d int ?U arrays, one per dim; 0-d fails loudly.
+
+    Only the rank is read, so an `int` or `Any` axis is fine (issue 362):
+    a call result `Bool[int]` is checked under each overload with its
+    own context, and the stubs' answers differ by rank, which mypy
+    erased to `Any`.
+    """
+    parts = _ndarray_parts(arg) or _known_rank_parts(arg)
     if parts is None:
         return ctx.default_return_type
     dims, _ = parts

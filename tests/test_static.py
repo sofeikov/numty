@@ -1352,8 +1352,8 @@ def test_ret_int_ok() -> None:
     }
     f64 = "numpy.dtype[numpy.float64]"
     assert notes == {
-        93: '"numpy.ndarray[tuple[?N@93], numpy.dtype[numpy.bool[Any]]]"',
-        94: '"numpy.ndarray[tuple[?N@94], numpy.dtype[numpy.bool[Any]]]"',
+        93: '"numpy.ndarray[tuple[?N@93], numpy.dtype[numpy.bool[bool]]]"',
+        94: '"numpy.ndarray[tuple[?N@94], numpy.dtype[numpy.bool[bool]]]"',
         95: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
     }, result.stdout
     assert _run_fixture("ret_int_ok.py") == [
@@ -5378,6 +5378,47 @@ def test_bad_names_messages() -> None:
     assert _run_fixture("bad_names_messages.py") == ["(2,)"]
 
 
+def test_dtype_generic_shapes() -> None:
+    # Issue 362: `Floating` and `Arr[PT, ...]` with `PT` bound by
+    # `np.inexact` keep their shapes through linalg (qr, inv), joins,
+    # reductions and a scalar element (`PT`, whose product with an array
+    # has the array's shape); `Arr` takes a TypeVar with values; the
+    # `Bool` head is `bool[bool]` as `np.bool` is, and `np.where` of a
+    # `Bool[N]` call result is rank-1 positions.
+    fixture = "dtype_generic_shapes_ok.py"
+    result = run_mypy(FIXTURES / fixture)
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    floating = "numpy.dtype[numpy.floating[Any]]"
+    assert notes[29] == f'"numpy.ndarray[tuple[n, n], {floating}]"', result.stdout
+    assert notes[30] == '"numpy.ndarray[tuple[n, n], numpy.dtype[PT]]"', result.stdout
+    assert notes[31] == f'"numpy.ndarray[tuple[2*n, n], {floating}]"', result.stdout
+    assert notes[32] == '"numpy.ndarray[tuple[2*n, n], numpy.dtype[PT]]"', result.stdout
+    assert notes[33] == '"numpy.ndarray[tuple[n], numpy.dtype[PT]]"', result.stdout
+    assert notes[34] == '"PT"', result.stdout
+    assert notes[35] == '"numpy.ndarray[tuple[n, n], numpy.dtype[Any]]"', result.stdout
+    assert notes[36] == f'"numpy.ndarray[tuple[int], {_BOOL}]"', result.stdout
+    assert notes[37] == f'"numpy.ndarray[tuple[?U@37], {_I64}]"', result.stdout
+    assert _run_fixture(fixture) == ["(2, 2) (4, 2) (2,) (2, 2)", "(3,) (2,)"]
+
+
+def test_bad_dtype_generic_shapes() -> None:
+    # Issue 362: the dtype-generic spellings catch what their F64 twins do;
+    # an `Arr` TypeVar with a value that is not a numpy scalar type says so.
+    result = run_mypy(FIXTURES / "bad_dtype_generic_shapes.py")
+    messages = _messages_by_line(result)
+    assert sorted(messages) == [13, 14, 15, 16, 19], result.stdout
+    assert all(len(texts) == 1 for texts in messages.values()), result.stdout
+    for line in (13, 14, 16):
+        assert messages[line] == ["matmul inner dimensions disagree: n vs n-1  [numty-shape]"], result.stdout
+    assert messages[15][0].endswith("2*n and n are different names  [numty-names]"), result.stdout
+    assert messages[19] == [
+        'Arr dtype "U" must be a TypeVar whose values are numpy scalar types'
+        ' (e.g. TypeVar("T", np.float64, np.complex128))  [numty-annotation]'
+    ], result.stdout
+    assert _run_fixture("bad_dtype_generic_shapes.py") == ["(2, 2) (1, 2)"]
+
+
 def test_bad_own_size_optin() -> None:
     # Issues 306/307 (opt-in): the size a call chose, and the size an
     # object's properties name, are sizes of their own. Silent with numty-names off.
@@ -6338,7 +6379,7 @@ def test_zero_d_head_ok() -> None:
     assert reveals_by_line(result) == {
         27: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"',
         28: f'"{_ND}[tuple[()], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"',
-        29: f'"{_ND}[tuple[()], numpy.dtype[numpy.bool[Any]]]"',
+        29: f'"{_ND}[tuple[()], numpy.dtype[numpy.bool[bool]]]"',
         30: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[Any]]]"',
         31: f'"{_ND}[tuple[()], {_F64}]"',
         39: f'"{_ND}[tuple[()], {_F64}]"',
@@ -6480,7 +6521,7 @@ def test_matrix_ops_symbolic() -> None:
         55: f'"{_ND}[tuple[?U@52], {_F64}]"',
         # The inverse maps every input element back: the input's shape.
         57: f'"{_ND}[tuple[N], {_I64}]"',
-        58: f'"tuple[{_ND}[tuple[?U@58], numpy.dtype[numpy.bool[Any]]], {_ND}[tuple[N, D], {_I64}]]"',
+        58: f'"tuple[{_ND}[tuple[?U@58], numpy.dtype[numpy.bool[bool]]], {_ND}[tuple[N, D], {_I64}]]"',
     }, result.stdout
     assert _run_fixture("matrix_symbolic_ok.py") == [
         "(3, 3) (4, 4) (3, 5) (3, 3)",

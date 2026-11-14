@@ -10,8 +10,8 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from mypy.nodes import (
-    ARG_POS, COVARIANT, INVARIANT, CallExpr, Decorator, Expression, FuncDef, IndexExpr, NameExpr, OpExpr,
-    OverloadedFuncDef, RefExpr, TypeInfo, TypeVarLikeExpr,
+    ARG_POS, CallExpr, Decorator, Expression, FuncDef, NameExpr, OpExpr, OverloadedFuncDef, TypeInfo,
+    TypeVarLikeExpr,
 )
 from mypy.argmap import map_actuals_to_formals
 from mypy.expandtype import expand_type
@@ -20,7 +20,7 @@ from mypy.plugin import (
     MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
-    PROTOCOL_NAMES, AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, RawExpressionType,
+    AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, RawExpressionType,
     TupleType, Type,
     TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
@@ -44,7 +44,7 @@ from ._types import (
     _OPERATOR_DUNDERS,
 )
 from ._callbind import (
-    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _union_actual_variants,
+    _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _sizes_covariant, _union_actual_variants,
 )
 from ._builders import (
     _guard_mixed, zeros_like_hook, _named_dtype, like_function_hook, copy_function_hook,
@@ -110,7 +110,7 @@ from ._broadcast import (
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
 from ._heads import (
-    _FAM_HEAD_DTYPES, _FamBail, _FamFail, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
+    _FAM_HEAD_DTYPES, _arr_head, _class_type_arg, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
     _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string, _index_head,
 )
@@ -688,28 +688,7 @@ class NumtyPlugin(Plugin):
         return bare_hook
 
     def _class_arg(self, ctx: AnalyzeTypeContext, fullname: str, arg: Type) -> Type:
-        """One type argument of a user class: a formula string (`Model[N, "N-1"]`) is the size it spells (issue 358)."""
-        if isinstance(arg, RawExpressionType) and isinstance(arg.literal_value, str):
-            short = fullname.rsplit(".", 1)[-1]
-            try:
-                dims = self._fam_string(ctx, short, arg.literal_value, arg)
-            except _FamFail as exc:
-                ctx.api.fail(str(exc), ctx.context, code=NUMTY_ANNOTATION)
-                return AnyType(TypeOfAny.from_error)
-            except _FamBail:
-                return AnyType(TypeOfAny.from_error)
-            if len(dims) != 1:
-                ctx.api.fail(
-                    f'{short} takes one size per type argument; "{arg.literal_value}" spells {len(dims)}',
-                    ctx.context,
-                    code=NUMTY_ANNOTATION,
-                )
-                return AnyType(TypeOfAny.from_error)
-            dim = dims[0]
-            if isinstance(dim, int):
-                return LiteralType(dim, ctx.api.named_type(INT_FULLNAME, []), line=arg.line, column=arg.column)
-            return dim
-        return ctx.api.analyze_type(arg)
+        return _class_type_arg(ctx, fullname, arg, self._fam_late_bound)
 
     # Phase 3 (#197) delegators: _fam_* bodies live in _heads.py as
     # module functions taking late_bound explicitly (same object as
@@ -1678,51 +1657,6 @@ def _own_sizes_unknown(ctx: AttributeContext, default: Type) -> Type:
     except Exception:
         _swallowed(ctx, "_own_sizes_unknown")
         return default
-
-
-def _sizes_covariant(ctx: ClassDefContext) -> None:
-    """Make the size type parameters of a user class covariant for subtyping (issue 358).
-
-    `Sys[N]` into `Sys[int]`: a size declared `int` is one numty does not
-    follow, and `F64[N]` already fits `F64[int]` (the shape tuple is
-    covariant). A class invariant in `N` refused it at a return and an
-    annotated local. A type parameter bound to `int` and declared
-    invariant is treated as covariant by mypy's subtype check, which
-    reads the variance off the class definition; the class's methods
-    keep their own variables, so no variance rule for parameters
-    applies to them.
-    """
-    try:
-        # `is_protocol` is set after this hook: a protocol names
-        # `Protocol` among the bases mypy takes out of the list.
-        for expr in [*ctx.cls.removed_base_type_exprs, *ctx.cls.base_type_exprs]:
-            base = expr.base if isinstance(expr, IndexExpr) else expr
-            if isinstance(base, RefExpr) and base.fullname in PROTOCOL_NAMES:
-                return
-        changed = False
-        tvars: list[TypeVarLikeType] = []
-        for tv in ctx.cls.type_vars:
-            upper = get_proper_type(tv.upper_bound) if isinstance(tv, TypeVarType) else None
-            if (
-                isinstance(tv, TypeVarType)
-                and tv.variance == INVARIANT
-                and not tv.values
-                and isinstance(upper, Instance)
-                and upper.type.fullname == INT_FULLNAME
-            ):
-                tvars.append(
-                    TypeVarType(
-                        tv.name, tv.fullname, tv.id, tv.values, tv.upper_bound, tv.default,
-                        variance=COVARIANT, line=tv.line, column=tv.column,
-                    )
-                )
-                changed = True
-            else:
-                tvars.append(tv)
-        if changed:
-            ctx.cls.type_vars = tvars
-    except Exception:
-        _swallowed(None, "_sizes_covariant")
 
 
 def substituted_attribute_hook(ctx: AttributeContext) -> Type:

@@ -10,11 +10,12 @@ from __future__ import annotations
 from mypy.expandtype import expand_type
 from mypy.maptype import map_instance_to_supertype
 from mypy.nodes import (
-    ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, COVARIANT, Expression, ListExpr, StarExpr, TupleExpr,
+    ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, COVARIANT, INVARIANT, Expression, IndexExpr, ListExpr,
+    RefExpr, StarExpr, TupleExpr,
 )
-from mypy.plugin import FunctionSigContext, MethodSigContext
+from mypy.plugin import ClassDefContext, FunctionSigContext, MethodSigContext
 from mypy.types import (
-    AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,
+    PROTOCOL_NAMES, AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,
     TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
@@ -358,6 +359,51 @@ def _class_arg_dims(formal_tp: Type, actual_tp: Type) -> list[tuple[int, TypeVar
         ):
             out.append((i, fp, get_proper_type(aarg)))
     return out
+
+
+def _sizes_covariant(ctx: ClassDefContext) -> None:
+    """Make the size type parameters of a user class covariant for subtyping (issue 358).
+
+    `Sys[N]` into `Sys[int]`: a size declared `int` is one numty does not
+    follow, and `F64[N]` already fits `F64[int]` (the shape tuple is
+    covariant). A class invariant in `N` refused it at a return and an
+    annotated local. A type parameter bound to `int` and declared
+    invariant is treated as covariant by mypy's subtype check, which
+    reads the variance off the class definition; the class's methods
+    keep their own variables, so no variance rule for parameters
+    applies to them.
+    """
+    try:
+        # `is_protocol` is set after this hook: a protocol names
+        # `Protocol` among the bases mypy takes out of the list.
+        for expr in [*ctx.cls.removed_base_type_exprs, *ctx.cls.base_type_exprs]:
+            base = expr.base if isinstance(expr, IndexExpr) else expr
+            if isinstance(base, RefExpr) and base.fullname in PROTOCOL_NAMES:
+                return
+        changed = False
+        tvars: list[TypeVarLikeType] = []
+        for tv in ctx.cls.type_vars:
+            upper = get_proper_type(tv.upper_bound) if isinstance(tv, TypeVarType) else None
+            if (
+                isinstance(tv, TypeVarType)
+                and tv.variance == INVARIANT
+                and not tv.values
+                and isinstance(upper, Instance)
+                and upper.type.fullname == INT_FULLNAME
+            ):
+                tvars.append(
+                    TypeVarType(
+                        tv.name, tv.fullname, tv.id, tv.values, tv.upper_bound, tv.default,
+                        variance=COVARIANT, line=tv.line, column=tv.column,
+                    )
+                )
+                changed = True
+            else:
+                tvars.append(tv)
+        if changed:
+            ctx.cls.type_vars = tvars
+    except Exception:
+        _swallowed(None, "_sizes_covariant")
 
 
 def _where(axis: int) -> str:
