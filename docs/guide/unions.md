@@ -18,8 +18,9 @@ dunder op with one variable on both sides (`u + u`, `self.u * self.u`)
 pairs index-wise too; other dunder ops with unions on both sides go
 through mypy's native cartesian matching, so cross terms may dissolve.
 
-`np.atleast_1d` / `atleast_2d` / `atleast_3d` lift each member
-(`(S, I) | (S,)` is `(S, I) | (1, S)` for `atleast_2d`). `.shape` of a union keeps literal sizes
+`np.atleast_1d` / `atleast_2d` / `atleast_3d` of a union keep the
+stubs' answer: code that lifts `F64[N] | F64[R, N]` narrows on `.ndim`
+afterwards, which numty does not follow. `.shape` of a union keeps literal sizes
 as literals, so `U.shape[0]` of `(N, N) | (0, 0)` is `N | Literal[0]`
 and `np.zeros(U.shape[0])` is `(N,) | (0,)`. A union value written with
 `out[i] = v` or `t += v` is checked per member: each array member must

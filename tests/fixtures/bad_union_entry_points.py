@@ -1,4 +1,4 @@
-"""Issue 354: atleast_*d, a `| Any` operand, writes and `.shape` check every union member."""
+"""Issue 354: a `| Any` operand, writes and `.shape` check every union member."""
 from typing import Any, TypeVar
 
 import numpy as np
@@ -10,7 +10,7 @@ N = TypeVar("N", bound=int)
 
 
 def lift(u: F64[S, I] | F64[S]) -> F64[S, I]:
-    return np.atleast_2d(u)  # E: the (1, S) member
+    return np.atleast_2d(u)  # the stubs' answer: `.ndim` narrowing is not followed
 
 
 def loose(x: F64[5, 1], H: F64[3, 5], bu: F64[5, 1] | Any) -> None:

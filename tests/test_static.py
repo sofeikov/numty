@@ -6805,10 +6805,12 @@ def test_union_entry_points_ok() -> None:
     result = run_mypy(FIXTURES / "union_entry_points_ok.py")
     assert result.returncode == 0, result.stdout
     assert reveals_by_line(result) == {
-        16: f'"{_ND}[tuple[S, I], {_F64}] | {_ND}[tuple[Literal[1], S], {_F64}]"',
-        17: f'"{_ND}[tuple[S, I], {_F64}] | {_ND}[tuple[S], {_F64}]"',
-        # A list keeps the stubs' answer: its rows are not followed into
-        # declared sizes yet (a filterpy `self.sigmas_h: F64[n_sig, n_z]`).
+        # A union and a list keep the stubs' answer: scipy's `normalize`
+        # lifts `F64[N] | F64[R, N]` and narrows on `.ndim`, which numty
+        # does not follow, and a list's rows are not followed into a
+        # declared size (filterpy's `self.sigmas_h: F64[n_sig, n_z]`).
+        16: f'"{_ND}[Any, Any]"',
+        17: f'"{_ND}[Any, Any]"',
         18: f'"{_ND}[Any, Any]"',
         22: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}] | Any"',
         23: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}] | Any"',
@@ -6822,11 +6824,6 @@ def test_union_entry_points_ok() -> None:
 def test_union_entry_points_catch() -> None:
     result = run_mypy(FIXTURES / "bad_union_entry_points.py")
     assert _messages_by_line(result) == {
-        13: [
-            'Incompatible return value type (got "ndarray[tuple[S, I], dtype[float64]] | '
-            'ndarray[tuple[Literal[1], S], dtype[float64]]", expected "ndarray[tuple[S, I], dtype[float64]]")  '
-            "[return-value]"
-        ],
         17: ["broadcast shapes disagree at trailing axis 1: 3 vs 5 (shapes (3, 1) vs (5, 1))  [numty-broadcast]"],
         21: ["cannot assign value of shape (4,) into target of shape (3,)  [numty-broadcast]"],
         22: ["cannot assign value of shape (3, 3) into target of shape (3,)  [numty-broadcast]"],

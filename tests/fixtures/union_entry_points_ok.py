@@ -1,4 +1,4 @@
-"""Issue 354: atleast_*d, a `| Any` operand, `.shape` and `u + u` read every union member."""
+"""Issue 354: a `| Any` operand, `.shape` and `u + u` read every union member."""
 from typing import Any, TypeVar
 
 import numpy as np
