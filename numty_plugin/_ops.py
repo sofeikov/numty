@@ -18,7 +18,8 @@ from ._heads import _record_index_on
 from ._types import (
     _dims_provably_ne, _report_mask_names, _report_names,
     _int_value, _dim_value, _dim_eq, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims,
-    _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg,
+    _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg, _union_members,
+    _union_results,
 )
 from ._reshape import (
     _check_axis, _all_positionals, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _is_none_type,
@@ -1652,6 +1653,46 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
         out[ax] = _dim_add_const(ctx, "sliding_window_view", ax, d, 1 - wval)
     out.extend(widths)
     return _ndarray_type(ctx, out, dtype)
+
+
+def _atleast_lift(ctx: FunctionContext, tp: Type, rank: int) -> Type:
+    """One array lifted to at least `rank` dimensions, as `np.atleast_<rank>d` does."""
+    parts = _ndarray_parts(tp)
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    if len(dims) >= rank:
+        return _ndarray_type(ctx, list(dims), dtype)
+    out: list[int | Type]
+    if rank == 1:
+        out = [1]
+    elif rank == 2:
+        out = [1, 1] if not dims else [1, *dims]
+    elif not dims:
+        out = [1, 1, 1]
+    elif len(dims) == 1:
+        out = [1, dims[0], 1]
+    else:
+        # rank == 3 with 2-D input: numpy appends the new axis.
+        out = [*dims, 1]
+    return _ndarray_type(ctx, out, dtype)
+
+
+def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
+    """np.atleast_1d/2d/3d of one operand (issue 354).
+
+    A union of arrays lifts per member (`(S, I) | (S,)` is
+    `(S, I) | (1, S)` for `atleast_2d`). Anything else that is not an
+    array keeps the stubs' answer.
+    """
+    pairs = _all_positionals(ctx)
+    if len(pairs) != 1:
+        # Multi-arg form returns a tuple the stubs own.
+        return ctx.default_return_type
+    members = _union_members(pairs[0][0]) or [pairs[0][0]]
+    if any(_ndarray_parts(member) is None for member in members):
+        return ctx.default_return_type
+    return _union_results([_atleast_lift(ctx, member, rank) for member in members])
 
 
 def _fft_seq_entry(expr: Expression, tp: Type | None) -> int | None | str:

@@ -21,7 +21,7 @@ from mypy.plugin import (
 )
 from mypy.types import (
     AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
-    TypeOfAny, TypeType, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
+    TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
@@ -29,9 +29,8 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import (
-    NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _quiet_type, _swallowed, _warn_startup,
-)
+from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._errors import _quiet_type
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -41,7 +40,7 @@ from ._unknowns import _fresh_unknown
 from ._types import (
     _dim_value, _ndarray_parts, _parts_or_unpack, _distribute_solve, _mentions_ndarray,
     _info_mentions_array, _note_rank_mismatches, _ndarray_type, _union_members, INT_FULLNAME, NDARRAY_FULLNAME,
-    TUPLE_FULLNAME, _OPERATOR_DUNDERS,
+    _OPERATOR_DUNDERS,
 )
 from ._callbind import (
     _conflict_pairs, _emit_call_site_conflicts, _callsite_formula_return, _union_actual_variants,
@@ -68,6 +67,7 @@ from ._ops import (
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
+    atleast_function_hook,
 )
 from ._matrix import (
     cov_function_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, eye_function_hook,
@@ -102,8 +102,7 @@ from ._indexing import (
     take_method_hook,
 )
 from ._broadcast import (
-    angle_function_hook, asarray_function_hook, atleast_function_hook, broadcast_method_hook,
-    broadcast_to_function_hook,
+    angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook,
     clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook,
     divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook,
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,
@@ -124,6 +123,8 @@ from ._unions import (
     _union_signature_clash,
 )
 from ._callsite import _relax_dynamic_formals, _report_call_site_names, _report_index_call_site, minmax_function_hook
+from ._callsite import _overloaded_method
+from ._types import shape_attribute_hook
 from ._returns import _holder_key, _return_sig_for_dynamic
 from ._unknowns import _fresh_own_size
 from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
@@ -1299,21 +1300,6 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         return ctx.default_signature
 
 
-def _overloaded_method(ctx: MethodSigContext, fullname: str) -> bool:
-    """Whether the method called on the receiver is overloaded (issue 355).
-
-    `a.predict(p, X)` names no node, so the callee check of a free
-    function misses it: the hook then ran on each item mypy tried and
-    reported the conflicts of an item it did not select.
-    """
-    proper = get_proper_type(ctx.type)
-    if isinstance(proper, TypeType):
-        proper = get_proper_type(proper.item)
-    if not isinstance(proper, Instance):
-        return False
-    return isinstance(proper.type.get_method(fullname.rpartition(".")[2]), OverloadedFuncDef)
-
-
 def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
     """Widen formals to Any on provable matmul mismatch (issue #140).
 
@@ -1666,44 +1652,6 @@ def substituted_attribute_hook(ctx: AttributeContext) -> Type:
     if sub is None:
         return default
     return sub
-
-
-def shape_attribute_hook(ctx: AttributeContext) -> Type:
-    # A union's members keep their literal sizes as literals (issue 354):
-    # mypy joins the members' shapes, and `int` carrying 0 would absorb
-    # `N` (`tuple[N, N] | tuple[0?, 0?]` is `tuple[0?, 0?]`).
-    dist = _distribute_solve([ctx.type], lambda t: _shape_type(ctx, t, literal=True))
-    if dist is not None:
-        return dist
-    return _shape_type(ctx, ctx.type)
-
-
-def _shape_type(ctx: AttributeContext, tp: Type, literal: bool = False) -> Type:
-    parts = _parts_or_unpack(tp)
-    if parts is None:
-        return ctx.default_attr_type
-    dims, _ = parts
-    int_fallback = ctx.api.named_generic_type("builtins.int", [])
-    items: list[Type] = []
-    for v in dims:
-        if isinstance(v, int) and literal:
-            items.append(LiteralType(v, fallback=int_fallback))
-        elif isinstance(v, int):
-            # mypy's widening form: a plain int carrying its literal
-            # value. Fresh locals widen to int (so `k = x.shape[0]; k -= 1`
-            # checks), while _int_value/_dim_value still read the value
-            # back for direct uses like reshape(x.shape[0], 3) (issue #62).
-            items.append(
-                int_fallback.copy_modified(
-                    last_known_value=LiteralType(v, fallback=int_fallback)
-                )
-            )
-        else:
-            items.append(v)
-    fallback = ctx.api.named_generic_type(
-        TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)]
-    )
-    return TupleType(items, fallback)
 
 
 def t_attribute_hook(ctx: AttributeContext) -> Type:

@@ -22,7 +22,7 @@ from ._types import (
     DTYPE_FULLNAME, INT_FULLNAME, _clash_dim, _dim_eq, _dim_str, _dim_value, _dims_provably_ne, _distribute_solve,
     _fold_int, _has_unpack, _int_value, _kept_name, _named_sizes_differ, _ndarray_parts, _ndarray_type,
     _parts_or_unpack, _report_mask_names, _report_names, _same_own_size, _scalar_union_members, _shape_from_arg,
-    _split_flat, _union_members, _union_results,
+    _split_flat, _target_is_union, _union_members,
 )
 from ._sequences import _comprehension_length
 from ._reshape import (
@@ -49,10 +49,7 @@ if TYPE_CHECKING:
     from mypy.plugin import MethodContext
 
 # Runtime-only (bodies check isinstance / read arg kinds).
-from mypy.nodes import (
-    Expression, FloatExpr, IndexExpr, ListComprehension, ListExpr, MemberExpr, NameExpr, OperatorAssignmentStmt, OpExpr,
-    StarExpr, TupleExpr,
-)
+from mypy.nodes import Expression, FloatExpr, IndexExpr, ListComprehension, ListExpr, OpExpr, StarExpr, TupleExpr
 from mypy.copytype import copy_type
 from mypy.subtypes import is_same_type
 from mypy.types import (
@@ -352,20 +349,6 @@ def inplace_method_hook(ctx: MethodContext) -> Type:
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_BROADCAST)
     return _checked_stub_type(ctx) if checked else ctx.default_return_type
-
-
-def _target_is_union(ctx: MethodContext) -> bool:
-    """Whether the target of an in-place operator is a union, checked per member by mypy."""
-    stmt = ctx.context
-    if not isinstance(stmt, OperatorAssignmentStmt):
-        return False
-    if not isinstance(stmt.lvalue, (NameExpr, MemberExpr)):
-        return False
-    try:
-        return isinstance(get_proper_type(ctx.api.get_expression_type(stmt.lvalue)), UnionType)
-    except Exception:
-        _swallowed(ctx, "_target_is_union")
-        return True
 
 
 def _checked_stub_type(ctx: MethodContext) -> Type:
@@ -1666,49 +1649,6 @@ def broadcast_to_function_hook(ctx: FunctionContext) -> Type:
 
 def asarray_function_hook(ctx: FunctionContext) -> Type:
     return _solve_asarray(ctx)
-
-
-def _atleast_lift(ctx: FunctionContext, tp: Type, rank: int) -> Type:
-    """One array lifted to at least `rank` dimensions, as `np.atleast_<rank>d` does."""
-    parts = _ndarray_parts(tp)
-    if parts is None:
-        return ctx.default_return_type
-    dims, dtype = parts
-    if len(dims) >= rank:
-        return _ndarray_type(ctx, list(dims), dtype)
-    out: list[int | Type]
-    if rank == 1:
-        out = [1]
-    elif rank == 2:
-        out = [1, 1] if not dims else [1, *dims]
-    elif not dims:
-        out = [1, 1, 1]
-    elif len(dims) == 1:
-        out = [1, dims[0], 1]
-    else:
-        # rank == 3 with 2-D input: numpy appends the new axis.
-        out = [*dims, 1]
-    return _ndarray_type(ctx, out, dtype)
-
-
-def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
-    """np.atleast_1d/2d/3d of one operand (issue 354).
-
-    A union of arrays lifts per member (`(S, I) | (S,)` is
-    `(S, I) | (1, S)` for `atleast_2d`). Anything else that is not an
-    array keeps the stubs' answer.
-    """
-    pairs = _all_positionals(ctx)
-    if len(pairs) != 1:
-        # Multi-arg form returns a tuple the stubs own.
-        return ctx.default_return_type
-    base = pairs[0][0]
-    if _union_members(base) is not None:
-        base = _solve_asarray(ctx)
-    members = _union_members(base) or [base]
-    if any(_ndarray_parts(member) is None for member in members):
-        return ctx.default_return_type
-    return _union_results([_atleast_lift(ctx, member, rank) for member in members])
 
 
 def _solve_truediv_pair(
