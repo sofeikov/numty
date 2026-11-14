@@ -332,3 +332,21 @@ def _quiet_type(
     """
     with ctx.api.msg.filter_errors():
         return ctx.api.get_expression_type(expr)
+
+
+def _checked_operand(ctx: MethodSigContext, expr: Expression) -> tuple[Type, bool]:
+    """The type of an operand expression, as `_quiet_type`, and whether checking it reports an error (issue 363).
+
+    `v - np.dot(A, x)` with a names report inside `np.dot`: mypy checks
+    the right operand once per item of `__sub__`, the report fails every
+    item, and mypy adds `Unsupported operand types` with two identical
+    types. The operand's own report stands for the operator. Only a
+    numty report counts: any other error in the operand (a wrong call
+    inside it) leaves mypy's own `[operator]` check of the operand type.
+    """
+    with ctx.api.msg.filter_errors(save_filtered_errors=True) as watcher:
+        tp = ctx.api.get_expression_type(expr)
+    reports = any(
+        info.code is not None and info.code.code.startswith("numty") for info in watcher.filtered_errors()
+    )
+    return tp, reports

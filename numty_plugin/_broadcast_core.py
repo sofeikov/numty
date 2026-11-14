@@ -529,9 +529,20 @@ def _solve_broadcast_unpack(
     return ctx.default_return_type
 
 
+def _scalar_bound(tp: Type) -> Type:
+    """A scalar of a dtype TypeVar (`PT` bound by `np.inexact`) as its bound, which numty solves (issue 362)."""
+    proper = get_proper_type(tp)
+    if isinstance(proper, TypeVarType):
+        bound = get_proper_type(proper.upper_bound)
+        if isinstance(bound, Instance) and any(base.fullname == "numpy.generic" for base in bound.type.mro):
+            return bound
+    return tp
+
+
 def _solve_broadcast(
     ctx: FunctionContext | MethodContext, left: Type, right: Type, op: str | None = None
 ) -> Type:
+    left, right = _scalar_bound(left), _scalar_bound(right)
     dist = _distribute_solve([left, right], lambda l, r: _broadcast_types(ctx, l, r, op))
     if dist is not None:
         return dist

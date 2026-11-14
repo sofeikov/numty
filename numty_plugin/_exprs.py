@@ -19,7 +19,7 @@ from ._forms import _DivForm, _LinForm, _MonoForm, _eval_form
 from ._state import STATE
 from ._unknowns import _unknown_names
 from mypy.types import (
-    Instance, TupleType, TypeAliasType, UnionType, UnpackType, get_proper_type,
+    CallableType, Instance, TupleType, TypeAliasType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
@@ -408,3 +408,37 @@ def _iter_tvarlikes(
             yield from _iter_tvarlikes(item, _seen)
     elif isinstance(tp, UnpackType):
         yield from _iter_tvarlikes(tp.type, _seen)
+
+
+def _form_names(tv: TypeVarLikeType) -> set[str]:
+    """Fullnames a size names: its own, or for a formula (`N+1`) the names in it."""
+    form = _form_of(tv) if isinstance(tv, TypeVarType) else None
+    if isinstance(form, _LinForm):
+        return {name for name, _ in form.coeffs}
+    if isinstance(form, _DivForm):
+        return {name for name, _ in form.inner.coeffs}
+    if isinstance(form, _MonoForm):
+        return set(form.vars)
+    return {tv.fullname}
+
+
+def _signature_names(scope: object, func: object) -> set[str]:
+    """Fullnames of the names a parameter (of `func` or an enclosing function) or a class binds.
+
+    A formula in a parameter (`x: F64["N+1"]`) binds the names in it.
+    """
+    bound: set[str] = set()
+    for item in getattr(scope, "stack", []):
+        item_tp = get_proper_type(getattr(item, "type", None))
+        if isinstance(item_tp, CallableType):
+            for arg in item_tp.arg_types:
+                for tv in _iter_tvarlikes(arg):
+                    bound.add(tv.fullname)
+                    bound |= _form_names(tv)
+        defn = getattr(item, "defn", None)  # a class on the stack
+        for tv in getattr(defn, "type_vars", None) or []:
+            bound.add(tv.fullname)
+    info = getattr(func, "info", None)
+    for tv in getattr(getattr(info, "defn", None), "type_vars", None) or []:
+        bound.add(tv.fullname)
+    return bound

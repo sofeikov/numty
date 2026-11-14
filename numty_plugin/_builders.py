@@ -45,6 +45,7 @@ from ._types import (
     _enum_member_count,
 )
 from ._sequences import _comprehension_length, _union_item_parts
+from ._unknowns import _is_one_size_unknown, _is_same_unknown
 from ._reshape import (
     _construct_dtype, _is_mixed_shape, _is_plain_int, _literal_positions, _ndarrays_in,
     _widen_literal_dims,
@@ -675,6 +676,18 @@ def _stub_shape_named_dtype(
     if dtype is None or not unknown:
         return ctx.default_return_type
     return default.copy_modified(args=[default.args[0], dtype])
+
+
+def _one_dtype(dtypes: list[Type]) -> Type | None:
+    """The dtype every item has when it names no one type (`floating[Any]`, `dtype[PT]`), else None (issue 362).
+
+    A join keeps it, the same answer for every overload mypy tries: the
+    stubs' dtype differs between them, and mypy made such a result `Any`.
+    """
+    first = get_proper_type(dtypes[0]) if dtypes else None
+    if not isinstance(first, Instance) or not first.args or isinstance(get_proper_type(first.args[0]), AnyType):
+        return None
+    return dtypes[0] if all(dtype == dtypes[0] for dtype in dtypes) else None
 
 
 def _default_dtype(ctx: FunctionContext | MethodContext) -> Type:
@@ -1501,7 +1514,7 @@ def _concatenate_items(
             # Issue #232: dtype[Any] items have no promotable dtype but the
             # shapes are known. Keep the stub dtype (Any) and continue with
             # rank/shape checks instead of bailing silently.
-            dtype = _default_dtype(ctx)
+            dtype = _one_dtype([dtype for _, dtype in items]) or _default_dtype(ctx)
     axis = _concat_axis(ctx, pairs)
     if axis is None:
         return ctx.default_return_type
@@ -1677,7 +1690,7 @@ def _stack_items(
             # Issue #232: dtype[Any] items have no promotable dtype but the
             # shapes are known. Keep the stub dtype (Any) and continue with
             # rank/shape checks instead of bailing silently.
-            dtype = _default_dtype(ctx)
+            dtype = _one_dtype([dtype for _, dtype in items]) or _default_dtype(ctx)
     promoted = [_stack_promote(dims, kind) for dims, _ in items]
     ranks = {len(dims) for dims in promoted}
     if len(ranks) != 1:
@@ -1838,15 +1851,21 @@ def _stack_new_axis(
             # Issue #232: dtype[Any] items have no promotable dtype but the
             # shapes are known. Keep the stub dtype (Any) and continue with
             # rank/shape checks instead of bailing silently.
-            dtype = _default_dtype(ctx)
+            dtype = _one_dtype([dtype for _, dtype in items]) or _default_dtype(ctx)
     axis = _concat_axis(ctx, pairs)
     if axis is None or axis == "none":
         return ctx.default_return_type
     if not isinstance(axis, int):
         return ctx.default_return_type
     first = list(items[0][0])
+
+    def same(x: int | Type, y: int | Type) -> bool:
+        # One unknown minted once is one size (`np.stack(np.nonzero(m))`
+        # of a `Bool[int, int]`, whose arrays share it).
+        return _dim_eq(x, y) or (_is_same_unknown(x, y) and _is_one_size_unknown(x))
+
     for dims, _ in items[1:]:
-        if len(dims) != len(first) or not all(_dim_eq(x, y) for x, y in zip(first, dims)):
+        if len(dims) != len(first) or not all(same(x, y) for x, y in zip(first, dims)):
             provable = len(dims) != len(first) or any(
                 _dims_provably_ne(x, y) for x, y in zip(first, dims)
             )

@@ -1194,7 +1194,7 @@ def test_callsite_formula_returns() -> None:
         41: f'"{f64.format("Literal[3], Literal[7]")}"',
     }, result.stdout
     assert _run_fixture("callsite_formula_ok.py") == [
-        "(7, 13)", "(4, 5)", "(3, 4)", "(3, 2)", "(3, 4)", "(3, 7)",
+        "(7, 13)", "(4, 5)", "(3, 4)", "(3, 2)", "(1, 2)", "(3, 7)",
     ]
 
 
@@ -1352,8 +1352,8 @@ def test_ret_int_ok() -> None:
     }
     f64 = "numpy.dtype[numpy.float64]"
     assert notes == {
-        93: '"numpy.ndarray[tuple[?N@93], numpy.dtype[numpy.bool[Any]]]"',
-        94: '"numpy.ndarray[tuple[?N@94], numpy.dtype[numpy.bool[Any]]]"',
+        93: '"numpy.ndarray[tuple[?N@93], numpy.dtype[numpy.bool[bool]]]"',
+        94: '"numpy.ndarray[tuple[?N@94], numpy.dtype[numpy.bool[bool]]]"',
         95: f'"numpy.ndarray[tuple[Literal[4]], {f64}]"',
     }, result.stdout
     assert _run_fixture("ret_int_ok.py") == [
@@ -5274,6 +5274,175 @@ def test_bad_own_size_return() -> None:
     assert _run_fixture("bad_own_size_return.py") == ["(3,) (4,)"]
 
 
+def test_free_return_forms() -> None:
+    # Issue 357: a free return name in a forwarded tuple, in a union whose
+    # members differ in dtype alone, inside a formula (`K+1` takes an
+    # unknown plus one), and bare in a returned tuple. At a call `K+1` and
+    # a bare `K` share the unknown the call gives `K`.
+    result = run_mypy(FIXTURES / "free_return_forms_ok.py")
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[52] == (
+        f'"tuple[numpy.ndarray[tuple[?K@52], {_F64}], numpy.ndarray[tuple[?K@52], {_F64}]]"'
+    ), result.stdout
+    assert notes[53] == f'"numpy.ndarray[tuple[?K@48+1], {_F64}]"', result.stdout
+    assert notes[54] == (
+        f'"tuple[numpy.ndarray[tuple[?K@49], {_F64}], numpy.ndarray[tuple[?K@49+1], {_F64}]]"'
+    ), result.stdout
+    assert notes[55] == '"?K@50"', result.stdout
+    assert notes[56] == f'"numpy.ndarray[tuple[?K@50], {_F64}]"', result.stdout
+    assert notes[57] == f'"numpy.ndarray[tuple[?K@50], {_F64}]"', result.stdout
+    # A caller whose own parameter is annotated with the same module-level
+    # `K` still gets the callee's `K` as the call's size.
+    assert notes[88] == (
+        f'"tuple[numpy.ndarray[tuple[?K@88], {_F64}], numpy.ndarray[tuple[?K@88+1], {_F64}]]"'
+    ), result.stdout
+    assert notes[89] == f'"numpy.ndarray[tuple[?K@89+1], {_F64}]"', result.stdout
+    # A name a `Callable` or `type[...]` parameter mentions is mypy's to solve.
+    assert notes[94] == '"Literal[3]"', result.stdout
+    assert notes[95] == '"int"', result.stdout
+    assert notes[96] == f'"tuple[numpy.ndarray[tuple[Literal[2]], {_F64}], Literal[2]]"', result.stdout
+    assert _run_fixture("free_return_forms_ok.py") == ["(2,) (2,) (3,) (3,) 2 (2,)", "3 0 2"]
+
+
+def test_bad_free_return_forms() -> None:
+    # Issue 357: two sizes under one free name are refused through a
+    # forwarded tuple and a formula, and a value that does not fit keeps
+    # its literal sizes (the name is not printed over the 3).
+    result = run_mypy(FIXTURES / "bad_free_return_forms.py")
+    errors = _errors_by_line(result)
+    assert sorted(errors) == [18, 23, 28, 32], result.stdout
+    for line in errors:
+        assert len(errors[line]) == 1 and errors[line][0].endswith("[return-value]"), result.stdout
+    assert "ndarray[tuple[?J@18]" in errors[18][0], result.stdout
+    assert 'got "ndarray[tuple[?U@22+2]' in errors[23][0], result.stdout
+    assert "ndarray[tuple[K+2]" in errors[28][0], result.stdout
+    assert 'got "ndarray[tuple[Literal[3], Literal[5]]' in errors[32][0], result.stdout
+    assert _run_fixture("bad_free_return_forms.py") == ["(1,)"]
+
+
+def test_generic_class_sizes() -> None:
+    # Issue 358: a method returning a formula over the class's names is in
+    # the receiver's terms; a formula is a type argument, in an annotation
+    # and (with an ignore for mypy's own expression check) a base class; a
+    # free name in a class return takes a size born in the body and is the
+    # call's own size. A size parameter keeps its declared variance, so a
+    # method or a property setter takes the bare name without mypy's
+    # covariant-parameter error.
+    fixture = "generic_class_sizes_ok.py"
+    result = run_mypy(FIXTURES / fixture)
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    assert notes[74] == f'"numpy.ndarray[tuple[N, Literal[3]], {_F64}]"', result.stdout
+    assert notes[75] == f'"numpy.ndarray[tuple[N, J-1], {_F64}]"', result.stdout
+    assert notes[76] == f'"numpy.ndarray[tuple[Literal[9], Literal[4]], {_F64}]"', result.stdout
+    assert notes[77] == '"tests.fixtures.generic_class_sizes_ok.Model[N, N-1]"', result.stdout
+    assert notes[78] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
+    assert notes[79] == f'"numpy.ndarray[tuple[?W@79], {_F64}]"', result.stdout
+    assert notes[80] == f'"numpy.ndarray[tuple[Literal[4]], {_F64}]"', result.stdout
+    # A protocol's formula position written `int` matches the class's formula.
+    assert notes[94] == f'"numpy.ndarray[tuple[int, Literal[4]], {_F64}]"', result.stdout
+    assert _run_fixture(fixture) == ["(2, 3) (9, 4) 2 (4,)"]
+
+
+def test_bad_generic_class_sizes() -> None:
+    # Issue 358: a class's size parameters keep their declared variance, so
+    # two arguments that give one name two sizes are mypy's own error, also
+    # through *args; a formula method result and a formula type argument
+    # keep checking. A formula parameter is held to the size another
+    # parameter gives its name, for a class's type arguments and an
+    # array's axes alike (mypy solves the formula as a name of its own).
+    # mypy's `Cannot infer value of type parameter` lines carry
+    # `# type: ignore[misc]`, which --warn-unused-ignores proves still fire.
+    result = run_mypy(FIXTURES / "bad_generic_class_sizes.py", flags=("--warn-unused-ignores",))
+    errors = _messages_by_line(result)
+    assert sorted(errors) == [44, 59, *range(65, 70)], result.stdout
+    for line in errors:
+        assert len(errors[line]) == 1, result.stdout
+    assert 'got "Model[N, N]", expected "Model[N, W]"' in errors[44][0], result.stdout
+    assert "J vs J-1" in errors[59][0] and errors[59][0].endswith("[numty-broadcast]"), result.stdout
+    assert errors[65][0].endswith("[assignment]"), result.stdout
+    assert '"Model[Literal[5], Literal[4]]"' in errors[66][0], result.stdout
+    assert errors[67][0] == (
+        "call-site shape conflict for 'N': N (argument 'm', type argument 0) gives N+1, "
+        "not N (argument 'm', type argument 1)  [numty-callsite]"
+    ), result.stdout
+    assert errors[68][0] == (
+        "call-site shape conflict for 'N': N = 5 (argument 'm', type argument 0) makes N+1 equal 6, "
+        "not 5 (argument 'm', type argument 1)  [numty-callsite]"
+    ), result.stdout
+    assert errors[69][0] == (
+        "call-site shape conflict for 'N': N = 5 (argument 'y', axis 0) makes N+1 equal 6, "
+        "not 4 (argument 'w', axis 0)  [numty-callsite]"
+    ), result.stdout
+    assert _run_fixture("bad_generic_class_sizes.py") == ["(2, 2)"]
+
+
+def test_bad_names_messages() -> None:
+    # Issue 363: a `Callable` parameter binds no name at a call, so a
+    # mismatched argument is mypy's `[arg-type]` alone (it was also a
+    # names report naming `argument '?'`); a names report inside an
+    # operand is the operator's only error, on either side of it.
+    # Only a numty report in an operand does that: another error there
+    # (a wrong call) keeps mypy's own check of the operand type.
+    result = run_mypy(FIXTURES / "bad_names_messages.py")
+    messages = _messages_by_line(result)
+    assert sorted(messages) == [22, 26, 27, 28, 29, 30, 31, 36], result.stdout
+    assert all(len(texts) == 1 for line, texts in messages.items() if line != 36), result.stdout
+    assert messages[22][0].startswith("Argument 1 has incompatible type"), result.stdout
+    assert messages[22][0].endswith("[arg-type]"), result.stdout
+    assert sorted(text.rsplit("[", 1)[1] for text in messages[36]) == ["call-arg]", "operator]"], result.stdout
+    for line in range(26, 32):
+        assert messages[line] == [
+            "matmul inner dimensions (shapes (S, S) vs (I,)): S and I are different names  [numty-names]"
+        ], result.stdout
+    assert _run_fixture("bad_names_messages.py") == ["(2,)"]
+
+
+def test_dtype_generic_shapes() -> None:
+    # Issue 362: `Floating` and `Arr[PT, ...]` with `PT` bound by
+    # `np.inexact` keep their shapes through linalg (qr, inv), joins,
+    # reductions and a scalar element (`PT`, whose product with an array
+    # has the array's shape); `Arr` takes a TypeVar with values; the
+    # `Bool` head is `bool[bool]` as `np.bool` is, and `np.where` of a
+    # `Bool[N]` call result is rank-1 positions.
+    fixture = "dtype_generic_shapes_ok.py"
+    result = run_mypy(FIXTURES / fixture)
+    assert result.returncode == 0, result.stdout
+    notes = reveals_by_line(result)
+    floating = "numpy.dtype[numpy.floating[Any]]"
+    assert notes[29] == f'"numpy.ndarray[tuple[n, n], {floating}]"', result.stdout
+    assert notes[30] == '"numpy.ndarray[tuple[n, n], numpy.dtype[PT]]"', result.stdout
+    assert notes[31] == f'"numpy.ndarray[tuple[2*n, n], {floating}]"', result.stdout
+    assert notes[32] == '"numpy.ndarray[tuple[2*n, n], numpy.dtype[PT]]"', result.stdout
+    assert notes[33] == '"numpy.ndarray[tuple[n], numpy.dtype[PT]]"', result.stdout
+    assert notes[34] == '"PT"', result.stdout
+    assert notes[35] == '"numpy.ndarray[tuple[n, n], numpy.dtype[Any]]"', result.stdout
+    assert notes[36] == f'"numpy.ndarray[tuple[int], {_BOOL}]"', result.stdout
+    assert notes[37] == f'"numpy.ndarray[tuple[?U@37], {_I64}]"', result.stdout
+    # The arrays of one `np.nonzero` of an `int`-sized input share their
+    # unknown, so stacking them keeps the shape.
+    assert notes[44] == f'"numpy.ndarray[tuple[Literal[2], ?U@44], {_I64}]"', result.stdout
+    assert _run_fixture(fixture) == ["(2, 2) (4, 2) (2,) (2, 2)", "(2, 2)", "(3,) (2,)"]
+
+
+def test_bad_dtype_generic_shapes() -> None:
+    # Issue 362: the dtype-generic spellings catch what their F64 twins do;
+    # an `Arr` TypeVar with a value that is not a numpy scalar type says so.
+    result = run_mypy(FIXTURES / "bad_dtype_generic_shapes.py")
+    messages = _messages_by_line(result)
+    assert sorted(messages) == [13, 14, 15, 16, 19], result.stdout
+    assert all(len(texts) == 1 for texts in messages.values()), result.stdout
+    for line in (13, 14, 16):
+        assert messages[line] == ["matmul inner dimensions disagree: n vs n-1  [numty-shape]"], result.stdout
+    assert messages[15][0].endswith("2*n and n are different names  [numty-names]"), result.stdout
+    assert messages[19] == [
+        'Arr dtype "U" must be a TypeVar whose values are numpy scalar types'
+        ' (e.g. TypeVar("T", np.float64, np.complex128))  [numty-annotation]'
+    ], result.stdout
+    assert _run_fixture("bad_dtype_generic_shapes.py") == ["(2, 2) (1, 2)"]
+
+
 def test_bad_own_size_optin() -> None:
     # Issues 306/307 (opt-in): the size a call chose, and the size an
     # object's properties name, are sizes of their own. Silent with numty-names off.
@@ -6234,7 +6403,7 @@ def test_zero_d_head_ok() -> None:
     assert reveals_by_line(result) == {
         27: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[numpy._typing._nbit_base._32Bit]]]"',
         28: f'"{_ND}[tuple[()], numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]]"',
-        29: f'"{_ND}[tuple[()], numpy.dtype[numpy.bool[Any]]]"',
+        29: f'"{_ND}[tuple[()], numpy.dtype[numpy.bool[bool]]]"',
         30: f'"{_ND}[tuple[()], numpy.dtype[numpy.floating[Any]]]"',
         31: f'"{_ND}[tuple[()], {_F64}]"',
         39: f'"{_ND}[tuple[()], {_F64}]"',
@@ -6376,7 +6545,7 @@ def test_matrix_ops_symbolic() -> None:
         55: f'"{_ND}[tuple[?U@52], {_F64}]"',
         # The inverse maps every input element back: the input's shape.
         57: f'"{_ND}[tuple[N], {_I64}]"',
-        58: f'"tuple[{_ND}[tuple[?U@58], numpy.dtype[numpy.bool[Any]]], {_ND}[tuple[N, D], {_I64}]]"',
+        58: f'"tuple[{_ND}[tuple[?U@58], numpy.dtype[numpy.bool[bool]]], {_ND}[tuple[N, D], {_I64}]]"',
     }, result.stdout
     assert _run_fixture("matrix_symbolic_ok.py") == [
         "(3, 3) (4, 4) (3, 5) (3, 3)",
@@ -6668,8 +6837,10 @@ def test_kept_names_catch_later_bugs() -> None:
         'expected "ndarray[tuple[N, H], dtype[float64]]")  [return-value]'
     )
     assert messages[13] == messages[17] == [swapped], result.stdout
+    # The value does not fit (2*N on axis 1), so its own unknown is not
+    # renamed `K` (issue 357).
     assert messages[25] == [
-        'Incompatible return value type (got "ndarray[tuple[N, 2*N, K], dtype[float64]]", '
+        'Incompatible return value type (got "ndarray[tuple[N, 2*N, ?U@25], dtype[float64]]", '
         'expected "ndarray[tuple[N, N, K], dtype[float64]]")  [return-value]'
     ], result.stdout
     assert messages[29] == [

@@ -8,8 +8,10 @@ function-local facade import is used only for a monkeypatch seam
 from __future__ import annotations
 
 from mypy.expandtype import expand_type
+from mypy.maptype import map_instance_to_supertype
 from mypy.nodes import ARG_NAMED, ARG_NAMED_OPT, ARG_OPT, ARG_POS, ARG_STAR, Expression, ListExpr, StarExpr, TupleExpr
 from mypy.plugin import FunctionSigContext, MethodSigContext
+from mypy.typeops import get_all_type_vars
 from mypy.types import (
     AnyType, CallableType, Instance, LiteralType, NoneType, TupleType, Type, TypeAliasType, TypeOfAny,
     TypeVarId, TypeVarLikeType, TypeVarTupleType, TypeVarType, UnionType, UnpackType, get_proper_type,
@@ -20,7 +22,7 @@ from ._unknowns import _fresh_own_size
 from ._forms import _LinForm, _form_has_unknown
 from ._exprs import (
     _EXPR_PREFIX, _expr_constituents, _expr_forms, _expr_ids, _expr_str, _form_of, _iter_tvarlikes,
-    _lookup_ns, _ns_of_ctx, _seen_vars, _short_var,
+    _lookup_ns, _ns_of_ctx, _seen_vars, _short_var, _signature_names,
 )
 from ._types import (
     INT_FULLNAME, NDARRAY_FULLNAME, _dim_value, _has_unknown_shape, _optional_members, _parts_or_unpack,
@@ -29,7 +31,7 @@ from ._types import (
 
 
 def _formal_name(sig: CallableType, i: int) -> str:
-    """The name of formal `i` for a message, or "?" when it has none.
+    """The name of formal `i` for a message, or its position from 1 when it has none (see `_arg_phrase`).
 
     Issue 335: a positional-only parameter (`def __call__(self, Z, /)`,
     the usual spelling of a callback Protocol) has no name in the
@@ -48,7 +50,14 @@ def _formal_name(sig: CallableType, i: int) -> str:
                 return found
     except Exception:
         _swallowed(None, "_formal_name")
-    return "?"
+    # A `Callable[[...], ...]` value names none of its parameters:
+    # its position, as mypy's `Argument 1` (issue 363).
+    return str(i + 1)
+
+
+def _arg_phrase(name: str) -> str:
+    """`argument 'x'` for a named formal, `argument 1` for one known by its position (`_formal_name`)."""
+    return f"argument {name}" if name.isdigit() else f"argument '{name}'"
 
 
 def _shape_tvar_formals(sig: CallableType) -> list[tuple[int, list[tuple[int, TypeVarType]]]]:
@@ -312,6 +321,11 @@ def _pairs_for_actual(
     return []
 
 
+def _where(axis: int) -> str:
+    """`axis 1`, or for a class's type argument (a negative axis, see `_sized_positions`) `type argument 0`."""
+    return f"axis {axis}" if axis >= 0 else f"type argument {-1 - axis}"
+
+
 def _conflict_pairs(
     sig: CallableType,
     ctx: FunctionSigContext | MethodSigContext,
@@ -339,7 +353,10 @@ def _conflict_pairs(
             # binds to it, so each one is checked.
             for expr in actuals:
                 out.extend(_pairs_for_actual(fname, tp, expr, ctx))
-    return out
+    # Only a name the call binds (issue 363): a caller's name in a
+    # `Callable[[F64[N]], ...]` parameter is mypy's `[arg-type]`.
+    own = {v.id for v in sig.variables}
+    return [pair for pair in out if pair[2].id in own]
 
 
 def _emit_call_site_conflicts(
@@ -365,8 +382,8 @@ def _emit_call_site_conflicts(
             if other[2] != first[2]:
                 message = (
                     f"call-site shape conflict for '{name}': "
-                    f"{first[2]} (argument '{first[0]}', axis {first[1]}) vs "
-                    f"{other[2]} (argument '{other[0]}', axis {other[1]})"
+                    f"{first[2]} ({_arg_phrase(first[0])}, {_where(first[1])}) vs "
+                    f"{other[2]} ({_arg_phrase(other[0])}, {_where(other[1])})"
                 )
                 # No dedup here (issue #44): mypy already collapses
                 # identical messages on one line, and a process-lifetime
@@ -396,7 +413,8 @@ def _callsite_formula_return(
         if new_ret is not None:
             # Formula variables only the old return mentioned are no longer
             # the callee's to bind (see the note in `_substitute_return_exprs`).
-            formal_ids = {tv.id for formal in sig.arg_types for tv in _iter_tvarlikes(formal)}
+            # Also a name in a `Callable[..., F64[K]]` formal (issue 357).
+            formal_ids = {tv.id for formal in sig.arg_types for tv in get_all_type_vars(formal)}
             ret_ids = {tv.id for tv in _iter_tvarlikes(new_ret)}
             sig = sig.copy_modified(
                 ret_type=new_ret,
@@ -410,6 +428,84 @@ def _callsite_formula_return(
     except Exception:
         _swallowed(ctx, "_callsite_formula_return")
         return sig
+
+
+def _receiver_bindings(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> dict[str, int | Type]:
+    """The sizes the receiver of a method call gives its class's names, by fullname (issue 358).
+
+    `MN(w4).resid()` with `MN[N, Literal[4]]` gives `J` 4. The class is
+    the one that defines the method, so a subclass receiver is mapped to
+    it first. Only literals and names are given; `int` and `Any` are not
+    sizes to put in a formula.
+    """
+    if not isinstance(ctx, MethodSigContext):
+        return {}
+    receiver = get_proper_type(ctx.type)
+    info = getattr(sig.definition, "info", None)
+    if not isinstance(receiver, Instance) or info is None or info not in receiver.type.mro:
+        return {}
+    try:
+        mapped = map_instance_to_supertype(receiver, info)
+    except Exception:
+        _swallowed(ctx, "_receiver_bindings")
+        return {}
+    out: dict[str, int | Type] = {}
+    for tv, arg in zip(info.defn.type_vars, mapped.args):
+        proper = get_proper_type(arg)
+        if not isinstance(tv, TypeVarType):
+            continue
+        if isinstance(proper, LiteralType) and isinstance(proper.value, int) and not isinstance(proper.value, bool):
+            out[tv.fullname] = proper.value
+        elif isinstance(proper, TypeVarType):
+            out[tv.fullname] = proper
+    return out
+
+
+def _is_int_bound(tv: TypeVarType) -> bool:
+    upper = get_proper_type(tv.upper_bound)
+    return isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME
+
+
+def _substitute_size(
+    sig: CallableType,
+    dim: TypeVarType,
+    bindings: dict[str, int | Type | _LinForm],
+    ctx: FunctionSigContext | MethodSigContext,
+    seen: frozenset[TypeAliasType],
+) -> Type | None:
+    """One size of a return outside an array, in the caller's terms (None when nothing changed)."""
+    try:
+        shape = TupleType([dim], ctx.api.named_generic_type("builtins.tuple", [AnyType(TypeOfAny.special_form)]))
+        array = ctx.api.named_generic_type(NDARRAY_FULLNAME, [shape, AnyType(TypeOfAny.special_form)])
+        sub = get_proper_type(_substitute_return_exprs(sig.copy_modified(ret_type=array), bindings, ctx, seen))
+    except Exception:
+        _swallowed(ctx, "_substitute_size")
+        return None
+    if not isinstance(sub, Instance) or len(sub.args) != 2:
+        return None
+    items = get_proper_type(sub.args[0])
+    if not isinstance(items, TupleType) or len(items.items) != 1:
+        return None
+    return items.items[0]
+
+
+def _enclosing_names(sig: CallableType, ctx: FunctionSigContext | MethodSigContext) -> set[str]:
+    """Names the scope of the callee binds: its class's, or for a local function the caller's.
+
+    A function defined at the top of a module or in a class binds a
+    name its parameters do not mention only through its class; one
+    defined in a function (its fullname is not qualified, or a local
+    class's carries `@line`) also sees the names of the functions
+    around it, which hold the call too.
+    """
+    definition = sig.definition
+    fullname = getattr(definition, "fullname", None) or ""
+    if definition is not None and "." in fullname and "@" not in fullname:
+        info = getattr(definition, "info", None)
+        return {tv.fullname for tv in getattr(getattr(info, "defn", None), "type_vars", None) or []}
+    scope = getattr(ctx.api, "scope", None)
+    func = scope.current_function() if scope is not None else None
+    return _signature_names(scope, func) if func is not None else set()
 
 
 def _settle_any_bound(sig: CallableType, bindings: dict[str, int | Type | _LinForm]) -> CallableType:
@@ -518,7 +614,7 @@ def _callsite_expr_bindings(
                         ctx.api.fail(
                             f"call-site shape conflict: no size '{_short_var(m_full)}' "
                             f"makes {_expr_str(form_f)} equal {fa.const} "
-                            f"(argument '{_formal_name(sig, i)}', axis {dim})",
+                            f"({_arg_phrase(_formal_name(sig, i))}, axis {dim})",
                             ctx.context,
                             code=NUMTY_CALLSITE,
                         )
@@ -697,12 +793,13 @@ def _substitute_return_exprs(
         _swallowed(ctx, "_substitute_return_exprs")
         pass
     # Dims mypy infers by itself: every variable a formal mentions,
-    # wherever it sits (`x: F64["N+1"]`, `xs: dict[str, F64[N, M]]`).
+    # wherever it sits (`x: F64["N+1"]`, `xs: dict[str, F64[N, M]]`), also
+    # through a `Callable[..., K]` or a `type[K]` (issue 357).
     inferred: set[str] = set()
     for formal in sig.arg_types:
         try:
             inferred.update(
-                tv.fullname for tv in _iter_tvarlikes(formal) if isinstance(tv, TypeVarType)
+                tv.fullname for tv in get_all_type_vars(formal) if isinstance(tv, TypeVarType)
             )
         except Exception:
             _swallowed(ctx, "_substitute_return_exprs")
@@ -711,7 +808,7 @@ def _substitute_return_exprs(
     in_formula: set[str] = set()
     for formal in sig.arg_types:
         try:
-            for tv in _iter_tvarlikes(formal):
+            for tv in get_all_type_vars(formal):
                 form = _form_of(tv) if isinstance(tv, TypeVarType) else None
                 if isinstance(form, _LinForm):
                     in_formula.update(name for name, _ in form.coeffs)
@@ -739,6 +836,21 @@ def _substitute_return_exprs(
         except Exception:
             _swallowed(ctx, "_substitute_return_exprs")
             return None
+        if (
+            isinstance(proper_ret, TypeVarType)
+            and not proper_ret.fullname.startswith(_EXPR_PREFIX)
+            and proper_ret.fullname not in bindings
+            and proper_ret.fullname not in inferred
+            and proper_ret.fullname not in in_formula
+            and proper_ret.id in {v.id for v in sig.variables}
+            # A `Callable` value's names are its holder's (issue #35).
+            and sig.definition is not None
+            and not proper_ret.values
+            and _is_int_bound(proper_ret)
+        ):
+            # A bare name of the return alone (`-> tuple[K, F64[K]]`):
+            # the size the call chose, as in an array position (issue 357).
+            return _fresh_own_size(ctx, proper_ret.name, proper_ret.fullname)
         if isinstance(proper_ret, TupleType):
             # Issues 244/220: a generic NamedTuple value is a TupleType
             # whose fallback is the NamedTuple Instance. Substituting field
@@ -932,6 +1044,14 @@ def _substitute_return_exprs(
                         new_args.append(b)
                         changed_a = True
                     continue
+                if isinstance(ap, TypeVarType) and ap.fullname.startswith(_EXPR_PREFIX):
+                    # A formula type argument (`-> Model[N, "N-1"]`, issue
+                    # 358): solved as the one size of an array would be.
+                    sized = _substitute_size(sig, ap, bindings, ctx, _seen)
+                    if sized is not None:
+                        new_args.append(sized)
+                        changed_a = True
+                        continue
                 # Nested ndarray inside generic arg: recurse.
                 try:
                     sub_sig_a = sig.copy_modified(ret_type=arg)
@@ -956,6 +1076,7 @@ def _substitute_return_exprs(
     new_dims: list[int | Type] = []
     changed = False
     own_ids = {v.id for v in sig.variables}
+    receiver = _receiver_bindings(sig, ctx)
     # For building new expr vars we need constituent objects by fullname.
     # Caller-ns first (Phase 4 Phase 1 namespaced B keys), then any-ns.
     obj_by_fullname: dict[str, TypeVarType] = {}
@@ -1027,6 +1148,28 @@ def _substitute_return_exprs(
                 form_r = form_early
             else:
                 return None
+            for cfull, _ in form_r.coeffs:
+                if cfull not in bindings and cfull in receiver:
+                    # A name of the receiver's class (`-> F64[N, "J-1"]`
+                    # on `MN[N, Literal[4]]`): mypy puts the class's
+                    # arguments in for plain names only (issue 358).
+                    bindings = {**bindings, cfull: receiver[cfull]}
+                if (
+                    cfull not in bindings
+                    and d.id in own_ids
+                    and sig.definition is not None
+                    and cfull not in inferred
+                    and cfull not in in_formula
+                    and not cfull.startswith(_EXPR_PREFIX)
+                    and cfull not in _enclosing_names(sig, ctx)
+                ):
+                    # A name of the return alone inside a formula
+                    # (`-> F64["K+1"]`): the size the call chose for
+                    # `K`, shared with the positions declared `K`
+                    # (issue 357).
+                    own = _fresh_own_size(ctx, cfull.rsplit(".", 1)[-1], cfull)
+                    bindings = {**bindings, cfull: own}
+                    obj_by_fullname[own.fullname] = own
             if any(cfull not in bindings for cfull, _ in form_r.coeffs):
                 # A name the call did not bind: mypy's own answer if
                 # the whole dim is a formal dim, else nothing is known.

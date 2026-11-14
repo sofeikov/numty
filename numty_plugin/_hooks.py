@@ -20,17 +20,18 @@ from mypy.plugin import (
     MethodSigContext, Plugin, ReportConfigContext,
 )
 from mypy.types import (
-    AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
+    AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, RawExpressionType,
+    TupleType, Type,
     TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
     from mypy.tvar_scope import TypeVarLikeScope
     from mypy.typeanal import TypeAnalyser
-    from mypy.types import RawExpressionType, UnboundType
+    from mypy.types import UnboundType
 
 from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, _CANARY_BY_MODULE, _swallowed, _warn_startup
-from ._errors import _quiet_type
+from ._errors import _checked_operand, _quiet_type
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -111,7 +112,8 @@ from ._broadcast import (
     truediv_method_hook, ufunc_call_hook, ufunc_function_hook, where_function_hook,
 )
 from ._heads import (
-    _FAM_HEAD_DTYPES, _arr_head, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words, _fam_ensure_implicit,
+    _FAM_HEAD_DTYPES, _arr_head, _class_type_arg, _fam_applied, _fam_arg, _fam_bare, _fam_bind_words,
+    _fam_ensure_implicit,
     _fam_expr, _fam_head, _fam_string, _index_head,
 )
 from ._exprs import _iter_tvarlikes
@@ -606,8 +608,28 @@ class NumtyPlugin(Plugin):
         info = sym.node
         if not info.type_vars:
             return None
-        if not _info_mentions_array(info):
+        if fullname in self._bare_tuple_guard:
             return None
+        if not _info_mentions_array(info):
+            # A class whose fields are not analyzed yet (a base class
+            # list, `class AR(Model[N, "N-1"])`) still takes a formula
+            # as a type argument (issue 358); anything else is mypy's.
+
+            def formula_args_hook(ctx: AnalyzeTypeContext) -> Type:
+                if any(
+                    isinstance(a, RawExpressionType) and isinstance(a.literal_value, str) for a in ctx.type.args
+                ):
+                    try:
+                        return ctx.api.named_type(fullname, [self._class_arg(ctx, fullname, a) for a in ctx.type.args])
+                    except Exception:
+                        _swallowed(ctx, "formula_args_hook")
+                self._bare_tuple_guard.add(fullname)
+                try:
+                    return ctx.api.analyze_type(ctx.type)
+                finally:
+                    self._bare_tuple_guard.discard(fullname)
+
+            return formula_args_hook
         # Issues #219/#221: a generic NamedTuple (e.g. Block[int]) must keep
         # mypy's default TupleType handling, which carries per-field types for
         # _replace self-checks and tuple unpacking. Rebuilding via named_type
@@ -621,7 +643,7 @@ class NumtyPlugin(Plugin):
             or getattr(info, "tuple_type", None) is not None
             or getattr(info, "typeddict_type", None) is not None
         ):
-            if fullname in self._bare_tuple_guard or getattr(info, "typeddict_type", None) is not None:
+            if getattr(info, "typeddict_type", None) is not None:
                 return None
 
             def bare_tuple_hook(ctx: AnalyzeTypeContext) -> Type:
@@ -644,7 +666,7 @@ class NumtyPlugin(Plugin):
         def bare_hook(ctx: AnalyzeTypeContext) -> Type:
             try:
                 if list(ctx.type.args):
-                    analyzed = [ctx.api.analyze_type(a) for a in ctx.type.args]
+                    analyzed = [self._class_arg(ctx, fullname, a) for a in ctx.type.args]
                     return ctx.api.named_type(fullname, analyzed)
             except Exception:
                 _swallowed(ctx, "bare_hook")
@@ -663,6 +685,9 @@ class NumtyPlugin(Plugin):
             return AnyType(TypeOfAny.from_error)
 
         return bare_hook
+
+    def _class_arg(self, ctx: AnalyzeTypeContext, fullname: str, arg: Type) -> Type:
+        return _class_type_arg(ctx, fullname, arg, self._fam_late_bound)
 
     # Phase 3 (#197) delegators: _fam_* bodies live in _heads.py as
     # module functions taking late_bound explicitly (same object as
@@ -1099,11 +1124,16 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             uu_right: Type | None = None
             if isinstance(call, _OpExpr0):
                 try:
-                    uu_left = _quiet_type(ctx, call.left)
-                    uu_right = _quiet_type(ctx, call.right)
+                    uu_left, left_reports = _checked_operand(ctx, call.left)
+                    uu_right, right_reports = _checked_operand(ctx, call.right)
                 except Exception:
                     _swallowed(ctx, "_broadcast_signature_hook")
                     uu_left = uu_right = None
+                    left_reports = right_reports = False
+                if left_reports or right_reports:
+                    # An operand that reports fails every overload, and
+                    # mypy adds `Unsupported operand types` (issue 363).
+                    return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
             elif isinstance(call, _CallExpr0) and call.args:
                 try:
                     uu_right = _quiet_type(ctx, call.args[0])
@@ -1329,6 +1359,9 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         from mypy.nodes import OpExpr as _OpExpr
 
         call = ctx.context
+        if isinstance(call, _OpExpr) and any(_checked_operand(ctx, side)[1] for side in (call.left, call.right)):
+            # An operand that reports fails every overload (issue 363).
+            return sig.copy_modified(arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types])
         left_tp: Type | None = None
         right_tp: Type | None = None
         if isinstance(call, _OpExpr):

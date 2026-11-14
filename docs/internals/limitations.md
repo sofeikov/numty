@@ -46,7 +46,10 @@ quiet, where it is approximate, and what to write instead.
     with a bad `n`). Ours is the readable one. An index error no longer
     gets mypy's `Invalid index type` on top (issue 333): it is reported
     past the overload trial that mypy runs for a key that is not all
-    arrays, so the trial does not fail.
+    arrays, so the trial does not fail. The same holds for an operator
+    whose operand reports (`v - np.dot(A, x)` with a names report inside
+    the `dot`): mypy no longer adds `Unsupported operand types` (issue
+    363).
 - Test runs use a dedicated mypy cache dir cleared per suite run (see
     `test_static.py`): mypy does not reliably invalidate plugin results
     across plugin edits, so never trust the default cache while hacking
@@ -76,6 +79,25 @@ quiet, where it is approximate, and what to write instead.
     overloaded numpy call dissolves to `Any` (mypy keeps the
     overload-inferred type over the hook result): hoist it to a local
     first (`kernel = gaussian_kernel(...); np.where(cond, kernel, 0.0)`).
+- A formula as a type argument of a base class (`class AR(Model[N,
+    "N-1"])`) is also read by mypy as a runtime expression, where a string
+    that is not a type is `Invalid type comment or annotation
+    [valid-type]`. numty still gives the base its formula; silence that
+    line with `# type: ignore[valid-type]`. In an annotation the formula
+    needs nothing (issue 358).
+- A `Protocol` member that returns a formula over the protocol's names
+    does not match a class that returns the same formula over its own:
+    mypy compares the two methods without putting the type arguments into
+    a formula (`2*X+1` against `2*N+1`). Declare the protocol's formula
+    position with `int` (issue 358).
+- A user generic class is invariant in its size parameters, as mypy
+    declares it: `Sys[N]` where `Sys[int]` is declared is accepted at a
+    call (issue 279) but not at a `return` or an annotated local, which
+    stay mypy's `[return-value]` and `[assignment]` errors (issue 358).
+    numty does not make the parameters covariant: mypy would then refuse
+    every method that takes the bare name (`def resize(self, n: N)`).
+    Where the class never takes the name in a method, declare the
+    variable `covariant=True` yourself.
 
 ## Symbolic sizes
 
@@ -134,7 +156,11 @@ quiet, where it is approximate, and what to write instead.
     unknown. So is a result dim that would be spelled exactly like one
     of the callee's own formula parameters over the same module-level
     name: `def g(x: F64[N], y: F64["N+1"]) -> F64[N]` called with an
-    `N+1`-sized `x` returns an unknown size, not `N+1`.
+    `N+1`-sized `x` returns an unknown size, not `N+1`. A formula
+    parameter whose names another parameter gives is held to them
+    (`F64[5]` and `F64[4]` for `x` and `y` is `N = 5 ... makes N+1 equal
+    6, not 4`, issue 358); a formula against a size with an unknown in
+    it, or a factor apart (`2*N` against `N`), is not reported.
 
 ## Dynamic shapes and dtypes
 

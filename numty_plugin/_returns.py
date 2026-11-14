@@ -33,13 +33,16 @@ from mypy.nodes import (
 from mypy.types import LiteralType
 
 from ._errors import _swallowed
-from ._exprs import _EXPR_PREFIX, _implicit_scope_vars, _iter_tvarlikes, _ns_of_ctx, _resolve_dim
-from ._forms import _form_has_unknown, _is_unknown_fullname
+from ._exprs import (
+    _EXPR_PREFIX, _form_names, _form_of, _implicit_scope_vars, _iter_tvarlikes, _ns_of_ctx, _resolve_dim,
+    _signature_names,
+)
+from ._forms import _LinForm, _form_has_unknown, _is_unknown_fullname
 from ._types import _OWN_NAME_OF, INT_FULLNAME, NDARRAY_FULLNAME
 from ._unknowns import _AST_REPEATED, _module_ast
 
 
-def _is_dynamic_return_dim(d: int | Type) -> bool:
+def _is_dynamic_return_dim(d: object) -> bool:
     """A dim the return-boundary rewrite turns into Any (issues #269/#271).
 
     A plain `int` (a builder's dynamic axis, e.g. `n` in `np.zeros(n)` or
@@ -249,7 +252,11 @@ def _declared_return_shapes(ctx: object, rank: int) -> list[list[Type]]:
             continue
         shape = get_proper_type(proper.args[0])
         if isinstance(shape, TupleType) and len(shape.items) == rank:
-            out.append([get_proper_type(item) for item in shape.items])
+            # Members that differ in dtype alone declare one shape
+            # (`F64[K] | Arr[np.complex128, K]`, issue 357).
+            items: list[Type] = [get_proper_type(item) for item in shape.items]
+            if items not in out:
+                out.append(items)
     return out
 
 
@@ -341,24 +348,7 @@ def _misplaced_name_axes(ctx: object, items: list[Type], shapes: list[list[Type]
         return set()
 
 
-_FREE_NAMES_CACHE: dict[int, tuple[object, dict[str, TypeVarType]]] = {}
-
-
-def _signature_names(scope: object, func: object) -> set[str]:
-    """Fullnames of the names a parameter (of `func` or an enclosing function) or a class binds."""
-    bound: set[str] = set()
-    for item in getattr(scope, "stack", []):
-        item_tp = get_proper_type(getattr(item, "type", None))
-        if isinstance(item_tp, CallableType):
-            for arg in item_tp.arg_types:
-                bound.update(tv.fullname for tv in _iter_tvarlikes(arg))
-        defn = getattr(item, "defn", None)  # a class on the stack
-        for tv in getattr(defn, "type_vars", None) or []:
-            bound.add(tv.fullname)
-    info = getattr(func, "info", None)
-    for tv in getattr(getattr(info, "defn", None), "type_vars", None) or []:
-        bound.add(tv.fullname)
-    return bound
+_FREE_NAMES_CACHE: dict[int, tuple[object, dict[str, TypeVarType], frozenset[str]]] = {}
 
 
 _BODY_NAMES_CACHE: dict[int, tuple[object, set[str]]] = {}
@@ -403,40 +393,103 @@ def _free_return_names(ctx: object) -> dict[str, TypeVarType]:
     an enclosing function binds, a formula and an unknown are not such
     names. A lambda has none.
     """
+    return _free_names(ctx)[0]
+
+
+def _free_formula_names(ctx: object) -> frozenset[str]:
+    """Fullnames of the free names (see `_free_return_names`) in a formula of the return (`F64["K+1"]`, issue 357)."""
+    return _free_names(ctx)[1]
+
+
+def _free_names(ctx: object) -> tuple[dict[str, TypeVarType], frozenset[str]]:
     scope = getattr(getattr(ctx, "api", None), "scope", None)
     func = scope.current_function() if scope is not None else None
     if func is None or isinstance(func, LambdaExpr):
-        return {}
+        return {}, frozenset()
     hit = _FREE_NAMES_CACHE.get(id(func))
     if hit is not None and hit[0] is func:
-        return hit[1]
+        return hit[1], hit[2]
     out: dict[str, TypeVarType] = {}
+    in_formula: set[str] = set()
     try:
         tp = get_proper_type(func.type)
         if isinstance(tp, CallableType):
             bound = _signature_names(scope, func)
             for tv in _iter_tvarlikes(tp.ret_type):
-                if (
-                    isinstance(tv, TypeVarType)
-                    and tv.fullname not in bound
-                    and not _is_unknown_fullname(tv.fullname)
-                    and not tv.fullname.startswith(_EXPR_PREFIX)
-                    and not tv.values
-                ):
+                if not isinstance(tv, TypeVarType) or _is_unknown_fullname(tv.fullname) or tv.values:
+                    continue
+                if tv.fullname.startswith(_EXPR_PREFIX):
+                    in_formula.update(
+                        name
+                        for name in _form_names(tv)
+                        if name not in bound and not _is_unknown_fullname(name) and not name.startswith(_EXPR_PREFIX)
+                    )
+                    continue
+                if tv.fullname not in bound:
                     upper = get_proper_type(tv.upper_bound)
                     if isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME:
                         out[tv.fullname] = tv
     except Exception:
         _swallowed(None, "_free_return_names")
-        out = {}
-    _FREE_NAMES_CACHE[id(func)] = (func, out)
-    return out
+        out, in_formula = {}, set()
+    _FREE_NAMES_CACHE[id(func)] = (func, out, frozenset(in_formula))
+    return out, frozenset(in_formula)
+
+
+def _formula_base(want: TypeVarType, have: Type, names: frozenset[str]) -> tuple[str, object] | None:
+    """The free name a formula position (`K+1`) gives `have`, and the size that leaves for the name (issue 357).
+
+    `K+c` takes a size that is an unknown plus `c` (`np.r_[r, 1.0]` with
+    `r` a selection), a literal of at least `c`, or an `int`; the name
+    is then the unknown, the literal less `c`, or the `int`.
+    """
+    form = _form_of(want)
+    if not isinstance(form, _LinForm) or len(form.coeffs) != 1 or form.coeffs[0][1] != 1:
+        return None
+    name = form.coeffs[0][0]
+    if name not in names:
+        return None
+    if _is_dynamic_return_dim(have):
+        return name, have
+    value = _literal_value(have)
+    if value is not None:
+        return (name, _LinForm((), value - form.const)) if value >= form.const else None
+    have_form = _form_of(have) if isinstance(have, TypeVarType) else None
+    if (
+        isinstance(have_form, _LinForm)
+        and len(have_form.coeffs) == 1
+        and have_form.coeffs[0][1] == 1
+        and _is_unknown_fullname(have_form.coeffs[0][0])
+        and have_form.const == form.const
+    ):
+        return name, _LinForm(((have_form.coeffs[0][0], 1),), 0)
+    return None
+
+
+def _size_key(dim: object) -> object:
+    """`dim` for comparing sizes given to one free name: a literal or a variable as its form."""
+    if isinstance(dim, _LinForm):
+        return dim
+    if isinstance(dim, Type):
+        value = _literal_value(dim)
+        if value is not None:
+            return _LinForm((), value)
+        if isinstance(dim, TypeVarType):
+            return _form_of(dim) or _LinForm(((dim.fullname, 1),), 0)
+    return dim
+
+
+def _literal_value(d: Type) -> int | None:
+    if isinstance(d, LiteralType) and isinstance(d.value, int):
+        return d.value
+    if isinstance(d, Instance) and d.type.fullname == INT_FULLNAME and d.last_known_value is not None:
+        value = d.last_known_value.value
+        return value if isinstance(value, int) else None
+    return None
 
 
 def _is_literal_dim(d: Type) -> bool:
-    if isinstance(d, LiteralType):
-        return isinstance(d.value, int)
-    return isinstance(d, Instance) and d.type.fullname == INT_FULLNAME and d.last_known_value is not None
+    return _literal_value(d) is not None
 
 
 def _is_born_dim(d: Type) -> bool:
@@ -453,6 +506,15 @@ def _is_born_dim(d: Type) -> bool:
     return False
 
 
+def _fits_declared(have: Type, want: Type) -> bool:
+    """Whether a size can be checked against the declared one as it stands: the same, or one side not followed."""
+    if have == want or isinstance(have, AnyType) or _is_born_dim(have):
+        return True
+    if _literal_value(want) is not None:
+        return _literal_value(have) == _literal_value(want)
+    return not isinstance(want, TypeVarType)
+
+
 def _array_shapes(tp: Type | None, rank: int) -> list[list[Type]]:
     """Shapes of the given rank among the array members of `tp` (an array, or a union with one)."""
     if tp is None:
@@ -466,7 +528,11 @@ def _array_shapes(tp: Type | None, rank: int) -> list[list[Type]]:
             continue
         shape = get_proper_type(inst.args[0])
         if isinstance(shape, TupleType) and len(shape.items) == rank:
-            out.append([get_proper_type(item) for item in shape.items])
+            # Members that differ in dtype alone declare one shape
+            # (`F64[K] | Arr[np.complex128, K]`, issue 357).
+            items: list[Type] = [get_proper_type(item) for item in shape.items]
+            if items not in out:
+                out.append(items)
     return out
 
 
@@ -577,10 +643,10 @@ def _shapes_at(declared: Type, p: int | None, rank: int) -> list[list[Type]]:
 # position is (tuple index, axis) for an item of the `return` itself,
 # and (tuple index, axis, line, column, item) for a binding of a local
 # that is returned there: each binding holds a size of its own.
-_OWN_RETURN_SIZES: dict[tuple[str, int, int, str], dict[tuple[int, ...], Type]] = {}
+_OWN_RETURN_SIZES: dict[tuple[str, int, int, str], dict[tuple[int, ...], object]] = {}
 
 
-def _fits_first(key: tuple[str, int, int, str], where: tuple[int, ...], dim: Type) -> bool:
+def _fits_first(key: tuple[str, int, int, str], where: tuple[int, ...], dim: object) -> bool:
     """Record `dim` for this position, and say whether it is the size the first position has.
 
     Every position a `return` declares with one free name must hold one
@@ -600,7 +666,7 @@ def _fits_first(key: tuple[str, int, int, str], where: tuple[int, ...], dim: Typ
     first = next((w for w, d in seen.items() if not _is_dynamic_return_dim(d)), where)
     if first == where:
         return True
-    return bool(seen[first] == dim)
+    return bool(_size_key(seen[first]) == _size_key(dim))
 
 
 def _plain_tuple(proper: TupleType) -> bool:
@@ -711,6 +777,98 @@ def _name_born_sizes(
     return _name_born_array(ctx, tp, None, 0)
 
 
+def _at_site(line: int, col: int) -> Callable[[ast.AST], bool]:
+    """Whether an `ast` node is the expression mypy places at `line`, `col`."""
+
+    def here(node: ast.AST) -> bool:
+        if (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col):
+            return True
+        # mypy places an operator at its left operand inside the
+        # parentheses: `(S**2) / n` is where `S**2` is, one column
+        # past the `(` (issue 330).
+        while isinstance(node, ast.BinOp):
+            node = node.left
+            if (node.lineno, node.col_offset) == (line, col):
+                return True
+        return False
+
+    return here
+
+
+def _name_born_class(ctx: FunctionContext | MethodContext, tp: Type) -> Type:
+    """`tp`, an object of a user generic class, with sizes born here written as their free name (issue 358).
+
+    `def ar(y: F64[N]) -> Model[N, W]` with `W` free: `return Model(y,
+    y[y > 0])` gives `Model[N, ?U]`, and the unknown takes `W` as it
+    would on an array axis. Only a value that is returned (whole, or as
+    an item of a returned tuple) under the class it is of takes it, and
+    every position declared with one name must hold one size.
+    """
+    proper = get_proper_type(tp)
+    if not isinstance(proper, Instance) or proper.type.fullname == NDARRAY_FULLNAME or not proper.args:
+        return tp
+    free = _free_return_names(ctx)
+    items = [get_proper_type(a) for a in proper.args]
+    if not free or not any(_is_born_dim(i) for i in items):
+        return tp
+    try:
+        tree = getattr(ctx.api, "tree", None)
+        path = getattr(tree, "path", None) if tree is not None else None
+        line = getattr(ctx.context, "line", None)
+        col = getattr(ctx.context, "column", None)
+        sites = _return_sites_of(path) if isinstance(path, str) else None
+        ret_stack = getattr(ctx.api, "return_types", None)
+        if not isinstance(path, str) or sites is None or line is None or col is None or not ret_stack:
+            return tp
+        here = _at_site(line, col)
+        want_ret = get_proper_type(ret_stack[-1])
+        declared: list[Type] | None = None
+        uses: list[tuple[ast.Return, int]] = []
+        for ret, _ in sites[0]:
+            if ret.value is None:
+                continue
+            for p in _return_positions(ret.value, lambda n: here(n) and not isinstance(n, (ast.Tuple, ast.List))):
+                want = want_ret
+                if p is not None:
+                    items_at = want_ret.items if isinstance(want_ret, TupleType) else []
+                    want = get_proper_type(items_at[p]) if p < len(items_at) else None
+                if not isinstance(want, Instance) or want.type is not proper.type or len(want.args) != len(items):
+                    return tp
+                args = [get_proper_type(a) for a in want.args]
+                if declared is not None and declared != args:
+                    return tp
+                declared = args
+                uses.append((ret, -1 if p is None else p))
+        if declared is None:
+            return tp
+        named = [
+            i
+            for i, (have, want) in enumerate(zip(items, declared))
+            if isinstance(want, TypeVarType)
+            and want.fullname in free
+            and want.id == free[want.fullname].id
+            and _is_born_dim(have)
+        ]
+        if not named or any(
+            i not in named and not _fits_declared(have, want) for i, (have, want) in enumerate(zip(items, declared))
+        ):
+            return tp
+        new_args = list(proper.args)
+        for i in named:
+            want = declared[i]
+            assert isinstance(want, TypeVarType)
+            if all(
+                _fits_first((path, ret.lineno, ret.col_offset, want.fullname), (p, -1 - i), items[i]) for ret, p in uses
+            ):
+                new_args[i] = want
+        if all(new is old for new, old in zip(new_args, proper.args)):
+            return tp
+        return proper.copy_modified(args=new_args)
+    except Exception:
+        _swallowed(ctx, "_name_born_class")
+        return tp
+
+
 def _name_born_array(
     ctx: FunctionContext | MethodContext | AttributeContext | FunctionSigContext | MethodSigContext,
     tp: Type,
@@ -725,8 +883,9 @@ def _name_born_array(
     if not isinstance(shape, TupleType) or not shape.items:
         return tp
     free = _free_return_names(ctx)
+    free_formula = _free_formula_names(ctx)
     items = [get_proper_type(i) for i in shape.items]
-    if not any(_is_born_dim(i) or (free and _is_literal_dim(i)) for i in items):
+    if not any(_is_born_dim(i) or ((free or free_formula) and _is_literal_dim(i)) for i in items):
         # Without a name of the return alone, only a size born here can
         # take a name: one the body declares (issue 330).
         return tp
@@ -742,17 +901,7 @@ def _name_born_array(
             return tp
         returns, assigns = sites
 
-        def here(node: ast.AST) -> bool:
-            if (getattr(node, "lineno", None), getattr(node, "col_offset", None)) == (line, col):
-                return True
-            # mypy places an operator at its left operand inside the
-            # parentheses: `(S**2) / n` is where `S**2` is, one column
-            # past the `(` (issue 330).
-            while isinstance(node, ast.BinOp):
-                node = node.left
-                if (node.lineno, node.col_offset) == (line, col):
-                    return True
-            return False
+        here = _at_site(line, col)
 
         def whole(node: ast.AST) -> bool:
             # A tuple display starts where its first item does.
@@ -776,6 +925,18 @@ def _name_born_array(
         for ret, _ in returns:
             if ret.value is not None:
                 uses.extend((ret, -1 if p is None else p, ()) for p in _return_positions(ret.value, match))
+                if item is not None:
+                    # `return pick(x)`: the whole tuple is returned, so
+                    # its item `item` is at that index of the return
+                    # (issue 357).
+                    # A subscript of the call starts where the call does.
+                    uses.extend(
+                        (ret, item, ())
+                        for p in _return_positions(
+                            ret.value, lambda n: whole(n) and not (isinstance(n, ast.Subscript) and whole(n.value))
+                        )
+                        if p is None
+                    )
         stack = getattr(getattr(ctx.api, "expr_checker", None), "type_context", None)
         context = stack[-1] if stack else None
         shapes = _array_shapes(context, len(items))
@@ -822,20 +983,41 @@ def _name_born_array(
         if declared is None:
             return tp
         new_items: list[Type] = list(shape.items)
+        named: list[int] = []
         for axis, (have, want) in enumerate(zip(items, declared)):
             # By id: a callee's variable of the same name (the formal an
             # argument is checked under) is not this function's name.
             if not isinstance(want, TypeVarType):
+                continue
+            if want.fullname.startswith(_EXPR_PREFIX):
+                # `F64["K+1"]` takes an unknown plus one (issue 357).
+                if uses and _formula_base(want, have, free_formula) is not None:
+                    named.append(axis)
                 continue
             if want.fullname in free:
                 if want.id != free[want.fullname].id:
                     continue
             elif not _is_body_name(ctx, want):
                 continue
-            if not (_is_born_dim(have) or (uses and _is_literal_dim(have))):
-                continue
+            if _is_born_dim(have) or (uses and _is_literal_dim(have)):
+                named.append(axis)
+        if any(
+            axis not in named and not _fits_declared(have, want)
+            for axis, (have, want) in enumerate(zip(items, declared))
+        ):
+            # A value that does not fit keeps its sizes: the name printed
+            # over a literal would hide the one that shows the mistake
+            # (`(3, 5)` returned as `F64["k 3"]`, issue 357).
+            return tp
+        for axis in named:
+            have, want = items[axis], declared[axis]
+            assert isinstance(want, TypeVarType)
+            name, size = want.fullname, have
+            base = _formula_base(want, have, free_formula) if want.fullname.startswith(_EXPR_PREFIX) else None
+            if base is not None:
+                name, size = base
             if all(
-                _fits_first((path, ret.lineno, ret.col_offset, want.fullname), (p, axis, *site), have)
+                _fits_first((path, ret.lineno, ret.col_offset, name), (p, axis, *site), size)
                 for ret, p, site in uses
             ):
                 new_items[axis] = want

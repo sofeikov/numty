@@ -41,4 +41,4 @@ def f(a: F64["2*M+2", "N+M"], b: F64["2*N+4"], c: F64["N+1"], d: F64["N+2"], e: 
     reveal_type(edges(np.zeros((4, 3))))  # R: (3, 7)
 
 
-f(np.zeros((8, 5)), np.zeros(8), np.zeros(3), np.zeros(4), np.zeros(6))
+f(np.zeros((8, 5)), np.zeros(8), np.zeros(3), np.zeros(4), np.zeros(3))

@@ -133,7 +133,16 @@ def _finish_fam(
     sym = cast(TypeAnalyser, ctx.api).lookup_fully_qualified(dtype_fullname)
     node = sym.node if sym is not None else None
     if isinstance(node, TypeInfo):
-        element = cast(TypeAnalyser, ctx.api).named_type(dtype_fullname, [], line, column)
+        # A scalar class whose parameters have defaults takes them, as
+        # the class written alone does: `np.bool` is `bool[bool]`, which
+        # every operator of the stubs gives (issue 362).
+        tvars = node.defn.type_vars
+        defaults = (
+            [tv.default for tv in tvars]
+            if tvars and all(isinstance(tv, TypeVarType) and tv.has_default() for tv in tvars)
+            else []
+        )
+        element = cast(TypeAnalyser, ctx.api).named_type(dtype_fullname, defaults, line, column)
     elif isinstance(node, TypeAlias):
         target = get_proper_type(node.target)
         if isinstance(target, Instance):
@@ -230,7 +239,19 @@ def _is_numpy_scalar_class(inst: Instance) -> bool:
 
 
 def _check_arr_bound(head: str, tv: TypeVarType) -> None:
-    """The bound of an `Arr` dtype TypeVar must be a numpy scalar type."""
+    """The bound of an `Arr` dtype TypeVar must be a numpy scalar type.
+
+    A TypeVar with values (`TypeVar("T", np.float64, np.complex128)`)
+    is accepted when every value is one (issue 362): mypy checks the
+    function once per value, as with the raw spelling.
+    """
+    if tv.values:
+        if all(isinstance(v, Instance) and _is_numpy_scalar_class(v) for v in map(get_proper_type, tv.values)):
+            return
+        raise _FamFail(
+            f'{head} dtype "{tv.name}" must be a TypeVar whose values are numpy scalar types'
+            ' (e.g. TypeVar("T", np.float64, np.complex128))'
+        )
     bound = get_proper_type(tv.upper_bound)
     if isinstance(bound, AnyType) and bound.type_of_any != TypeOfAny.from_error:
         return
@@ -462,6 +483,26 @@ def _fam_string(
         else:
             dims.append(_fam_expr(ctx, head, word, node, late_bound))
     return dims
+
+
+def _class_type_arg(ctx: AnalyzeTypeContext, fullname: str, arg: Type, late_bound: set[str]) -> Type:
+    """One type argument of a user class: a formula string (`Model[N, "N-1"]`) is the size it spells (issue 358)."""
+    if not (isinstance(arg, RawExpressionType) and isinstance(arg.literal_value, str)):
+        return ctx.api.analyze_type(arg)
+    short = fullname.rsplit(".", 1)[-1]
+    try:
+        dims = _fam_string(ctx, short, arg.literal_value, arg, late_bound)
+        if len(dims) != 1:
+            raise _FamFail(f'{short} takes one size per type argument; "{arg.literal_value}" spells {len(dims)}')
+    except _FamFail as bad:
+        ctx.api.fail(bad.msg, ctx.context, code=NUMTY_ANNOTATION)
+        return AnyType(TypeOfAny.from_error)
+    except _FamBail:
+        return AnyType(TypeOfAny.from_error)
+    dim = dims[0]
+    if isinstance(dim, int):
+        return LiteralType(dim, ctx.api.named_type("builtins.int", []), line=arg.line, column=arg.column)
+    return dim
 
 
 def _fam_expr(
