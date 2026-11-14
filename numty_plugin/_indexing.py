@@ -25,9 +25,17 @@ import ast
 
 from ._returns import _module_ast
 from ._casts import _report_cast
-from ._index_sources import _past_overload_trial, _strided_count, _symbolic_slice, _tuple_target_value
+from ._index_sources import (
+    _FromEnd, _is_size_bound, _past_overload_trial, _strided_count, _symbolic_slice, _tuple_target_value,
+)
 from ._unknowns import _fresh_mask_count
 from ._ops import flatnonzero_function_hook
+from ._broadcast_core import _inplace_never_fits
+from ._bindings import (
+    _assignment_lines, _bound_in_loop, _count_var_assignments, _enclosing_func, _mask_var_key, _single_rvalue,
+    _value_of_rebound_name,
+)
+from ._types import _int_expr_dim
 from ._reshape import (
     _all_positionals, _dims_str, _formal_pair, _is_none_type, _is_plain_int, _known_rank_parts, _movable_parts,
     _normalize_axis, _normalize_axis_0d, _parse_axis_arg, _scalar_key,
@@ -45,215 +53,17 @@ if TYPE_CHECKING:
 # Runtime-only (bodies check isinstance / read arg kinds).
 from mypy.nodes import (
     ARG_POS, CallExpr, EllipsisExpr, Expression, IndexExpr, IntExpr, ListExpr, NameExpr, OpExpr, SliceExpr, StarExpr,
-    TupleExpr,
+    TupleExpr, UnaryExpr,
 )
-from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type
+from mypy.types import (
+    AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, UnpackType, get_proper_type,
+)
 from ._linalg import (
     _dtype_base, _kind_of, _scalar_of_dtype, _string_value,
 )
 from ._types import (
     _unpack_shape,
 )
-
-
-def _enclosing_func(
-    ctx: MethodContext | FunctionSigContext | FunctionContext,
-    use_line: int,
-) -> tuple[str, object | None]:
-    """Innermost function containing `use_line`: (fullname, node).
-
-    Best-effort flow-insensitive scope for mask-var reuse (issue #288):
-    the same mask variable in the same function reuses one count; a
-    variable rebound between uses must not. Different scopes never share
-    (documented limit: a global mask reused in two functions mints one
-    count per function).
-    """
-    from mypy.nodes import ClassDef as _ClassDef
-    from mypy.nodes import FuncDef as _FuncDef
-
-    try:
-        tree = getattr(ctx.api, "tree", None)
-        module = getattr(tree, "fullname", "") or ""
-        if tree is None or use_line <= 0:
-            return f"{module}::<module>", None
-        best: tuple[str, object | None] = (f"{module}::<module>", None)
-        best_span = -1
-
-        def _visit_func(node: object, prefix: str) -> None:
-            nonlocal best, best_span
-            line = getattr(node, "line", 0) or 0
-            end = getattr(node, "end_line", 0) or line
-            if not (line <= use_line <= end):
-                return
-            span = end - line
-            fullname = getattr(node, "fullname", "") or f"{module}::{prefix}"
-            if best[1] is None or span < best_span or best_span < 0:
-                best = (fullname, node)
-                best_span = span
-            body = getattr(getattr(node, "body", None), "body", []) or []
-            for stmt in body:
-                if isinstance(stmt, _FuncDef):
-                    _visit_func(stmt, getattr(stmt, "name", "?") or "?")
-
-        defs = getattr(tree, "defs", []) or []
-        for top in defs:
-            if isinstance(top, _FuncDef):
-                _visit_func(top, getattr(top, "name", "?") or "?")
-            elif isinstance(top, _ClassDef):
-                members = getattr(getattr(top, "defs", None), "body", []) or []
-                for member in members:
-                    if isinstance(member, _FuncDef):
-                        _visit_func(member, getattr(member, "name", "?") or "?")
-        return best
-    except Exception:
-        _swallowed(ctx, "_enclosing_func")
-        tree = getattr(ctx.api, "tree", None)
-        module = getattr(tree, "fullname", "") or "" if tree is not None else ""
-        return f"{module}::<module>", None
-
-
-def _nested_bodies(stmt: object) -> list[list]:
-    """The statement lists inside a compound statement.
-
-    `body` is one block (`for`, `while`, `with`, `try`) or a list of
-    blocks (`if` / `elif`); `handlers` is the list of `except` blocks.
-    """
-    out: list[list] = []
-    for attr in ("body", "else_body", "finally_body", "handlers"):
-        sub = getattr(stmt, attr, None)
-        for block in sub if isinstance(sub, list) else [sub]:
-            inner = getattr(block, "body", None)
-            if isinstance(inner, list) and inner:
-                out.append(inner)
-    return out
-
-
-def _shallow_bodies(stmt: object) -> list[list]:
-    """`_nested_bodies` without the branches of an `if`: what the counts of issue #288 were built on.
-
-    The records of index positions rely on it (a name assigned in both
-    branches of an `if` keeps its record, `bad_index_overrun.py`).
-    """
-    out: list[list] = []
-    for attr in ("body", "else_body", "finally_body"):
-        sub = getattr(stmt, attr, None)
-        inner = getattr(sub, "body", None) if sub is not None else None
-        if isinstance(inner, list) and inner:
-            out.append(inner)
-    handlers = getattr(stmt, "handlers", None)
-    if isinstance(handlers, list):
-        for handler in handlers:
-            hbody = getattr(getattr(handler, "body", None), "body", None)
-            if isinstance(hbody, list) and hbody:
-                out.append(hbody)
-    return out
-
-
-def _count_var_assignments(func_node: object | None, varname: str, deep: bool = False) -> tuple[int, bool]:
-    """(assignments to `varname`, is_param) in one function body.
-
-    Flow-insensitive: any `Name = ...`, `for Name in ...`, `with ... as
-    Name` or `+=` counts. Nested functions/classes are different scopes
-    and are skipped (documented limit). `is_param` is whether the name is
-    a parameter of the function.
-    """
-    from mypy.nodes import AssignmentStmt as _AssignmentStmt
-    from mypy.nodes import ClassDef as _ClassDef
-    from mypy.nodes import ForStmt as _ForStmt
-    from mypy.nodes import FuncDef as _FuncDef
-    from mypy.nodes import OperatorAssignmentStmt as _OpAssign
-    from mypy.nodes import WithStmt as _WithStmt
-
-    if func_node is None:
-        return 0, False
-    arg_names = getattr(func_node, "arg_names", []) or []
-    is_param = varname in (arg_names or [])
-    count = 0
-
-    def _targets(lvalue: object) -> list[str]:
-        if isinstance(lvalue, NameExpr):
-            return [lvalue.name]
-        if isinstance(lvalue, (TupleExpr, ListExpr)):
-            out: list[str] = []
-            for item in getattr(lvalue, "items", []) or []:
-                out.extend(_targets(item))
-            return out
-        if isinstance(lvalue, StarExpr):
-            return _targets(getattr(lvalue, "expr", None))
-        return []
-
-    def _walk(stmts: object) -> None:
-        nonlocal count
-        items = list(stmts) if isinstance(stmts, list) else []
-        for stmt in items:
-            if isinstance(stmt, (_FuncDef, _ClassDef)):
-                continue
-            if isinstance(stmt, _AssignmentStmt):
-                for lv in getattr(stmt, "lvalues", []) or []:
-                    if varname in _targets(lv):
-                        count += 1
-            elif isinstance(stmt, _OpAssign):
-                if varname in _targets(getattr(stmt, "lvalue", None)):
-                    count += 1
-            elif isinstance(stmt, _ForStmt):
-                if varname in _targets(getattr(stmt, "index", None)):
-                    count += 1
-            elif isinstance(stmt, _WithStmt):
-                for item in getattr(stmt, "items", []) or []:
-                    target = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
-                    if target is not None and varname in _targets(target):
-                        count += 1
-            for inner in _nested_bodies(stmt) if deep else _shallow_bodies(stmt):
-                _walk(inner)
-
-    top_body = getattr(getattr(func_node, "body", None), "body", []) or []
-    if isinstance(top_body, list):
-        _walk(top_body)
-    return count, is_param
-
-
-def _bound_in_loop(func_node: object | None, varname: str) -> bool:
-    """Whether `varname` may hold a value per run of a loop (issue 328).
-
-    A binding inside a `for` / `while` body, or as a `for` target, does;
-    so does a name with no binding of its own in the function that is
-    not a parameter (a comprehension variable, a walrus, a global).
-    """
-    from mypy.nodes import AssignmentStmt as _AssignmentStmt
-    from mypy.nodes import ClassDef as _ClassDef
-    from mypy.nodes import ForStmt as _ForStmt
-    from mypy.nodes import FuncDef as _FuncDef
-    from mypy.nodes import WhileStmt as _WhileStmt
-
-    count, is_param = _count_var_assignments(func_node, varname, deep=True)
-    if count == 0:
-        return not is_param
-
-    def _names(lvalue: object) -> list[str]:
-        if isinstance(lvalue, NameExpr):
-            return [lvalue.name]
-        if isinstance(lvalue, (TupleExpr, ListExpr)):
-            return [n for item in getattr(lvalue, "items", []) or [] for n in _names(item)]
-        if isinstance(lvalue, StarExpr):
-            return _names(getattr(lvalue, "expr", None))
-        return []
-
-    def _walk(stmts: object, in_loop: bool) -> bool:
-        for stmt in stmts if isinstance(stmts, list) else []:
-            if isinstance(stmt, (_FuncDef, _ClassDef)):
-                continue
-            loop = in_loop or isinstance(stmt, (_ForStmt, _WhileStmt))
-            if loop:
-                if isinstance(stmt, _ForStmt) and varname in _names(stmt.index):
-                    return True
-                if isinstance(stmt, _AssignmentStmt) and any(varname in _names(lv) for lv in stmt.lvalues):
-                    return True
-            for inner in _nested_bodies(stmt):
-                if _walk(inner, loop):
-                    return True
-        return False
-
-    return _walk(getattr(getattr(func_node, "body", None), "body", None), False)
 
 
 def _mask_repeats(ctx: MethodContext | FunctionContext, mask_expr: Expression | None) -> bool:
@@ -268,55 +78,6 @@ def _mask_repeats(ctx: MethodContext | FunctionContext, mask_expr: Expression | 
         return True
 
 
-def _single_rvalue(func_node: object | None, varname: str) -> Expression | None:
-    """The value of `varname = <expr>` when that is the only binding of the name in the function."""
-    from mypy.nodes import AssignmentStmt as _AssignmentStmt
-    from mypy.nodes import ClassDef as _ClassDef
-    from mypy.nodes import FuncDef as _FuncDef
-
-    count, is_param = _count_var_assignments(func_node, varname, deep=True)
-    if is_param or count != 1:
-        return None
-    found: list[Expression] = []
-
-    def _walk(stmts: object) -> None:
-        for stmt in stmts if isinstance(stmts, list) else []:
-            if isinstance(stmt, (_FuncDef, _ClassDef)):
-                continue
-            if isinstance(stmt, _AssignmentStmt) and len(stmt.lvalues) == 1:
-                lv = stmt.lvalues[0]
-                if isinstance(lv, NameExpr) and lv.name == varname:
-                    found.append(stmt.rvalue)
-            for inner in _nested_bodies(stmt):
-                _walk(inner)
-
-    _walk(getattr(getattr(func_node, "body", None), "body", None))
-    return found[0] if len(found) == 1 else None
-
-
-def _assignment_lines(func_node: object | None, varname: str) -> list[int]:
-    """The lines of the plain assignments `varname = ...` in the function, at any depth."""
-    from mypy.nodes import AssignmentStmt as _AssignmentStmt
-    from mypy.nodes import ClassDef as _ClassDef
-    from mypy.nodes import FuncDef as _FuncDef
-
-    lines: list[int] = []
-
-    def _walk(stmts: object) -> None:
-        for stmt in stmts if isinstance(stmts, list) else []:
-            if isinstance(stmt, (_FuncDef, _ClassDef)):
-                continue
-            if isinstance(stmt, _AssignmentStmt) and any(
-                isinstance(lv, NameExpr) and lv.name == varname for lv in stmt.lvalues
-            ):
-                lines.append(stmt.line)
-            for inner in _nested_bodies(stmt):
-                _walk(inner)
-
-    _walk(getattr(getattr(func_node, "body", None), "body", None))
-    return lines
-
-
 def _recorded_on_lines(module: str, lines: list[int], idims: list[int | Type]) -> int | Type | None:
     """The one record, among those lines, of an array with exactly this shape."""
     found = [
@@ -326,67 +87,6 @@ def _recorded_on_lines(module: str, lines: list[int], idims: list[int | Type]) -
         if first is not None and _index_dims_match(first, idims)
     ]
     return found[0] if len(found) == 1 else None
-
-
-def _int_expr_dim(ctx: MethodContext | FunctionContext, expr: Expression | None, depth: int = 0) -> int | Type | None:
-    """An `int` expression as a size: a literal, a named size, or a formula over `int` variables.
-
-    `len(x)` and `x.shape[i]` read the size of `x`. A variable bound
-    once by `n = <expr>` reads that expression; any other variable
-    bound once (a parameter, a loop variable) is the unknown `?name`.
-    `+`, `-` and a literal factor combine them. Anything else is None.
-    """
-    from numty_plugin import _materialize_dim, _resolve_dim
-    from ._forms import _lin_add, _lin_scale
-    from ._unknowns import _fresh_int_symbol
-
-    if expr is None or depth > 4:
-        return None
-    value = _fold_int(expr)
-    if value is not None:
-        return value
-
-    def combine(left: int | Type | None, right: int | Type | None, sign: int) -> int | Type | None:
-        if left is None or right is None:
-            return None
-        fl, fr = _resolve_dim(left), _resolve_dim(right)
-        if not isinstance(fl, _LinForm) or not isinstance(fr, _LinForm):
-            return None
-        return _materialize_dim(ctx, "slice", 0, _lin_add(fl, _lin_scale(fr, sign)))
-
-    if isinstance(expr, OpExpr) and expr.op in ("+", "-"):
-        left = _int_expr_dim(ctx, expr.left, depth + 1)
-        return combine(left, _int_expr_dim(ctx, expr.right, depth + 1), 1 if expr.op == "+" else -1)
-    if isinstance(expr, OpExpr) and expr.op == "*":
-        for factor, other in ((expr.left, expr.right), (expr.right, expr.left)):
-            k = _fold_int(factor)
-            if k is not None:
-                return combine(0, _int_expr_dim(ctx, other, depth + 1), k)
-        return None
-    if isinstance(expr, CallExpr):
-        callee = expr.callee
-        if isinstance(callee, NameExpr) and callee.fullname == "builtins.len" and len(expr.args) == 1:
-            parts = _ndarray_parts(ctx.api.get_expression_type(expr.args[0]))
-            if parts is not None and parts[0] and isinstance(parts[0][0], (int, TypeVarType)):
-                return parts[0][0]
-        return None
-    tp = get_proper_type(ctx.api.get_expression_type(expr))
-    if isinstance(tp, TypeVarType):
-        return tp if isinstance(_resolve_dim(tp), _LinForm) else None  # `x.shape[i]` of a named size
-    if not isinstance(expr, NameExpr) or not isinstance(tp, Instance) or tp.type.fullname != INT_FULLNAME:
-        return None
-    if tp.last_known_value is not None and isinstance(tp.last_known_value.value, int):
-        return tp.last_known_value.value
-    key = _mask_var_key(ctx, expr)
-    if key is None:
-        return None
-    use_line = getattr(expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
-    rvalue = _single_rvalue(_enclosing_func(ctx, use_line)[1], expr.name)
-    if rvalue is not None:
-        inner = _int_expr_dim(ctx, rvalue, depth + 1)
-        if inner is not None:
-            return inner
-    return _fresh_int_symbol(ctx, expr.name, key)
 
 
 def _own_index_annotation(func_node: object | None, varname: str, var_line: int) -> tuple[bool, bool, object | None]:
@@ -606,36 +306,6 @@ def _recorded_for_operand(
         except Exception:
             _swallowed(ctx, "_recorded_for_operand")
             return None
-
-
-def _mask_var_key(ctx: MethodContext | FunctionContext, mask_expr: Expression | None) -> str | None:
-    """Stable key for a mask variable use, else None to mint per site (issue #288).
-
-    Same `Name` in the same function (module::func::name), not rebound
-    between uses, reuses one unknown. Inline masks (`x[x > 0]`), member
-    access, `flatnonzero` results and any rebinding bail to a fresh
-    per-site unknown (documented limits).
-    """
-    if not isinstance(mask_expr, NameExpr):
-        return None
-    varname = mask_expr.name
-    if not varname or varname in ("True", "False", "None"):
-        return None
-    try:
-        use_line = getattr(mask_expr, "line", 0) or getattr(ctx.context, "line", 0) or 0
-        func_fullname, func_node = _enclosing_func(ctx, use_line)
-        count, is_param = _count_var_assignments(func_node, varname)
-        if is_param:
-            if count >= 1:
-                return None
-        elif count > 1:
-            return None
-        tree = getattr(ctx.api, "tree", None)
-        module = getattr(tree, "fullname", "") or ""
-        return f"{module}::{func_fullname}::{varname}"
-    except Exception:
-        _swallowed(ctx, "_mask_var_key")
-        return None
 
 
 def _mask_count_for(ctx: MethodContext, mask_expr: Expression | None, dim: int) -> Type:
@@ -929,12 +599,26 @@ def _parse_index_item(
     if isinstance(expr, (ListExpr, TupleExpr)) and expr.items:
         if all(_fold_int(e) is not None for e in expr.items):
             return ("fancy", [len(expr.items)])
+    proper_tp = get_proper_type(tp)
+    if _is_int_list(proper_tp) and not isinstance(expr, TupleExpr):
+        # A list of integers is a 1-D fancy index (issue 361): a display
+        # (`x[:, [k]]`) has its length, a `list[int]` value an unknown one.
+        if isinstance(expr, ListExpr):
+            if expr.items and not any(isinstance(e, StarExpr) for e in expr.items):
+                return ("fancy", [len(expr.items)])
+        else:
+            from numty_plugin import _fresh_unknown
+
+            if _value_of_rebound_name(ctx, ctx.context):
+                # `rows = x[train]; rows = x[test]`, or into a parameter:
+                # a fresh `?U` each time would refuse the rebinding.
+                return None
+            return ("fancy", [_fresh_unknown(ctx, "list-index", getattr(expr, "column", 0))])
     if isinstance(expr, SliceExpr):
         # Unprovable bounds no longer bail the whole getitem (issue #57):
         # they become "unknown" and the consumer mints a fresh unknown
         # for that axis while keeping the sibling dims.
         return _slice_item(ctx, expr.begin_index, expr.end_index, expr.stride)
-    proper_tp = get_proper_type(tp)
     if expr is not None:
         # `slice(...)` behind a Final name, or a local bound once to it (issue 333).
         init = _final_slice_call(ctx, expr) or _local_call(ctx, expr, "builtins.slice")
@@ -981,6 +665,18 @@ def _parse_index_item(
     return None
 
 
+def _is_int_list(proper: object) -> bool:
+    """A `list` of Python or numpy integers (not of `bool`, a mask)."""
+    if not (isinstance(proper, Instance) and proper.type.fullname == "builtins.list" and len(proper.args) == 1):
+        return False
+    item = get_proper_type(proper.args[0])
+    if isinstance(item, LiteralType):
+        item = item.fallback
+    return isinstance(item, Instance) and item.type.fullname in (
+        INT_FULLNAME, "numpy.signedinteger", "numpy.unsignedinteger", "numpy.integer",
+    )
+
+
 def _slice_item(
     ctx: FunctionContext | MethodContext, begin: Expression | None, end: Expression | None, stride: Expression | None
 ) -> tuple:
@@ -994,7 +690,12 @@ def _slice_item(
         value: object = _fold_index_bound(ctx, bound)
         if value is None and i < 2:
             try:
-                value = _int_expr_dim(ctx, bound)
+                if isinstance(bound, UnaryExpr) and bound.op == "-":
+                    # `x[:-k]` counts from the end (issue 359).
+                    inner = _int_expr_dim(ctx, bound.expr)
+                    value = _FromEnd(inner) if isinstance(inner, Type) else None
+                else:
+                    value = _int_expr_dim(ctx, bound)
             except Exception:
                 _swallowed(ctx, "_slice_item")
         out.append("unknown" if value is None else value)
@@ -1102,7 +803,7 @@ def _consume_one(
         )
         return None
     _, begin, end, stride = item
-    if isinstance(begin, Type) or isinstance(end, Type):
+    if _is_size_bound(begin) or _is_size_bound(end):
         return [_fresh_unknown(ctx, role, pos)]  # a symbolic bound: not followed on this path
     if isinstance(size, int):
         if "unknown" in (begin, end, stride):
@@ -1580,13 +1281,13 @@ def _solve_getitem(
             size = dims[dim]
             frag: int | Type
             symbolic = None
-            if isinstance(begin, Type) or isinstance(end, Type):
+            if _is_size_bound(begin) or _is_size_bound(end):
                 try:
                     symbolic = _symbolic_slice(ctx, dim, size, begin, end, stride)
                 except Exception:
                     _swallowed(ctx, "_solve_getitem")
-                begin = "unknown" if isinstance(begin, Type) else begin
-                end = "unknown" if isinstance(end, Type) else end
+                begin = "unknown" if _is_size_bound(begin) else begin
+                end = "unknown" if _is_size_bound(end) else end
             slice_expr = pairs[n][1] if n < len(pairs) else None
             shared = _slice_var_count(ctx, slice_expr, size)
             if stride == "unknown" and begin == end == "missing" and isinstance(slice_expr, SliceExpr):
@@ -1785,6 +1486,16 @@ def setitem_method_hook(ctx: MethodContext) -> Type:
         return ctx.default_return_type
     value_dims = value_parts[0]
     if len(value_dims) > len(target_dims):
+        ctx.api.fail(
+            f"cannot assign value of shape {_dims_str(value_dims)} "
+            f"into target of shape {_dims_str(target_dims)}",
+            ctx.context,
+            code=NUMTY_BROADCAST,
+        )
+        return ctx.default_return_type
+    if _inplace_never_fits(list(target_dims), list(value_dims)):
+        # A named value size into a literal-1 target axis fits only when
+        # the name is 1 (issue 361), as for `col += P`.
         ctx.api.fail(
             f"cannot assign value of shape {_dims_str(value_dims)} "
             f"into target of shape {_dims_str(target_dims)}",

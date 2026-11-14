@@ -312,7 +312,7 @@ def _expr_var(
 
 
 def _materialize_dim(
-    ctx: FunctionContext | MethodContext,
+    ctx: FunctionContext | MethodContext | AttributeContext,
     op: str,
     index: int,
     form: _LinForm | _DivForm | _MonoForm,

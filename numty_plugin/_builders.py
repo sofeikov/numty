@@ -103,7 +103,7 @@ def _builder_shape(
     if dims is not None:
         return list(dims)
     if expr is not None and not isinstance(expr, (TupleExpr, ListExpr, StarExpr)):
-        if isinstance(expr, OpExpr) and _fold_int(expr) is None:
+        if isinstance(expr, (OpExpr, NameExpr)) and _fold_int(expr) is None:
             try:
                 folded = _builder_fold_dim_expr(ctx, expr, 0)
                 if isinstance(folded, int):
@@ -146,7 +146,7 @@ def _builder_shape(
     for i, (item, item_tp) in enumerate(zip(expr.items, proper.items)):
         if isinstance(item, StarExpr):
             return None
-        if isinstance(item, OpExpr) and _fold_int(item) is None:
+        if isinstance(item, (OpExpr, NameExpr)) and _fold_int(item) is None:
             try:
                 folded = _builder_fold_dim_expr(ctx, item, i)
                 if isinstance(folded, int):

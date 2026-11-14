@@ -6740,3 +6740,137 @@ def test_clash_unknown_is_not_absorbed_by_a_later_name() -> None:
     assert sorted(on) == [21, 26], on
     assert all("D and N are different names  [numty-names]" in m for line in on.values() for m in line), on
     assert _run_fixture("bad_clash_unknown.py") == ["ValueError", "[2.0, 1.5, 1.3333333333333333]", "(3, 3)", "(2, 3)"]
+
+
+def test_reshape_targets_ok() -> None:
+    # Issue 353: a -1 next to a size name on an `int`-sized input is
+    # unknown, `Any` (never `Literal[-1]`), a list target reads like a tuple, a
+    # -1 next to the input's own leading axis is its trailing axis, and
+    # a `.shape` of unknown length gives an unknown rank, not 0-d.
+    result = run_mypy(FIXTURES / "reshape_targets_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        23: f'"{_ND}[tuple[K, Any], {f64}]"',
+        24: f'"{_ND}[tuple[K, Any], {f64}]"',
+        25: f'"{_ND}[tuple[int], {f64}]"',
+        31: f'"{_ND}[tuple[X, N], {f64}]"',
+        32: f'"{_ND}[tuple[X, N], {f64}]"',
+        33: f'"{_ND}[tuple[Literal[3], Literal[2]], {f64}]"',
+        34: f'"{_ND}[tuple[X, ?U@34], {f64}]"',
+        39: f'"{_ND}[tuple[n-1, c], {f64}]"',
+        41: f'"{_ND}[tuple[-?start+?stop, c], {f64}]"',
+        42: f'"{_ND}[tuple[n, c], {f64}]"',
+        48: f'"{_ND}[Any, {f64}]"',
+    }, result.stdout
+
+
+def test_reshape_targets_bad() -> None:
+    # Issue 353: the sizes read above are checked where they are declared.
+    errors = _messages_by_line(run_mypy(FIXTURES / "bad_reshape_targets.py"))
+    assert errors == {
+        14: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[K, Any], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N, int], dtype[float64]]")  [assignment]'
+        ],
+        18: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[X, N], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N, X], dtype[float64]]")  [assignment]'
+        ],
+        23: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[n-1, c], dtype[float64]]", '
+            'variable has type "ndarray[tuple[n-1, n], dtype[float64]]")  [assignment]'
+        ],
+    }, errors
+    assert _run_fixture("bad_reshape_targets.py") == ["(3, 2)"]
+
+
+def test_index_rows_ok() -> None:
+    # Issue 361: a list of integers is a 1-D fancy index (a display has
+    # its length, a `list[int]` value an unknown one), and `list()`,
+    # `iter()`, `enumerate()` and `zip()` give an array's rows.
+    result = run_mypy(FIXTURES / "index_rows_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        17: f'"{_ND}[tuple[N, Literal[1]], {f64}]"',
+        18: f'"{_ND}[tuple[Literal[2], K], {f64}]"',
+        19: f'"{_ND}[tuple[?U@19, K], {f64}]"',
+        20: f'"{_ND}[tuple[N, Literal[1]], {f64}]"',
+        25: f'"list[{_ND}[tuple[X], {f64}]]"',
+        26: f'"typing.Iterator[{_ND}[tuple[X], {f64}]]"',
+        28: f'"{_ND}[tuple[X], {f64}]"',
+        30: f'"{_ND}[tuple[X], {f64}]"',
+        32: f'"{_ND}[tuple[N], {f64}]"',
+        33: '"list[numpy.float64]"',
+    }, result.stdout
+
+
+def test_index_rows_bad() -> None:
+    # Issue 361: a named value size into a literal-1 target axis fits
+    # only when the name is 1, as the in-place rule says for `col += P`.
+    errors = _messages_by_line(run_mypy(FIXTURES / "bad_index_rows.py"))
+    assign = 'Incompatible types in assignment (expression has type "ndarray[tuple[{}], dtype[float64]]", ' \
+        'variable has type "ndarray[tuple[{}], dtype[float64]]")  [assignment]'
+    assert errors == {
+        18: [assign.format("Literal[1], K", "N, Literal[1]")],
+        22: ["cannot assign value of shape (N, N) into target of shape (N, 1)  [numty-broadcast]"],
+        23: ["cannot assign value of shape (N, N) into target of shape (N, 1)  [numty-broadcast]"],
+        24: ["cannot assign value of shape (1, N) into target of shape (N, 1)  [numty-broadcast]"],
+        28: [assign.format("X", "N")],
+        30: [assign.format("N", "X")],
+    }, errors
+    assert _run_fixture("bad_index_rows.py") == ["ValueError", "ValueError"]
+
+
+def test_sizes_in_ints_ok() -> None:
+    # Issue 359: sizes spelled through an `int` expression, a local,
+    # `.size` or `len()` keep what numty knows, and an `int` size fits a
+    # name declared on an earlier line as on the annotated line. A local
+    # bound to a product stays `int` (line 36): a free name of the return
+    # may stand for it (`kp = k * p` declared `F64["kp kp"]`). A local
+    # bound again (`total += y.size`, `rows = x[test]`) keeps main's
+    # `int` / Any, so `rebound` checks.
+    result = run_mypy(FIXTURES / "sizes_in_ints_ok.py")
+    assert result.returncode == 0, result.stdout
+    f64 = "numpy.dtype[numpy.float64]"
+    assert reveals_by_line(result) == {
+        22: f'"{_ND}[tuple[c, Literal[1]], {f64}]"',
+        23: f'"{_ND}[tuple[?U@23, c, ?ws], {f64}]"',
+        24: f'"{_ND}[tuple[c, n-?m], {f64}]"',
+        28: f'"{_ND}[tuple[K, K], {f64}]"',
+        34: f'"{_ND}[tuple[N+1], {f64}]"',
+        36: f'"{_ND}[tuple[int], {f64}]"',
+        41: '"S"',
+        42: '"Literal[12]?"',
+        43: '"S*X"',
+        44: f'"{_ND}[tuple[X, S], {f64}]"',
+        46: f'"{_ND}[tuple[S], {f64}]"',
+        55: '"?K@54"',
+        67: f'"{_ND}[tuple[N-S, K*S], {f64}]"',
+        # A constant width over a cancelled `int` stays unknown (the last
+        # batch is clipped), and so does `range(N, 2)`, never `2-N`.
+        87: f'"{_ND}[tuple[?U@87, K], {f64}]"',
+        88: f'"{_ND}[tuple[?U@88, K], {f64}]"',
+    }, result.stdout
+
+
+def test_sizes_in_ints_bad() -> None:
+    # Issue 359: what the sizes above read is checked.
+    errors = _messages_by_line(run_mypy(FIXTURES / "bad_sizes_in_ints.py"))
+    assert errors == {
+        15: [
+            "broadcast at trailing axis 0 (shapes (-?k+N-1,) vs (-?k+N,)): -?k+N-1 and -?k+N are 1 apart"
+            "  [numty-names]"
+        ],
+        20: [
+            'Incompatible return value type (got "ndarray[tuple[N+2], dtype[float64]]", '
+            'expected "ndarray[tuple[N+1], dtype[float64]]")  [return-value]'
+        ],
+        25: ["assignment of shape (X,) into target of shape (S,): X and S are different names  [numty-names]"],
+        35: [
+            "r_ dimension 1 differs: ?K@33-1 vs ?K@33-2 (shapes (1, ?K@33-1) vs (?K@33-1, ?K@33-2))"
+            "  [numty-shape]"
+        ],
+    }, errors
+    assert _run_fixture("bad_sizes_in_ints.py") == ["(5,)", "ValueError"]

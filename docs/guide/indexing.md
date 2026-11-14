@@ -32,7 +32,14 @@ removed: a row of `F64[3, 2]` is `(2,)`, and the two halves of a
 `(2, ?U)` array are `(?U,)` each. With a literal first axis, an
 unpacking into another number of names is an error (`a, b =
 np.zeros((3, 2))`, `tests/fixtures/array_unpack.py`). A rank-1 array
-gives scalars, which stay with the stubs.
+gives scalars, which stay with the stubs. `list(m)`, `iter(m)`,
+`enumerate(m)` and `zip(m, w)` give the same rows: `for i, s in
+enumerate(sigmas)` with `sigmas: F64[N, X]` has `s: (X,)`
+(`tests/fixtures/index_rows_ok.py`).
+
+A list of integers is a 1-D fancy index whatever its items: `x[:, [k]]`
+is `(N, 1)` for an `int` `k`, as `x[:, [3]]` is, and a `list[int]`
+value adds an axis of unknown length (`x[idx]` is `(?U, K)`).
 
 ## Bounds over `int` variables
 
@@ -52,8 +59,14 @@ out[k:]                              # (N-?k,)
 
 This is the size when the bounds are inside the axis; numpy clips them
 otherwise (`x[i : i + bs]` on the last batch). So it is given when an
-`int` variable is left in it, and such a size is an unknown: nothing
-is proved from it with `numty-names` off. Under the `numty-names` code
+`int` variable is in a bound, and a size with one left in it is an
+unknown: nothing is proved from it with `numty-names` off. Where the
+variable cancels out the size is exact: `x[:, i : i + 1]` is `(c, 1)`
+and `R[s : s + len(z)]` is `(K,)` for `z: F64[K]` (issue 359). A
+constant width other than 1 stays unknown, as `x[:32]` does: the last
+batch of `X[i : i + 32]` in a batching loop is clipped. A
+negated stop counts from the end: `x[:-m]` is `(n-?m,)`, as `x[m:]` is
+(`tests/fixtures/sizes_in_ints_ok.py`). Under the `numty-names` code
 (on by default) two
 of them a constant apart are reported, `out[k:] = mins` as `-?k+N+1 and
 -?k+N are 1 apart` (`tests/fixtures/symbolic_slice.py`).
@@ -162,6 +175,10 @@ v[:-1]` with `out: F64[S, C]` and `v: F64[C]` is `cannot assign value of
 shape (C-1,) into target of shape (C,)`. Two different names (`S` into
 `C`) and a mask's count against a name are not provable either: they
 are `[numty-names]` reports (on by default), silent with that code off.
+A named value size into a literal-1 target axis fits only when the name
+is 1, as for an in-place operator: `col[:] = P` with `col: F64[N, 1]`
+and `P: F64[N, N]` is `cannot assign value of shape (N, N) into target
+of shape (N, 1)` (`tests/fixtures/bad_index_rows.py`).
 Other unknowns and an `int` size stay silent
 (`tests/fixtures/bad_setitem_symbolic.py`). An `int` axis is skipped on
 its own, not the whole write: in a buffer `a = np.empty((x.shape[0], n))`

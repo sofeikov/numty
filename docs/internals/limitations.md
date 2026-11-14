@@ -343,11 +343,20 @@ quiet, where it is approximate, and what to write instead.
     `X = list[3]` does). Spell the sizes with `Literal`
     (`Mat34: TypeAlias = F64[Literal[3], Literal[4]]`, or the PEP 695
     `type` form); uses then check and infer exactly.
+- `np.arange(ws, we)` over `int` variables stays the stubs' `(int,)`,
+    though the slice `x[ws:we]` is `(?we-?ws,)`: an unknown row count
+    there makes a local that is later bound to its transpose (`values =
+    np.swapaxes(values, 0, -1)`) an `[assignment]` error, where `Any`
+    fits. A builder reads a local bound to a sum (`m = n + 1`) but not one
+    bound to a product (`kp = k * p`), which a free name of the return
+    may stand for (issue 359).
 - Integer bookkeeping on a *symbolic* dim keeps the dim, like plain
     mypy for generic containers (`n = x.shape[0]` infers `N`, so
     `n //= 2` is an error). Concrete dims widen to `int` (keeping the
-    value for direct uses like `reshape(x.shape[0], 3)`), and unknown
-    (`?U`) dims are plain `int`. For a loop counter over a symbolic
+    value for direct uses like `reshape(x.shape[0], 3)`). `len()` and
+    `.size` of a selection count are plain `int`; a size a call chose
+    for a name of its return (`?K@14`) stays, as `.shape[0]` keeps every
+    unknown (issue 359). For a loop counter over a symbolic
     axis, write `int(...)` explicitly (`n = int(x.shape[0])`). In array
     arithmetic such a size is a Python `int` scalar: `X @ X.T / X.shape[0]`
     keeps `(N, N)` like `/ float(X.shape[0])` does.

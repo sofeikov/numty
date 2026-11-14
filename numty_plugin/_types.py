@@ -32,6 +32,7 @@ from ._forms import (
 from ._exprs import (
     _expr_constituents, _expr_str, _form_of, _seen_vars,
 )
+from ._bindings import _mask_var_key, _single_rvalue_of
 
 NDARRAY_FULLNAME = "numpy.ndarray"
 INT_FULLNAME = "builtins.int"
@@ -1178,6 +1179,72 @@ def _int_shape_from_arg(tp: Type, expr: Expression | None) -> list[int] | None:
     return out
 
 
+def _reshape_list_target(
+    ctx: FunctionContext | MethodContext, pairs: list[tuple[Type, Expression | None]]
+) -> list[tuple[Type, Expression | None]]:
+    """`pairs` with a list target (`reshape(H, [d, n])`) read as a tuple.
+
+    mypy types `[d, n]` as `list[int]`, which drops the sizes; numpy reads
+    the list exactly like the tuple `(d, n)` (issue 353). Each item is
+    read from its own expression: a literal, a size name, a formula.
+    """
+    if not pairs or not isinstance(pairs[0][1], ListExpr):
+        return pairs
+    items_expr = pairs[0][1].items
+    if not items_expr or any(isinstance(item, StarExpr) for item in items_expr):
+        return pairs
+    int_instance = ctx.api.named_generic_type(INT_FULLNAME, [])
+    items: list[Type] = []
+    for index, item in enumerate(items_expr):
+        dim = _fold_dim_expr(ctx, item, index)
+        if isinstance(dim, int):
+            items.append(LiteralType(dim, fallback=int_instance))
+        elif dim is not None:
+            items.append(dim)
+        else:
+            items.append(int_instance)
+    fallback = ctx.api.named_generic_type("builtins.tuple", [int_instance])
+    return [(TupleType(items, fallback=fallback), None), *pairs[1:]]
+
+
+def _is_unsized_tuple(tp: Type) -> bool:
+    """A tuple of unknown length (`tuple[Any, ...]`, `tuple[int, ...]`).
+
+    A `*Ts` shape (`tuple[N, *Ts]`) is not one: the stubs bind it.
+    """
+    proper = get_proper_type(tp)
+    if isinstance(proper, Instance):
+        return proper.type.fullname == "builtins.tuple"
+    if isinstance(proper, TupleType):
+        return any(
+            isinstance(item, UnpackType) and _is_unsized_tuple(item.type)
+            for item in proper.items
+        )
+    return False
+
+
+def _reshape_kept_axes(
+    dims_old: list[int | Type], raw: list[int | TypeVarType]
+) -> list[int | Type] | None:
+    """The target with its -1 solved from the input's own axes, else None.
+
+    `np.reshape(a, (a.shape[0], -1))`: the sizes around the -1 are the
+    input's leading and trailing axes, whatever their form (`n-1`,
+    `?stop-?start`), so the -1 is the one input axis between them
+    (issue 353). Only a single axis left over is spelled; more would be
+    a product the algebra may not hold.
+    """
+    j = raw.index(-1)
+    head, tail = raw[:j], raw[j + 1:]
+    if len(head) + len(tail) + 1 != len(dims_old):
+        return None
+    if not all(_dim_eq(a, b) for a, b in zip(head, dims_old)):
+        return None
+    if not all(_dim_eq(a, b) for a, b in zip(tail, dims_old[len(dims_old) - len(tail):])):
+        return None
+    return [*head, dims_old[j], *tail]
+
+
 def _builder_fold_dim_expr(
     ctx: FunctionContext | MethodContext, expr: Expression, index: int
 ) -> int | Type | None:
@@ -1238,7 +1305,7 @@ def _enum_member_count(info) -> int | None:
 
 
 def _fold_dim_expr(
-    ctx: FunctionContext | MethodContext, expr: Expression, index: int
+    ctx: FunctionContext | MethodContext, expr: Expression, index: int, depth: int = 0
 ) -> int | Type | None:
     """A size written as arithmetic over known sizes, else None.
 
@@ -1252,9 +1319,11 @@ def _fold_dim_expr(
     value = _fold_int(expr)
     if value is not None:
         return value
+    if depth > 4:
+        return None
     if isinstance(expr, OpExpr) and expr.op in ("+", "-", "*", "//"):
-        left = _fold_dim_expr(ctx, expr.left, index)
-        right = _fold_dim_expr(ctx, expr.right, index)
+        left = _fold_dim_expr(ctx, expr.left, index, depth + 1)
+        right = _fold_dim_expr(ctx, expr.right, index, depth + 1)
         if left is None or right is None:
             return None
         op = "shape-arith"
@@ -1285,7 +1354,82 @@ def _fold_dim_expr(
     if tp is None:
         return None
     dim = _dim_value(tp)
-    return dim if isinstance(dim, (int, TypeVarType)) else None
+    if isinstance(dim, (int, TypeVarType)):
+        return dim
+    proper = get_proper_type(tp)
+    if isinstance(expr, NameExpr) and isinstance(proper, Instance) and proper.type.fullname == INT_FULLNAME:
+        # `m = x.shape[0] + 1; np.zeros(m)` (issue 359): a local bound
+        # once spells the size its value spells. Nothing is minted for
+        # a name whose value is no size (`np.zeros(n)` stays `int`). A
+        # product stays `int` too: such a local is often given a name of
+        # its own in the return (`kp = k * p` declared `F64["kp kp"]`),
+        # which a size spelled with the signature's names cannot take.
+        rvalue = _single_rvalue_of(ctx, expr)
+        if rvalue is not None:
+            folded = _fold_dim_expr(ctx, rvalue, index, depth + 1)
+            if folded is None or isinstance(folded, int) or isinstance(_resolve_dim(folded), _LinForm):
+                return folded
+    return None
+
+
+def _int_expr_dim(ctx: MethodContext | FunctionContext, expr: Expression | None, depth: int = 0) -> int | Type | None:
+    """An `int` expression as a size: a literal, a named size, or a formula over `int` variables.
+
+    `len(x)` and `x.shape[i]` read the size of `x`. A variable bound
+    once by `n = <expr>` reads that expression; any other variable
+    bound once (a parameter, a loop variable) is the unknown `?name`.
+    `+`, `-` and a literal factor combine them. Anything else is None.
+    """
+    from numty_plugin import _materialize_dim, _resolve_dim
+    from ._forms import _lin_add, _lin_scale
+    from ._unknowns import _fresh_int_symbol
+
+    if expr is None or depth > 4:
+        return None
+    value = _fold_int(expr)
+    if value is not None:
+        return value
+
+    def combine(left: int | Type | None, right: int | Type | None, sign: int) -> int | Type | None:
+        if left is None or right is None:
+            return None
+        fl, fr = _resolve_dim(left), _resolve_dim(right)
+        if not isinstance(fl, _LinForm) or not isinstance(fr, _LinForm):
+            return None
+        return _materialize_dim(ctx, "slice", 0, _lin_add(fl, _lin_scale(fr, sign)))
+
+    if isinstance(expr, OpExpr) and expr.op in ("+", "-"):
+        left = _int_expr_dim(ctx, expr.left, depth + 1)
+        return combine(left, _int_expr_dim(ctx, expr.right, depth + 1), 1 if expr.op == "+" else -1)
+    if isinstance(expr, OpExpr) and expr.op == "*":
+        for factor, other in ((expr.left, expr.right), (expr.right, expr.left)):
+            k = _fold_int(factor)
+            if k is not None:
+                return combine(0, _int_expr_dim(ctx, other, depth + 1), k)
+        return None
+    if isinstance(expr, CallExpr):
+        callee = expr.callee
+        if isinstance(callee, NameExpr) and callee.fullname == "builtins.len" and len(expr.args) == 1:
+            parts = _ndarray_parts(ctx.api.get_expression_type(expr.args[0]))
+            if parts is not None and parts[0] and isinstance(parts[0][0], (int, TypeVarType)):
+                return parts[0][0]
+        return None
+    tp = get_proper_type(ctx.api.get_expression_type(expr))
+    if isinstance(tp, TypeVarType):
+        return tp if isinstance(_resolve_dim(tp), _LinForm) else None  # `x.shape[i]` of a named size
+    if not isinstance(expr, NameExpr) or not isinstance(tp, Instance) or tp.type.fullname != INT_FULLNAME:
+        return None
+    if tp.last_known_value is not None and isinstance(tp.last_known_value.value, int):
+        return tp.last_known_value.value
+    key = _mask_var_key(ctx, expr)
+    if key is None:
+        return None
+    rvalue = _single_rvalue_of(ctx, expr)
+    if rvalue is not None:
+        inner = _int_expr_dim(ctx, rvalue, depth + 1)
+        if inner is not None:
+            return inner
+    return _fresh_int_symbol(ctx, expr.name, key)
 
 
 def _has_unknown_shape(tp: Type) -> bool:

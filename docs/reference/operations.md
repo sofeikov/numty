@@ -16,7 +16,16 @@ dtype=other.dtype)` with a bare `np.ndarray` is `(int, int)` with dtype
 `Any`). `np.eye(n)` and `np.identity(n)` read their size like a
 builder: with `n = X.shape[1]` both are `(D, D)`, `np.eye(k + 1)` is
 `(D+1, D+1)`, and `np.eye(n, m, k=1)` is `(n, m)` (the offset never
-resizes).
+resizes). A local bound once to a size formula is read through
+(`m = x.shape[0] + 1; np.zeros(m)` is `(N+1,)`); a local bound to a
+product stays `int`, since a free name of the return may stand for it
+(`kp = k * p` declared `F64["kp kp"]`). `x.size` is the product of the
+axes (`S` for `(S,)`, `12` for `(3, 4)`, `S*X` for `(S, X)`), and
+`len()` of a size a call chose is that size, as `.shape[0]` is (issue
+359). Assigned to a local that is bound again in the function (`total =
+x.size; total += y.size`, `n = len(d); n //= 2`, or a parameter),
+`.size` and `len()` stay `int`, since mypy types the local from its
+first binding.
 
 ## Joining
 
@@ -44,6 +53,13 @@ whatever the input's size, since numpy raises otherwise: from a `?U`
 slice (`np.reshape(p[k:k + n * h], (n, h))`), from an `int` input, and
 to a tuple-typed value (`x.reshape(W.shape)`) it is `(N, H)` for `n: N`,
 `h: H`, in the method form (`p.reshape(n, h)`) as in the function form.
+A list target reads like a tuple (`np.reshape(H, [d, n])` is `(X, N)`).
+A `-1` next to the input's own leading (or trailing) axes is the one
+axis left, whatever the form of the kept ones: `np.reshape(a, (a.shape[0],
+-1))` of `(n-1, c)` is `(n-1, c)`. Next to a size name on an input of
+`int` sizes it is unknown (`params.reshape(k, -1)` is `(K, Any)`), and
+a target `.shape` of unknown length (an untracked join) gives an unknown
+rank, `ndarray[Any, ...]` (issue 353).
 
 ## Rank changes
 
@@ -90,7 +106,13 @@ dtype is `result_type(m, float64)` (`float32` input gives `float64`).
 Consumes leading dims without an ellipsis (`v[0]`,
 `v[None, ...]`). Comparisons broadcast and return bool arrays; `argmax`
 drops the axis, `sort` keeps the shape, and a literal `partition` kth
-past the axis errors.
+past the axis errors. A list of integers is a 1-D fancy index
+(`x[:, [k]]` is `(N, 1)`, a `list[int]` value adds a `?U` axis, or
+leaves the result unknown as before when it is assigned to a local
+bound again, such as `rows = x[train]; rows = x[test]`), and
+`list()`, `iter()`, `enumerate()` and `zip()` give an array's rows as a
+`for` does (issue 361). Slice bounds over `int` variables are in
+[Indexing](../guide/indexing.md).
 
 ## Shape math
 
@@ -139,7 +161,10 @@ comprehension or of a `list[...]` value has one `?U` axis in front:
 `np.array([i == 1 for i in kinds])` is `(?U,)` bool, and a list of
 `F64[N]` items is `(?U, N)`, as for `np.stack`. An unfiltered
 comprehension with one `for` over a known size has that many items, in
-`np.array` and `np.stack`: over `range(3)` it is 3, over the rows of an
+`np.array` and `np.stack`: over `range(3)` it is 3, over `range(lags,
+nobs)` it is `nobs - lags` (`N-S` with `nobs = len(y)`, `lags: S`, the
+bounds taken in order, issue 359; a formula that falls as its names
+grow, `range(N, 2)`, is left unknown), over the rows of an
 `(N, M)` array, `zip` of such arrays or `enumerate` of one it is `N`,
 over a tuple of two arrays 2. A filter (`if`), a second `for`, or an
 `int` length (`range(n)` with `n: int`) leave the `?U`. `np.array([a, b])` of

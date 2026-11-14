@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, _CANARY_BY_MODULE, _swallowed, _warn_startup
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -73,7 +73,7 @@ from ._matrix import (
     identity_function_hook, outer_function_hook,
 )
 from ._reshape import (
-    _reshape_new_dims, _all_positionals, _scalar_key, reshape_method_hook, reshape_function_hook,
+    _reshape_new_dims, _scalar_key, reshape_method_hook, reshape_function_hook,
     transpose_method_hook, transpose_function_hook, swapaxes_function_hook, swapaxes_method_hook,
     moveaxis_function_hook, rollaxis_function_hook, matrix_transpose_function_hook,
     mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook,
@@ -115,7 +115,7 @@ from ._exprs import _iter_tvarlikes
 from ._reshape import _known_rank_parts, _movable_parts
 from ._linalg import _dtype_base
 from ._types import (
-    _enum_member_count, _mask_pair_in, _named_pair_in, _names_enabled,
+    _mask_pair_in, _named_pair_in, _names_enabled,
 )
 from ._unions import (
     _UNION_PAIR_METHODS, _reflected_name, _union_pair_hook, _union_reflected_hook,
@@ -124,6 +124,7 @@ from ._unions import (
 from ._callsite import _relax_dynamic_formals, _report_call_site_names, _report_index_call_site, minmax_function_hook
 from ._returns import _holder_key, _return_sig_for_dynamic
 from ._unknowns import _fresh_own_size
+from ._sequences import len_function_hook, rows_function_hook, size_attribute_hook
 from ._frames import POLARS_FRAME_TO_NUMPY, POLARS_SERIES_TO_NUMPY, frame_to_numpy_hook
 from ._aliases import held_call_hook, holds_numpy_function, masked_attribute_hook
 from ._aliases import masked_function_hook, masked_method_hook
@@ -739,6 +740,8 @@ class NumtyPlugin(Plugin):
     def _function_hook(self, fullname: str) -> Callable[..., Type] | None:
         if fullname == "builtins.len":
             return len_function_hook
+        if fullname in ("builtins.list", "builtins.iter", "builtins.enumerate", "builtins.zip"):
+            return rows_function_hook
         if fullname == "builtins.divmod":
             return divmod_function_hook
         if fullname in ("builtins.max", "builtins.min"):
@@ -778,6 +781,8 @@ class NumtyPlugin(Plugin):
     ) -> Callable[[AttributeContext], Type] | None:
         if fullname == "numpy.ndarray.shape":
             return shape_attribute_hook
+        if fullname == "numpy.ndarray.size":
+            return size_attribute_hook
         # T lives on the shared _ArrayOrScalarCommon base in the stubs.
         if fullname == "numpy._ArrayOrScalarCommon.T":
             return t_attribute_hook
@@ -1704,44 +1709,6 @@ def _t_type(ctx: AttributeContext, tp: Type, default: Type) -> Type:
         dims, dtype = parts
         return _ndarray_type(ctx, list(reversed(dims)), dtype)
     return default
-
-
-def len_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if len(pairs) != 1:
-        return ctx.default_return_type
-    int_fallback = ctx.api.named_generic_type("builtins.int", [])
-    proper = get_proper_type(pairs[0][0])
-    if isinstance(proper, CallableType):
-        # An enum class arrives as its constructor; len() counts members.
-        ret = get_proper_type(proper.ret_type)
-        if isinstance(ret, Instance) and ret.type.is_enum:
-            count = _enum_member_count(ret.type)
-            if count is not None:
-                return LiteralType(count, fallback=int_fallback)
-            return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
-    if parts is None:
-        return ctx.default_return_type
-    dims, _ = parts
-    if not dims:
-        ctx.api.fail("len() of unsized object", ctx.context, code=NUMTY_SHAPE)
-        return ctx.default_return_type
-    first = dims[0]
-    if isinstance(first, TypeVarType):
-        if first.fullname.startswith("__numty_unknown__."):
-            # Unknown (data-dependent) lengths are plain ints: nothing
-            # nameable is lost, and `k = len(masked); k = max(k, 1)`
-            # checks (issue #62). Named dims stay exact.
-            return int_fallback
-        return first
-    if not isinstance(first, int):
-        return ctx.default_return_type
-    # Same widening form as .shape items (issue #62): fresh locals get
-    # plain int (`k = len(x); k -= 1`), direct uses still read the value.
-    return int_fallback.copy_modified(
-        last_known_value=LiteralType(first, fallback=int_fallback)
-    )
 
 
 def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
