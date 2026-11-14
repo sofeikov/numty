@@ -55,9 +55,9 @@ addopts = "-n 4"
 
 [tool.ruff]
 line-length = 120
-# The fixtures are inputs for mypy and ty. Many of them are wrong on
-# purpose, so the linter does not read them.
-extend-exclude = ["tests/fixtures"]
+# The fixtures and the bug-hunt benchmark are inputs for mypy and ty. Many
+# of them are wrong on purpose, so the linter does not read them.
+extend-exclude = ["tests/fixtures", "bench/hunt"]
 
 [tool.ruff.lint]
 # Pyflakes (unused imports, undefined names, unused variables) and the
@@ -70,4 +70,4 @@ ignore = ["F722"]
 # Files that need the numty plugin to type-check, or that are wrong on
 # purpose: the fixtures, the runtime test (string dims and int dims in
 # annotations) and the demo (2 expected errors, pinned by test_ty.py).
-exclude = ["tests/fixtures", "tests/test_runtime.py", "demo.py"]
+exclude = ["tests/fixtures", "tests/test_runtime.py", "demo.py", "bench/hunt"]

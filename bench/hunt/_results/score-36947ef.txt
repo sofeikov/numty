@@ -1,0 +1,363 @@
+filterpy/kalman: clean errors {'default': 1, 'names': 1}; real bugs 32/32 mutants; caught default 15, +names 0; silent 11 (caught 4)
+  [-] silent  m01_predict_F_no_T.py: KalmanFilter.predict: P = F P F (forgot .T on the square F)
+  [D] crash   m02_update_PHT_no_T.py: KalmanFilter.update: PHT = P @ H (forgot H.T)
+  [D] crash   m03_update_gain_swapped.py: KalmanFilter.update: K = SI @ PHT (operands swapped)
+  [-] silent  m04_update_residual_sign.py: KalmanFilter.update: y = Hx - z (residual sign flipped)
+  [D] crash   m05_update_joseph_K_no_T.py: KalmanFilter.update: Joseph term K R K (forgot K.T)
+  [D] crash   m06_update_IKH_swapped.py: KalmanFilter.update: I - H K instead of I - K H
+  [D] crash   m07_correlated_MH_no_T.py: update_correlated: S cross term M @ H instead of M.T @ H.T
+  [D] crash   m08_correlated_P_M_no_T.py: update_correlated: P -= K (HP + M) (forgot M.T)
+  [D] crash   m09_steady_K_T.py: update_steadystate: x += K.T @ y (spurious .T on the gain)
+  [D] silent  m10_get_update_ravel.py: get_update: y = zc - (H x).ravel() (flattened prediction broadcasts to (n_z, n_z))
+  [-] silent  m11_mahalanobis_S.py: mahalanobis: uses S instead of its inverse SI
+  [-] crash   m12_loglik_of_P.py: log_likelihood_of: state covariance P instead of system uncertainty S
+  [D] silent  m13_fupdate_gain_swapped.py: module update: K = (H.T P) inv(S) (operands of P H.T swapped, inside the bare try)
+  [D] crash   m14_fupdate_KH_swapped.py: module update: KH = H K (operands swapped)
+  [-] crash   m15_fupdate_shape1.py: module update: reshape_z(z, Hx.shape[1]) (wrong shape index)
+  [-] crash   m16_fpredict_Bu_swapped.py: module predict: dot(u, B) instead of dot(B, u)
+  [-] crash   m17_seq_reshape_order.py: update_sequential: H_i reshaped to (dim_x, length) instead of (length, dim_x)
+  [-] silent  m18_rts_class_Fk.py: KalmanFilter.rts_smoother: residual uses Fs[k] instead of Fs[k + 1]
+  [-] silent  m19_rts_class_gain_F_no_T.py: KalmanFilter.rts_smoother: gain P F inv(Pp) (forgot .T on the square F)
+  [-] crash   m20_rts_mod_range.py: module rts_smoother: loop starts at n - 1 (off by one, x[k + 1] out of range)
+  [-] silent  m21_rts_mod_K_no_T.py: module rts_smoother: K (P' - Pp) K (forgot .T on the square gain)
+  [D] silent  m22_fbatch_means_dim.py: module batch_filter: means buffer (n, dim_x, dim_x) instead of (n, dim_x, 1)
+  [D] crash   m23_batch_covp_dim.py: KalmanFilter.batch_filter: covariances_p buffer (n, dim_x, dim_z)
+  [-] crash   m24_batch_store_P_in_means.py: KalmanFilter.batch_filter: stores self.P into means_p (wrong variable)
+  [D] crash   m25_seq_H_axis.py: update_sequential: H_i = H[:, start:stop] (slices columns instead of rows)
+  [-] crash   m26_seq_flat_z.py: update_sequential: residual from the 1-D z_i instead of the (n_i, 1) column
+  [-] crash   m27_reshape_z_axis0.py: reshape_z: transposes when shape[0] == dim_z instead of shape[1]
+  [-] crash   m28_rts_mod_dim_idx.py: module rts_smoother: dim_x = Xs.shape[2] (wrong axis index, 1)
+  [D] silent  m29_init_M_dims.py: KalmanFilter.__init__: M = zeros((dim_z, dim_x)) (dims swapped)
+  [-] silent  m30_get_prediction_selfQ.py: get_prediction: adds self.Q, ignoring the Q argument
+  [D] crash   m31_update_scalarR_dimx.py: KalmanFilter.update: scalar R expanded with eye(dim_x) instead of eye(dim_z)
+  [-] crash   m32_batch_H_is_F.py: KalmanFilter.batch_filter: update(z, R=R, H=F) (wrong loop variable)
+filterpy/ukf: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 19, +names 0; silent 5 (caught 1)
+  [D] crash   m01_ut_mean_swapped_operands.py: unscented_transform: weighted mean written np.dot(sigmas, Wm) (operands swapped)
+  [D] crash   m02_ut_cov_forgot_T.py: unscented_transform: covariance np.dot(y, diag(Wc) @ y), forgot y.T
+  [D] crash   m03_ut_newaxis_wrong_place.py: unscented_transform: mean broadcast as x[:, np.newaxis] instead of x[np.newaxis, :]
+  [D] crash   m04_ut_mean_missing_newaxis.py: unscented_transform: weighted mean as np.sum(Wm * sigmas, axis=0), Wm missing [:, np.newaxis]
+  [D] crash   m05_ut_mean_wrong_axis.py: unscented_transform: weighted mean summed over axis=1 (state) instead of axis=0 (sigma points)
+  [-] silent  m06_ut_mean_uses_Wc.py: unscented_transform: mean weighted with Wc instead of Wm
+  [D] crash   m07_ut_residual_column.py: unscented_transform: residual loop takes column sigmas[:, k] instead of row sigmas[k]
+  [-] crash   m08_merwe_U_column.py: Merwe sigma_points: offsets from columns U[:, k] of the upper Cholesky factor instead of rows U[k]
+  [-] crash   m09_merwe_builder_2n.py: Merwe sigma_points: sigma buffer built np.zeros((2 * n, n)), one row short
+  [-] crash   m10_julier_offby1_index.py: Julier sigma_points: negative points written to sigmas[n + k] instead of sigmas[n + k + 1]
+  [-] silent  m11_julier_elementwise_sqrt.py: Julier sigma_points: elementwise np.sqrt of (n+kappa)P instead of the matrix square root
+  [D] crash   m12_simplex_return_noT.py: Simplex sigma_points: returns sigmas (n, n+1) without the final .T
+  [-] crash   m13_simplex_U_noT.py: Simplex sigma_points: scaled_unitary = U.dot(I), forgot U.T
+  [D] crash   m14_simplex_reshape_row.py: Simplex sigma_points: x reshaped to a row (1, -1) instead of a column (-1, 1)
+  [-] crash   m15_simplex_Istar_T.py: Simplex sigma_points: I built from Istar.T (n+1, n) instead of Istar (n, n+1)
+  [-] crash   m16_cholesky_lower.py: cholesky: returns the lower factor (forgot .T); scipy.linalg.cholesky is upper
+  [D] crash   m17_K_swapped_operands.py: UKF.update: Kalman gain np.dot(SI, Pxz) instead of np.dot(Pxz, SI)
+  [D] crash   m18_P_forgot_KT.py: UKF.update: P - K S K, forgot K.T
+  [D] crash   m19_x_update_swapped.py: UKF.update: state correction np.dot(y, K) instead of np.dot(K, y)
+  [-] silent  m20_residual_sign.py: UKF.update: innovation residual_z(zp, z) (predicted minus measured), sign flipped
+  [D] crash   m21_crossvar_builder_swapped.py: UKF.cross_variance: Pxz buffer built (dim_z, dim_x) instead of (dim_x, dim_z)
+  [D] crash   m22_crossvar_outer_swapped.py: UKF.cross_variance: np.outer(dz, dx) instead of np.outer(dx, dz)
+  [-] crash   m23_update_R_eye_dimx.py: UKF.update: scalar R expanded with np.eye(dim_x) instead of np.eye(dim_z)
+  [D] crash   m24_update_hx_sigmas_T.py: UKF.update: hx applied to the columns of sigmas_f (for s in sigmas_f.T)
+  [D] crash   m25_predict_R_for_Q.py: UKF.predict: process UT given the measurement noise R instead of Q
+  [D] silent  m26_update_x_mean_for_z_mean.py: UKF.update: measurement UT given the state mean function x_mean instead of z_mean
+  [-] silent  m27_rts_gain_KT_square.py: UKF.rts_smoother: covariance correction (K (P' - Pb)) K instead of K.T
+  [-] crash   m28_rts_range_offby1.py: UKF.rts_smoother: backward loop over range(n) instead of range(n - 1)
+  [D] crash   m29_rts_shape_unpack_swapped.py: UKF.rts_smoother: dim_x, n = Xs.shape (unpack order swapped)
+  [D] crash   m30_batch_means_index.py: UKF.batch_filter: means[:, i] = x instead of means[i, :]
+  [D] crash   m31_batch_zn_wrong_axis.py: UKF.batch_filter: number of steps read as zs.shape[1] (dim_z) instead of len(zs)
+  [-] crash   m32_batch_cov_builder_dimz.py: UKF.batch_filter: covariances buffer built (z_n, dim_x, dim_z) instead of (z_n, dim_x, dim_x)
+filterpy/ekf_ckf: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 19, +names 0; silent 8 (caught 3)
+  [-] silent  m01_ekf_predict_forgot_FT.py: EKF.predict: covariance propagated as F P F instead of F P F' (square, uncatchable)
+  [D] crash   m02_ekf_update_PHT_no_T.py: EKF.update: PHT = P H instead of P H' (forgotten .T on the Jacobian)
+  [-] silent  m03_ekf_update_K_uses_S.py: EKF.update: gain uses S instead of S^-1 (value-only)
+  [D] crash   m04_ekf_update_S_swapped.py: EKF.update: S = PHT H + R instead of H PHT + R (swapped operands)
+  [D] crash   m05_ekf_update_Ky_swapped.py: EKF.update: x + y K instead of x + K y (swapped operands)
+  [D] crash   m06_ekf_update_KRK_no_T.py: EKF.update: Joseph form K R K instead of K R K' (forgotten .T)
+  [D] crash   m07_ekf_update_Rscalar_dimx.py: EKF.update: scalar R expanded with eye(dim_x) instead of eye(dim_z) (wrong builder dim)
+  [D] silent  m08_ekf_update_residual_swapped.py: EKF.update: residual(hx, z) instead of residual(z, hx) (swapped, value-only)
+  [D] crash   m09_ekf_pu_P_plus_R.py: EKF.predict_update: prior covariance adds measurement noise R instead of Q
+  [-] crash   m10_ekf_predict_x_Bu_swapped.py: EKF.predict_x: control term dot(u, B) instead of dot(B, u) (swapped operands)
+  [D] crash   m11_ekf_pu_K_swapped.py: EKF.predict_update: K = S^-1 PHT instead of PHT S^-1 (swapped operands)
+  [-] crash   m12_ekf_predict_x_xF.py: EKF.predict_x: x F instead of F x (swapped operands)
+  [D] crash   m13_ckf_update_pxz_offbyone.py: CKF.update: cross covariance over sigmas_f[:-1] (off-by-one slice)
+  [-] crash   m14_ekf_maha_T_misplaced.py: EKF.mahalanobis: y SI y' instead of y' SI y (transpose on the wrong factor)
+  [D] silent  m15_ekf_init_K_dims.py: EKF.__init__: K initialised zeros((dim_z, dim_x)) instead of (dim_x, dim_z) (wrong builder dim)
+  [D] crash   m16_ekf_update_IKH_swapped.py: EKF.update: I - H K instead of I - K H (swapped operands)
+  [-] silent  m17_ekf_loglik_SI.py: EKF.log_likelihood: logpdf with cov=SI instead of S (value-only)
+  [-] crash   m18_mvn_reshape_column.py: _mvn_logpdf: x reshaped to a column (-1, 1) instead of flattened (wrong reshape)
+  [D] crash   m19_ops_einsum_AA.py: outer_product_sum: einsum of A with itself instead of A with B (wrong operand)
+  [D] crash   m20_ops_sum_axis1.py: outer_product_sum: sums the outer products over axis=1 instead of axis=0 (wrong axis)
+  [D] silent  m21_srs_2n_plus_1.py: spherical_radial_sigmas: allocates 2n+1 points (UKF habit) instead of 2n (wrong builder dim)
+  [-] silent  m22_srs_lower_chol.py: spherical_radial_sigmas: lower Cholesky factor (forgot the .T) so rows of L are used (square, uncatchable)
+  [-] crash   m23_srs_no_flatten.py: spherical_radial_sigmas: uses x as given (no flatten); a column x broadcasts each row to (n, n)
+  [-] crash   m24_ckft_mean_row.py: ckf_transform: mean made a row [None, :] instead of a column [:, None] (wrong newaxis position)
+  [D] crash   m25_ckft_zeros_m.py: ckf_transform: covariance allocated (m, m) (point count) instead of (n, n) (wrong builder dim)
+  [-] crash   m26_ckft_outer_column.py: ckf_transform: outer of column Xs[:, k] instead of row Xs[k] (wrong index)
+  [-] silent  m27_ckft_unbiased.py: ckf_transform: covariance scaled 1/(m-1) (sample-covariance habit) instead of 1/m (value-only)
+  [-] crash   m28_ckf_predict_sigma_column.py: CKF.predict: fx applied to column sigmas[:, k] instead of row sigmas[k] (wrong index)
+  [D] crash   m29_ckf_update_pxz_swapped.py: CKF.update: cross covariance Pzx (h first) instead of Pxz (swapped operands)
+  [D] crash   m30_ckf_update_P_no_T.py: CKF.update: P - K S K instead of P - K S K' (forgotten .T)
+  [D] crash   m31_ckf_update_zp_no_flatten.py: CKF.update: subtracts the column zp from sigmas_h without flattening it
+  [D] crash   m32_ckf_init_sigmas_h_dimx.py: CKF.__init__: sigmas_h allocated (2*dim_x, dim_x) instead of (2*dim_x, dim_z) (wrong builder dim)
+filterpy/info_sqrt: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 14, +names 0; silent 11 (caught 0)
+  [D] crash   m01_noinfo_forgot_HT.py: no-information update uses H instead of H.T in dot(H_T, R_inv).dot(z)
+  [D] crash   m02_resid_swapped.py: residual computed as z - x' H' (row) instead of z - H x
+  [D] crash   m03_S_swapped_H.py: posterior information S = P_inv + H R_inv H' (H and H' swapped)
+  [-] silent  m04_K_no_inverse.py: gain uses the information matrix S instead of inv(S)
+  [-] silent  m05_update_uses_z.py: state update adds K z instead of K y (raw measurement, not residual)
+  [D] crash   m06_x_missing_newaxis.py: state update uses the flattened residual y[:, 0] (missing newaxis), broadcasting x to (n_x, n_x)
+  [D] crash   m07_Sy_swapped.py: residual covariance H' P H instead of H P H' (operands swapped)
+  [D] crash   m08_logpdf_cov_S.py: log-likelihood uses the (n_x, n_x) information matrix S as the residual covariance (the upstream bug)
+  [D] crash   m09_Rinv_eye_dimx.py: scalar R_inv expanded with np.eye(dim_x) instead of np.eye(dim_z)
+  [-] silent  m10_A_forgot_FinvT.py: predict A = F_inv P_inv F_inv (forgot .T on the first F_inv; square)
+  [-] crash   m11_predict_x_swapped.py: info predict x = x F instead of F x (operands swapped)
+  [-] crash   m12_predict_H_for_F.py: info predict propagates x with H instead of F
+  [-] silent  m13_Pinv_A_not_AI.py: info predict P_inv = inv(A + Q) instead of inv(inv(A) + Q) (mixes information and covariance)
+  [-] silent  m14_IPF_swapped.py: non-invertible predict I - F_inv P_inv instead of I - P_inv F_inv (square, swapped)
+  [D] crash   m15_FTIX_swapped.py: non-invertible predict FTIX = x' FTI (row) instead of FTI x
+  [-] silent  m16_M_R2_forgot_T.py: sqrt update writes R2 instead of R2.T into the M block (square)
+  [D] crash   m17_M_HP_forgot_T.py: sqrt update writes H P1_2 (n_z, n_x) without .T into the (n_x, n_z) block of M
+  [D] crash   m18_M_P_offbyone.py: sqrt update writes P1_2.T into M[dim_z - 1:, dim_z:] (off by one row)
+  [-] crash   m19_S12_offbyone.py: S1_2 slices r[0:dim_z, 0:dim_z + 1] (off by one column)
+  [D] crash   m20_K_forgot_T.py: sqrt gain uses r[0:dim_z, dim_z:] without .T
+  [-] silent  m21_P12_forgot_T.py: sqrt update keeps the upper factor r[dim_z:, dim_z:] without .T (square)
+  [D] crash   m22_x_update_swapped.py: sqrt update x += y' K' (row) instead of K y
+  [D] crash   m23_M_builder_2dimx.py: M built as (2*dim_x, 2*dim_x) (the predict block size) instead of (dim_z + dim_x, dim_z + dim_x)
+  [-] silent  m24_sqrt_predict_axis0.py: sqrt predict stacks [F P1_2, Q1_2] along axis=0 instead of side by side
+  [-] silent  m25_sqrt_predict_forgot_T.py: sqrt predict QR of hstack([F P1_2, Q1_2]) without the .T
+  [-] crash   m26_sqrt_P2_wrong_index.py: sqrt predict slices P2[:dim_z, :dim_x] instead of P2[:dim_x, :dim_x]
+  [-] crash   m27_sqrt_Bu_swapped.py: sqrt predict control term dot(u, B) instead of dot(B, u)
+  [-] silent  m28_Q_prop_swapped_T.py: Q property returns Q1_2' Q1_2 instead of Q1_2 Q1_2' (square)
+  [-] crash   m29_reshape_z_index.py: reshape_z tests z2.shape[0] instead of z2.shape[1] before transposing
+  [-] crash   m30_logpdf_reshape.py: logpdf flattens x with reshape(-1, 1) (column) instead of flatten()
+  [-] silent  m31_logpdf_U_swapped.py: logpdf Mahalanobis term U @ x instead of x @ U (square)
+  [D] crash   m32_info_x_builder.py: information filter state built as zeros((dim_z, 1)) instead of zeros((dim_x, 1))
+scipy_signal/lti_conversion: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 13, +names 0; silent 8 (caught 0)
+  [-] crash   m01_gbt_cd_solve_forgot_T.py: gbt: solve for C^T with c instead of c.transpose() (forgotten .T)
+  [D] crash   m02_gbt_cd_missing_final_T.py: gbt: cd = cd_t, the solved (n, p) block is not transposed back to (p, n)
+  [D] crash   m03_gbt_dd_swapped.py: gbt: dd uses np.dot(bd, c) instead of np.dot(c, bd) (swapped operands)
+  [-] silent  m04_gbt_ad_square_T.py: gbt: ad solves with ima.transpose() (square n x n, transpose keeps the shape)
+  [D] crash   m05_gbt_eye_wrong_dim.py: gbt: identity sized by the inputs, np.eye(b.shape[1]) instead of np.eye(a.shape[0])
+  [D] crash   m06_zoh_lower_zeros_dims.py: zoh: lower-left zero block built (n, m) instead of (m, n)
+  [-] silent  m07_zoh_upper_swapped.py: zoh: upper block stacked as [B A] instead of [A B] (same (n, n+m) shape)
+  [-] crash   m08_zoh_ms_rows_offbyone.py: zoh: keeps n+1 rows of expm(em) instead of n (off-by-one slice)
+  [-] crash   m09_zoh_bd_slice_offbyone.py: zoh: bd sliced from column n-1 instead of n (off-by-one, (n, m+1))
+  [D] crash   m10_zoh_concat_axis.py: zoh: em built with concatenate(axis=1) instead of vstack (wrong axis)
+  [-] crash   m11_foh_lower_width.py: foh: lower zero block (m, n+m) instead of (m, n+2m) (wrong builder dim)
+  [-] crash   m12_foh_eye_n.py: foh: identity block np.eye(n) instead of np.eye(m) (wrong builder dim)
+  [-] crash   m13_foh_ms12_offbyone.py: foh: ms12 slice n:n+m+1 (one column too many)
+  [D] crash   m14_impulse_bd_order.py: impulse: bd = b @ ad * dt instead of ad @ b * dt (swapped operands)
+  [-] silent  m15_impulse_cd_value.py: impulse: cd = c @ ad instead of c (domain mistake, same (p, n) shape)
+  [D] crash   m16_ss2tf_B1_missing_slice.py: ss2tf: B1 = B[:, input] (1-D) instead of B[:, input:input + 1] (missing newaxis)
+  [D] crash   m17_ss2tf_D1_wrong_axis.py: ss2tf: D1 = D[input:input + 1, :] slices the wrong axis
+  [D] crash   m18_ss2tf_num_width.py: ss2tf: numerator built (nout, n) instead of (nout, n+1) (wrong builder dim)
+  [D] crash   m19_ss2tf_Ck_column.py: ss2tf: Ck takes column k of C instead of row k (wrong index)
+  [-] silent  m20_ss2tf_outer_transposed.py: ss2tf: np.dot(Ck.T, B1.T) instead of np.dot(B1, Ck) (square (n, n) result, transposed)
+  [D] crash   m21_ss2tf_full_D.py: ss2tf: uses D[k] (all inputs) instead of the SIMO D1[k]
+  [D] crash   m22_ss2tf_shape_unpack_swapped.py: ss2tf: nin, nout = D.shape (swapped unpacking)
+  [-] crash   m23_abcd_B_zeros_swapped.py: abcd_normalize: missing B rebuilt as zeros (p, n) instead of (n, p)
+  [-] crash   m24_abcd_q_wrong_axis.py: abcd_normalize: q read from C2.shape[1] instead of C2.shape[0]
+  [-] silent  m25_abcd_n_from_C_rows.py: abcd_normalize: n falls back to C2.shape[0] instead of C2.shape[1]
+  [-] crash   m26_tf2ss_eye_swapped.py: tf2ss: companion block np.eye(K - 1, K - 2) instead of np.eye(K - 2, K - 1)
+  [-] crash   m27_tf2ss_outer_swapped.py: tf2ss: np.outer(den_n[1:], num_p[:, 0]) (swapped operands, (K-1, p))
+  [-] silent  m28_tf2ss_pad_right.py: tf2ss: numerator zero-padded on the right instead of the left (same shape)
+  [D] crash   m29_block_diag_offset.py: _block_diag2: second block placed at row r2 instead of r1 (wrong index)
+  [-] silent  m30_expm_solve_swapped.py: _expm: solve(v + u, v - u) instead of solve(v - u, v + u) (gives expm(-A), square)
+  [-] silent  m31_normalize_row_index.py: normalize: leading-zero test reads row j instead of column j
+  [-] crash   m32_zpk2tf_b2_width.py: zpk2tf: 2-D numerator built (rows, n_zeros) instead of (rows, n_zeros+1)
+scipy_signal/ltisys: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 16, +names 0; silent 8 (caught 0)
+  [D] crash   m01_series_swap_BC.py: _series: B1*C2 block computed as dot(other.C, self.B) (swapped operands)
+  [D] crash   m02_series_zeros_dims.py: _series: lower-left zero block built as zeros((n1, n2)) instead of (n2, n1)
+  [D] crash   m03_series_d_swap.py: _series: feedthrough d = dot(other.D, self.D) (swapped operands)
+  [D] crash   m04_scale_input_forgot_D.py: _scale_input: forgets to scale D by the input matrix (d = self.D)
+  [D] crash   m05_scale_output_swap.py: _scale_output: c = dot(self.C, other) (swapped operands, post- instead of pre-multiply)
+  [D] crash   m06_parallel_hstack_B.py: _parallel: input matrices joined with hstack instead of vstack
+  [D] crash   m07_block_diag_offset.py: _block_diag2: second block placed at out[r2:, r2:] instead of out[r1:, r1:]
+  [D] crash   m08_interp_no_newaxis.py: _interp_linear: weights not lifted to a column (w instead of w[:, np.newaxis])
+  [-] crash   m09_interp_clip_off_by_one.py: _interp_linear: clip upper bound len(t) - 1 instead of len(t) - 2 (idx + 1 can run off the end)
+  [-] silent  m10_expm_square_T.py: expm: squaring phase uses R @ R.T instead of R @ R (square matrix)
+  [D] crash   m11_lsim_y_forgot_T.py: lsim: final output computed as xout @ C (forgot .T)
+  [D] crash   m12_lsim_UD_forgot_T.py: lsim: feedthrough computed as U2 @ D (forgot .T)
+  [D] crash   m13_lsim_M_zeros_dim.py: lsim ZOH: bottom zero block of M built with n_states rows instead of n_inputs
+  [D] crash   m14_lsim_M2_identity.py: lsim FOH: identity block of M2 is identity(n_states) instead of identity(n_inputs)
+  [-] crash   m15_lsim_newaxis_order.py: lsim: 1-D U lifted to a row U_in[np.newaxis, :] instead of a column
+  [-] silent  m16_lsim_noinput_forgot_T.py: lsim zero-input branch: expm(A * dt) instead of expm(A.T * dt) (square)
+  [-] silent  m17_lsim_zoh_index.py: lsim ZOH loop: uses U2[i] instead of U2[i-1] (input sample off by one)
+  [-] crash   m18_lsim_xout_dims.py: lsim: state buffer built as (n_states, n_steps) instead of (n_steps, n_states)
+  [-] crash   m19_impulse_C_state.py: impulse: initial state taken from C instead of B (X = squeeze(sys.C))
+  [-] crash   m20_step_ones_dims.py: step: unit input built as ones((len(T), n_states)) instead of ones(T.shape)
+  [-] silent  m21_default_T_count.py: _default_response_times: linspace with A.shape[0] samples instead of n
+  [D] crash   m22_place_diag_builder.py: place_poles lstsq path: diag_poles built as zeros(B.shape) instead of zeros(A.shape)
+  [-] crash   m23_place_sum_axis.py: place_poles: kernel vectors summed over axis=0 instead of axis=1
+  [-] silent  m24_place_solve_noT.py: place_poles: m = solve(X.T, diag(P) X.T) without the outer .T (square)
+  [-] crash   m25_YT_order_noT.py: _YT_loop: update order array not transposed (np.array(update_order) - 1)
+  [-] silent  m26_order_complex_sign.py: _order_complex_poles: selects poles with positive imaginary part first (imag > 0)
+  [-] silent  m27_place_no_neg.py: place_poles: forgets the A+BK -> A-BK sign flip of the gain
+  [D] crash   m28_dlsim_xout_builder.py: dlsim: state buffer built with B.shape[1] (n_inputs) columns instead of A.shape[0]
+  [D] crash   m29_dlsim_dot_swap.py: dlsim: input term np.dot(u_dt[i, :], system.B) (swapped operands)
+  [-] crash   m30_dlsim_1d_noT.py: dlsim: 1-D input lifted with atleast_2d but not transposed (row instead of column)
+  [D] crash   m31_dlsim_x0_dim.py: dlsim: default initial state zeros((B.shape[1],)) instead of zeros((A.shape[1],))
+  [-] silent  m32_KNV0_Q_row.py: _KNV0: orthogonal vector taken as the last row Q[-1, :] instead of the last column (square)
+scipy_signal/savgol_zi: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 13, +names 0; silent 10 (caught 1)
+  [D] crash   m01_order_row.py: savgol_coeffs: the powers are reshaped to a row (1, -1) instead of a column (-1, 1)
+  [-] crash   m02_design_T.py: savgol_coeffs: the design matrix is transposed before lstsq, (window, n_coef) against y of n_coef
+  [-] silent  m03_x_short.py: savgol_coeffs: the sample positions stop one short (window_length - pos - 1), window - 1 coefficients
+  [-] silent  m04_zero_coef_len.py: savgol_coeffs: deriv > polyorder returns polyorder + 1 zeros instead of window_length
+  [-] silent  m05_deriv_scale.py: savgol_coeffs: derivative scale multiplies by delta**deriv instead of dividing
+  [D] crash   m06_polyval_col.py: _polyval: Horner step adds the column p[:, j] instead of the row p[j, ...]
+  [D] crash   m07_polyval_acc_dims.py: _polyval: accumulator allocated (n_cols, n_pts) instead of (n_pts, n_cols)
+  [-] crash   m08_vander_newaxis.py: _polyfit: Vandermonde built with the newaxes swapped, (n_coef, window) instead of (window, n_coef)
+  [D] crash   m09_scale_axis.py: _polyfit: column norms taken over axis=1 (per sample) instead of axis=0 (per power)
+  [D] crash   m10_unscale_noT.py: _polyfit: unscaling divides c by scale without the transpose dance
+  [-] crash   m11_polyder_slice.py: _polyder: drops m + 1 trailing coefficients instead of m (p[:-m - 1])
+  [D] silent  m12_polyder_zero_row.py: _polyder: n <= m returns zeros_like(p[0, ...]), 1-D, instead of one row p[:1, ...]
+  [-] silent  m13_conv_noreverse.py: _convolve1d: windows @ weights (correlation) instead of the reversed weights (convolution)
+  [-] crash   m14_window_axis0.py: _convolve1d: sliding windows taken along axis=0 (channels) instead of axis=1
+  [D] crash   m15_pad_axis.py: _convolve1d: constant-mode pad widths applied to the channel axis instead of the sample axis
+  [D] crash   m16_edge_noswap.py: _fit_edge: the edge is not swapped to (window, n_channels) before polyfit
+  [-] crash   m17_values_reshape.py: _fit_edge: values reshaped to (n_channels, n_interp) instead of (n_interp, n_channels)
+  [-] silent  m18_right_interp_off1.py: _fit_edges_polyfit: right edge interpolation starts at n - halflen - 1, overwriting one interior sample
+  [D] crash   m19_convolve_xT.py: savgol_filter: interp path convolves x.T instead of x
+  [-] silent  m20_zi_drop_last.py: lfilter_zi: drops the last cumulative sum ([:-1]) instead of the first ([1:])
+  [-] crash   m21_sos_a_slice.py: sosfilt_zi: denominator sliced sos[section, 2:] (4 taps) instead of sos[section, 3:]
+  [D] crash   m22_sos_zi_dims.py: sosfilt_zi: zi allocated (2, n_sections) instead of (n_sections, 2)
+  [-] silent  m23_odd_right_short.py: odd_ext: right extension sliced -2:-(n + 1), n - 1 samples instead of n
+  [D] crash   m24_even_concat_axis.py: even_ext: extension concatenated along axis=0 instead of the last axis
+  [-] crash   m25_outer_swap.py: _lfilter: state update uses np.outer(b_pad[1:-1], xt), (taps, channels), instead of (channels, taps)
+  [-] crash   m26_state_row.py: _lfilter: output reads the state row z[0, :] instead of the column z[:, 0]
+  [D] crash   m27_sos_zi_index.py: _sosfilt: section state taken as zi[:, s] instead of zi[s]
+  [-] crash   m28_x0_row.py: filtfilt: initial value x0 taken as the first row ext[:1, :] instead of the first column
+  [-] silent  m29_backward_noreverse.py: filtfilt: backward pass filters y without reversing it
+  [-] silent  m30_unpad_off1.py: filtfilt: unpadding slice y[:, edge:-edge + 1] keeps one extra sample
+  [D] crash   m31_zi3d_reshape.py: sosfiltfilt: zi reshaped to (1, n_sections, 2) instead of (n_sections, 1, 2)
+  [-] crash   m32_x0_nokeepdims.py: sosfiltfilt: x_0 = ext[:, 0] drops the size-1 axis (no keepdims)
+statsmodels/mnlogit: clean errors {'default': 0, 'names': 0}; real bugs 30/32 mutants; caught default 18, +names 0; silent 7 (caught 3)
+  [D] crash   m01_cdf_missing_newaxis.py: MNLogit.cdf: row sums divide without [:, None] (missing newaxis)
+  [D] crash   m02_cdf_sum_axis0.py: MNLogit.cdf: normalizer summed over axis 0 (observations) instead of axis 1
+  [D] crash   m03_cdf_ones_wrong_dim.py: MNLogit.cdf: base-class column built with np.ones(X.shape[1]) instead of len(X)
+  [D] crash   m04_cdf_no_base_column.py: MNLogit.cdf: base class exp(0)=1 column forgotten, softmax over J-1 columns only
+  [-] silent  m05_loglike_reshape_c_order.py: MNLogit.loglike: flat params reshaped in C order instead of order='F'
+  [D] silent  m06_loglike_params_T.py: MNLogit.loglike: linear predictor uses params2d.T (extra transpose)
+  [D] crash   m07_score_forgot_T.py: MNLogit.score: firstterm.T forgotten in the score contraction
+  [-] silent  m08_score_flatten_order_F.py: MNLogit.score: (J-1, K) gradient flattened in F order, mismatching the params layout
+  [D] crash   m09_score_obs_cdf_slice_2.py: MNLogit.score_obs: cdf columns sliced [:, 2:] instead of [:, 1:] (off by one)
+  [D] crash   m10_loglike_and_score_no_slice.py: MNLogit.loglike_and_score: base-class column of the cdf not dropped
+  [D] silent  m11_score_obs_reshape_wrong.py: MNLogit.score_obs: result reshaped (-1, nobs) instead of (nobs, -1)
+  [D] crash   m12_hessian_forgot_T.py: MNLogit.hessian: diagonal block uses (w*X) @ X without .T
+  [D] crash   m13_hessian_missing_newaxis.py: MNLogit.hessian: off-diagonal weight (nobs,) multiplies X without [:, None]
+  [-] silent  m14_hessian_transpose_axes.py: MNLogit.hessian: blocks assembled with axes (0, 1, 2, 3) instead of (0, 2, 1, 3)
+  [-] crash   m15_hessian_inner_range_J.py: MNLogit.hessian: inner loop over range(J) instead of range(J - 1)
+  [D] crash   m16_hessian_factor_eye_J.py: MNLogit.hessian_factor: identity built with np.eye(self.J) instead of J - 1
+  [-] crash   m17_predict_linear_zeros_dim.py: MultinomialModel.predict(which='linear'): base zeros column sized by X2.shape[1] instead of len(X2)
+  [-] crash   m18_predict_swapped_dot.py: MultinomialModel.predict: linear predictor np.dot(params, X2) (swapped operands)
+  [-] same    m19_fit_reshape_swapped.py: MultinomialModel.fit: optimum reshaped (-1, K) instead of (K, -1)
+  [D] silent  m20_initialize_argmax_axis0.py: MultinomialModel.initialize: endog = wendog.argmax(0) (wrong axis)
+  [-] crash   m21_initialize_K_shape0.py: MultinomialModel.initialize: K = exog.shape[0] (rows, not regressors)
+  [-] crash   m22_fit_start_K_times_J.py: MultinomialModel.fit: zero start params sized K * J instead of K * (J - 1)
+  [-] silent  m23_dummies_drop_first_class.py: _numpy_to_dummies: drops the first class (dummy-coding habit), J-1 indicator columns
+  [D] crash   m24_logit_hessian_forgot_T.py: Logit.hessian: weights multiply X instead of X.T
+  [D] crash   m25_logit_score_swapped.py: Logit.score: np.dot(X, y - fitted) (swapped operands)
+  [-] crash   m26_poisson_score_obs_missing_newaxis.py: Poisson.score_obs: (endog - L) multiplies X without [:, None]
+  [D] crash   m27_poisson_prob_mu_row.py: Poisson.predict(which='prob'): means made a row [None, :] instead of a column
+  [D] crash   m28_poisson_pmf_gammaln_col.py: _poisson_pmf: log-factorial term broadcast as a column [:, None] instead of a row
+  [D] crash   m29_const_idx_min_axis1.py: _const_idx: column minimum taken over axis=1 (per row)
+  [-] crash   m30_matrix_rank_norm_axis1.py: _matrix_rank_qr: pivot column norms summed over axis=1 (rows) instead of axis=0
+  [-] same    m31_predict_count_params_rows.py: CountModel._predict_count: params sliced to X.shape[0] (rows) instead of X.shape[1]
+  [-] crash   m32_binary_predict_extra_T.py: BinaryModel.predict: linear predictor np.dot(X.T, params) (stray transpose)
+statsmodels/var: clean errors {'default': 1, 'names': 1}; real bugs 31/32 mutants; caught default 9, +names 0; silent 9 (caught 0)
+  [-] silent  m01_forecast_cov_phi_no_T.py: forecast_cov: Phi Sigma Phi instead of Phi Sigma Phi' (forgot .T on a square matrix)
+  [D] crash   m02_compute_acov_no_T.py: _compute_acov: np.dot(x[lag:], x[:-lag]) without the .T
+  [-] silent  m03_acf_to_acorr_wrong_index.py: acf_to_acorr: variances from acf[:, 0] (lag axis) instead of acf[0]
+  [-] crash   m04_ma_rep_builder_maxn.py: ma_rep: phis built with maxn rows instead of maxn + 1
+  [-] same    m05_ma_rep_swapped.py: ma_rep: A_j @ Phi_{i-j} instead of Phi_{i-j} @ A_j (swapped operands, square)
+  [-] crash   m06_comp_matrix_concat_axis0.py: comp_matrix: concatenate coefs along axis=0 instead of axis=1
+  [-] crash   m07_comp_matrix_identity_offby1.py: comp_matrix: identity column index arange(kp - k1 + 1), one too many
+  [-] silent  m08_var_acf_block_transposed.py: _var_acf: block taken as acf_full[k*i:k*(i+1), :k] (row block) instead of the column block
+  [-] crash   m09_var_acf_eye_dim.py: _var_acf: np.eye(k * p**2) instead of np.eye((k * p)**2)
+  [D] crash   m10_forecast_builder_swapped.py: forecast: forcs = np.zeros((k, steps)) (builder dims swapped)
+  [-] silent  m11_forecast_y_offby1.py: forecast: prior_y = y[h - i] instead of y[h - i - 1] (uses y[0] for the last obs)
+  [-] silent  m12_forecast_dot_swapped.py: forecast: np.dot(prior_y, A_i) instead of np.dot(A_i, prior_y) (swapped, square)
+  [-] crash   m13_forecast_exog_dot_swapped.py: forecast: np.dot(trend_coefs, exog) instead of np.dot(exog, trend_coefs)
+  [D] crash   m14_forecast_vars_no_diag.py: _forecast_vars: covs[:, inds] (one index) instead of covs[:, inds, inds]
+  [D] crash   m15_compute_acov_mean_axis1.py: _compute_acov: demean with x.mean(1) instead of x.mean(0)
+  [D] crash   m16_char_mat_sum_axis1.py: VARProcess._char_mat: coefs.sum(1) instead of coefs.sum(0)
+  [-] silent  m17_acovs_to_acorrs_no_outer.py: _acovs_to_acorrs: acovs / sd instead of acovs / outer(sd, sd) (missing the second axis)
+  [D] crash   m18_results_swapaxes_01.py: VARResults.__init__: lagged.swapaxes(0, 1) instead of swapaxes(1, 2)
+  [-] silent  m19_results_forgot_swapaxes.py: VARResults.__init__: coefs = lagged.copy(), forgot to transpose each A_i (square)
+  [D] crash   m20_results_coefs_exog_no_T.py: VARResults.__init__: coefs_exog = params[:endog_start] without .T
+  [-] crash   m21_fittedvalues_extra_T.py: fittedvalues: np.dot(endog_lagged.T, params) (stray .T)
+  [-] crash   m22_resid_slice_offby1.py: resid: endog[k_ar - 1:] instead of endog[k_ar:]
+  [-] silent  m23_cov_alpha_kn.py: _cov_alpha: drop k_exog rows instead of k_exog * neqs rows of cov_params
+  [-] crash   m24_cov_sigma_T_swapped.py: _cov_sigma: D_Kinv.T @ sigxsig @ D_Kinv (transposes on the wrong side)
+  [-] crash   m25_stderr_reshape_swapped.py: stderr: reshape((neqs, df_model)) instead of (df_model, neqs)
+  [-] crash   m26_bmat_zeros_dim.py: _bmat_forc_cov: trailing zeros block (lower_dim, k_exog) instead of (lower_dim, neqs)
+  [-] crash   m27_estimate_ysample_offby1.py: _estimate_var: y_sample = endog[lags - 1:] instead of endog[lags:]
+  [-] crash   m28_estimate_sse_outer.py: _estimate_var: sse = resid @ resid.T (nobs x nobs) instead of resid.T @ resid
+  [-] silent  m29_get_var_endog_no_reverse.py: get_var_endog: lag block not reversed (y_{t-p}..y_{t-1} order)
+  [-] crash   m30_process_forecast_trend_no_T.py: VARProcess.forecast: trend_coefs = coefs_exog without .T ((neqs, k_exog) not (k_exog, neqs))
+  [D] crash   m31_mse_builder_steps_plus1.py: VARProcess.mse: forc_covs built with steps + 1 rows
+  [D] crash   m32_intercept_row_not_col.py: VARProcess.__init__: intercept = coefs_exog[0] (first row) instead of coefs_exog[:, 0]
+statsmodels/linear_model: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 17, +names 0; silent 10 (caught 3)
+  [D] crash   m01_pinv_vt_no_T.py: pinv_extended: np.dot(vt, ...) instead of np.dot(vt.T, ...) (forgot the transpose of vt)
+  [-] crash   m02_pinv_s_row.py: pinv_extended: s[np.newaxis, :] instead of s[:, np.newaxis] when scaling the rows of u.T
+  [D] crash   m03_ncp_swapped.py: fit(pinv): normalized_cov_params = pinv.T @ pinv instead of pinv @ pinv.T
+  [D] crash   m04_beta_endog.py: fit(pinv): beta from the raw endog instead of the whitened wendog
+  [-] silent  m05_qr_R_Rt.py: fit(qr): normalized_cov_params = inv(R @ R.T) instead of inv(R.T @ R) (R is square k x k)
+  [-] crash   m06_qr_effects_no_T.py: fit(qr): effects = Q @ wendog instead of Q.T @ wendog
+  [D] crash   m07_predict_swapped.py: predict: np.dot(params, exog) instead of np.dot(exog, params)
+  [D] crash   m08_gls_whiten_vec2d.py: GLS.whiten: diagonal sigma, 2-d x multiplied by cholsigmainv without [:, None]
+  [-] silent  m09_gls_whiten_full_T.py: GLS.whiten: full sigma whitened with cholsigmainv.T (upper) instead of the lower factor
+  [D] crash   m10_gls_whiten_full_swapped.py: GLS.whiten: full sigma, np.dot(x, cholsigmainv) instead of np.dot(cholsigmainv, x)
+  [-] crash   m11_sigma_repeat_off.py: _get_sigma: scalar sigma repeated nobs - 1 times
+  [D] crash   m12_wls_whiten_row.py: WLS.whiten: 2-d x scaled by sqrt(weights)[None, :] instead of [:, None]
+  [D] crash   m13_ols_xprod_swapped.py: OLS._setup_score_hess: wexog @ wexog.T instead of wexog.T @ wexog
+  [-] silent  m14_ols_hessian_inner.py: OLS.hessian: np.dot(ssrp, ssrp) (inner) instead of np.outer(ssrp, ssrp)
+  [-] silent  m15_ridge_alpha_row.py: fit_ridge: alpha[None, :] * v (scales columns) instead of alpha[:, None] * v (rows)
+  [-] crash   m16_yw_lag_slice.py: yule_walker: lag product x[0:-k] * x[k + 1:] (off by one)
+  [-] silent  m17_yw_toeplitz_r1.py: yule_walker: R = toeplitz(r[1:]) instead of toeplitz(r[:-1])
+  [-] crash   m18_yw_solve_full_r.py: yule_walker: solve(R, r) instead of solve(R, r[1:])
+  [-] crash   m19_glsar_lag_target.py: GLSAR.whiten: _x[i:] updated with lag i+1 values (target slice off by one)
+  [-] silent  m20_glsar_return_off.py: GLSAR.whiten: return _x[order - 1:] (keeps one presample row)
+  [D] crash   m21_hccm_row.py: _HCCM: scale[None, :] * pinv.T instead of scale[:, None]
+  [D] crash   m22_abat_einsum_out.py: _abat_diagonal: einsum output 'j' instead of 'i' (sums over observations)
+  [D] crash   m23_ttest_sd_no_r.py: t_test: sd from diag(cov_params()) without r_matrix
+  [D] crash   m24_covr_no_T.py: cov_params: R @ cov @ R instead of R @ cov @ R.T
+  [D] silent  m25_cov_other_swapped.py: cov_params: other @ cov @ R.T instead of R @ cov @ other.T
+  [D] silent  m26_cov_column_diag.py: cov_params(column=array): cov_p[column, column] (diagonal) instead of cov_p[column[:, None], column]
+  [-] crash   m27_wald_cparams_1d.py: wald_test: cparams = R @ params without params[:, None]
+  [-] crash   m28_fvalue_restr_cols.py: fvalue (robust): restr = mat[:, idx] (drops a column) instead of mat[idx] (drops a row)
+  [-] silent  m29_gls_slogdet_sign.py: GLS.loglike: slogdet(sigma)[0] (the sign) instead of [1] (log|det|)
+  [D] crash   m30_const_max_axis.py: _handle_constant: np.max(exog, axis=1) instead of axis=0
+  [D] silent  m31_fitted_wexog.py: fittedvalues: predict with the whitened wexog instead of exog
+  [D] crash   m32_wresid_endog.py: wresid: raw endog minus wexog @ params instead of wendog
+statsmodels/pca: clean errors {'default': 0, 'names': 0}; real bugs 32/32 mutants; caught default 24, +names 0; silent 6 (caught 1)
+  [D] crash   m01_keep_col_axis.py: _keep_col: NaN columns found with np.any(..., 1) (row axis) instead of axis 0
+  [-] crash   m02_init_weights_builder.py: __init__: default weights built as np.ones(self._nobs) instead of nvar
+  [D] crash   m03_prepare_mu_axis.py: _prepare_data: column mean taken over axis=1 (per observation)
+  [-] silent  m04_prepare_swap_mu_sigma.py: _prepare_data: returns (data, sigma, mu) instead of (data, mu, sigma)
+  [-] silent  m05_svd_forgot_T.py: _compute_using_svd: returns Vh instead of Vh.T as the eigenvectors
+  [-] silent  m06_eig_vecs_T.py: _compute_using_eig: returns eigh's vecs.T (rows) instead of the column eigenvectors
+  [D] crash   m07_eig_gram_xxT.py: _compute_using_eig: eigh of the nobs x nobs Gram x.dot(x.T) instead of x'x
+  [D] crash   m08_svd_on_xT.py: _compute_eig: svd dispatch passes x.T
+  [-] crash   m09_nipals_var_axis.py: NIPALS: start column picked by argmax(x.var(1)) (per-observation variance)
+  [D] crash   m10_nipals_vec_noT.py: NIPALS: loading update x.dot(factor) instead of x.T.dot(factor)
+  [D] crash   m11_nipals_outer_norm.py: NIPALS: normalizes vec by sqrt(vec.dot(vec.T)) (outer product) instead of vec.T.dot(vec)
+  [-] crash   m12_nipals_store_vecT.py: NIPALS: stores vec.T into the column vecs[:, [i]]
+  [D] crash   m13_nipals_deflate_swap.py: NIPALS: deflation subtracts vec.dot(factor.T) instead of factor.dot(vec.T)
+  [D] crash   m14_nipals_vecs_builder.py: NIPALS: eigenvector buffer built with x.shape[0] (nobs) rows
+  [D] crash   m15_nipals_factor_reshape.py: NIPALS: start factor reshaped to a row (1, nobs) instead of a column
+  [D] crash   m16_pcaeig_row_index.py: _compute_pca_from_eig: eigenvectors reordered by rows eigenvecs[indices, :]
+  [D] crash   m17_init_weights_reshape.py: __init__: user weights reshaped to a column (-1, 1) instead of flattened
+  [D] crash   m18_pcaeig_slice_rows.py: _compute_pca_from_eig: truncates eigenvector rows vecs[:ncomp, :] instead of columns
+  [D] crash   m19_pcaeig_off_by_one.py: _compute_pca_from_eig: keeps ncomp + 1 eigenvector columns
+  [D] crash   m20_pcaeig_coeff_noT.py: _compute_pca_from_eig: coeff = vecs_k (forgot .T)
+  [D] crash   m21_pcaeig_normalize_untruncated.py: _compute_pca_from_eig: factors normalized by all eigenvalues (vals) instead of vals_k
+  [-] silent  m22_pcaeig_num_good_off.py: _compute_pca_from_eig: overwrites one positive eigenvalue too many (vals[num_good - 1:])
+  [D] crash   m23_project_coeff_cols.py: _project: truncates coeff columns coeff[:, :ncomp] instead of rows
+  [D] crash   m24_gls_var_axis.py: _compute_gls_weights: residual variance over axis 1 (per observation)
+  [-] silent  m25_gls_check_rows.py: _compute_gls_weights: full-rank guard compares ncomp to nobs (shape[0]) instead of nvar
+  [D] crash   m26_rsq_tss_axis.py: _compute_rsquare_and_ic: per-series TSS summed over axis 1
+  [D] crash   m27_rsq_ess_builder.py: _compute_rsquare_and_ic: ess = np.zeros(ncomp) (forgot the +1 for the 0-component model)
+  [D] crash   m28_rsq_ess_indiv_swapped.py: _compute_rsquare_and_ic: ess_indiv built (n_var, ncomp + 1) (dims swapped)
+  [D] crash   m29_rsq_missing_newaxis.py: _compute_rsquare_and_ic: penalties used without [:, None]
+  [D] silent  m30_rsq_ic_forgot_T.py: _compute_rsquare_and_ic: returns ic (3, k) instead of ic.T
+  [D] crash   m31_rsq_r_untruncated.py: _compute_rsquare_and_ic: penalty index r built from the untruncated ess
+  [D] crash   m32_em_fill_builder.py: _fill_missing_em: mean-fill matrix built with prepared.shape[1] (nvar) rows
