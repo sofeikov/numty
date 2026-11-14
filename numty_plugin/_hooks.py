@@ -201,7 +201,18 @@ class NumtyPlugin(Plugin):
             _swallowed(None, "startup_check")
 
     def get_customize_class_mro_hook(self, fullname: str) -> Callable[[ClassDefContext], None] | None:
-        return _sizes_covariant
+        def hook(ctx: ClassDefContext) -> None:
+            _sizes_covariant(ctx)
+            # mypy takes the first plugin's hook: the later plugins' runs too.
+            chain = getattr(getattr(ctx.api, "plugin", None), "_plugins", None)
+            if isinstance(chain, list) and self in chain:
+                for plugin in chain[chain.index(self) + 1 :]:
+                    later = plugin.get_customize_class_mro_hook(fullname)
+                    if later is not None:
+                        later(ctx)
+                        return
+
+        return hook
 
     def get_function_signature_hook(
         self, fullname: str
