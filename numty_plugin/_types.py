@@ -1360,10 +1360,15 @@ def _fold_dim_expr(
     if isinstance(expr, NameExpr) and isinstance(proper, Instance) and proper.type.fullname == INT_FULLNAME:
         # `m = x.shape[0] + 1; np.zeros(m)` (issue 359): a local bound
         # once spells the size its value spells. Nothing is minted for
-        # a name whose value is no size (`np.zeros(n)` stays `int`).
+        # a name whose value is no size (`np.zeros(n)` stays `int`). A
+        # product stays `int` too: such a local is often given a name of
+        # its own in the return (`kp = k * p` declared `F64["kp kp"]`),
+        # which a size spelled with the signature's names cannot take.
         rvalue = _single_rvalue_of(ctx, expr)
         if rvalue is not None:
-            return _fold_dim_expr(ctx, rvalue, index, depth + 1)
+            folded = _fold_dim_expr(ctx, rvalue, index, depth + 1)
+            if folded is None or isinstance(folded, int) or isinstance(_resolve_dim(folded), _LinForm):
+                return folded
     return None
 
 

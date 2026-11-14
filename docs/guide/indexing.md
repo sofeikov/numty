@@ -63,8 +63,7 @@ otherwise (`x[i : i + bs]` on the last batch). So it is given when an
 unknown: nothing is proved from it with `numty-names` off. Where the
 variable cancels out the size is exact: `x[:, i : i + 1]` is `(c, 1)`
 and `R[s : s + len(z)]` is `(K,)` for `z: F64[K]` (issue 359). A
-negated stop counts from the end: `x[:-m]` is `(n-?m,)`, as `x[m:]` is,
-and `np.arange(ws, we)` is `(?we-?ws,)` like `x[ws:we]`
+negated stop counts from the end: `x[:-m]` is `(n-?m,)`, as `x[m:]` is
 (`tests/fixtures/sizes_in_ints_ok.py`). Under the `numty-names` code
 (on by default) two
 of them a constant apart are reported, `out[k:] = mins` as `-?k+N+1 and

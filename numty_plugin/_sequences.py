@@ -10,7 +10,7 @@ _LAYERS).
 """
 from __future__ import annotations
 
-from mypy.nodes import ARG_POS, CallExpr, Expression, ListComprehension, ListExpr, NameExpr, StarExpr
+from mypy.nodes import ARG_POS, CallExpr, Expression, ListComprehension, ListExpr, NameExpr, OpExpr, StarExpr
 from mypy.plugin import AttributeContext, FunctionContext, MethodContext
 from mypy.types import (
     CallableType, Instance, LiteralType, TupleType, Type, TypeVarType, UnpackType, get_proper_type,
@@ -92,8 +92,12 @@ def _sequence_length(ctx: FunctionContext | MethodContext, seq: Expression) -> i
         name = seq.callee.fullname
         if any(kind != ARG_POS for kind in seq.arg_kinds):
             return None
-        if name == "builtins.range" and len(seq.args) == 1:
-            size = _builder_fold_dim_expr(ctx, seq.args[0], 0)
+        if name == "builtins.range" and len(seq.args) in (1, 2):
+            # `range(lags, nobs)` has `nobs - lags` items, read as the
+            # formula `stop - start` (issue 359); like `np.arange(1, m + 1)`
+            # the bounds are taken to be in order.
+            span = seq.args[0] if len(seq.args) == 1 else OpExpr("-", seq.args[1], seq.args[0])
+            size = _builder_fold_dim_expr(ctx, span, 0)
             return max(size, 0) if isinstance(size, int) else size
         if name == "builtins.enumerate" and len(seq.args) == 1:
             return _sequence_length(ctx, seq.args[0])

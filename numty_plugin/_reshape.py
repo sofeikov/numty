@@ -251,8 +251,8 @@ def _solve_reshape_dynamic(
     a plain `int` like the input's dynamic dims ((n, 3) -> (-1, 3) is
     (int, 3)). Next to a plain `int` size it is a ratio the caller may
     know to be fixed ((n, 3) -> (n, -1) is (n, 3) again), so it is
-    unknown (Any), which fits where a literal was expected. Next to
-    size names only it is a fresh unknown. Plain `int`
+    unknown (Any), which fits where a literal was expected, and so it
+    is next to size names only. Plain `int`
     target sizes go unknown where they may stand for a literal the name
     was first bound with: on a mixed input's literal axes, and anywhere
     when the input has no literal axis to line them up with.
@@ -273,13 +273,13 @@ def _solve_reshape_dynamic(
         inferred = AnyType(TypeOfAny.explicit)
     if not plain and not any(d >= 0 for d in ints) and -1 in ints:
         # reshape(-1), reshape(N, -1): the -1 is not readable here. Next
-        # to a size name it is an unknown size of its own (issue 353), so
-        # the name still checks; never the stubs' `Literal[-1]`.
+        # to a size name it is unknown (Any) as next to a plain `int`, so
+        # the name still checks and the -1 fits a declared size (issue
+        # 353); never the stubs' `Literal[-1]`.
         if len(dims) == 1:
             flat = ctx.api.named_generic_type(INT_FULLNAME, [])
             return _mixed_result(_ndarray_type(ctx, [flat], proper.args[1]), old)
-        from numty_plugin import _fresh_unknown
-        inferred = _fresh_unknown(ctx, "reshape", dims.index(-1))
+        inferred = AnyType(TypeOfAny.explicit)
     out = [inferred if d == -1 else d for d in dims]
     if not _is_mixed_shape(proper):
         # No literal axis to line the sizes up with (x.ravel().reshape(n,

@@ -556,14 +556,20 @@ def _bound_names(
 def _shapes_at(declared: Type, p: int | None, rank: int) -> list[list[Type]]:
     """Array shapes of the given rank declared at a position of a return.
 
-    The position is None for the value itself, else the tuple index.
+    The position is None for the value itself, else the tuple index. A
+    union of tuples (a function that also returns a null system of
+    rank-1 arrays) gives the shapes each member declares there.
     """
     if p is None:
         return _array_shapes(declared, rank)
     proper = get_proper_type(declared)
-    if isinstance(proper, TupleType) and p < len(proper.items):
-        return _array_shapes(proper.items[p], rank)
-    return []
+    members = proper.items if isinstance(proper, UnionType) else [proper]
+    out: list[list[Type]] = []
+    for member in members:
+        tup = get_proper_type(member)
+        if isinstance(tup, TupleType) and p < len(tup.items):
+            out.extend(shape for shape in _array_shapes(tup.items[p], rank) if shape not in out)
+    return out
 
 
 # Sizes already given to a free name in one `return`, by position:

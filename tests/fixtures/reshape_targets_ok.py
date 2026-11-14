@@ -1,7 +1,7 @@
 """Reshape targets numty now reads (issue 353).
 
-A `-1` next to a size name on an `int`-sized input is an unknown of its
-own (never the stubs' `Literal[-1]`); a list target is read like a
+A `-1` next to a size name on an `int`-sized input is unknown, `Any`
+(never the stubs' `Literal[-1]`); a list target is read like a
 tuple; a `-1` next to the input's own leading axis is its trailing
 axis, whatever the form of the leading one; a target `.shape` of
 unknown length gives an unknown rank, not a 0-d array.

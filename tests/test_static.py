@@ -6743,16 +6743,16 @@ def test_clash_unknown_is_not_absorbed_by_a_later_name() -> None:
 
 
 def test_reshape_targets_ok() -> None:
-    # Issue 353: a -1 next to a size name on an `int`-sized input is an
-    # unknown (never `Literal[-1]`), a list target reads like a tuple, a
+    # Issue 353: a -1 next to a size name on an `int`-sized input is
+    # unknown, `Any` (never `Literal[-1]`), a list target reads like a tuple, a
     # -1 next to the input's own leading axis is its trailing axis, and
     # a `.shape` of unknown length gives an unknown rank, not 0-d.
     result = run_mypy(FIXTURES / "reshape_targets_ok.py")
     assert result.returncode == 0, result.stdout
     f64 = "numpy.dtype[numpy.float64]"
     assert reveals_by_line(result) == {
-        23: f'"{_ND}[tuple[K, ?U@23], {f64}]"',
-        24: f'"{_ND}[tuple[K, ?U@24], {f64}]"',
+        23: f'"{_ND}[tuple[K, Any], {f64}]"',
+        24: f'"{_ND}[tuple[K, Any], {f64}]"',
         25: f'"{_ND}[tuple[int], {f64}]"',
         31: f'"{_ND}[tuple[X, N], {f64}]"',
         32: f'"{_ND}[tuple[X, N], {f64}]"',
@@ -6770,7 +6770,7 @@ def test_reshape_targets_bad() -> None:
     errors = _messages_by_line(run_mypy(FIXTURES / "bad_reshape_targets.py"))
     assert errors == {
         14: [
-            'Incompatible types in assignment (expression has type "ndarray[tuple[K, ?U@14], dtype[float64]]", '
+            'Incompatible types in assignment (expression has type "ndarray[tuple[K, Any], dtype[float64]]", '
             'variable has type "ndarray[tuple[N, int], dtype[float64]]")  [assignment]'
         ],
         18: [
@@ -6826,23 +6826,26 @@ def test_index_rows_bad() -> None:
 def test_sizes_in_ints_ok() -> None:
     # Issue 359: sizes spelled through an `int` expression, a local,
     # `.size` or `len()` keep what numty knows, and an `int` size fits a
-    # name declared on an earlier line as on the annotated line.
+    # name declared on an earlier line as on the annotated line. A local
+    # bound to a product stays `int` (line 36): a free name of the return
+    # may stand for it (`kp = k * p` declared `F64["kp kp"]`).
     result = run_mypy(FIXTURES / "sizes_in_ints_ok.py")
     assert result.returncode == 0, result.stdout
     f64 = "numpy.dtype[numpy.float64]"
-    intp = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._32Bit | numpy._typing._nbit_base._64Bit]]"
     assert reveals_by_line(result) == {
-        21: f'"{_ND}[tuple[c, Literal[1]], {f64}]"',
-        22: f'"{_ND}[tuple[?we-?ws], {intp}]"',
-        23: f'"{_ND}[tuple[c, n-?m], {f64}]"',
-        27: f'"{_ND}[tuple[K, K], {f64}]"',
-        33: f'"{_ND}[tuple[N+1], {f64}]"',
-        38: '"S"',
-        39: '"Literal[12]?"',
-        40: '"S*X"',
-        41: f'"{_ND}[tuple[X, S], {f64}]"',
-        43: f'"{_ND}[tuple[S], {f64}]"',
-        52: '"?K@51"',
+        22: f'"{_ND}[tuple[c, Literal[1]], {f64}]"',
+        23: f'"{_ND}[tuple[?U@23, c, ?ws], {f64}]"',
+        24: f'"{_ND}[tuple[c, n-?m], {f64}]"',
+        28: f'"{_ND}[tuple[K, K], {f64}]"',
+        34: f'"{_ND}[tuple[N+1], {f64}]"',
+        36: f'"{_ND}[tuple[int], {f64}]"',
+        41: '"S"',
+        42: '"Literal[12]?"',
+        43: '"S*X"',
+        44: f'"{_ND}[tuple[X, S], {f64}]"',
+        46: f'"{_ND}[tuple[S], {f64}]"',
+        55: '"?K@54"',
+        67: f'"{_ND}[tuple[N-S, K*S], {f64}]"',
     }, result.stdout
 
 
