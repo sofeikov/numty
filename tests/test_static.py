@@ -7197,8 +7197,9 @@ def test_array_rank_ok() -> None:
         18: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
         19: f'"{_ND}[tuple[Literal[3], N], {_F64}]"',
         20: f'"{_ND}[tuple[N], {_F64}]"',
-        # filterpy's missing-measurement marker: an object array, `int` long.
-        21: f'"{_ND}[tuple[int, Literal[1]], {any_dt}]"',
+        # filterpy's missing-measurement marker: an object array; an `int`
+        # count is an unknown (`Any`) size, which a declared `(n_z, 1)` takes.
+        21: f'"{_ND}[tuple[Any, Literal[1]], {any_dt}]"',
         22: f'"{_ND}[tuple[Literal[2], ?U@22], {_F64}]"',
         # Ragged rows are numpy's error: the stubs' answer.
         23: f'"{_ND}[tuple[Any, ...], {any_dt}]"',

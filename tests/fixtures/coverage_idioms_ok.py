@@ -1,10 +1,10 @@
 """Issues 349-351, 360: idioms from scipy, statsmodels and filterpy that stay clean."""
-from typing import TypeVar
+from typing import Generic, Literal, TypeVar
 
 import numpy as np
 from numpy import real
 from numpy.lib.stride_tricks import sliding_window_view
-from numty import F64
+from numty import F64, Arr
 
 S = TypeVar("S", bound=int)
 N = TypeVar("N", bound=int)
@@ -70,3 +70,13 @@ def response_times(A: F64[S, S]) -> float:
     if r == 0.0:
         r = 1.0
     return 1.0 / r
+
+
+class Filter(Generic[N]):
+    def __init__(self, dim_z: int) -> None:
+        self._dim_z = dim_z
+        # filterpy's marker for a missing measurement, set again elsewhere.
+        self.z: Arr[np.object_, N, Literal[1]] | F64[N] = np.array([[None] * dim_z]).T
+
+    def update(self) -> None:
+        self.z = np.array([[None] * self._dim_z]).T

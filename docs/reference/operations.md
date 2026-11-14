@@ -207,7 +207,9 @@ two arrays of one shape is `(2, *shape)`; an axis where an item has an
 `np.stack`). A nested display has one axis per level
 (`np.array([[-a, a]])` is `(1, 2)`), and a list repetition repeats its
 items: `np.array([0.0] * 3)` is `(3,)`, `np.array([v] * n)` of `(N,)` is
-`(n, N)` for a size `n` and `(int, N)` for an `int` one. Rows of
+`(n, N)` for a size `n` and `(Any, N)` for an `int` one (an unknown
+size that a declared name takes, as filterpy's `self.z =
+np.array([[None] * self._dim_z]).T` needs). Rows of
 different lengths are numpy's error and keep the stubs' answer.
 `np.array(1.0)` and `np.asarray(x)` of a scalar are 0-d, with the
 scalar's dtype for a literal or a numpy scalar and an open dtype for a

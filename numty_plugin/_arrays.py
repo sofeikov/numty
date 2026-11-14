@@ -16,7 +16,7 @@ from ._dtypes import (
 from ._forms import _form_has_unknown
 from ._bindings import _value_of_rebound_name
 from ._types import (
-    DTYPE_FULLNAME, INT_FULLNAME, _dim_eq, _dim_mul_const, _distribute_solve, _fold_dim_expr,
+    DTYPE_FULLNAME, _dim_eq, _dim_mul_const, _distribute_solve, _fold_dim_expr,
     _fold_int, _has_unpack, _ndarray_parts, _ndarray_type,
     _parts_or_unpack,
 )
@@ -404,8 +404,11 @@ def _display_shape(
         display, times = repetition
         n = _fold_dim_expr(ctx, times, depth)
         if n is None:
-            # An `int` count is an `int` size, as in a builder.
-            n = ctx.api.named_type(INT_FULLNAME)
+            # An `int` count is an unknown size (`Any`): filterpy rebinds
+            # `self.z = np.array([[None] * self._dim_z]).T` to an attribute
+            # declared `(n_z, 1)` in another method, which an `int` would
+            # not fit. The rank is still checked.
+            n = AnyType(TypeOfAny.special_form)
         width = len(display.items)
         count = width * n if isinstance(n, int) else _dim_mul_const(ctx, "asarray", depth, n, width)
         exprs: list[Expression | None] = list(display.items)
