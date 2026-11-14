@@ -93,8 +93,10 @@ quiet, where it is approximate, and what to write instead.
     in a loop or a comprehension (a call there, a mask variable bound
     there, a variable holding an object bound there) such a size is a
     size per run and nothing is proved from it; the same goes for any
-    other unknown (`?U@14` from an inline mask): one site can stand for
-    the items of a comprehension. A value kept across calls of a
+    other unknown (`?U@14` from an inline mask) minted there: one site can
+    stand for the items of a comprehension. One minted elsewhere ran once
+    and is one size against itself in a contraction or a broadcast
+    (`q @ r` of one `np.linalg.qr`, issue 352). A value kept across calls of a
     function (an attribute holding last call's selection) is not
     seen as another size.
 - An in-place op that grows a `1` axis to a size over names is

@@ -32,6 +32,7 @@ from ._forms import (
 from ._exprs import (
     _expr_constituents, _expr_str, _form_of, _seen_vars,
 )
+from ._unknowns import _is_single_site
 
 NDARRAY_FULLNAME = "numpy.ndarray"
 INT_FULLNAME = "builtins.int"
@@ -244,6 +245,9 @@ _OWN_NAME_OF: dict[TypeVarId, set[str]] = {}
 def _same_own_size(a: int | Type, b: int | Type) -> bool:
     """One selection count, or one size a call chose, on both sides (issues 288, 307).
 
+    Also one site unknown minted outside a loop or a comprehension
+    (issue 352): `q` and `r` of one `np.linalg.qr` share their size.
+
     Also a free name against the unknown that took it: `sel * y[keep]`
     with `sel = x[keep]` named `K` is one count on both sides.
     """
@@ -255,7 +259,8 @@ def _same_own_size(a: int | Type, b: int | Type) -> bool:
         return True
     if b.fullname in _OWN_NAME_OF.get(a.id, ()) or a.fullname in _OWN_NAME_OF.get(b.id, ()):
         return True
-    return False
+    # One site unknown minted where it runs once (issue 352): `q @ r`.
+    return a.fullname == b.fullname and _is_single_site(a)
 
 
 def _mask_counts_differ(a: int | Type, b: int | Type) -> bool:

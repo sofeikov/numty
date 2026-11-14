@@ -13,11 +13,12 @@ from ._dtypes import (
     _GENERIC_KIND, _NAME_OF_KIND_SIZE,
 )
 from ._types import (
-    TUPLE_FULLNAME, _check_dim_eq, _dim_eq, _dim_str, _has_unpack, _int_value, _ndarray_parts, _ndarray_type,
+    TUPLE_FULLNAME, _check_dim_eq, _dim_eq, _dim_str, _dims_provably_ne, _has_unpack, _int_value, _ndarray_parts,
+    _ndarray_type, _report_mask_names, _report_names,
 )
 from ._reshape import (
     _check_axis, _all_positionals, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
-    _is_none_type, _normalize_axis, _parse_axis_arg, _promote_all, _promote_dtypes, _weak_name,
+    _is_none_type, _is_plain_int, _normalize_axis, _parse_axis_arg, _promote_all, _promote_dtypes, _weak_name,
 )
 from ._builders import (
     _fold_single,
@@ -123,6 +124,35 @@ def _linalg_eig_names(kind: str, size: int, hermitian: bool) -> tuple[str, str] 
     return None
 
 
+def _check_rows(
+    ctx: FunctionContext,
+    op: str,
+    size: int | Type,
+    rows: int | Type,
+    dims_a: list[int | Type],
+    dims_b: list[int | Type],
+) -> bool:
+    """The rows of b against a's for solve and lstsq: False after an error (issue 352).
+
+    As a matmul's inner pair: an error when the sizes provably differ
+    (`N` vs `N-1`), the `[numty-names]` report for two different names,
+    and on otherwise, since the result does not hang on the pair.
+    """
+    if _dim_eq(size, rows) or _is_plain_int(size) or _is_plain_int(rows):
+        return True
+    shapes = f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})"
+    if (isinstance(size, int) and isinstance(rows, int)) or _dims_provably_ne(size, rows):
+        ctx.api.fail(
+            f"linalg.{op} inner dimensions disagree: {_dim_str(size)} vs {_dim_str(rows)} {shapes}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return False
+    _report_names(ctx, size, rows, f"linalg.{op} inner dimensions {shapes}")
+    _report_mask_names(ctx, size, rows, f"linalg.{op} inner dimensions {shapes}")
+    return True
+
+
 def _linalg_solve(ctx: FunctionContext) -> Type:
     from numty_plugin import _broadcast_result
     pairs = _all_positionals(ctx)
@@ -159,28 +189,17 @@ def _linalg_solve(ctx: FunctionContext) -> Type:
             code=NUMTY_SHAPE,
         )
         return ctx.default_return_type
+    rows = dims_b[0] if len(dims_b) == 1 else dims_b[-2]
+    if not _check_rows(ctx, "solve", size, rows, dims_a, dims_b):
+        return ctx.default_return_type
+    if _is_plain_int(size):
+        size = rows
     if len(dims_b) == 1:
-        if not _check_dim_eq(
-            ctx,
-            dims_b[0],
-            size,
-            f"linalg.solve inner dimensions disagree: {_dim_str(size)} vs "
-            f"{_dim_str(dims_b[0])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
-        ):
-            return ctx.default_return_type
         batch_b: list[int | Type] = []
         core = [size]
     else:
-        if not _check_dim_eq(
-            ctx,
-            dims_b[-2],
-            size,
-            f"linalg.solve inner dimensions disagree: {_dim_str(size)} vs "
-            f"{_dim_str(dims_b[-2])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
-        ):
-            return ctx.default_return_type
         batch_b = dims_b[:-2]
-        core = dims_b[-2:]
+        core = [size, dims_b[-1]]
     batch, cause = _broadcast_result(dims_a[:-2], batch_b, ctx)
     if cause is not None:
         ctx.api.fail(
@@ -453,26 +472,9 @@ def _linalg_lstsq(ctx: FunctionContext) -> Type:
     rows, cols = dims_a[-2], dims_a[-1]
     if not dims_b:
         return ctx.default_return_type
-    if len(dims_b) == 1:
-        if not _check_dim_eq(
-            ctx,
-            dims_b[0],
-            rows,
-            f"linalg.lstsq inner dimensions disagree: {_dim_str(rows)} vs "
-            f"{_dim_str(dims_b[0])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
-        ):
-            return ctx.default_return_type
-        core = [cols]
-    else:
-        if not _check_dim_eq(
-            ctx,
-            dims_b[-2],
-            rows,
-            f"linalg.lstsq inner dimensions disagree: {_dim_str(rows)} vs "
-            f"{_dim_str(dims_b[-2])} (shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
-        ):
-            return ctx.default_return_type
-        core = [cols, dims_b[-1]]
+    if not _check_rows(ctx, "lstsq", rows, dims_b[0] if len(dims_b) == 1 else dims_b[-2], dims_a, dims_b):
+        return ctx.default_return_type
+    core = [cols] if len(dims_b) == 1 else [cols, dims_b[-1]]
     dtype = _linalg_solve_dtype(ctx, dtype_a, dtype_b)
     if dtype is None:
         return ctx.default_return_type

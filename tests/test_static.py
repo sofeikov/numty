@@ -3313,10 +3313,10 @@ def test_dot18_ok_clean() -> None:
 
 
 def test_dot_nd_mismatch() -> None:
-    assert_rank_mismatch(
+    # Issue 364: no `Never` [arg-type] follow-on from the overload trial.
+    assert_single_error(
         run_mypy(FIXTURES / "bad_dot_nd.py"),
         "dot contracted dimensions disagree: 3 vs 4",
-        "incompatible type",
     )
 
 
@@ -6740,3 +6740,59 @@ def test_clash_unknown_is_not_absorbed_by_a_later_name() -> None:
     assert sorted(on) == [21, 26], on
     assert all("D and N are different names  [numty-names]" in m for line in on.values() for m in line), on
     assert _run_fixture("bad_clash_unknown.py") == ["ValueError", "[2.0, 1.5, 1.3333333333333333]", "(3, 3)", "(2, 3)"]
+
+
+# Issue 352: np.dot / np.matmul / linalg.solve / lstsq gave Any for a scalar
+# operand, a union operand with a member that fits nothing, rows that are not
+# provably equal, and one unknown shared by both operands.
+def test_contraction_operands_ok() -> None:
+    result = run_mypy(FIXTURES / "contraction_operands_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[Literal[5], Literal[2]], {_F64}]"',
+        13: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}]"',
+        14: f'"{_ND}[tuple[Literal[5], Literal[2]], {_F64}]"',
+        18: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}] | {_ND}[tuple[Literal[5]], {_F64}]"',
+        19: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}] | {_ND}[tuple[Literal[5]], {_F64}]"',
+        # The (3,) member fits nothing, but the (2, 3) one does: as for `@`.
+        23: f'"{_ND}[tuple[Literal[5], Literal[3]], {_F64}]"',
+        27: f'"{_ND}[tuple[N, Literal[3]], {_F64}]"',
+        28: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        33: f'"{_ND}[tuple[M, N], {_F64}]"',
+        35: f'"{_ND}[tuple[M, N], {_F64}]"',
+        36: f'"{_ND}[tuple[M, N], {_F64}]"',
+        37: f'"{_ND}[tuple[?U@34], {_F64}]"',
+    }, result.stdout
+
+
+def test_contraction_operands_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_contraction_operands.py")
+    assert _messages_by_line(result) == {
+        13: [
+            'Incompatible return value type (got "ndarray[tuple[Literal[5], Literal[2]], dtype[float64]]", '
+            'expected "ndarray[tuple[Literal[5], Literal[1]], dtype[float64]]")  [return-value]'
+        ],
+        17: ["matmul inner dimensions disagree: 3 vs 5  [numty-shape]"],
+        18: ["matmul inner dimensions disagree: 3 vs 5  [numty-shape]"],
+        19: ["matmul inner dimensions disagree: 4 vs 5  [numty-shape]"],
+        23: ["linalg.solve inner dimensions disagree: N vs N-1 (shapes (N, N) vs (N-1, N))  [numty-shape]"],
+        24: ["linalg.solve inner dimensions (shapes (N, N) vs (P, N)): N and P are different names  [numty-names]"],
+        25: ["linalg.lstsq inner dimensions (shapes (N, P) vs (P,)): N and P are different names  [numty-names]"],
+        30: [
+            'Incompatible return value type (got "ndarray[tuple[M, M], dtype[float64]]", '
+            'expected "ndarray[tuple[N, N], dtype[float64]]")  [return-value]'
+        ],
+        # Issue 364: no `Never` [arg-type] follow-on from the overload trial.
+        34: ["matmul inner dimensions disagree: 1 vs 5  [numty-shape]"],
+    }, result.stdout
+
+
+def test_dot_nested_names_no_follow_on() -> None:
+    # Issue 364: the inner np.dot's report failed each overload of the outer one.
+    result = run_mypy(FIXTURES / "bad_dot_nested_names.py")
+    assert _messages_by_line(result) == {
+        12: [
+            "broadcast at trailing axis 0 (shapes (N, N) vs (N, K)): N and K are different names  [numty-names]",
+            "matmul inner dimensions (shapes (K, K) vs (N, K)): K and N are different names  [numty-names]",
+        ],
+    }, result.stdout
