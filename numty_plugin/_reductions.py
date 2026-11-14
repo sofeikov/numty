@@ -1482,10 +1482,23 @@ def flatten_method_hook(ctx: MethodContext) -> Type:
 
 
 def ravel_function_hook(ctx: FunctionContext) -> Type:
+    """np.ravel: as the method; a total it cannot spell is a fresh `?U`.
+
+    The method's stub keeps `(int,)` there, the function's loses the
+    rank and dtype (issue 351), so the function answers `(?U,)` with
+    the input's dtype.
+    """
+    from numty_plugin import _fresh_unknown
     pairs = _all_positionals(ctx)
     if not pairs:
         return ctx.default_return_type
-    return _ravel_solve(ctx, pairs[0][0])
+    result = _ravel_solve(ctx, pairs[0][0])
+    if result is not ctx.default_return_type:
+        return result
+    parts = _parts_or_unpack(pairs[0][0]) or _known_rank_parts(pairs[0][0])
+    if parts is None:
+        return result
+    return _ndarray_type(ctx, [_fresh_unknown(ctx, "ravel", 0)], parts[1])
 
 
 def diff_function_hook(ctx: FunctionContext) -> Type:

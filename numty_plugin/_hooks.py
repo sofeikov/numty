@@ -50,8 +50,9 @@ from ._builders import (
     ascontiguousarray_function_hook, full_function_hook, linspace_function_hook,
     tri_function_hook, concatenate_function_hook,
     vstack_function_hook, hstack_function_hook, dstack_function_hook, column_stack_function_hook,
-    stack_function_hook, r_getitem_hook,
+    stack_function_hook,
 )
+from ._joins import block_function_hook, c_getitem_hook, r_getitem_hook
 from ._arange import arange_function_hook
 from ._matmul import (
     _matmul_names_report, _matmul_result, _matmul_unpack_dims, _operand_parts, matmul_hook,
@@ -67,7 +68,7 @@ from ._ops import (
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
-    atleast_function_hook,
+    atleast_function_hook, append_function_hook, insert_function_hook, delete_function_hook,
 )
 from ._matrix import (
     cov_function_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, eye_function_hook,
@@ -77,8 +78,8 @@ from ._reshape import (
     _reshape_new_dims, _scalar_key, reshape_method_hook, reshape_function_hook,
     transpose_method_hook, transpose_function_hook, swapaxes_function_hook, swapaxes_method_hook,
     moveaxis_function_hook, rollaxis_function_hook, matrix_transpose_function_hook,
-    mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook,
-    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook,
+    mt_attribute_hook, permute_dims_function_hook, squeeze_method_hook, squeeze_function_hook,
+    expand_dims_function_hook,
 )
 from ._reductions import (
     allany_method_hook, allany_function_hook, reduction_method_hook, ufunc_method_hook,
@@ -94,15 +95,16 @@ from ._fft import (
 from ._einsum import _einsum_signature_hook, einsum_function_hook
 from ._linalg import (
     _linalg_cross_signature_hook, _norm_signature_hook, cross_function_hook,
-    linalg_cross_function_hook, linalg_function_hook,
+    linalg_cross_function_hook, linalg_function_hook, poly_function_hook, roots_function_hook,
 )
 from ._indexing import (
     flatnonzero_mask_hook, getitem_method_hook, iter_method_hook,
     setitem_method_hook, take_along_axis_function_hook, take_function_hook,
     take_method_hook,
 )
+from ._arrays import asarray_function_hook
 from ._broadcast import (
-    angle_function_hook, asarray_function_hook, broadcast_method_hook, broadcast_to_function_hook,
+    angle_function_hook, broadcast_method_hook, broadcast_to_function_hook,
     clip_function_hook, clip_method_hook, compare_method_hook, divmod_function_hook,
     divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook, isclose_function_hook,
     logical_method_hook, round_function_hook, round_method_hook, subtract_method_hook,
@@ -912,6 +914,8 @@ class NumtyPlugin(Plugin):
             return setitem_method_hook
         if fullname == "numpy.lib._index_tricks_impl.RClass.__getitem__":
             return r_getitem_hook
+        if fullname == "numpy.lib._index_tricks_impl.CClass.__getitem__":
+            return c_getitem_hook
         short = fullname.rsplit(".", 1)[-1]
         if fullname.startswith("numpy.ndarray.") and short in {
             "__eq__",
@@ -1788,6 +1792,7 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "atleast_1d": partial(atleast_function_hook, rank=1),
             "atleast_2d": partial(atleast_function_hook, rank=2),
             "atleast_3d": partial(atleast_function_hook, rank=3),
+            "block": block_function_hook,
             "hstack": hstack_function_hook,
             "stack": stack_function_hook,
             "vstack": vstack_function_hook,
@@ -1833,6 +1838,10 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
             "sinc": partial(ufunc_function_hook, group="float"),
         },
         "numpy.lib._histograms_impl": {"histogram": histogram_function_hook},
+        "numpy.lib._polynomial_impl": {
+            "poly": poly_function_hook,
+            "roots": roots_function_hook,
+        },
         "numpy.lib._nanfunctions_impl": {
             "nanargmax": partial(arg_function_hook, op="nanargmax"),
             "nanargmin": partial(arg_function_hook, op="nanargmin"),
@@ -1893,6 +1902,8 @@ def _numpy_function_hooks() -> dict[str, Callable[[FunctionContext], Type]]:
                     "det",
                     "eig",
                     "eigh",
+                    "eigvals",
+                    "eigvalsh",
                     "inv",
                     "lstsq",
                     "matrix_power",

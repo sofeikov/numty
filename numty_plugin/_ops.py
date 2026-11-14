@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from mypy.nodes import Expression, ListExpr, StarExpr, TupleExpr
 from mypy.plugin import FunctionContext, MethodContext
-from mypy.types import AnyType, Instance, TupleType, Type, TypeOfAny, TypeVarType, get_proper_type
+from mypy.types import AnyType, Instance, LiteralType, TupleType, Type, TypeOfAny, TypeVarType, get_proper_type
 
 from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
 from ._dtypes import _DTYPE_INFO
@@ -19,6 +19,7 @@ from ._types import (
     _dims_provably_ne, _report_mask_names, _report_names,
     _int_value, _dim_value, _dim_eq, _dim_add_const, _dim_add2, _dim_mul_const, _dim_div, _mul_dims,
     _fold_int, _ndarray_parts, _parts_or_unpack, _has_unpack, _ndarray_type, _shape_from_arg,
+    _distribute_solve, _in_loop_body, _fold_dim_expr,
 )
 from ._reshape import (
     _check_axis, _all_positionals, _dims_str, _dtype_kind_size, _fold_flag, _formal_pair, _is_none_type,
@@ -34,8 +35,9 @@ from ._reshape import (
     _construct_dtype, _known_rank_parts, _mixed_parts,
 )
 from ._reshape import (
-    _bound_args, _check_unique_axes, _int_or_none, _picture_complete, _positionals_only,
+    _bound_args, _check_unique_axes, _int_or_none, _picture_complete, _positionals_only, _promote_all,
 )
+from ._builders import _scalar_spec
 from ._linalg import (
     _string_value,
 )
@@ -852,7 +854,8 @@ def _pad_widths(
         if len(expr.items) == 2 and not any(
             isinstance(e, (TupleExpr, ListExpr)) for e in expr.items
         ):
-            return collect([entry(expr, None)])
+            # The pair's own type reads an `int` side (issue 351).
+            return collect([entry(expr, tp)])
         return collect([entry(e, t) for e, t in zip(expr.items, types)])
     proper = get_proper_type(tp)
     if isinstance(proper, TupleType):
@@ -1564,15 +1567,23 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
     if found_w is None:
         return ctx.default_return_type
     window = _int_or_none(found_w)
-    widths: list[int] | None = None
+    widths: list[int | Type] | None = None
     if isinstance(window, int):
         widths = [window]
+        scalar_window = True
+    elif window == "bail" and _is_single_index(found_w[0]):
+        # A size window (`w.shape[0]`, `n + 1`) is that size on the
+        # window axis, an `int` one `int` (issue 351).
+        size = _fold_dim_expr(ctx, found_w[1], 0) if found_w[1] is not None else None
+        if size is None:
+            size = _dim_value(found_w[0])
+        widths = [ctx.api.named_generic_type("builtins.int", []) if size is None else size]
         scalar_window = True
     elif window == "bail":
         seq = _fft_seq_arg(found_w)
         if not isinstance(seq, list):
             return ctx.default_return_type
-        items: list[int] = []
+        items: list[int | Type] = []
         for entry in seq:
             if not isinstance(entry, int):
                 return ctx.default_return_type
@@ -1590,12 +1601,12 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
             seq = _fft_seq_arg(found_ax)
             if not isinstance(seq, list):
                 return ctx.default_return_type
-            items = []
+            axis_items: list[int] = []
             for entry in seq:
                 if not isinstance(entry, int):
                     return ctx.default_return_type
-                items.append(entry)
-            axes = items
+                axis_items.append(entry)
+            axes = axis_items
         else:
             axes = None
     if axes is None:
@@ -1631,6 +1642,12 @@ def sliding_window_view_function_hook(ctx: FunctionContext) -> Type:
             return ctx.default_return_type
     out = list(dims)
     for ax, wval in zip(eff, widths):
+        if not isinstance(wval, int):
+            # The shortened axis is `int`: code pads the input to a size
+            # of its own name first (`n_padded`, which is `n + w - 1`), and
+            # `n_padded - w + 1` would not be `n` (scipy's convolve1d).
+            out[ax] = ctx.api.named_generic_type("builtins.int", [])
+            continue
         if wval < 0:
             ctx.api.fail(
                 "sliding_window_view `window_shape` cannot contain "
@@ -1741,3 +1758,175 @@ def _fft_seq_arg(
     if _int_value(tp) is not None:
         return "scalar"
     return "bail"
+
+
+def append_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    if len(pairs) < 2:
+        return ctx.default_return_type
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 2:
+        axis_pair = pairs[2]
+    # Union arguments reach the hook one member pair at a time, every
+    # member of `arr` with every member of `values`. `np.append(1 - y, y)`
+    # with `y` a union has co-derived arguments, so each call gives the
+    # members paired index-wise (issue 331), as other union inputs do.
+    # Not in a loop body (see _in_loop_body): `out = np.append(out, row)`.
+    if not _in_loop_body(ctx):
+        whole = [_whole_arg_type(ctx, tp, expr) for tp, expr in pairs[:2]]
+        dist = _distribute_solve(whole, lambda a, b: _append_types(ctx, a, b, axis_pair))
+        if dist is not None:
+            return dist
+    return _append_types(ctx, pairs[0][0], pairs[1][0], axis_pair)
+
+
+def _whole_arg_type(ctx: FunctionContext, tp: Type, expr: Expression | None) -> Type:
+    """The type of an argument expression before mypy split its union."""
+    if expr is None:
+        return tp
+    try:
+        return ctx.api.get_expression_type(expr)
+    except Exception:
+        _swallowed(ctx, "_whole_arg_type")
+        return tp
+
+
+def _append_types(
+    ctx: FunctionContext, a: Type, b: Type, axis_pair: tuple[Type, Expression | None] | None
+) -> Type:
+    from numty_plugin import _fresh_unknown
+    parts_a = _ndarray_parts(a)
+    parts_b = _ndarray_parts(b)
+    if parts_a is None or parts_b is None:
+        return ctx.default_return_type
+    dims_a, dtype_a = parts_a
+    dims_b, dtype_b = parts_b
+    dtype = _promote_all(ctx, [dtype_a, dtype_b])
+    if dtype is None:
+        return ctx.default_return_type
+    axis_val = _int_or_none(axis_pair)
+    if axis_val is None:
+        # axis=None: flatten and concat -> 1-D
+        # total = product(a) + product(b) if concrete, else unknown
+        if all(isinstance(d, int) for d in dims_a) and all(isinstance(d, int) for d in dims_b):
+            prod_a = 1
+            for d in dims_a:
+                assert isinstance(d, int)
+                prod_a *= d
+            prod_b = 1
+            for d in dims_b:
+                assert isinstance(d, int)
+                prod_b *= d
+            return _ndarray_type(ctx, [prod_a + prod_b], dtype)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "append", 0)], dtype)
+    if axis_val == "bail":
+        return ctx.default_return_type
+    assert isinstance(axis_val, int)
+    # axis specified: must be valid for both, ranks must match?
+    # Reuse concat logic: out dims same except axis summed
+    # For append, values can be 1-D? but we check ranks equal for simplicity, else bail to Any-like (unknown)
+    if len(dims_a) != len(dims_b):
+        # If ranks differ, numpy still allows? Actually append with axis requires same shape except axis.
+        # We'll bail if ranks differ.
+        return ctx.default_return_type
+    norm = _check_axis(ctx, "append axis", axis_val, dims_a)
+    if norm is None:
+        return ctx.default_return_type
+    out = list(dims_a)
+    for i, (da, db) in enumerate(zip(dims_a, dims_b)):
+        if i == norm:
+            continue
+        if not _dim_eq(da, db):
+            if isinstance(da, int) and isinstance(db, int):
+                ctx.api.fail(
+                    f"append dimension {i} differs: {da} vs {db} "
+                    f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
+                    ctx.context,
+                    code=NUMTY_SHAPE,
+                )
+                return ctx.default_return_type
+            return ctx.default_return_type
+    out[norm] = _dim_add2(ctx, "append", norm, dims_a[norm], dims_b[norm])
+    return _ndarray_type(ctx, out, dtype)
+
+
+def insert_function_hook(ctx: FunctionContext) -> Type:
+    pairs = _all_positionals(ctx)
+    from numty_plugin import _fresh_unknown
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 3:
+        # insert(arr, obj, values, axis) -> axis is 4th? Actually signature: arr, obj, values, axis
+        # positionals: arr, obj, values, axis
+        axis_pair = pairs[3] if len(pairs) > 3 else None
+    if axis_pair is None:
+        # axis=None flattens -> 1-D unknown (insertion increases size, but hard to know)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "insert", 0)], dtype)
+    axis_val = _int_or_none(axis_pair)
+    if axis_val == "bail":
+        return ctx.default_return_type
+    if axis_val is None:
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "insert", 0)], dtype)
+    assert isinstance(axis_val, int)
+    norm = _check_axis(ctx, "insert axis", axis_val, dims)
+    if norm is None:
+        return ctx.default_return_type
+    out = list(dims)
+    out[norm] = _fresh_unknown(ctx, "insert", norm)
+    return _ndarray_type(ctx, out, dtype)
+
+
+def _is_single_index(tp: Type) -> bool:
+    """An integer scalar (`int`, a numpy integer, an int-bound size), not a bool."""
+    key = _scalar_spec(tp)
+    if key is not None:
+        return key == ("weak", "builtins.int") or (
+            key[0] == "strong" and _DTYPE_INFO.get(key[1], ("", 0))[0] in ("i", "u")
+        )
+    proper = get_proper_type(tp)
+    if isinstance(proper, LiteralType):
+        return isinstance(proper.value, int) and not isinstance(proper.value, bool)
+    return isinstance(proper, TypeVarType) and _dim_value(proper) is not None
+
+
+def delete_function_hook(ctx: FunctionContext) -> Type:
+    """np.delete: one entry less for a single integer index (issue 351).
+
+    A list, slice or mask removes a data-dependent count: that axis is a
+    fresh unknown. Without `axis=` the input is flattened first.
+    """
+    pairs = _all_positionals(ctx)
+    from numty_plugin import _fresh_unknown
+    if not pairs:
+        return ctx.default_return_type
+    parts = _ndarray_parts(pairs[0][0]) or _known_rank_parts(pairs[0][0])
+    if parts is None:
+        return ctx.default_return_type
+    dims, dtype = parts
+    single = len(pairs) > 1 and _is_single_index(pairs[1][0])
+    axis_pair = _formal_pair(ctx, "axis")
+    if axis_pair is None and len(pairs) > 2:
+        axis_pair = pairs[2]
+    axis_val = None if axis_pair is None else _int_or_none(axis_pair)
+    if axis_val == "bail":
+        return ctx.default_return_type
+    if axis_val is None:
+        if single:
+            total = _mul_dims(ctx, "delete", 0, list(dims))
+            return _ndarray_type(ctx, [_dim_add_const(ctx, "delete", 0, total, -1)], dtype)
+        return _ndarray_type(ctx, [_fresh_unknown(ctx, "delete", 0)], dtype)
+    assert isinstance(axis_val, int)
+    norm = _check_axis(ctx, "delete axis", axis_val, dims)
+    if norm is None:
+        return ctx.default_return_type
+    out = list(dims)
+    if single:
+        out[norm] = _dim_add_const(ctx, "delete", norm, dims[norm], -1)
+    else:
+        out[norm] = _fresh_unknown(ctx, "delete", norm)
+    return _ndarray_type(ctx, out, dtype)

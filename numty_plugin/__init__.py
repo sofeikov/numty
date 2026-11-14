@@ -74,15 +74,18 @@ from ._indexing import (  # noqa: F401
     _take_index_values, _take_indices, _take_solve, getitem_method_hook, setitem_method_hook,
     take_along_axis_function_hook, take_function_hook, take_method_hook,
 )
+from ._arrays import (  # noqa: F401
+    _apply_ndmin, _asarray_array_type, _display_element_kind, _solve_asarray, asarray_function_hook,
+)
 from ._broadcast import (  # noqa: F401
-    _apply_ndmin, _asarray_array_type, _broadcast_dims, _broadcast_dims_unpack, _broadcast_result,
+    _broadcast_dims, _broadcast_dims_unpack, _broadcast_result,
     _broadcast_shapes, _broadcast_to_compatible, _broadcast_to_types, _clip_types, _combine_specs,
-    _compare_types, _display_element_kind, _is_bool_operand, _is_builtin_int, _is_plain_bool,
-    _logical_types, _merge_shape_lists, _operand_spec, _smallest_float, _solve_asarray,
+    _compare_types, _is_bool_operand, _is_builtin_int, _is_plain_bool,
+    _logical_types, _merge_shape_lists, _operand_spec, _smallest_float,
     _solve_broadcast_to, _solve_clip, _solve_round, _solve_truediv_pair, _solve_ufunc,
     _solve_ufunc_binary_bool, _solve_ufunc_binary_float, _solve_where, _specs_dtype, _truediv_types,
     _ufunc_bool_types, _ufunc_call_solve, _ufunc_float_types, _ufunc_name, _ufunc_types,
-    _where_types, angle_function_hook, asarray_function_hook, broadcast_method_hook,
+    _where_types, angle_function_hook, broadcast_method_hook,
     broadcast_to_function_hook, clip_function_hook, clip_method_hook, compare_method_hook,
     divmod_function_hook, divmod_method_hook, floordiv_mod_pow_method_hook, inplace_method_hook,
     isclose_function_hook, logical_method_hook, round_function_hook, round_method_hook,
@@ -151,7 +154,7 @@ from ._ops import (  # noqa: F401
     argwhere_function_hook, unique_function_hook, isin_function_hook, _search_values_dims,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook,
     sliding_window_view_function_hook, atleast_function_hook,
-    _fft_seq_arg, _fft_seq_entry,
+    _fft_seq_arg, _fft_seq_entry, append_function_hook, insert_function_hook, delete_function_hook,
 )
 from ._matrix import (  # noqa: F401
     eye_function_hook, identity_function_hook, diag_function_hook, diagonal_function_hook,
@@ -168,8 +171,8 @@ from ._reshape import (  # noqa: F401
     transpose_method_hook, transpose_function_hook, _swapaxes_solve, swapaxes_function_hook,
     swapaxes_method_hook, _moveaxis_permutation, _parse_shape_like, moveaxis_function_hook,
     rollaxis_function_hook, _matrix_transpose_solve, matrix_transpose_function_hook,
-    mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook,
-    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook,
+    mt_attribute_hook, permute_dims_function_hook, squeeze_method_hook, squeeze_function_hook,
+    expand_dims_function_hook,
     REDUCTION_DTYPES, _check_unique_axes, _construct_dtype, _exact_element, _int_or_none,
     _is_mixed_shape, _is_plain_int, _literal_positions, _mixed_parts, _mixed_result, _movable_parts,
     _ndarrays_in, _picture_complete, _positionals_only, _unknown_axis_parts, _widen_literal_dims,

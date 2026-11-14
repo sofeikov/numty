@@ -28,13 +28,14 @@ from ._dtypes import (
 )
 
 from ._types import (
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int, _dim_mul_const,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
-    _distribute_pairings, _in_loop_body, _kept_name, _union_members, _union_results,
+    _distribute_pairings, _in_loop_body, _kept_name, _union_members, _union_results, _has_unpack,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
+from ._bindings import _is_conditional_branch
 from ._reshape import (
     _check_axis, _fail_axis,
     _all_positionals, _construct_datetime_dtype, _dims_str, _formal_pair, _is_none_type,
@@ -563,6 +564,13 @@ def _zeros_of(
         if _explicit_dtype(ctx):
             return _stub_shape_named_dtype(ctx, _named_dtype(ctx), (shape_arg, shape_expr))
         return _stub_shape_named_dtype(ctx, None)
+    if 0 in dims and _is_conditional_branch(ctx, ctx.context):
+        # An empty stand-in, `A2 = f(A) if A is not None else np.zeros((0, 0))`
+        # (scipy's abcd_normalize): the code tells it apart later by `.size`
+        # or an `or` over its sizes, which numty does not follow. Its 0
+        # sizes are `int`, so the union still fits the declared `F64[N, N]`;
+        # the other sizes stay, or mypy's join would lose the other branch's.
+        dims = [ctx.api.named_generic_type(INT_FULLNAME, []) if isinstance(d, int) and d == 0 else d for d in dims]
     if not _dims_fit_intp(ctx, dims):
         return ctx.default_return_type
     if _explicit_dtype(ctx):
@@ -719,8 +727,10 @@ def _scalar_ret_name(ret: Type) -> str | None:
     if not isinstance(proper, Instance):
         return None
     base = proper.type.fullname
-    if base == "numpy.bool":
-        return "numpy.bool"
+    if base in _DTYPE_INFO:
+        # np.float64 and np.complex128 are classes of their own, not a
+        # generic class with a width tag (issue #349).
+        return base
     kind = _GENERIC_KIND.get(base)
     if kind is None or len(proper.args) != 1:
         return None
@@ -1381,6 +1391,9 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
         return _union_results([_concatenate_items(ctx, pairs, items) for items in variants])
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
+        whole = _ndarray_parts(pairs[0][0]) or _known_rank_parts(pairs[0][0])
+        if whole is not None and not _has_unpack(whole[0]):
+            return _concatenate_array(ctx, pairs, list(whole[0]), whole[1])
         if _is_empty_sequence(pairs[0][0], pairs[0][1]):
             ctx.api.fail(
                 "concatenate needs at least one array (got an empty sequence)",
@@ -1401,6 +1414,75 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
             return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
     return _concatenate_items(ctx, pairs, items)
+
+
+def _concatenate_array(
+    ctx: FunctionContext,
+    pairs: list[tuple[Type, Expression | None]],
+    dims: list[int | Type],
+    dtype: Type,
+) -> Type:
+    """np.concatenate of one array: its first-axis items, joined (issue 351).
+
+    `(2, n, m)` along axis 1 is `(n, 2*m)`; a product of two names
+    (`(k, n, m)`) is an unknown. With `axis=None` it is the flat total. A 1-D array has 0-d items, which numpy refuses.
+    A 1-D object (or unknown-dtype) array's items may be arrays themselves
+    (ragged chunks in `np.empty(k, dtype=object)`), so it is left to the
+    stubs.
+    """
+    if len(dims) == 1 and _items_may_be_arrays(dtype):
+        return ctx.default_return_type
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        dtype = named
+    axis = _concat_axis(ctx, pairs)
+    if axis is None:
+        return ctx.default_return_type
+    if axis == "none":
+        return _ndarray_type(ctx, [_mul_dims(ctx, "concatenate", 0, dims) if dims else 1], dtype)
+    if not isinstance(axis, int) or not dims:
+        return ctx.default_return_type
+    count, rest = dims[0], dims[1:]
+    if not rest:
+        ctx.api.fail(
+            f"concatenate of one array joins its items, which are 0-d for shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    norm = _check_axis(ctx, "concatenate axis", axis, rest, len(rest))
+    if norm is None:
+        return ctx.default_return_type
+    from numty_plugin import _fresh_unknown
+    out = list(rest)
+    size = rest[norm]
+    if isinstance(count, int) and isinstance(size, int):
+        out[norm] = count * size
+    elif isinstance(count, int):
+        out[norm] = _dim_mul_const(ctx, "concatenate", norm, size, count)
+    elif isinstance(size, int):
+        out[norm] = _dim_mul_const(ctx, "concatenate", norm, count, size)
+    else:
+        # A product of two names is an unknown: code names it on its
+        # own (`kp = k * p` declared `F64["kp kp"]`), as for a local
+        # bound to a product (issue 359).
+        out[norm] = _fresh_unknown(ctx, "concatenate", norm)
+    return _ndarray_type(ctx, out, dtype)
+
+
+def _items_may_be_arrays(dtype: Type) -> bool:
+    """`Any`, `dtype[Any]` or `dtype[object_]`: items numty cannot see."""
+    proper = get_proper_type(dtype)
+    if isinstance(proper, AnyType):
+        return True
+    if not isinstance(proper, Instance) or len(proper.args) != 1:
+        return False
+    element = get_proper_type(proper.args[0])
+    return isinstance(element, AnyType) or (
+        isinstance(element, Instance) and element.type.fullname == "numpy.object_"
+    )
 
 
 def _concatenate_items(
@@ -1845,71 +1927,3 @@ def _stack_new_axis(
     out = list(first)
     out.insert(norm, len(items))
     return _ndarray_type(ctx, out, dtype)
-
-
-def r_getitem_hook(ctx: MethodContext) -> Type:
-    """np.r_[...]: concatenate scalars/arrays along axis 0 (issue #230).
-
-    Minimal solver for the common cases (np.r_[0.0, x], run boundaries
-    np.r_[True, x[1:] != x[:-1]]). Each item is an array (dims kept) or
-    a Python/numpy scalar (1-D [1] with the weak dtype). Items promote
-    like concatenate and merge along axis 0.
-    """
-    pairs = _all_positionals(ctx)
-    if len(pairs) != 1:
-        return ctx.default_return_type
-    tp, expr = pairs[0]
-    proper = get_proper_type(tp)
-    if not isinstance(proper, TupleType):
-        return ctx.default_return_type
-    # expr should mirror the TupleType; if not, fall back to types alone.
-    expr_items: list[Expression | None]
-    if isinstance(expr, TupleExpr) and len(expr.items) == len(proper.items):
-        expr_items = list(expr.items)
-    else:
-        expr_items = [None] * len(proper.items)
-    items: list[tuple[list[int | Type], Type]] = []
-    for item_tp, item_expr in zip(proper.items, expr_items):
-        parts = _ndarray_parts(item_tp)
-        if parts is not None:
-            dims, dtype = parts
-            items.append((list(dims), dtype))
-            continue
-        # Scalar -> 1-D [1] with weak dtype (Python) or strong (numpy).
-        scalar_dtype: Type | None = None
-        # Python literals via expression.
-        if item_expr is not None:
-            if isinstance(item_expr, IntExpr) and not isinstance(item_expr.value, bool):
-                scalar_dtype = _construct_dtype(ctx, "numpy.int64")
-            elif isinstance(item_expr, FloatExpr):
-                scalar_dtype = _construct_dtype(ctx, "numpy.float64")
-            elif isinstance(item_expr, NameExpr) and item_expr.name in ("True", "False"):
-                scalar_dtype = _construct_dtype(ctx, "numpy.bool")
-        if scalar_dtype is None:
-            key = _scalar_key(item_tp)
-            if key is not None:
-                kind, name = key
-                strong_name = _WEAK_DEFAULT.get(name, name) if kind == "weak" else name
-                scalar_dtype = _construct_dtype(ctx, strong_name)
-            else:
-                # An int-valued TypeVar (e.g. len(x): T) is a 1-element
-                # int64 scalar, like a plain-int expression (issue #230).
-                proper_item = get_proper_type(item_tp)
-                if isinstance(proper_item, TypeVarType):
-                    upper = get_proper_type(proper_item.upper_bound)
-                    if isinstance(upper, Instance) and upper.type.fullname == INT_FULLNAME:
-                        scalar_dtype = _construct_dtype(ctx, "numpy.int64")
-                if scalar_dtype is None:
-                    ret_name = _scalar_ret_name(item_tp)
-                    if ret_name is not None:
-                        scalar_dtype = _construct_dtype(ctx, ret_name)
-        if scalar_dtype is None:
-            return ctx.default_return_type
-        items.append(([1], scalar_dtype))
-    if not items:
-        return ctx.default_return_type
-    dtype = _promote_all(ctx, [dtype for _, dtype in items])
-    if dtype is None:
-        dtype = _default_dtype(ctx)
-    return _concat_merge(ctx, "r_", items, dtype, 0)
-

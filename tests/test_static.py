@@ -7052,3 +7052,221 @@ def test_size_tvar_call_catch() -> None:
         23: f'"{_ND}[tuple[N], {_F64}]"',
         24: f'"{_ND}[tuple[N], {_F64}]"',
     }, result.stdout
+
+
+# Issue 349: `np.float64` (a class of its own, not a generic class with a
+# width tag) names the dtype like `float` and `np.float32` do.
+def test_dtype_float64_ok() -> None:
+    result = run_mypy(FIXTURES / "dtype_float64_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[P+1], {_F64}]"',
+        13: f'"{_ND}[tuple[Literal[3], Literal[4]], {_F64}]"',
+        14: f'"{_ND}[tuple[S], {_F64}]"',
+        15: f'"{_ND}[tuple[n], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[3], Literal[4]], {_F64}]"',
+        17: f'"{_ND}[tuple[Literal[3], Literal[4]], {_F64}]"',
+        18: f'"{_ND}[tuple[Literal[3], Literal[4]], numpy.dtype[numpy.complex128]]"',
+    }, result.stdout
+
+
+def test_dtype_float64_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_dtype_float64.py")
+    assert _messages_by_line(result) == {
+        11: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[3], Literal[4]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[4], Literal[3]], dtype[float64]]")  [assignment]'
+        ],
+        12: ["broadcast shapes disagree at trailing axis 0: 4 vs 3 (shapes (4,) vs (4, 3))  [numty-broadcast]"],
+        13: [
+            'Incompatible return value type (got "ndarray[tuple[P+1], dtype[float64]]", '
+            'expected "ndarray[tuple[P+2], dtype[float64]]")  [return-value]'
+        ],
+    }, result.stdout
+
+
+# Issue 350: functions with a hooked sibling are solved like it: eigvalsh
+# like eigh, np.block like hstack/vstack, np.c_ like column_stack; np.poly
+# has one coefficient more than roots. eigvals is checked like eig and
+# typed by the stubs.
+def test_coverage_functions_ok() -> None:
+    result = run_mypy(FIXTURES / "coverage_functions_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[Any, Any]"',
+        13: f'"{_ND}[tuple[n], {_F64}]"',
+        14: f'"{_ND}[tuple[n, k+n], {_F64}]"',
+        15: f'"{_ND}[tuple[k+n, n], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
+        17: f'"{_ND}[tuple[n, n+1], {_F64}]"',
+        18: f'"{_ND}[tuple[Literal[3], Literal[3]], {_F64}]"',
+        19: f'"{_ND}[tuple[k+1], {_F64}]"',
+        20: (
+            f'"{_ND}[tuple[?U@20], numpy.dtype[numpy.complexfloating[Any, Any]]]'
+            f' | {_ND}[tuple[?U@20], numpy.dtype[numpy.floating[Any]]]"'
+        ),
+    }, result.stdout
+
+
+def test_coverage_functions_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_coverage_functions.py")
+    assert _messages_by_line(result) == {
+        7: [
+            "linalg.eigvals requires a square (..., M, M) array, got shape (3, 4)  [numty-shape]",
+            # The stubs' own refusal, as for eig.
+            'Argument 1 to "eigvals" has incompatible type "ndarray[tuple[Literal[3], Literal[4]], '
+            'dtype[float64]]"; expected "ndarray[tuple[Any, ...], dtype[inexact[Never, Any]]]"  [arg-type]',
+        ],
+        8: ["block dimension 1 differs: 5 vs 4 (shapes (2, 5) vs (3, 4))  [numty-shape]"],
+        9: ["c_ dimension 0 differs: 2 vs 4 (shapes (2, 5) vs (4, 1))  [numty-shape]"],
+        10: ["poly requires a 1-D or square 2-D array, got shape (3, 4)  [numty-shape]"],
+        11: ["roots requires a 1-D array, got shape (3, 3)  [numty-shape]"],
+    }, result.stdout
+
+
+# Issue 351: kron multiplies symbolic dims, `** 2` is a product, squeeze
+# drops literal 1s and keeps names, ravel / pad / sliding_window_view /
+# delete keep the rank with an unknown where the size is not known,
+# concatenate of one array joins its items, svd with a `bool`
+# full_matrices is the union of both answers.
+def test_symbolic_args_ok() -> None:
+    result = run_mypy(FIXTURES / "symbolic_args_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        16: f'"{_ND}[tuple[a*b, a*b], {_F64}]"',
+        # `** 2` is not read as a product (a local's size stays `int`).
+        17: f'"{_ND}[tuple[int, int], {_F64}]"',
+        18: f'"{_ND}[tuple[n], {_F64}]"',
+        19: f'"{_ND}[tuple[t, p], {_F64}]"',
+        # A `?U` axis may be 1: any rank, the dtype kept.
+        20: f'"{_ND}[tuple[Any, ...], {_F64}]"',
+        21: f'"{_ND}[tuple[?U@21], {_F64}]"',
+        25: f'"{_ND}[tuple[?U@25], {_F64}]"',
+        # A size window keeps its name on the window axis; the shortened
+        # axis is `int` (scipy pads to a name of its own first).
+        26: f'"{_ND}[tuple[c, int, W], {_F64}]"',
+        27: f'"{_ND}[tuple[c, int, int], {_F64}]"',
+        # A product of two names is an unknown, as a local bound to one is `int`.
+        28: f'"{_ND}[tuple[n, ?U@28], {_F64}]"',
+        29: f'"{_ND}[tuple[Literal[6], Literal[4]], {_F64}]"',
+        31: f'"{_ND}[tuple[?U@30], {_F64}]"',
+        32: f'"{_ND}[tuple[?U@30c, n], {_F64}]"',
+        33: f'"{_ND}[tuple[c, n-1], {_F64}]"',
+        34: f'"{_ND}[tuple[Literal[4], Literal[3]], {_F64}]"',
+        35: f'"{_ND}[tuple[c, ?U@35], {_F64}]"',
+    }, result.stdout
+
+
+def test_symbolic_args_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_symbolic_args.py")
+    assert _messages_by_line(result) == {
+        19: ["too many indices for 2 dimensions (got 3, shape (a*a, a*a))  [numty-axis]"],
+        20: [
+            'Argument 1 to "lsim0" has incompatible type "ndarray[tuple[n, n], dtype[float64]]"; '
+            'expected "ndarray[tuple[Never], dtype[float64]]"  [arg-type]'
+        ],
+        21: ["too many indices for 1 dimensions (got 2, shape (?U@21,))  [numty-axis]"],
+        22: ["too many indices for 3 dimensions (got 4, shape (c, ?, W))  [numty-axis]"],
+        24: ["cannot assign value of shape (6, 4) into target of shape (3, 8)  [numty-broadcast]"],
+        25: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[4], Literal[3]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[4], Literal[4]], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout
+
+
+# Issue 360: np.array / np.asarray of a scalar is 0-d; a nested display
+# has one axis per level; `[x] * n` repeats the items (`n` a size, else
+# an unknown); items with an `int` size join like np.stack.
+def test_array_rank_ok() -> None:
+    result = run_mypy(FIXTURES / "array_rank_ok.py")
+    assert result.returncode == 0, result.stdout
+    any_dt = "numpy.dtype[Any]"
+    i64 = "numpy.dtype[numpy.signedinteger[numpy._typing._nbit_base._64Bit]]"
+    assert reveals_by_line(result) == {
+        12: f'"{_ND}[tuple[()], {_F64}]"',
+        # A value typed `float` may hold an int: the dtype stays open.
+        13: f'"{_ND}[tuple[()], {any_dt}]"',
+        14: f'"{_ND}[tuple[()], {_F64}]"',
+        # A scalar member of a union keeps the stubs' answer.
+        15: f'"{_ND}[tuple[Any, ...], {any_dt}] | {_ND}[tuple[N], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[1], Literal[2]], {_F64}]"',
+        17: f'"{_ND}[tuple[Literal[2], Literal[2]], {i64}]"',
+        18: f'"{_ND}[tuple[Literal[3]], {_F64}]"',
+        19: f'"{_ND}[tuple[Literal[3], N], {_F64}]"',
+        20: f'"{_ND}[tuple[N], {_F64}]"',
+        # filterpy's missing-measurement marker: an object array; an `int`
+        # count is an unknown (`Any`) size, which a declared `(n_z, 1)` takes.
+        21: f'"{_ND}[tuple[Any, Literal[1]], {any_dt}]"',
+        22: f'"{_ND}[tuple[Literal[2], ?U@22], {_F64}]"',
+        # Ragged rows are numpy's error: the stubs' answer.
+        23: f'"{_ND}[tuple[Any, ...], {any_dt}]"',
+    }, result.stdout
+
+
+def test_array_rank_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_array_rank.py")
+    assert _messages_by_line(result) == {
+        11: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[Literal[3]], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N, N], dtype[float64]]")  [assignment]'
+        ],
+        12: ["too many indices for 2 dimensions (got 3, shape (2, ?U@12))  [numty-axis]"],
+        13: ["matmul inner dimensions disagree: 2 vs 3  [numty-shape]"],
+        14: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[()], dtype[float64]]", '
+            'variable has type "ndarray[tuple[N], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout
+
+
+# Issues 349-351, 360: the new answers stay out of the way of real code
+# that numty cannot follow: an empty stand-in in a conditional, a local
+# grown in a loop, `.squeeze()` of a union narrowed on `.ndim`, a window
+# over an input padded to a size of its own name, `full_matrices` from a
+# flag, a product of names the return names on its own, and eigvals'
+# stub-typed values (scipy, statsmodels, filterpy).
+def test_coverage_idioms_ok() -> None:
+    result = run_mypy(FIXTURES / "coverage_idioms_ok.py")
+    assert result.returncode == 0, result.stdout
+
+
+# Review of issues 349-351, 360: a zero-size stand-in turns only its 0s
+# into `int`; r_/c_ read a 0-d array as a scalar; a 1-D object array's
+# concatenate is the stubs'; np.poly keeps float32; an attribute set
+# again in its class, or a module name bound again, keeps the stubs'
+# answer for a display or a scalar.
+def test_coverage_review_ok() -> None:
+    result = run_mypy(FIXTURES / "coverage_review_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        13: f'"{_ND}[tuple[int, Literal[3]], {_F64}]"',
+        15: f'"{_ND}[tuple[N+1], {_F64}]"',
+        16: f'"{_ND}[tuple[Literal[1], Literal[2]], {_F64}]"',
+        19: f'"{_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+        21: f'"{_ND}[tuple[N+1], {_F32}]"',
+        22: f'"{_ND}[tuple[N+1], {_F32}]"',
+        33: f'"{_ND}[tuple[Any, ...], numpy.dtype[Any]]"',
+        34: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
+        46: f'"{_ND}[tuple[Literal[2], Literal[2]], {_F64}]"',
+        51: f'"{_ND}[tuple[()], {_F64}]"',
+    }, result.stdout
+
+
+def test_coverage_review_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_coverage_review.py")
+    assert _messages_by_line(result) == {
+        12: ["matmul inner dimensions disagree: 3 vs 4  [numty-shape]"],
+        19: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[2], Literal[2]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[3], Literal[3]], dtype[float64]]")  [assignment]'
+        ],
+        22: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[2], Literal[2]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[3], Literal[3]], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout

@@ -43,7 +43,7 @@ def test_trace_records_bail_and_unhooked(tmp_path: Path) -> None:
         "import numpy as np\n"
         "a = np.zeros((2, 3))\n"
         "b = np.zeros((4, 5))\n"
-        "reveal_type(np.linalg.eigvals(a))\n"
+        "reveal_type(np.isreal(a))\n"
         "reveal_type(np.median(a))\n",
         encoding="utf-8",
     )
@@ -55,16 +55,16 @@ def test_trace_records_bail_and_unhooked(tmp_path: Path) -> None:
     events = _load_trace(trace, src.name)
     assert events, f"no trace events for {src.name}: {trace.read_text()[:2000]}"
     by_op = [(e["op"], e["outcome"], e["line"]) for e in events]
-    # eigvals is unhooked (no solver), median bails (int median unsolved).
+    # isreal is unhooked (no solver), median bails (int median unsolved).
     assert any(
-        "eigvals" in op and outcome == "unhooked" for op, outcome, _ in by_op
+        "isreal" in op and outcome == "unhooked" for op, outcome, _ in by_op
     ), by_op
     assert any(
         outcome == "bail" for _, outcome, _ in by_op
     ), by_op
-    # The unhooked eigvals line is the reveal line (line 4).
+    # The unhooked isreal line is the reveal line (line 4).
     assert any(
-        "eigvals" in op and outcome == "unhooked" and line == 4
+        "isreal" in op and outcome == "unhooked" and line == 4
         for op, outcome, line in by_op
     ), by_op
 
