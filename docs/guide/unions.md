@@ -19,8 +19,7 @@ pairs index-wise too; other dunder ops with unions on both sides go
 through mypy's native cartesian matching, so cross terms may dissolve.
 
 `np.atleast_1d` / `atleast_2d` / `atleast_3d` lift each member
-(`(S, I) | (S,)` is `(S, I) | (1, S)` for `atleast_2d`) and read a list
-of arrays as `np.asarray` does. `.shape` of a union keeps literal sizes
+(`(S, I) | (S,)` is `(S, I) | (1, S)` for `atleast_2d`). `.shape` of a union keeps literal sizes
 as literals, so `U.shape[0]` of `(N, N) | (0, 0)` is `N | Literal[0]`
 and `np.zeros(U.shape[0])` is `(N,) | (0,)`. A union value written with
 `out[i] = v` or `t += v` is checked per member: each array member must

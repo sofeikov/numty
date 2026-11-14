@@ -76,7 +76,9 @@ swapped for the index shape; literal indices past the axis error unless
 A union operand of `dot` or `matmul` solves per member, as `@` does: a
 member that fits no member of the other operand is the error
 (`matmul inner dimensions disagree: 3 vs 5`), otherwise the result is the
-union of the pairs that fit. `linalg.solve` and `linalg.lstsq` check b's
+union of the pairs that fit; two union operands pair index-wise, and a
+scalar member's product stays `Any` (`np.dot(B, u)` with
+`u: F64[N, 1] | float` is `(X, 1) | Any`). `linalg.solve` and `linalg.lstsq` check b's
 rows like a matmul's inner pair: `N` against `N-1` is an error, two
 different names are the `[numty-names]` report, and the result keeps its
 shape. One unknown on both sides of a contraction (`q @ r` of one

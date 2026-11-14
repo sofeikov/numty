@@ -21,7 +21,7 @@ from mypy.plugin import (
 )
 from mypy.types import (
     AnyType, CallableType, FunctionLike, Instance, LiteralType, Overloaded, TupleType, Type,
-    TypeOfAny, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
+    TypeOfAny, TypeType, TypeVarId, TypeVarLikeType, TypeVarType, UnionType, UnpackType, get_proper_type,
 )
 
 if TYPE_CHECKING:
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _quiet_type, _swallowed, _warn_startup
 from ._trace import _numty_strict
 from ._state import STATE
 from ._forms import _LinForm, _is_unknown_fullname
@@ -419,8 +419,11 @@ class NumtyPlugin(Plugin):
             ctx.context.callee.node if hasattr(ctx.context.callee, "node") else None,
             OverloadedFuncDef,
         )
+        # An overloaded method reached through its receiver: no reports
+        # either, its signature is still put in the caller's terms.
+        quiet = overloaded or _overloaded_method(ctx, fullname)
         try:
-            if isinstance(sig, CallableType) and not overloaded:
+            if isinstance(sig, CallableType) and not quiet:
                 # A union actual is checked per member (issue 331).
                 for overrides in _union_actual_variants(sig, ctx):
                     _emit_call_site_conflicts(ctx, _conflict_pairs(sig, ctx, overrides))
@@ -429,7 +432,8 @@ class NumtyPlugin(Plugin):
             _swallowed(ctx, "method_signature_hook")
             pass
         if isinstance(sig, CallableType) and not overloaded:
-            _report_call_site_names(sig, ctx)
+            if not quiet:
+                _report_call_site_names(sig, ctx)
             sig = _return_sig_for_dynamic(_relax_dynamic_formals(_callsite_formula_return(sig, ctx), ctx), ctx)
         _note_rank_mismatches(ctx, sig)
         return sig
@@ -1082,14 +1086,14 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             uu_right: Type | None = None
             if isinstance(call, _OpExpr0):
                 try:
-                    uu_left = ctx.api.get_expression_type(call.left)
-                    uu_right = ctx.api.get_expression_type(call.right)
+                    uu_left = _quiet_type(ctx, call.left)
+                    uu_right = _quiet_type(ctx, call.right)
                 except Exception:
                     _swallowed(ctx, "_broadcast_signature_hook")
                     uu_left = uu_right = None
             elif isinstance(call, _CallExpr0) and call.args:
                 try:
-                    uu_right = ctx.api.get_expression_type(call.args[0])
+                    uu_right = _quiet_type(ctx, call.args[0])
                     uu_left = ctx.type
                 except Exception:
                     _swallowed(ctx, "_broadcast_signature_hook")
@@ -1158,7 +1162,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             # (an inline complex operand otherwise matches the first
             # overload as `ndarray[Any, Any]` and nothing is said).
             for side in (call.left, call.right):
-                side_part = _parts_or_unpack(ctx.api.get_expression_type(side))
+                side_part = _parts_or_unpack(_quiet_type(ctx, side))
                 if side_part is not None and _dtype_base(side_part[1]) == "c":
                     return sig.copy_modified(
                         arg_types=[AnyType(TypeOfAny.explicit) for _ in sig.arg_types]
@@ -1247,7 +1251,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             # Instead, try right first: if right type has known dims and mismatches, use it;
             # otherwise try left. Simplest: check both, if either mismatches with self, trigger.
             try:
-                right_tp = ctx.api.get_expression_type(call.right)
+                right_tp = _quiet_type(ctx, call.right)
                 right_list = _member_dims(right_tp)
                 if right_list is not None and _any_mismatch([list(dims_a)], right_list):
                     return sig.copy_modified(
@@ -1257,7 +1261,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
                 _swallowed(ctx, "_broadcast_signature_hook")
                 pass
             try:
-                left_tp = ctx.api.get_expression_type(call.left)
+                left_tp = _quiet_type(ctx, call.left)
                 left_list = _member_dims(left_tp)
                 if left_list is not None and _any_mismatch([list(dims_a)], left_list):
                     return sig.copy_modified(
@@ -1275,7 +1279,7 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
         if other_expr is None:
             return ctx.default_signature
         try:
-            other_tp = ctx.api.get_expression_type(other_expr)
+            other_tp = _quiet_type(ctx, other_expr)
         except Exception:
             _swallowed(ctx, "_broadcast_signature_hook")
             return ctx.default_signature
@@ -1290,6 +1294,21 @@ def _broadcast_signature_hook(ctx: MethodSigContext) -> FunctionLike:
     except Exception:
         _swallowed(ctx, "_broadcast_signature_hook")
         return ctx.default_signature
+
+
+def _overloaded_method(ctx: MethodSigContext, fullname: str) -> bool:
+    """Whether the method called on the receiver is overloaded (issue 355).
+
+    `a.predict(p, X)` names no node, so the callee check of a free
+    function misses it: the hook then ran on each item mypy tried and
+    reported the conflicts of an item it did not select.
+    """
+    proper = get_proper_type(ctx.type)
+    if isinstance(proper, TypeType):
+        proper = get_proper_type(proper.item)
+    if not isinstance(proper, Instance):
+        return False
+    return isinstance(proper.type.get_method(fullname.rpartition(".")[2]), OverloadedFuncDef)
 
 
 def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
@@ -1321,8 +1340,8 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             if call.op != "@":
                 return ctx.default_signature
             try:
-                left_tp = ctx.api.get_expression_type(call.left)
-                right_tp = ctx.api.get_expression_type(call.right)
+                left_tp = _quiet_type(ctx, call.left)
+                right_tp = _quiet_type(ctx, call.right)
             except Exception:
                 _swallowed(ctx, "_matmul_signature_hook")
                 return ctx.default_signature
@@ -1332,7 +1351,7 @@ def _matmul_signature_hook(ctx: MethodSigContext) -> FunctionLike:
             callee = call.callee
             name = getattr(callee, "name", None)
             try:
-                arg_tp = ctx.api.get_expression_type(call.args[0])
+                arg_tp = _quiet_type(ctx, call.args[0])
             except Exception:
                 _swallowed(ctx, "_matmul_signature_hook")
                 return ctx.default_signature

@@ -12,7 +12,7 @@ from mypy.plugin import FunctionContext, MethodContext, MethodSigContext
 from mypy.subtypes import is_same_type
 from mypy.types import AnyType, Type, get_proper_type
 
-from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_BROADCAST, NUMTY_SHAPE, _quiet_type, _swallowed
 from ._types import _has_unpack, _parts_or_unpack, _scalar_union_members, _union_members, _union_results
 from ._reshape import _movable_parts
 from ._matmul import _matmul_result, _matmul_unpack_dims, _operand_parts
@@ -123,8 +123,8 @@ def _operator_operands(
     for op, left_expr, right_expr in pairs:
         if symbols is not None and op not in symbols:
             continue
-        left = ctx.api.get_expression_type(left_expr)
-        right = ctx.api.get_expression_type(right_expr)
+        left = _quiet_type(ctx, left_expr)
+        right = _quiet_type(ctx, right_expr)
         if other is None and _array_union(right) is None:
             # The reflected call (no `other`) is on a union on the right, one
             # with numbers or `Any` among its members too (issue 354).
@@ -181,7 +181,7 @@ def _paired_member(ctx: MethodContext) -> Type | None:
     call = ctx.context
     if not isinstance(call, OpExpr) or not _same_operand(call.left, call.right):
         return None
-    union = ctx.api.get_expression_type(call.left)
+    union = _quiet_type(ctx, call.left)
     members = _union_members(union)
     if members is None or not is_same_type(ctx.arg_types[0][0], union):
         return None
@@ -316,8 +316,8 @@ def _union_signature_clash(ctx: MethodSigContext, matmul: bool) -> bool:
     elif isinstance(call, ComparisonExpr):
         pairs = [(call.operands[i], call.operands[i + 1]) for i in range(len(call.operators))]
     for left_expr, right_expr in pairs:
-        left = ctx.api.get_expression_type(left_expr)
-        right = ctx.api.get_expression_type(right_expr)
+        left = _quiet_type(ctx, left_expr)
+        right = _quiet_type(ctx, right_expr)
         for member in _members_or_self(left):
             for other in _members_or_self(right):
                 if _shape_clash(member, other, matmul) is not None:

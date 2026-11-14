@@ -11,7 +11,7 @@ from mypy.nodes import ARG_POS, CallExpr, Expression, ListExpr, MemberExpr, Name
 from mypy.plugin import FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
 from mypy.types import AnyType, CallableType, FunctionLike, Type, TypeOfAny, TypeVarType, UnionType, get_proper_type
 
-from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _swallowed
+from ._errors import NUMTY_AXIS, NUMTY_SHAPE, _quiet_type, _swallowed
 from ._forms import _form_has_unknown, _forms_provably_ne, _is_unknown_fullname
 from ._unknowns import _is_one_size_unknown, _is_same_unknown
 from ._exprs import _expr_str
@@ -112,7 +112,7 @@ def _union_operand(ctx: FunctionContext | MethodContext | FunctionSigContext | M
         return False
     try:
         for e in exprs:
-            if _union_members(ctx.api.get_expression_type(e)) is not None:
+            if _union_members(_quiet_type(ctx, e)) is not None:
                 return True
             # In mypy's per-member check of a call the argument reads as
             # the member; the variable still holds the union.
@@ -483,8 +483,16 @@ def _union_contraction_verdict(left: Type, right: Type, op: str) -> str | None:
     paired, so a member is an error only when it fits none. Without a
     union, the message of the one pair.
     """
-    members_b = _contraction_members(right) or [right]
-    for member in _contraction_members(left) or [left]:
+    members_a = _contraction_members(left)
+    members_b = _contraction_members(right)
+    if members_a is not None and members_b is not None:
+        # Two unions pair index-wise (see `_solve_union_contraction`).
+        if len(members_a) != len(members_b):
+            return None
+        messages = [_contraction_clash(a, b, op) for a, b in zip(members_a, members_b)]
+        return messages[0] if all(message is not None for message in messages) else None
+    members_b = members_b or [right]
+    for member in members_a or [left]:
         messages = [_contraction_clash(member, other, op) for other in members_b]
         if all(message is not None for message in messages):
             return messages[0]
@@ -510,17 +518,54 @@ def _solve_union_contraction(
     members_b = _contraction_members(right)
     if members_a is None and members_b is None:
         return None
+    if members_a is not None and members_b is not None:
+        # Two unions pair index-wise, as elsewhere (`_distribute_pairings`):
+        # `dot(B, u)` with `B: F64[X, U] | float` and `u: F64[U, 1] | float`
+        # is `(X, 1) | float`, never the cross pairs. Other widths bail.
+        if len(members_a) != len(members_b):
+            return ctx.default_return_type
+        pairs = list(zip(members_a, members_b))
+        fitting = [(a, b) for a, b in pairs if _contraction_clash(a, b, op) is None]
+        if not fitting:
+            ctx.api.fail(_contraction_clash(*pairs[0], op) or "", ctx.context, code=NUMTY_SHAPE)
+            return ctx.default_return_type
+        return _union_results([_member_solve(solve, a, b) for a, b in fitting])
     message = _union_contraction_verdict(left, right, op)
     if message is not None:
         ctx.api.fail(message, ctx.context, code=NUMTY_SHAPE)
         return ctx.default_return_type
     results = [
-        solve(a, b)
+        _member_solve(solve, a, b)
         for a in members_a or [left]
         for b in members_b or [right]
         if _contraction_clash(a, b, op) is None
     ]
     return _union_results(results) if results else ctx.default_return_type
+
+
+def _member_solve(solve: Callable[[Type, Type], Type], a: Type, b: Type) -> Type:
+    """One pair of members of a union contraction; a scalar member's product stays open."""
+    if _scalar_key(a) is not None or _scalar_key(b) is not None:
+        return AnyType(TypeOfAny.special_form)
+    return solve(a, b)
+
+
+def _scalar_member_trial(ctx: FunctionContext | MethodContext) -> bool:
+    """Whether a scalar operand is mypy's trial of one member of a union operand.
+
+    mypy solves `np.dot(B, u)` with `u: F64[N, 1] | float` once per
+    member, and the scalar member gives `B`'s own shape: a union
+    member the code never meant as a shape (issue 352).
+    """
+    call = ctx.context
+    if not isinstance(call, CallExpr):
+        return False
+    exprs = list(call.args) + ([call.callee.expr] if isinstance(call.callee, MemberExpr) else [])
+    try:
+        return any(_contraction_members(_quiet_type(ctx, e)) is not None for e in exprs)
+    except Exception:
+        _swallowed(ctx, "_scalar_member_trial")
+        return False
 
 
 def _solve_dot(ctx: FunctionContext | MethodContext, left: Type, right: Type) -> Type:
@@ -531,6 +576,10 @@ def _solve_dot(ctx: FunctionContext | MethodContext, left: Type, right: Type) ->
     parts_a, parts_b = _operand_parts(left, right)
     if parts_a is None or parts_b is None:
         if _scalar_key(left) is not None or _scalar_key(right) is not None:
+            if _scalar_member_trial(ctx):
+                # The scalar member of `F64[N, 1] | float` (`u=0`): its
+                # product is left open, the array member is checked.
+                return AnyType(TypeOfAny.special_form)
             # A Python or numpy scalar operand: dot is multiplication (issue 352).
             return _solve_broadcast(ctx, left, right)
         return ctx.default_return_type

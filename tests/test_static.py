@@ -6807,7 +6807,9 @@ def test_union_entry_points_ok() -> None:
     assert reveals_by_line(result) == {
         16: f'"{_ND}[tuple[S, I], {_F64}] | {_ND}[tuple[Literal[1], S], {_F64}]"',
         17: f'"{_ND}[tuple[S, I], {_F64}] | {_ND}[tuple[S], {_F64}]"',
-        18: f'"{_ND}[tuple[?U@18, Z], {_F64}]"',
+        # A list keeps the stubs' answer: its rows are not followed into
+        # declared sizes yet (a filterpy `self.sigmas_h: F64[n_sig, n_z]`).
+        18: f'"{_ND}[Any, Any]"',
         22: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}] | Any"',
         23: f'"{_ND}[tuple[Literal[5], Literal[1]], {_F64}] | Any"',
         28: '"N | Literal[0]"',
@@ -6834,4 +6836,66 @@ def test_union_entry_points_catch() -> None:
             'ndarray[tuple[Literal[0]], dtype[float64]]", expected "ndarray[tuple[Literal[0]], dtype[float64]]")  '
             "[return-value]"
         ],
+    }, result.stdout
+
+
+# Issue 355: the call-site check missed a conflict next to an `int` axis or
+# in a union-of-heads formal, read an overload item mypy did not select, and
+# a free name in the callee's return turned `int` + name into `object`.
+def test_callsite_binding_ok() -> None:
+    result = run_mypy(FIXTURES / "callsite_binding_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        23: f'"{_ND}[tuple[Literal[5]], {_F64}]"',
+        31: f'"{_ND}[tuple[?K@31], {_F64}]"',
+        32: f'"{_ND}[tuple[?K@32], {_F64}]"',
+    }, result.stdout
+
+
+def test_callsite_binding_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_callsite_binding.py")
+    i_conflict = "call-site shape conflict for 'I': 1 (argument 'b', axis 0) vs 3 (argument 'u', axis 1)  [numty-callsite]"
+    n_conflict = "call-site shape conflict for 'N': 4 (argument 'x', axis 0) vs 3 (argument 'P', axis 0)  [numty-callsite]"
+    assert _messages_by_line(result) == {
+        20: [i_conflict],
+        21: [i_conflict],
+        22: [n_conflict],
+        23: [n_conflict],
+    }, result.stdout
+
+
+# Issue 356: a size TypeVar bound through an `int` argument reaches a formula
+# return and an inline call; one fixed by the receiver is not solved again.
+def test_size_tvar_call_ok() -> None:
+    result = run_mypy(FIXTURES / "size_tvar_call_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        21: f'"{_ND}[tuple[K+1], {_F64}]"',
+        22: f'"{_ND}[tuple[Literal[11]], {_F64}]"',
+        23: f'"{_ND}[tuple[K, k], {_F64}]"',
+    }, result.stdout
+
+
+def test_size_tvar_call_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_size_tvar_call.py")
+    g_arg = (
+        'Argument 1 to "g" of "C" has incompatible type "ndarray[tuple[M], dtype[float64]]"; '
+        'expected "ndarray[tuple[N], dtype[float64]]"  [arg-type]'
+    )
+    assert _messages_by_line(result) == {
+        23: [g_arg],
+        24: [
+            'Argument 1 has incompatible type "ndarray[tuple[M], dtype[float64]]"; '
+            'expected "ndarray[tuple[N], dtype[float64]]"  [arg-type]'
+        ],
+        # No follow-on: the result is (N,), and `+ n` is checked quietly.
+        25: [g_arg],
+        29: [
+            'Incompatible types in assignment (expression has type "ndarray[tuple[S, k], dtype[float64]]", '
+            'variable has type "ndarray[tuple[T, k], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout
+    assert reveals_by_line(result) == {
+        23: f'"{_ND}[tuple[N], {_F64}]"',
+        24: f'"{_ND}[tuple[N], {_F64}]"',
     }, result.stdout

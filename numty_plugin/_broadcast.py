@@ -1694,15 +1694,17 @@ def _atleast_lift(ctx: FunctionContext, tp: Type, rank: int) -> Type:
 def atleast_function_hook(ctx: FunctionContext, rank: int) -> Type:
     """np.atleast_1d/2d/3d of one operand (issue 354).
 
-    The operand reads as `np.asarray` reads it, so a union lifts per
-    member (`(S, I) | (S,)` is `(S, I) | (1, S)` for `atleast_2d`) and a
-    list of arrays is `(?U, ...)` before the lift.
+    A union of arrays lifts per member (`(S, I) | (S,)` is
+    `(S, I) | (1, S)` for `atleast_2d`). Anything else that is not an
+    array keeps the stubs' answer.
     """
     pairs = _all_positionals(ctx)
     if len(pairs) != 1:
         # Multi-arg form returns a tuple the stubs own.
         return ctx.default_return_type
-    base = pairs[0][0] if _ndarray_parts(pairs[0][0]) is not None else _solve_asarray(ctx)
+    base = pairs[0][0]
+    if _union_members(base) is not None:
+        base = _solve_asarray(ctx)
     members = _union_members(base) or [base]
     if any(_ndarray_parts(member) is None for member in members):
         return ctx.default_return_type

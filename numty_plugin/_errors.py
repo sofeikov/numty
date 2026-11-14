@@ -16,8 +16,9 @@ from mypy.errorcodes import MISC, ErrorCode
 from ._trace import _numty_strict, _trace_event
 
 if TYPE_CHECKING:
+    from mypy.nodes import Expression
     from mypy.options import Options
-    from mypy.plugin import FunctionContext, MethodContext
+    from mypy.plugin import FunctionContext, FunctionSigContext, MethodContext, MethodSigContext
     from mypy.types import Type
 
 # Error codes, one per kind of diagnostic a user may want to silence or
@@ -316,3 +317,18 @@ def _warn_startup(message: str) -> None:
         print(message, file=sys.stderr)
     except Exception:  # reporting must never be the thing that crashes
         pass
+
+
+def _quiet_type(
+    ctx: FunctionContext | MethodContext | FunctionSigContext | MethodSigContext, expr: Expression
+) -> Type:
+    """The type of an operand expression, with its own errors held back.
+
+    For hooks that read an operand while mypy tries the items of an
+    overload: an error the operand replays there (an `[arg-type]` of a
+    call in it) fails the item, and the operator gets an `[operator]` or
+    `[arg-type]` follow-on (issues 356, 364). mypy reports the operand's
+    errors when it checks the operand itself.
+    """
+    with ctx.api.msg.filter_errors():
+        return ctx.api.get_expression_type(expr)
