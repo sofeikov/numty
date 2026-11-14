@@ -7126,3 +7126,51 @@ def test_coverage_functions_catch() -> None:
         10: ["poly requires a 1-D or square 2-D array, got shape (3, 4)  [numty-shape]"],
         11: ["roots requires a 1-D array, got shape (3, 3)  [numty-shape]"],
     }, result.stdout
+
+
+# Issue 351: kron multiplies symbolic dims, `** 2` is a product, squeeze
+# drops literal 1s and keeps names, ravel / pad / sliding_window_view /
+# delete keep the rank with an unknown where the size is not known,
+# concatenate of one array joins its items, svd with a `bool`
+# full_matrices is the union of both answers.
+def test_symbolic_args_ok() -> None:
+    result = run_mypy(FIXTURES / "symbolic_args_ok.py")
+    assert result.returncode == 0, result.stdout
+    assert reveals_by_line(result) == {
+        16: f'"{_ND}[tuple[a*b, a*b], {_F64}]"',
+        17: f'"{_ND}[tuple[a*a, a*a], {_F64}]"',
+        18: f'"{_ND}[tuple[n], {_F64}]"',
+        19: f'"{_ND}[tuple[t, p], {_F64}]"',
+        # A `?U` axis may be 1: any rank, the dtype kept.
+        20: f'"{_ND}[tuple[Any, ...], {_F64}]"',
+        21: f'"{_ND}[tuple[?U@21], {_F64}]"',
+        25: f'"{_ND}[tuple[?U@25], {_F64}]"',
+        26: f'"{_ND}[tuple[c, -W+n+1, W], {_F64}]"',
+        27: f'"{_ND}[tuple[c, ?U@27b, ?U@27], {_F64}]"',
+        28: f'"{_ND}[tuple[n, k*m], {_F64}]"',
+        29: f'"{_ND}[tuple[Literal[6], Literal[4]], {_F64}]"',
+        31: f'"{_ND}[tuple[?U@30], {_F64}]"',
+        32: f'"{_ND}[tuple[n, n], {_F64}] | {_ND}[tuple[?U@30, n], {_F64}]"',
+        33: f'"{_ND}[tuple[c, n-1], {_F64}]"',
+        34: f'"{_ND}[tuple[Literal[4], Literal[3]], {_F64}]"',
+        35: f'"{_ND}[tuple[c, ?U@35], {_F64}]"',
+    }, result.stdout
+
+
+def test_symbolic_args_catch() -> None:
+    result = run_mypy(FIXTURES / "bad_symbolic_args.py")
+    assert _messages_by_line(result) == {
+        19: ["too many indices for 2 dimensions (got 3, shape (a*a, a*a))  [numty-axis]"],
+        20: [
+            'Argument 1 to "lsim0" has incompatible type "ndarray[tuple[n, n], dtype[float64]]"; '
+            'expected "ndarray[tuple[Never], dtype[float64]]"  [arg-type]'
+        ],
+        21: ["too many indices for 1 dimensions (got 2, shape (?U@21,))  [numty-axis]"],
+        22: ["too many indices for 3 dimensions (got 4, shape (c, p-W+1, W))  [numty-axis]"],
+        24: ["cannot assign value of shape (6, 4) into target of shape (3, 8)  [numty-broadcast]"],
+        25: [
+            'Incompatible types in assignment (expression has type '
+            '"ndarray[tuple[Literal[4], Literal[3]], dtype[float64]]", variable has type '
+            '"ndarray[tuple[Literal[4], Literal[4]], dtype[float64]]")  [assignment]'
+        ],
+    }, result.stdout

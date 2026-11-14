@@ -23,10 +23,10 @@ from ._forms import _DivForm, _MonoForm, _canon_div, _form_has_unknown, _forms_p
 from ._exprs import _expr_str
 
 from ._types import (
-    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2,
+    _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str,
     _is_bare_name_dim, _linear_product, _reshape_total_form, _fold_int,
     _ndarray_parts, _ndarray_type, _shape_from_arg, _int_shape_from_arg, NDARRAY_FULLNAME,
-    INT_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME,
+    INT_FULLNAME, DTYPE_FULLNAME, STR_FULLNAME, TUPLE_FULLNAME,
 )
 from ._types import (
     _unpack_shape,
@@ -35,7 +35,7 @@ from ._dtypes import (
     _DTYPE_BASE, _NBIT_MODULES, _NBIT_TAG_BY_BYTES,
 )
 from ._types import (
-    _fold_dim_expr, _has_unknown_shape, _distribute_solve, _in_loop_body,
+    _fold_dim_expr, _has_unknown_shape,
 )
 from ._types import _is_unsized_tuple, _reshape_kept_axes, _reshape_list_target
 from collections.abc import (
@@ -1057,18 +1057,31 @@ def _promote_all(ctx: FunctionContext | MethodContext, dtypes: list[Type]) -> Ty
     return _construct_dtype(ctx, result)
 
 
+def _any_rank_type(ctx: FunctionContext | MethodContext, dtype: Type) -> Type:
+    """`ndarray[tuple[Any, ...], dtype]`: the dtype without a rank."""
+    shape = ctx.api.named_generic_type(TUPLE_FULLNAME, [AnyType(TypeOfAny.explicit)])
+    return ctx.api.named_generic_type(NDARRAY_FULLNAME, [shape, dtype])
+
+
 def _solve_squeeze(
     ctx: FunctionContext | MethodContext,
     dims: list[int | Type],
     dtype: Type,
     axis: list[int] | None | str,
 ) -> Type:
+    from numty_plugin import _resolve_dim
     ndim = len(dims)
     if not isinstance(axis, list):
         if axis in ("absent", "none"):
-            if any(not isinstance(d, int) for d in dims):
-                # A symbolic dim could be 1 at runtime: bail out.
-                return ctx.default_return_type
+            # Literal 1s go; a size name is taken not to be 1, as np.cov
+            # does (issue 351). An `int` or unknown size may be 1, so the
+            # rank is open there: any rank, the input's dtype.
+            if any(
+                not isinstance(d, int)
+                and (not isinstance(d, TypeVarType) or _form_has_unknown(_resolve_dim(d)))
+                for d in dims
+            ):
+                return _any_rank_type(ctx, dtype)
             return _ndarray_type(ctx, [d for d in dims if d != 1], dtype)
         return ctx.default_return_type
     if not _check_unique_axes(ctx, dims, axis, "squeeze"):
@@ -1483,155 +1496,6 @@ def permute_dims_function_hook(ctx: FunctionContext) -> Type:
     if axes is None:
         return ctx.default_return_type
     return _apply_permutation(ctx, dims, dtype, axes)
-
-
-def append_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    if len(pairs) < 2:
-        return ctx.default_return_type
-    axis_pair = _formal_pair(ctx, "axis")
-    if axis_pair is None and len(pairs) > 2:
-        axis_pair = pairs[2]
-    # Union arguments reach the hook one member pair at a time, every
-    # member of `arr` with every member of `values`. `np.append(1 - y, y)`
-    # with `y` a union has co-derived arguments, so each call gives the
-    # members paired index-wise (issue 331), as other union inputs do.
-    # Not in a loop body (see _in_loop_body): `out = np.append(out, row)`.
-    if not _in_loop_body(ctx):
-        whole = [_whole_arg_type(ctx, tp, expr) for tp, expr in pairs[:2]]
-        dist = _distribute_solve(whole, lambda a, b: _append_types(ctx, a, b, axis_pair))
-        if dist is not None:
-            return dist
-    return _append_types(ctx, pairs[0][0], pairs[1][0], axis_pair)
-
-
-def _whole_arg_type(ctx: FunctionContext, tp: Type, expr: Expression | None) -> Type:
-    """The type of an argument expression before mypy split its union."""
-    if expr is None:
-        return tp
-    try:
-        return ctx.api.get_expression_type(expr)
-    except Exception:
-        _swallowed(ctx, "_whole_arg_type")
-        return tp
-
-
-def _append_types(
-    ctx: FunctionContext, a: Type, b: Type, axis_pair: tuple[Type, Expression | None] | None
-) -> Type:
-    from numty_plugin import _fresh_unknown
-    parts_a = _ndarray_parts(a)
-    parts_b = _ndarray_parts(b)
-    if parts_a is None or parts_b is None:
-        return ctx.default_return_type
-    dims_a, dtype_a = parts_a
-    dims_b, dtype_b = parts_b
-    dtype = _promote_all(ctx, [dtype_a, dtype_b])
-    if dtype is None:
-        return ctx.default_return_type
-    axis_val = _int_or_none(axis_pair)
-    if axis_val is None:
-        # axis=None: flatten and concat -> 1-D
-        # total = product(a) + product(b) if concrete, else unknown
-        if all(isinstance(d, int) for d in dims_a) and all(isinstance(d, int) for d in dims_b):
-            prod_a = 1
-            for d in dims_a:
-                assert isinstance(d, int)
-                prod_a *= d
-            prod_b = 1
-            for d in dims_b:
-                assert isinstance(d, int)
-                prod_b *= d
-            return _ndarray_type(ctx, [prod_a + prod_b], dtype)
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "append", 0)], dtype)
-    if axis_val == "bail":
-        return ctx.default_return_type
-    assert isinstance(axis_val, int)
-    # axis specified: must be valid for both, ranks must match?
-    # Reuse concat logic: out dims same except axis summed
-    # For append, values can be 1-D? but we check ranks equal for simplicity, else bail to Any-like (unknown)
-    if len(dims_a) != len(dims_b):
-        # If ranks differ, numpy still allows? Actually append with axis requires same shape except axis.
-        # We'll bail if ranks differ.
-        return ctx.default_return_type
-    norm = _check_axis(ctx, "append axis", axis_val, dims_a)
-    if norm is None:
-        return ctx.default_return_type
-    out = list(dims_a)
-    for i, (da, db) in enumerate(zip(dims_a, dims_b)):
-        if i == norm:
-            continue
-        if not _dim_eq(da, db):
-            if isinstance(da, int) and isinstance(db, int):
-                ctx.api.fail(
-                    f"append dimension {i} differs: {da} vs {db} "
-                    f"(shapes {_dims_str(dims_a)} vs {_dims_str(dims_b)})",
-                    ctx.context,
-                    code=NUMTY_SHAPE,
-                )
-                return ctx.default_return_type
-            return ctx.default_return_type
-    out[norm] = _dim_add2(ctx, "append", norm, dims_a[norm], dims_b[norm])
-    return _ndarray_type(ctx, out, dtype)
-
-
-def insert_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    from numty_plugin import _fresh_unknown
-    if not pairs:
-        return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
-    if parts is None:
-        return ctx.default_return_type
-    dims, dtype = parts
-    axis_pair = _formal_pair(ctx, "axis")
-    if axis_pair is None and len(pairs) > 3:
-        # insert(arr, obj, values, axis) -> axis is 4th? Actually signature: arr, obj, values, axis
-        # positionals: arr, obj, values, axis
-        axis_pair = pairs[3] if len(pairs) > 3 else None
-    if axis_pair is None:
-        # axis=None flattens -> 1-D unknown (insertion increases size, but hard to know)
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "insert", 0)], dtype)
-    axis_val = _int_or_none(axis_pair)
-    if axis_val == "bail":
-        return ctx.default_return_type
-    if axis_val is None:
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "insert", 0)], dtype)
-    assert isinstance(axis_val, int)
-    norm = _check_axis(ctx, "insert axis", axis_val, dims)
-    if norm is None:
-        return ctx.default_return_type
-    out = list(dims)
-    out[norm] = _fresh_unknown(ctx, "insert", norm)
-    return _ndarray_type(ctx, out, dtype)
-
-
-def delete_function_hook(ctx: FunctionContext) -> Type:
-    pairs = _all_positionals(ctx)
-    from numty_plugin import _fresh_unknown
-    if not pairs:
-        return ctx.default_return_type
-    parts = _ndarray_parts(pairs[0][0])
-    if parts is None:
-        return ctx.default_return_type
-    dims, dtype = parts
-    axis_pair = _formal_pair(ctx, "axis")
-    if axis_pair is None and len(pairs) > 2:
-        axis_pair = pairs[2]
-    if axis_pair is None:
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "delete", 0)], dtype)
-    axis_val = _int_or_none(axis_pair)
-    if axis_val == "bail":
-        return ctx.default_return_type
-    if axis_val is None:
-        return _ndarray_type(ctx, [_fresh_unknown(ctx, "delete", 0)], dtype)
-    assert isinstance(axis_val, int)
-    norm = _check_axis(ctx, "delete axis", axis_val, dims)
-    if norm is None:
-        return ctx.default_return_type
-    out = list(dims)
-    out[norm] = _fresh_unknown(ctx, "delete", norm)
-    return _ndarray_type(ctx, out, dtype)
 
 
 def squeeze_method_hook(ctx: MethodContext) -> Type:

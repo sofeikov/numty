@@ -151,7 +151,7 @@ from ._ops import (  # noqa: F401
     argwhere_function_hook, unique_function_hook, isin_function_hook, _search_values_dims,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook,
     sliding_window_view_function_hook, atleast_function_hook,
-    _fft_seq_arg, _fft_seq_entry,
+    _fft_seq_arg, _fft_seq_entry, append_function_hook, insert_function_hook, delete_function_hook,
 )
 from ._matrix import (  # noqa: F401
     eye_function_hook, identity_function_hook, diag_function_hook, diagonal_function_hook,
@@ -168,8 +168,8 @@ from ._reshape import (  # noqa: F401
     transpose_method_hook, transpose_function_hook, _swapaxes_solve, swapaxes_function_hook,
     swapaxes_method_hook, _moveaxis_permutation, _parse_shape_like, moveaxis_function_hook,
     rollaxis_function_hook, _matrix_transpose_solve, matrix_transpose_function_hook,
-    mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook,
-    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook,
+    mt_attribute_hook, permute_dims_function_hook, squeeze_method_hook, squeeze_function_hook,
+    expand_dims_function_hook,
     REDUCTION_DTYPES, _check_unique_axes, _construct_dtype, _exact_element, _int_or_none,
     _is_mixed_shape, _is_plain_int, _literal_positions, _mixed_parts, _mixed_result, _movable_parts,
     _ndarrays_in, _picture_complete, _positionals_only, _unknown_axis_parts, _widen_literal_dims,

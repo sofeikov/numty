@@ -13,8 +13,8 @@ from ._dtypes import (
     _GENERIC_KIND, _NAME_OF_KIND_SIZE,
 )
 from ._types import (
-    TUPLE_FULLNAME, _check_dim_eq, _dim_add2, _dim_eq, _dim_str, _dims_provably_ne, _has_unpack, _int_value, _ndarray_parts,
-    _ndarray_type, _report_mask_names, _report_names,
+    TUPLE_FULLNAME, _check_dim_eq, _dim_add2, _dim_eq, _dim_str, _dims_provably_ne, _has_unpack, _int_value,
+    _ndarray_parts, _ndarray_type, _report_mask_names, _report_names,
 )
 from ._reshape import (
     _check_axis, _all_positionals, _dims_str, _dtype_fullname, _dtype_kind_size, _fold_flag, _formal_pair,
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     
 
 # Runtime-only (bodies check isinstance / read arg kinds).
+from mypy.typeops import make_simplified_union
 from mypy.types import AnyType, CallableType, TupleType, Type, TypeOfAny
 from ._reshape import (
     _construct_dtype, _mixed_parts,
@@ -402,7 +403,7 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
     rows, cols = dims[-2], dims[-1]
     full = _linalg_flag(ctx, "full_matrices", True)
     compute_uv = _linalg_flag(ctx, "compute_uv", True)
-    if full is None or compute_uv is None:
+    if compute_uv is None:
         return ctx.default_return_type
     ks = _dtype_kind_size(dtype)
     if ks is None:
@@ -430,16 +431,17 @@ def _linalg_svd(ctx: FunctionContext) -> Type:
     s_type = _ndarray_type(ctx, [*batch, inner], s_dtype)
     if not compute_uv:
         return s_type
-    if full:
-        u_dims, vh_dims = [*batch, rows, rows], [*batch, cols, cols]
-    else:
-        u_dims, vh_dims = [*batch, rows, inner], [*batch, inner, cols]
+    # A `bool` full_matrices (issue 351) makes u and vh the union of
+    # both answers; s is the same either way.
+    shapes = [] if full is False else [([*batch, rows, rows], [*batch, cols, cols])]
+    if full is not True:
+        shapes.append(([*batch, rows, inner], [*batch, inner, cols]))
     return _linalg_named(
         ctx,
         [
-            _ndarray_type(ctx, u_dims, uv_dtype),
+            make_simplified_union([_ndarray_type(ctx, u, uv_dtype) for u, _ in shapes]),
             s_type,
-            _ndarray_type(ctx, vh_dims, uv_dtype),
+            make_simplified_union([_ndarray_type(ctx, vh, uv_dtype) for _, vh in shapes]),
         ],
     )
 

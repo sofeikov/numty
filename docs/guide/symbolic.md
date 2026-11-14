@@ -48,7 +48,8 @@ target may spell its sizes as arithmetic over known ones:
 and `2 * n`, `n + 1` and `n // 2` are read the same way.
 `sliding_window_view` appends the window
 after the shrunken dims (`N-w+1`, symbolic included — the conv-output
-formula falls out). Linear forms also spell in annotations: `I64["N+1"]`
+formula falls out: a window `w.shape[0]` of `(W,)` gives `N-W+1` and
+`W`; an `int` window keeps the rank with unknowns). Linear forms also spell in annotations: `I64["N+1"]`
 denotes one more than `N`, so the offsets/lengths duality checks both
 ways — `np.diff` of `I64["N+1"]` is `I64[N]`, and
 `np.concatenate([[0], np.cumsum(lengths)])` of `I64[N]` is `I64["N+1"]`

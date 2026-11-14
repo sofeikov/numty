@@ -31,7 +31,7 @@ from ._types import (
     _int_value, _dim_value, _dim_eq, _dims_provably_ne, _dim_str, _dim_add2, _mul_dims, _fold_int,
     _ndarray_parts, _parts_or_unpack, _distribute_solve, _ndarray_type, _single_shape_arg,
     _single_shape_expr, _shape_from_arg, _int_shape_from_arg, _builder_fold_dim_expr, _report_names,
-    _distribute_pairings, _in_loop_body, _kept_name, _union_members, _union_results,
+    _distribute_pairings, _in_loop_body, _kept_name, _union_members, _union_results, _has_unpack,
     NDARRAY_FULLNAME, INT_FULLNAME, FLOAT64_FULLNAME, DTYPE_FULLNAME,
 )
 from ._returns import _return_any_for_dynamic
@@ -1383,6 +1383,9 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
         return _union_results([_concatenate_items(ctx, pairs, items) for items in variants])
     items = _sequence_parts(ctx, pairs[0][0], pairs[0][1])
     if items is None:
+        whole = _ndarray_parts(pairs[0][0]) or _known_rank_parts(pairs[0][0])
+        if whole is not None and not _has_unpack(whole[0]):
+            return _concatenate_array(ctx, pairs, list(whole[0]), whole[1])
         if _is_empty_sequence(pairs[0][0], pairs[0][1]):
             ctx.api.fail(
                 "concatenate needs at least one array (got an empty sequence)",
@@ -1403,6 +1406,48 @@ def concatenate_function_hook(ctx: FunctionContext) -> Type:
             return AnyType(TypeOfAny.from_error)
         return ctx.default_return_type
     return _concatenate_items(ctx, pairs, items)
+
+
+def _concatenate_array(
+    ctx: FunctionContext,
+    pairs: list[tuple[Type, Expression | None]],
+    dims: list[int | Type],
+    dtype: Type,
+) -> Type:
+    """np.concatenate of one array: its first-axis items, joined (issue 351).
+
+    `(k, n, m)` along axis 1 is `(n, k*m)`; with `axis=None` it is the
+    flat total. A 1-D array has 0-d items, which numpy refuses.
+    """
+    if _explicit_dtype(ctx):
+        named = _named_dtype(ctx)
+        if named is None:
+            return ctx.default_return_type
+        dtype = named
+    axis = _concat_axis(ctx, pairs)
+    if axis is None:
+        return ctx.default_return_type
+    if axis == "none":
+        return _ndarray_type(ctx, [_mul_dims(ctx, "concatenate", 0, dims) if dims else 1], dtype)
+    if not isinstance(axis, int) or not dims:
+        return ctx.default_return_type
+    count, rest = dims[0], dims[1:]
+    if not rest:
+        ctx.api.fail(
+            f"concatenate of one array joins its items, which are 0-d for shape {_dims_str(dims)}",
+            ctx.context,
+            code=NUMTY_SHAPE,
+        )
+        return ctx.default_return_type
+    norm = _check_axis(ctx, "concatenate axis", axis, rest, len(rest))
+    if norm is None:
+        return ctx.default_return_type
+    out = list(rest)
+    if isinstance(count, int) and isinstance(rest[norm], int):
+        out[norm] = count * rest[norm]
+    else:
+        out[norm] = _mul_dims(ctx, "concatenate", norm, [count, rest[norm]])
+    return _ndarray_type(ctx, out, dtype)
 
 
 def _concatenate_items(

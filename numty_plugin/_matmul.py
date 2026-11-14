@@ -18,7 +18,7 @@ from ._exprs import _expr_str
 
 from ._types import (
     _int_value, _dim_eq, _dims_provably_ne, _dim_str, _reshape_total_form, _fold_int,
-    _ndarray_parts, _has_unpack, _ndarray_type,
+    _ndarray_parts, _has_unpack, _ndarray_type, _mul_dims,
 )
 from ._reshape import (
     _fail_axis, _all_positionals, _dims_str, _dtype_fullname, _formal_pair, _promote_dtypes, _scalar_key,
@@ -30,7 +30,7 @@ from ._reductions import (
     _promoted_result_type,
 )
 from ._reshape import (
-    _construct_dtype, _is_plain_int, _mixed_parts,
+    _construct_dtype, _is_plain_int, _known_rank_parts, _mixed_parts,
 )
 from ._linalg import (
     _scalar_of_dtype,
@@ -769,15 +769,16 @@ def kron_function_hook(ctx: FunctionContext) -> Type:
     """np.kron: right-aligned dim products, dtype result_type (issue #58).
 
     (2, 3) kron (4, 5) is (8, 15): shorter inputs pad with 1s on the
-    left, each output dim is the product of the aligned pair. Only
-    int dims solve (symbolic products are nonlinear); anything else
-    bails to the stubs instead of guessing.
+    left, each output dim is the product of the aligned pair. A
+    symbolic pair is the monomial (`(a, a)` kron `(b, b)` is `(a*b,
+    a*b)`), and a pair with an `int` size an unknown: the rank is kept
+    either way (issue 351).
     """
     pair = _two_arrays(ctx)
     if pair is None:
         return ctx.default_return_type
-    parts_a = _ndarray_parts(pair[0])
-    parts_b = _ndarray_parts(pair[1])
+    parts_a = _ndarray_parts(pair[0]) or _known_rank_parts(pair[0])
+    parts_b = _ndarray_parts(pair[1]) or _known_rank_parts(pair[1])
     if parts_a is None or parts_b is None:
         return ctx.default_return_type
     (dims_a, dtype_a), (dims_b, dtype_b) = parts_a, parts_b
@@ -787,13 +788,13 @@ def kron_function_hook(ctx: FunctionContext) -> Type:
     left = [1] * (width - len(dims_a)) + list(dims_a)
     right = [1] * (width - len(dims_b)) + list(dims_b)
     out: list[int | Type] = []
-    for x, y in zip(left, right):
+    for index, (x, y) in enumerate(zip(left, right)):
+        if isinstance(x, bool) or isinstance(y, bool):
+            return ctx.default_return_type
         if isinstance(x, int) and isinstance(y, int):
-            if isinstance(x, bool) or isinstance(y, bool):
-                return ctx.default_return_type
             out.append(x * y)
         else:
-            return ctx.default_return_type
+            out.append(_mul_dims(ctx, "kron", index, [x, y]))
     dtype = _promoted_result_type(ctx, dtype_a, dtype_b)
     if dtype is None:
         return ctx.default_return_type

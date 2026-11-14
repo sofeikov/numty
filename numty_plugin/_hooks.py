@@ -68,7 +68,7 @@ from ._ops import (
     array_split_function_hook, nonzero_function_hook, count_nonzero_function_hook, bincount_function_hook,
     argwhere_function_hook, unique_function_hook, isin_function_hook,
     histogram_function_hook, searchsorted_function_hook, searchsorted_method_hook, sliding_window_view_function_hook,
-    atleast_function_hook,
+    atleast_function_hook, append_function_hook, insert_function_hook, delete_function_hook,
 )
 from ._matrix import (
     cov_function_hook, diag_function_hook, diagonal_function_hook, diagonal_method_hook, eye_function_hook,
@@ -78,8 +78,8 @@ from ._reshape import (
     _reshape_new_dims, _scalar_key, reshape_method_hook, reshape_function_hook,
     transpose_method_hook, transpose_function_hook, swapaxes_function_hook, swapaxes_method_hook,
     moveaxis_function_hook, rollaxis_function_hook, matrix_transpose_function_hook,
-    mt_attribute_hook, permute_dims_function_hook, append_function_hook, insert_function_hook,
-    delete_function_hook, squeeze_method_hook, squeeze_function_hook, expand_dims_function_hook,
+    mt_attribute_hook, permute_dims_function_hook, squeeze_method_hook, squeeze_function_hook,
+    expand_dims_function_hook,
 )
 from ._reductions import (
     allany_method_hook, allany_function_hook, reduction_method_hook, ufunc_method_hook,

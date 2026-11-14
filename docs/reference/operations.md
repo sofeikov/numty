@@ -71,7 +71,13 @@ rank, `ndarray[Any, ...]` (issue 353).
 
 `transpose`/`.T` (which bail out over `*Ts`: no
 annotation can spell its reversal), `squeeze`, `expand_dims`; bad
-permutations, repeated axes and non-1 squeeze axes error.
+permutations, repeated axes and non-1 squeeze axes error. `squeeze`
+without `axis=` drops the literal 1s and keeps the names (a size name
+is taken not to be 1, as for `np.cov`): `(n, 1)` is `(n,)`. An `int` or
+unknown axis may be 1, so the rank is open there: `ndarray[tuple[Any,
+...]]` with the input's dtype (issue 351). `np.concatenate(x)` of one
+array joins its first-axis items: `(k, n, m)` along axis 1 is `(n,
+k*m)`.
 
 ## Reductions
 
@@ -92,7 +98,9 @@ operand, so `(N,)` by `(T,)` is `(N, T)` and an `(N, D)` operand counts
 `D*N`), and `take` (the axis is
 swapped for the index shape; literal indices past the axis error unless
 `mode` clips or wraps). `matmul` on a scalar or 0-d operand errors, while
-`dot` with a scalar or 0-d operand is multiplication (`np.dot(B, 0)` and
+`kron` multiplies the aligned dims, symbolic ones too (`(a, a)` kron
+`(b, b)` is `(a*b, a*b)`; an `int` size gives `?U`), and a size written
+`n ** 2` is `n*n`. `dot` with a scalar or 0-d operand is multiplication (`np.dot(B, 0)` and
 `B.dot(0)` keep `B`'s shape), and
 `linalg.norm` with an explicit `ord` needs one or two reduced axes.
 A union operand of `dot` or `matmul` solves per member, as `@` does: a
@@ -150,7 +158,11 @@ non-positive sizes error.
 must have one per element and literal counts sum to the new size; an
 array of counts gives a plain `int`, a size that is not followed, and a
 scalar count that is not a literal gives `?U`), `pad`
-adds widths per axis, `split` returns a list of equal parts (`?U` for
+adds widths per axis (an `int` width gives `?U`: `np.pad(v, (0, k))` is
+`(?U,)`), `np.ravel` of an input whose total is not spelled is `(?U,)`
+with its dtype, `np.delete` with one integer index removes one entry
+(`np.delete(X, j, axis=1)` of `(n, n)` is `(n, n-1)`; a list, slice or
+mask gives `?U`), `split` returns a list of equal parts (`?U` for
 uneven index splits); negative counts and uneven divisions error.
 
 ## Selection
@@ -279,6 +291,8 @@ tracking dtypes (`eigh` and `eigvalsh` stay real, `eigvals` is
 shared by the factors: `qr` (reduced) is `(M, ?K)` and `(?K, N)`, `svd`
 is `(M, ?K)`, `(?K,)`, `(?K, N)` with `full_matrices=False` and `(M, M)`,
 `(?K,)`, `(N, N)` with the default; a square `(D, D)` input is exact.
+A `full_matrices` that is a `bool` variable makes `u` and `vh` the
+union of both answers (`(N, N) | (?K, N)`), `s` is `(?K,)` either way.
 The result keeps its NamedTuple fields (`.U`, `.S`, `.Q`), typed by the
 stubs (`tests/fixtures/svd_qr_symbolic_ok.py`). `linalg.cross` takes batches of vectors of any
 rank, where NumPy's stubs stop at 2-D. `np.round` and `np.around` keep
