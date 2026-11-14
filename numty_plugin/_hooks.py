@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from mypy.typeanal import TypeAnalyser
     from mypy.types import RawExpressionType, UnboundType
 
-from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, NUMTY_SHAPE, _CANARY_BY_MODULE, _swallowed, _warn_startup
+from ._errors import NUMTY_ANNOTATION, NUMTY_BROADCAST, _CANARY_BY_MODULE, _swallowed, _warn_startup
 from ._errors import _quiet_type
 from ._trace import _numty_strict
 from ._state import STATE

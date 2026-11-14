@@ -6819,6 +6819,8 @@ def test_index_rows_bad() -> None:
         24: ["cannot assign value of shape (1, N) into target of shape (N, 1)  [numty-broadcast]"],
         28: [assign.format("X", "N")],
         30: [assign.format("N", "X")],
+        # The runtime demo writes a union value; issue 354 checks each member.
+        37: ["cannot assign value of shape (2, 2) into target of shape (2, 1)  [numty-broadcast]"],
     }, errors
     assert _run_fixture("bad_index_rows.py") == ["ValueError", "ValueError"]
 
